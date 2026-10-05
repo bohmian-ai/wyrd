@@ -45,7 +45,7 @@ Required execution skill: `$wyrd-implement`.
 - Existing client, queue, Vala, Skald, configuration, validation, and
   serialization error owners whose public codes are missing from the catalog
 - Python exception annotations and stub-generation sources under
-  `python/py-wyrd`
+  `sdks/wyrd-sdk-python`
 - Focused Wyrd error derive/catalog tests and Python error contract tests
 
 Paths are ownership guidance, not a private implementation allowlist.
@@ -153,7 +153,7 @@ Python test lane.
 | Every stable public Python code migrating in PYERR-T02 resolves through the derive-backed catalog with actionable metadata | `crates/wyrd-spec/src/error.rs` (+40 `WYRD_AGENT_*`, `WYRD_SESSION_*`, `WYRD_TOOL_*`, `WYRD_RUNTIME_*`, `WYRD_WORKFLOW_*`, `WYRD_CLIENT_*` variants); `crates/wyrd-spec/src/vala/error.rs::BifrostError::SchemaParse` | `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=error::tests::python_boundary_codes_resolve_through_the_catalog) + test(=error::tests::bifrost_schema_parse_is_catalog_owned)'` (2 passed) | PASS |
 | Unknown or internal sources fail safely without panicking or swallowing a construction error | Unchanged `wyrd_error_to_py_err` `PyRuntimeError` fallback and `WyrdError::from_code` `None` contract | `crates/shared/wyrd-client/src/error.rs::tests::unknown_code_preserved_in_catch_all` (existing) | PASS |
 | `wyrd-spec` stays PyO3-free; no new dependency or Cargo feature | No manifest changes in the diff | `mise run check:pyo3-scope`; `git diff --stat` shows no `Cargo.toml` change | PASS |
-| Generated stubs describe the runtime shared exception shape | `python/py-wyrd/python/wyrd/stubs/error.pyi` (source), `_wyrd.pyi` (regenerated) | `mise run codegen:check`; `mise run py:typecheck` | PASS |
+| Generated stubs describe the runtime shared exception shape | `sdks/wyrd-sdk-python/python/wyrd/stubs/error.pyi` (source), `_wyrd.pyi` (regenerated) | `mise run codegen:check`; `mise run py:typecheck` | PASS |
 | No duplicate converter, exception registration, problem builder, or parallel metadata accessor added | Only `wyrd-utils/src/py.rs` gained types; no new `create_exception!` or metadata table | `mise run lints`; `git diff --stat` | PASS |
 
 ### Commands
@@ -171,7 +171,7 @@ git diff --check
 mise exec -- cargo nextest run --locked -p wyrd-spec --lib \
   -E 'test(=error::tests::python_boundary_codes_resolve_through_the_catalog) + test(=error::tests::bifrost_schema_parse_is_catalog_owned)'
 mise run py:setup
-cd python/py-wyrd && mise exec -- uv run pytest tests/test_error_contract.py
+cd sdks/wyrd-sdk-python && mise exec -- uv run pytest tests/test_error_contract.py
 ```
 
 ### Material limits

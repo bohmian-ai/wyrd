@@ -51,13 +51,13 @@ Required execution skill: `$wyrd-implement`.
 ## Relevant Surface
 
 - Approved Python owner crates listed in `AGENTS.md` §7, especially
-  `vala-sdk`, `skald-agent`, `skald-tool`, `skald-workflow`, `skald-prompt`,
+  `wyrd-cli`, `skald-agent`, `skald-tool`, `skald-workflow`, `skald-prompt`,
   `wyrd-interfaces`, `wyrd-cards`, `wyrd-config`, and `wyrd-testing`
 - Public package projections and exception construction under
-  `python/py-wyrd/python/wyrd`, including Bifrost and schema helpers
+  `sdks/wyrd-sdk-python/python/wyrd`, including Bifrost and schema helpers
 - Python-boundary guidance in
   `architecture/references/languages/pyo3-boundaries.md`
-- Native registration under `python/py-wyrd/src`
+- Native registration under `sdks/wyrd-sdk-python/src`
 - Generated Python stubs and the focused negative tests for each touched owner
   family
 - Production-wheel exclusion evidence for `wyrd.testing`
@@ -114,7 +114,7 @@ registration, extraction, GC, import, or deliberately preserved callback
 plumbing.
 
 After implementation, perform a fresh broad search across every approved
-Python owner crate and `python/py-wyrd` for all remaining occurrences of:
+Python owner crate and `sdks/wyrd-sdk-python` for all remaining occurrences of:
 
 - `PyResult` and `PyErr`;
 - `PyValueError`, `PyRuntimeError`, and other direct Python exception
@@ -223,14 +223,14 @@ Do not run `mise run gate`, `mise run test:rust`, `mise run test:shared`,
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| Every Wyrd-owned failure from every user-callable production Python owner is catchable as shared `WyrdError` with the eight direct attributes and no aggregate `problem` | `crates/shared/wyrd-utils/src/py.rs` (`WyrdPyError`, `build_wyrd_py_exception` sets exactly `code`/`message`/`detail`/`details`/`remediation`/`status`/`title`/`type`); owner conversions in `crates/vala/vala-sdk/src/python.rs`, `crates/skald/skald-agent/src/python.rs`, `crates/skald/skald-tool/src/python.rs`, `crates/skald/skald-workflow/src/python.rs`, `crates/skald/skald-prompt/src/error.rs`, `crates/wyrd/wyrd-interfaces/src/error.rs`, `crates/wyrd/wyrd-cards/src/{card_ref,data,model,prompt}.rs`, `crates/wyrd/wyrd-config/src/py.rs` | `mise exec -- uv run pytest -q tests/test_error_contract.py` (py-wyrd) | PASS |
+| Every Wyrd-owned failure from every user-callable production Python owner is catchable as shared `WyrdError` with the eight direct attributes and no aggregate `problem` | `crates/shared/wyrd-utils/src/py.rs` (`WyrdPyError`, `build_wyrd_py_exception` sets exactly `code`/`message`/`detail`/`details`/`remediation`/`status`/`title`/`type`); owner conversions in `sdks/wyrd-sdk-python/src/bifrost`, `crates/skald/skald-agent/src/python.rs`, `crates/skald/skald-tool/src/python.rs`, `crates/skald/skald-workflow/src/python.rs`, `crates/skald/skald-prompt/src/error.rs`, `crates/wyrd/wyrd-interfaces/src/error.rs`, `crates/wyrd/wyrd-cards/src/{card_ref,data,model,prompt}.rs`, `crates/wyrd/wyrd-config/src/py.rs` | `mise exec -- uv run pytest -q tests/test_error_contract.py` (wyrd-sdk-python) | PASS |
 | `WyrdTestServer` uses the same contract while staying out of production wheels | `crates/wyrd/wyrd-testing/src/python.rs` (`not_started`, `harness_error`, `From<WyrdTestServerError> for WyrdPyError`, all `#[pymethods]` on `WyrdPyResult`) | `mise run py:setup:testing` then `mise exec -- uv run pytest -q tests/test_test_server.py`; `mise run check:py-wheel-no-testing` | PASS |
-| No reachable owner-local metadata projector, partial Python constructor, manual attribute assignment, generic Wyrd-owned `ValueError`/`RuntimeError`, or silent conversion failure remains | Deleted `status`/`title`/`remediation` from `skald-agent/src/error.rs` and `skald-tool/src/toolerror.rs`; deleted `wyrd-interfaces` local `WyrdPyError` enum; `python/py-wyrd/python/wyrd/_schema.py::_wyrd_error` now calls native `build_wyrd_error`; `AgentRun::error` returns `WyrdPyResult` instead of `.and_then(Result::ok)` | Audit sections A–D below; `mise exec -- uv run pytest -q tests/test_prompt_output_schema.py tests/test_prompt_output_schema_rust.py tests/test_session.py` | PASS |
+| No reachable owner-local metadata projector, partial Python constructor, manual attribute assignment, generic Wyrd-owned `ValueError`/`RuntimeError`, or silent conversion failure remains | Deleted `status`/`title`/`remediation` from `skald-agent/src/error.rs` and `skald-tool/src/toolerror.rs`; deleted `wyrd-interfaces` local `WyrdPyError` enum; `sdks/wyrd-sdk-python/python/wyrd/_schema.py::_wyrd_error` now calls native `build_wyrd_error`; `AgentRun::error` returns `WyrdPyResult` instead of `.and_then(Result::ok)` | Audit sections A–D below; `mise exec -- uv run pytest -q tests/test_prompt_output_schema.py tests/test_prompt_output_schema_rust.py tests/test_session.py` | PASS |
 | `AgentPyResult`, `AgentPyError`, `CardPyResult`, card-local `WyrdPyError`, `agent_error_to_py`, `query_error_to_py`, `tool_error_to_py_err`, workflow handwritten projectors are deleted | `crates/skald/skald-agent/src/py_error.rs` deleted; aliases and converters removed from the owners above | Audit section B below returns no owner-local alias or `*_error_to_py*` converter | PASS |
-| Bifrost no longer exports or raises `BifrostQueryError`, `IncompleteQueryStreamError`, `NoCredentialsError` | `crates/vala/vala-sdk/src/python.rs`, `python/py-wyrd/python/wyrd/bifrost/__init__.py` | Audit section D returns no match; `mise exec -- uv run pytest -q tests/test_bifrost.py tests/bifrost/test_public_typing.py` | PASS |
+| Bifrost no longer exports or raises `BifrostQueryError`, `IncompleteQueryStreamError`, `NoCredentialsError` | `sdks/wyrd-sdk-python/src/bifrost`, `sdks/wyrd-sdk-python/python/wyrd/bifrost/__init__.py` | Audit section D returns no match; `mise exec -- uv run pytest -q tests/test_bifrost.py tests/bifrost/test_public_typing.py` | PASS |
 | Retained domain subclasses remain `WyrdError` subclasses with the same eight-field projection | `create_exception!(wyrd._wyrd, AgentError, WyrdError, ...)` and the `ToolError`/`SessionError` siblings in `crates/shared/wyrd-utils/src/py.rs`; `exception_type_for_code` selects centrally | `mise exec -- uv run pytest -q tests/test_error_contract.py tests/test_session.py` | PASS |
 | Automatic Python argument/type failures and preserved user callback exceptions keep established behavior | `crates/skald/skald-agent/src/python.rs` callback plumbing keeps `PyResult` and `py_err_to_wyrd_error`; `test_python_journal_surface_is_not_public` still asserts PyO3's own `TypeError` | `mise exec -- uv run pytest -q tests/test_callbacks.py tests/test_session.py` | PASS |
-| Public imports and generated stubs match runtime behavior | `python/py-wyrd/python/wyrd/stubs/error.pyi` (source) adds `build_wyrd_error`; `_wyrd.pyi` and `bifrost/__init__.pyi` regenerated by `mise run codegen:regen` | `mise run codegen:check`; `mise run py:typecheck` | PASS |
+| Public imports and generated stubs match runtime behavior | `sdks/wyrd-sdk-python/python/wyrd/stubs/error.pyi` (source) adds `build_wyrd_error`; `_wyrd.pyi` and `bifrost/__init__.pyi` regenerated by `mise run codegen:regen` | `mise run codegen:check`; `mise run py:typecheck` | PASS |
 | Successful behavior, values, GIL release, async wrappers, callbacks, and wheel composition do not regress | Signatures and return values unchanged; only error types moved | `mise exec -- uv run pytest -q tests/cards tests/config tests/unit tests/test_card_ref.py tests/test_card_surface_contracts.py tests/test_agent_structured_output.py` (375 passed); `mise exec -- cargo nextest run --locked -p wyrd-interfaces -p wyrd-cards -p wyrd-config -p skald-prompt -p skald-tool -p skald-workflow -p wyrd-utils` (204 passed) | PASS |
 | Post-implementation broad source audit accounts for every remaining raw site under REQ-005 | Audit sections A–E below | Commands and full inventory recorded below | PASS |
 
@@ -240,10 +240,10 @@ Owner set searched (AGENTS.md §7 plus the Python package root):
 
 ```
 crates/wyrd/wyrd-interfaces crates/wyrd/wyrd-cards crates/wyrd/wyrd-config
-crates/shared/wyrd-utils crates/vala/vala-sdk crates/skald/skald-observer
+crates/shared/wyrd-utils crates/wyrd/wyrd-cli crates/skald/skald-observer
 crates/skald/skald-prompt crates/skald/skald-runtime crates/skald/skald-agent
 crates/skald/skald-tool crates/skald/skald-workflow crates/wyrd/wyrd-testing
-python/py-wyrd/src python/py-wyrd/python
+sdks/wyrd-sdk-python/src sdks/wyrd-sdk-python/python
 ```
 
 ```bash
@@ -287,7 +287,7 @@ single canonical projector writing the complete eight-field contract from
 
 | Category | Sites | Why retained |
 |---|---|---|
-| Module/class/exception registration | 28 `register*` / `python_register` / `_wyrd` functions across every owner and `python/py-wyrd/src/lib.rs` | PyO3 module-init signatures; failure is interpreter import machinery, not a Wyrd-owned operation |
+| Module/class/exception registration | 28 `register*` / `python_register` / `_wyrd` functions across every owner and `sdks/wyrd-sdk-python/src/lib.rs` | PyO3 module-init signatures; failure is interpreter import machinery, not a Wyrd-owned operation |
 | Python↔JSON value conversion primitives | `wyrd-utils/src/py.rs:113,153,211,363` (`json_to_pyobject`, `pyobject_to_json`, `pydict_to_json_value`, `py_iterable_to_json`) | Generic PyO3 extraction/conversion helpers shared by all owners; callers convert at their boundary via `From<PyErr> for WyrdPyError` |
 | The shared adapter's own internals | `wyrd-utils/src/py.rs:57,232,276,286,299,305,371,372,375` | `From<PyErr>`, `module_version`, `build_wyrd_error`, and the exception builders — the adapter cannot be expressed in terms of itself |
 | Deliberately preserved callback plumbing | `skald-agent/src/python.rs:799,800,823,839,935,939,947,955,961,965`; `skald-tool/src/python.rs:205` | Callback invocation and replacement-value extraction; user-raised exceptions must survive verbatim and are re-entered through `py_err_to_wyrd_error`. Every Wyrd-owned failure inside these functions now constructs a catalog error first (`PyErr::from(invalid_argument(..))`, `PyErr::from(structured_decode_error(..))`, `PyErr::from(boundary_internal(..))`) |

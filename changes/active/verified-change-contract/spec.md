@@ -1,7 +1,7 @@
 ---
 id: SPEC-verified-change-contract
 revision: 64
-status: draft
+status: approved
 ---
 
 # Verification contract
@@ -60,6 +60,9 @@ to two replicas without a manual peer list.
 - Treating verification as approval, merge, deployment, or authorization.
 - UI layout or component behavior.
 - Offline Eval scenario Data Card registration and dataset-backed evaluation.
+- Refusing registration of Card kinds that are not yet implemented
+  (`Experiment`, `Workflow`, `Policy`, `Mcp`, `Audit`, `Artifact`,
+  `Source`). Deferred; REQ-193 only keeps them out of the SDKs.
 - Workflow Operator invocation. Its existing action shape remains parseable,
   but a verification binding cannot activate it until the separate server
   invocation change supplies an executable path.
@@ -1496,7 +1499,10 @@ table on `(data_tenant_id, result_id)`.
     with the same optional media. A Drift Verifier takes a non-empty sequence
     of feature rows in the forms `observe.drift` accepts; the client turns the
     rows into REQ-167 columns. Input of the wrong shape for the Verifier's kind
-    fails locally with `WYRD_SDK_400_INVALID_OBSERVATION`.
+    fails locally with `WYRD_SDK_400_INVALID_OBSERVATION`. A Drift Verifier
+    whose baseline is not yet ready is refused with
+    `WYRD_VERIFICATION_409_BASELINE_NOT_READY`; baselines are fitted
+    asynchronously, so a caller that needs one waits on the Card's status.
   - It judges only. It records no observation, creates no run, dispatches no
     Operator, and writes nothing to Bifrost. It calls REQ-167 and keeps
     REQ-168's authorization, audit, bounds, errors, and no-retry rule. It does
@@ -1522,7 +1528,12 @@ table on `(data_tenant_id, result_id)`.
   `get_run`, `execute`) and the Python `wyrd.verification` module MUST be
   removed from the Rust, Python, and TypeScript SDKs, their exports, and their
   generated stubs and declarations. No alias or compatibility shim remains.
-  `wyrd-client` keeps only the transport `observe.verify` needs.
+  `wyrd-client` keeps only the transport `observe.verify` needs. Rust's
+  `WyrdError`, today reachable only as `wyrd_sdk::verification::WyrdError`,
+  is exported at the SDK root as `wyrd_sdk::WyrdError`, matching
+  `from wyrd import WyrdError` and the TypeScript root export. The Python
+  error shape and catalog completeness are owned by the approved
+  `py-error-refactor` change, not by this revision.
 - **REQ-190**: An `http` Operator action whose `auth` names an `http`
   connection MAY give `url` as a path template beginning with `/`. The
   request then goes to the connection's stored origin, read at each attempt.
@@ -1535,21 +1546,139 @@ table on `(data_tenant_id, result_id)`.
   Values that are present are still checked and refused on mismatch with
   `RegistryManifestHashMismatch`. Served and downloaded Cards always carry
   both.
-- **REQ-192**: The verification user journeys in all three SDKs MUST follow
-  one style, recorded in `TESTING.md` as the repository's journey standard:
-  - Card graphs are checked-in YAML fixture directories shared by the three
-    SDKs. No test builds Card YAML in code or splices values into it.
-  - A test uses only the public SDK, `WyrdTestServer` lifecycle, and the
-    server's documented test-only clock control (making a schedule due). It
-    runs no SQL against server tables, no CLI subprocess for a read the SDK
-    offers, and no polling of server-internal state.
-  - One user story per test, readable top to bottom, with typed inputs and
-    results and domain objects as fixtures.
-  - Assertions are on what a user can observe: a `Judgment`, an Operator
-    request received by a local endpoint, or rows the user reads through the
-    public Bifrost query API.
-  - Engine statistics (PSI bins, SPC limits, judge scoring) are proven by Rust
-    engine tests, not SDK journeys.
+- **REQ-192**: Every client-facing test in the Rust, Python, and TypeScript
+  SDKs MUST follow one standard, recorded in `TESTING.md` and used as the
+  review checklist. Tests are the product's public examples: they are written
+  for the user who copies them and the maintainer who will own them, so how a
+  test is written is held to the same bar as what it proves.
+  - **One story per file, one outcome per test.** A file covers one user
+    story; each test name states the outcome the user gets (for example
+    `test_agent_answer_passes_its_verifier`). A story has the same file name,
+    test names, and fixtures in all three SDKs, so the languages can be read
+    side by side.
+  - **Checked-in YAML only.** Cards come from fixture directories under a
+    repository-root `fixtures/cards/<story>/`, shared by the three SDKs. Test
+    code never builds or edits YAML, JSON, digests, or URLs.
+  - **Deployment-shaped server.** A session `WyrdTestServer` exports its
+    address and key the way a deployment's environment does, and SDK and CLI
+    calls resolve them without arguments. Only a test about credentials passes
+    them explicitly.
+  - **Public surfaces only.** A test uses the public SDK modules, the CLI
+    functions (REQ-196), and the three test controls (REQ-195). It uses no
+    private or extension import, subprocess, raw HTTP, SQL against server
+    tables, digest computation, YAML or JSON parsing of results, sleep, or
+    polling loop.
+  - **Setup is fixtures that return domain objects** (a `WyrdState`, a
+    registered Card), never helper functions in the test file. A test body
+    acts on the SDK and asserts on typed results, short enough to copy as an
+    example.
+  - **Errors assert one exact catalog code** on the raised `WyrdError`;
+    message matching and accepting any of several codes are prohibited.
+  - **Fixed, meaningful names**, never uuid or time suffixes; registering a
+    fixture again is idempotent.
+  - **Value tables use `parametrize` / `it.each` / a table loop with one
+    assertion shape**, never branching inside a loop.
+  - **Engine mathematics and internals stay in Rust tests**: PSI bins, SPC
+    limits, judge scoring, cache and fence counters, and audit staging.
+  - **Written to be owned.** Fixtures, fixture YAML, `conftest` and
+    `tests/support` modules are production-quality code: minimal, realistic,
+    typed, named for the domain, documented by intent, and free of dead
+    options, magic values, and clever indirection. Fixture YAML reads as the
+    Card a user would author. A fixture that hides an ugly flow behind a name
+    does not satisfy this requirement.
+- **REQ-193**: `cards.get(ref)` MUST return the same typed Card in all
+  three SDKs (parity), for the implemented and tested kinds only: `Data`,
+  `Model`, `Prompt`, `Agent`, `Verifier`, `Service`, `Trigger`, and
+  `Operator`. It returns the envelope, a `spec` typed by `kind` (for example
+  `VerifierSpec`, `ServiceSpec`), and the typed server-managed `status`,
+  including a Drift Verifier's baseline state. No SDK exposes a typed spec
+  for `Experiment`, `Workflow`, `Policy`, `Mcp`, `Audit`, `Artifact`, or
+  `Source` until that kind is implemented and tested.
+  Rust already returns `wyrd_spec::envelope::Card`. Python gains the method,
+  and TypeScript's `spec`, today `Record<string, unknown>`, becomes a union
+  discriminated by `kind`. The Python and TypeScript types are generated
+  from the `wyrd-spec` JSON schemas, so that `codegen:check` fails when a
+  language drifts. The kind-specific `cards.data`, `cards.model`, and
+  `cards.prompt` loaders are unchanged.
+- **REQ-194**: A Run view identifies itself by the alias it was opened with.
+  The view property is `alias` (Rust `alias()`, Python and TypeScript
+  `alias`), replacing the string `card_ref` / `cardRef`, whose value and
+  documentation disagreed. The exact Card reference for an alias stays
+  available from the state as a typed `CardRef` (`state.card_ref(alias)`).
+- **REQ-195**: `WyrdTestServer` in all three SDKs documents exactly three
+  test controls, each test-only and backed by the production code path:
+  - `flush_bifrost()`: publish every accepted row now, so the next query
+    sees it;
+  - `wait_for_baseline(verifier, timeout)`: return once the named Drift
+    Verifier's baseline is ready, or fail at the deadline with the last
+    observed baseline state; and
+  - `make_binding_due(...)`: make a schedule due.
+- **REQ-196**: The `wyrd` CLI ships with all three SDKs and its commands are
+  callable in-process: Python `wyrd.cli.<command>(...)`, TypeScript
+  `cli.<command>(...)` from `@wyrd/sdk`, and Rust `wyrd_sdk::cli::<command>`
+  behind an optional `cli` feature. Each function runs the same Rust command
+  implementation as the `wyrd` executable, takes the command's options as
+  typed arguments, returns the typed result the command prints with
+  `--format json`, and raises `WyrdError` instead of returning an exit code.
+  At minimum `plan`, `apply`, `get`, and `load` are exposed; any further
+  command a journey needs is exposed the same way. Python and TypeScript
+  also install the `wyrd` executable.
+- **REQ-197**: An observation emit never blocks the caller. A full queue
+  refuses with `WYRD_CLIENT_429_QUEUE_FULL`; this is the documented contract,
+  and no SDK adds a blocking or retrying emit.
+- **REQ-198**: Every SDK client exposes `access_token()`, returning a current
+  bearer token for its credential, for handing to third-party clients such as
+  an OpenAI SDK pointed at the Gateway. No principal-id accessor is added.
+- **REQ-199**: Card-scoped key issuance and Gateway provider credential
+  writes are performed through the CLI functions (REQ-196). No separate SDK
+  method is added.
+- **REQ-200**: The Bifrost query API in all three SDKs accepts bind
+  parameters (`sql(query, params)`), and Oracle binds them server-side.
+  Examples and tests read their own rows through the Bifrost client with
+  parameters, never by interpolating values into SQL text.
+- **REQ-201**: A tenant's built-in Bifrost tables are created when the tenant
+  is created, so a query against a built-in table that has never been written
+  returns zero rows instead of `TABLE_NOT_FOUND`. Existing tenants receive any
+  built-in table they lack when the server starts, so a built-in added in a
+  later release needs no per-tenant step. Lazy creation on first write or
+  describe is removed.
+- **REQ-202**: The SDKs expose typed values where the tests found raw wire
+  objects: typed constructors for Operator-connection requests and
+  `CardRef`; an options object for TypeScript `TableConfig.fromJsonSchema`;
+  a catalog code on every local refusal; and no public TypeScript
+  constructor that takes a native binding type. A trusted artifact hash is
+  read from the registered Card's `artifact_hash`, not recomputed.
+- **REQ-203**: Python Card and runtime authoring is typed end to end, and
+  each capability exists in Rust and TypeScript wherever that SDK exposes the
+  same Card kind:
+  - `DataCard.from_path` and `ModelCard.from_path` load a saved Card
+    directory or a Card YAML file in one call, as `PromptCard.from_path`
+    does;
+  - `DataCard` accepts typed `splits` and `target_columns`, and interface
+    options read back as typed values;
+  - `agent.to_card()` returns a typed `AgentCard`; callback context, prompt
+    response schema (`prompt.response_schema`), `WyrdConfig` values, model
+    signature dimensions, and query terminals are typed objects, not dicts
+    or `repr` text;
+  - a documented offline mock provider, with caller-set canned responses,
+    is available from public modules for tests and examples.
+- **REQ-204**: The client-facing test suites are brought to REQ-192 using the
+  per-file verdicts in `review/sdk-test-audit/` as the inventory: tests marked
+  DELETE are removed, MOVE tests are re-homed in the named Rust tier, and
+  REWRITE and TIGHTEN tests are fixed. Type-only assertions move to
+  compile-time type tests (`expectTypeOf`, `ty` fixtures outside pytest
+  collection). Every test file runs in a `mise` lane, and the Python
+  `WyrdTestServer` stub matches its runtime.
+- **REQ-205**: Wyrd's OTLP endpoints accept the caller's API key directly in
+  an `x-wyrd-api-key` header, validated on each request, so a stock
+  OpenTelemetry exporter in any language is configured with standard OTel
+  settings (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`) and
+  keeps working past any access-token lifetime. No SDK exporter helper is
+  added.
+- **REQ-206**: Verification history is read with SQL through the Bifrost
+  client, like any warehouse table; no SDK history API is added. How
+  `vala.verification.results` stores its Drift and Eval summaries is owned by
+  `SPEC-bifrost-variant` in `wyrd-forge`.
 
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
@@ -2534,13 +2663,46 @@ published image pinned by an immutable registry digest before release.
   refused at registration. A fixture artifact without `sha256` and
   `size_bytes` registers, and a wrong declared digest is refused.
 - **AC-048**: `TESTING.md` records the REQ-192 standard, and every
-  verification journey in the three SDKs conforms to it: shared fixture
-  directories, no Card YAML in code, no SQL against server tables, no CLI
-  subprocess reads, and one story per test.
+  client-facing test in the three SDKs conforms to it, checked by review
+  against each bullet of REQ-192.
+- **AC-049**: `cards.get(ref)` returns each of the eight REQ-193 kinds,
+  typed, in all three SDKs, read back from a shared fixture, with `codegen:check` proving the Python and TypeScript
+  types match the `wyrd-spec` schemas. A Python journey reads a Drift Verifier
+  through `cards.get(ref)` and sees its baseline state; `observe.verify` before the
+  baseline is ready is refused with `WYRD_VERIFICATION_409_BASELINE_NOT_READY`,
+  and succeeds after `wait_for_baseline`.
+- **AC-050**: Run views expose `alias` and no `card_ref` / `cardRef` in all
+  three SDKs, and `codegen:check` passes.
+- **AC-051**: In each SDK a journey runs `apply` and `get` in-process through
+  the CLI functions against the test server; a refused command raises
+  `WyrdError` with its catalog code; and the installed `wyrd` executable runs
+  from Python and TypeScript packages.
+- **AC-052**: Rust callers import `wyrd_sdk::WyrdError`, and no journey reads
+  a refusal code out of `UpstreamFailure` details.
+- **AC-053**: A journey calls the Gateway through the stock OpenAI SDK with
+  a token from `access_token()` (REQ-198), and the CLI functions issue a Card-scoped key and write a
+  provider credential (REQ-199).
+- **AC-054**: In each SDK a parameterised `sql` returns the caller's rows,
+  and a bound value containing SQL text is treated as data (REQ-200).
+- **AC-055**: A new tenant's built-in tables are queryable and empty before
+  any write; an existing tenant missing a built-in has it after restart
+  (REQ-201).
+- **AC-056**: Each REQ-202 and REQ-203 capability has a test in every SDK
+  that exposes it, and `codegen:check` passes.
+- **AC-057**: Every DELETE, MOVE, REWRITE, and TIGHTEN row in
+  `review/sdk-test-audit/` is resolved, and every client-facing test file is
+  selected by a `mise` lane (REQ-204).
+- **AC-058**: In each SDK, a stock OTel exporter configured only with the
+  standard `OTEL_EXPORTER_OTLP_*` settings and an `x-wyrd-api-key` header
+  exports a span that is then read back through the Bifrost client
+  (REQ-205).
 
 ## Open material decisions
 
-None for revision 62.
+Revision 64:
+
+- None. The Bifrost storage and query decisions moved to
+  `SPEC-bifrost-variant`.
 
 Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
@@ -2576,7 +2738,8 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
-- **Revision 64 SDK verification ergonomics (2026-10-05, draft):** The
+- **Revision 64 SDK verification ergonomics (2026-10-05, approved by the user
+  directing planning into two tasks independent of the Bifrost work):** The
   user found the SDK verification surface and its journeys unusable: a
   separate `Verification` handle driven by raw dicts and UIDs, polling, raw
   SQL, and Card YAML built from Python strings. Real-time verification moves
@@ -2586,7 +2749,23 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
   HTTP Operators may take their origin from a named connection (REQ-190) and
   artifact digests may be computed by the client (REQ-191), so fixture Cards
   are static files. REQ-192 sets the journey test standard, modelled on the
-  opsml client, PromptCard, and agent-service tests.
+  opsml client, PromptCard, and agent-service tests. The SDK test audit
+  (`review/sdk-test-audit/`) added what the journeys could not do without
+  workarounds: a refusal for an unready baseline (REQ-188), a root Rust
+  `WyrdError` (REQ-189), a typed `cards.get` for every kind in every SDK (REQ-193), `alias` on the Run
+  view (REQ-194), three documented test-server controls (REQ-195), and the
+  CLI as in-process functions in every SDK (REQ-196). The user approved the
+  test standard (REQ-192), widened to every client-facing test and to how
+  tests and fixtures are written, not only what they assert. Audit follow-ups:
+  non-blocking emit stays (REQ-197), `access_token()` (REQ-198), key and
+  credential setup through the CLI (REQ-199), bind parameters (REQ-200),
+  built-in tables created with the tenant (REQ-201), typed SDK values
+  (REQ-202), typed Python authoring with parity (REQ-203), and the test
+  clean-up (REQ-204). Refusing unimplemented kinds at registration is
+  deferred. OTLP endpoints accept API keys so stock exporters need no helper
+  (REQ-205), and verification history stays SQL (REQ-206). Bifrost storage
+  and query work (Variant, Iceberg v3, shredding, pruning, typed result
+  summaries) moved to its own change, `SPEC-bifrost-variant`.
 - **Revision 63 Observations carry their own event time (2026-10-03, approved
   on user direction):** SDK observations omitted `wyrd_event_time`, so Scribe
   stamped the batch's receipt time and a buffered observation landed in the

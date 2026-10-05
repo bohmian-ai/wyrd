@@ -25,7 +25,8 @@ does not add product behavior or require test-driven implementation ordering.
   catalog.
 - Add catalog coverage for stable codes currently maintained by public SDK or
   Python-boundary implementations outside the derive-backed catalog.
-- Migrate every approved Python owner crate, the public `py-wyrd` package, and
+- Migrate every approved Python owner crate, the public `wyrd-sdk-python` package (`sdks/wyrd-sdk-python`, which also
+  owns the Python Bifrost client and `WyrdTestServer` bindings), and
   the test-tier `WyrdTestServer` surface to the shared adapter.
 - Remove owner-local public error projection, duplicated metadata, and raw
   generic Python exceptions for Wyrd-owned failures.
@@ -141,7 +142,7 @@ their attributes through the shared projection.
 - `wyrd-spec` remains PyO3-free.
 - Generic Python boundary behavior remains owned by `wyrd-utils` behind its
   existing optional `python` feature.
-- `python/py-wyrd` remains a thin aggregator and package projection.
+- `sdks/wyrd-sdk-python` remains a thin aggregator and package projection.
 - Public error metadata comes from the derive-backed catalog; no handwritten
   parallel metadata tables or accessors are permitted.
 - Conversion failures never panic, swallow the original Wyrd failure, or
@@ -226,6 +227,13 @@ None.
 
 ## Revision history
 
+- **Editorial correction — 2026-10-05.** Paths updated for the SDK move:
+  `python/py-wyrd` is now `sdks/wyrd-sdk-python`, the Python Bifrost client
+  moved from `vala-sdk` into `sdks/wyrd-sdk-python/src/bifrost`, and
+  `wyrd-cli` gained an optional `python` feature and is a Python owner. No
+  requirement changed, so the revision stays 3 and approved. Both tasks carry
+  PASS evidence and the shared adapter is in use across the owners; the change
+  has not been through final review and completion.
 - **Revision 3 — 2026-09-11 — approved.** The user removed the Python
   exception's aggregate `problem` convenience attribute. Task 01 remains the
   completed revision-2 foundation; Task 02 first removes that attribute before

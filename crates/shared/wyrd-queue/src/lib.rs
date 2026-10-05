@@ -27,6 +27,7 @@ pub mod queue;
 pub mod schema;
 pub mod sealed_sender;
 pub mod sink;
+pub mod variant;
 
 pub use batch_builder::{BatchBuilder, is_reserved_column};
 pub use bounded_arrow::{

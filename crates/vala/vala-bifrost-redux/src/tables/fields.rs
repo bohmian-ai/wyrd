@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow_schema::extension::{
     EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY, ExtensionType,
 };
@@ -76,17 +76,14 @@ pub fn fixed_binary(name: &str, size: i32, nullable: bool) -> Field {
 /// enclosing field, never on this type.
 #[must_use]
 pub fn variant_storage() -> DataType {
-    DataType::Struct(Fields::from(vec![
-        Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
-    ]))
+    wyrd_queue::variant::variant_storage_type()
 }
 
 /// Declare one Variant field: canonical storage plus the
 /// `arrow.parquet.variant` extension marker.
 #[must_use]
 pub fn variant(name: &str, nullable: bool) -> Field {
-    mark_variant(Field::new(name, variant_storage(), nullable))
+    wyrd_queue::variant::variant_field(name, nullable)
 }
 
 /// Stamp the `arrow.parquet.variant` extension marker onto a storage field.

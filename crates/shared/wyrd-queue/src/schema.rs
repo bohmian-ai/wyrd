@@ -6,7 +6,7 @@
 //! [`wyrd_spec::vala::api::FieldSpec`]. The PyO3 acquisition (Pydantic
 //! `model_json_schema()` / `pyarrow.Schema`) lives in `wyrd_client::bifrost` and calls these.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
@@ -17,6 +17,7 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::error::WyrdQueueError;
+use crate::variant::{variant_field, variant_storage_type};
 
 /// Walk a JSON-Schema object (a Pydantic `model_json_schema()` output) into the
 /// wire `Vec<FieldSpec>`, per the locked mapping table.
@@ -280,20 +281,13 @@ fn field_to_spec(field: &Field) -> FieldSpec {
 /// This is therefore the lossy forward half of [`field_to_spec`], not its
 /// inverse.
 fn spec_to_field(spec: &FieldSpec) -> Field {
-    let field = Field::new(
-        spec.name.as_str(),
-        data_type_to_arrow(&spec.data_type),
-        spec.nullable,
-    );
     match spec.data_type {
-        DataTypeSpec::Variant => field.with_metadata(HashMap::from([
-            (
-                EXTENSION_TYPE_NAME_KEY.to_owned(),
-                VARIANT_EXTENSION_NAME.to_owned(),
-            ),
-            (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
-        ])),
-        _ => field,
+        DataTypeSpec::Variant => variant_field(spec.name.as_str(), spec.nullable),
+        _ => Field::new(
+            spec.name.as_str(),
+            data_type_to_arrow(&spec.data_type),
+            spec.nullable,
+        ),
     }
 }
 
@@ -391,10 +385,7 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         )),
         // The unshredded `arrow.parquet.variant` storage; the extension marker
         // is stamped on the enclosing field by `spec_to_field`.
-        DataTypeSpec::Variant => DataType::Struct(Fields::from(vec![
-            Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, false),
-        ])),
+        DataTypeSpec::Variant => variant_storage_type(),
     }
 }
 

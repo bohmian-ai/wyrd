@@ -31,20 +31,14 @@ const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
-/// Derives a row group's Bloom-filter distinct-value hint from its row count.
+/// Bloom-filter capacity of every Bifrost Bloom column, in distinct values.
 ///
-/// # Panics
-/// Never panics: the row count is first bounded by parquet-rs's row-group row
-/// maximum, which fits in `u64`.
-fn bloom_filter_ndv(row_count: usize) -> u64 {
-    let ndv = u64::try_from(row_count.min(DEFAULT_MAX_ROW_GROUP_ROW_COUNT))
-        .expect("bounded row count fits in u64");
-    if ndv > 1_000 {
-        (ndv / 100).max(1_000)
-    } else {
-        ndv
-    }
-}
+/// Each filter is sized for the most rows a row group can hold —
+/// parquet-rs's row-group row maximum, which every Bifrost recipe keeps — so
+/// a filter is never undersized for the group it describes. Parquet folds each
+/// filter down to the distinct values the group actually holds when it writes
+/// it, so a sparse group still gets a small filter at [`BLOOM_FPP`].
+const BLOOM_NDV: u64 = DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64;
 
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
@@ -68,8 +62,8 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 ///
 /// # Panics
 /// Never panics — ZSTD level 3 is always valid.
-pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
-    bifrost_writer_properties_with_metadata(row_count, Vec::new(), bloom_columns)
+pub fn bifrost_writer_properties(bloom_columns: &[String]) -> WriterProperties {
+    bifrost_writer_properties_with_metadata(Vec::new(), bloom_columns)
 }
 
 /// Parquet properties carrying caller-supplied footer metadata.
@@ -90,11 +84,10 @@ pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> 
 /// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 #[must_use]
 pub fn bifrost_writer_properties_with_metadata(
-    row_count: usize,
     metadata: Vec<KeyValue>,
     bloom_columns: &[String],
 ) -> WriterProperties {
-    let mut builder = recipe_builder(row_count, bloom_columns);
+    let mut builder = recipe_builder(bloom_columns);
     if !metadata.is_empty() {
         builder = builder.set_key_value_metadata(Some(metadata));
     }
@@ -121,7 +114,7 @@ pub fn bifrost_rewrite_writer_properties(
     bloom_columns: &[String],
     tenant: DataTenantId,
 ) -> WriterProperties {
-    recipe_builder(DEFAULT_MAX_ROW_GROUP_ROW_COUNT, bloom_columns)
+    recipe_builder(bloom_columns)
         .set_max_row_group_bytes(Some(
             usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
         ))
@@ -134,11 +127,7 @@ pub fn bifrost_rewrite_writer_properties(
 /// Extracted so the rewrite writer cannot drift from the ingest writer: a
 /// producer that encoded differently would make an otherwise-identical file
 /// obsolete on the next selection pass for no semantic reason.
-fn recipe_builder(
-    row_count: usize,
-    bloom_columns: &[String],
-) -> parquet::file::properties::WriterPropertiesBuilder {
-    let bloom_ndv = bloom_filter_ndv(row_count);
+fn recipe_builder(bloom_columns: &[String]) -> parquet::file::properties::WriterPropertiesBuilder {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
@@ -159,7 +148,7 @@ fn recipe_builder(
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
             .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
-            .set_column_bloom_filter_max_ndv(path, bloom_ndv);
+            .set_column_bloom_filter_max_ndv(path, BLOOM_NDV);
     }
 
     builder
@@ -186,7 +175,7 @@ mod tests {
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(50_000, &bloom_columns);
+        let properties = bifrost_writer_properties(&bloom_columns);
 
         for column in ["service_name", "run_id", "message", "card_uid"] {
             let path = ColumnPath::from(column);
@@ -221,7 +210,7 @@ mod tests {
     #[test]
     fn writer_recipe_metadata_is_deterministic() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(50_000, &bloom_columns);
+        let properties = bifrost_writer_properties(&bloom_columns);
         let timestamp = ColumnPath::from("wyrd_event_time");
 
         assert_eq!(
@@ -265,7 +254,7 @@ mod tests {
                 .bloom_filter_properties(&ColumnPath::from(column.as_str()))
                 .expect("allowlisted column has a bloom filter");
             assert!((properties_for_column.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
-            assert_eq!(properties_for_column.ndv(), 1_000);
+            assert_eq!(properties_for_column.ndv(), BLOOM_NDV);
         }
 
         for column in ["message", "payload", "value"] {
@@ -284,7 +273,7 @@ mod tests {
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
         let floor = ["card_uid".to_owned(), "run_id".to_owned()];
-        let properties = bifrost_writer_properties(50_000, &floor);
+        let properties = bifrost_writer_properties(&floor);
         for column in &floor {
             assert!(
                 properties
@@ -303,14 +292,36 @@ mod tests {
         }
     }
 
-    /// The Bloom distinct-value hint scales with rows and is bounded by the
-    /// row-group row maximum.
+    /// Scribe and Forge size every Bloom filter for a full row group.
+    ///
+    /// The Scribe recipe takes no batch input at all, so the size of the batch
+    /// that opens a file cannot change the capacity; the Forge rewrite recipe
+    /// lands on the same capacity at any row-group byte target. Both keep the
+    /// row-group row maximum the capacity is derived from and the fixed
+    /// false-positive rate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either writer's Bloom capacity, row maximum, or
+    /// false-positive rate drifts.
     #[test]
-    fn writer_recipe_bloom_ndv_is_bounded() {
-        assert_eq!(bloom_filter_ndv(1_000), 1_000);
-        assert_eq!(bloom_filter_ndv(50_000), 1_000);
-        assert_eq!(bloom_filter_ndv(200_000), 2_000);
-        assert_eq!(bloom_filter_ndv(usize::MAX), 10_485);
+    fn bloom_capacity_uses_row_group_limit_for_scribe_and_forge() {
+        let columns = declared_recipe();
+        let scribe = bifrost_writer_properties_with_metadata(Vec::new(), &columns);
+        let forge = bifrost_rewrite_writer_properties(1_024, &columns, DataTenantId::new_v7());
+        for properties in [&scribe, &forge] {
+            assert_eq!(
+                properties.max_row_group_row_count(),
+                Some(DEFAULT_MAX_ROW_GROUP_ROW_COUNT)
+            );
+            for column in &columns {
+                let bloom = properties
+                    .bloom_filter_properties(&ColumnPath::from(column.as_str()))
+                    .expect("a Bloom column has a filter");
+                assert_eq!(bloom.ndv(), DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64);
+                assert!((bloom.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
+            }
+        }
     }
 
     /// The row-group target is soft: a row larger than the target is written

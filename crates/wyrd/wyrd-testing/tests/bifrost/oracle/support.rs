@@ -330,7 +330,6 @@ pub(crate) async fn seed_foreign_hot_row(
     )?;
     let mut parquet = Vec::new();
     let properties = bifrost_writer_properties_with_metadata(
-        batch.num_rows(),
         vec![tenant_key_value(foreign)],
         &[],
     );

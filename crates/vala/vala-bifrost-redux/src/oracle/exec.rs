@@ -4335,9 +4335,8 @@ mod tests {
 
     /// Builds the production writer recipe with a footer proving
     /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
-    fn fixture_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
+    fn fixture_writer_properties(bloom_columns: &[String]) -> WriterProperties {
         crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
-            row_count,
             vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
             bloom_columns,
         )
@@ -4587,8 +4586,7 @@ mod tests {
     /// the production row-group target is 128 MiB of encoded bytes, so no
     /// size-driven fixture could produce two groups at unit scale.
     fn write_grouped_fixture(schema: &SchemaRef, blocks: &[RecordBatch]) -> bytes::Bytes {
-        let rows: usize = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = fixture_writer_properties(rows, &["service_name".to_owned()]);
+        let properties = fixture_writer_properties(&["service_name".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(schema), Some(properties))
@@ -4912,8 +4910,7 @@ mod tests {
                 .expect("trace id block")
             })
             .collect::<Vec<_>>();
-        let rows = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = fixture_writer_properties(rows, &["trace_id".to_owned()]);
+        let properties = fixture_writer_properties(&["trace_id".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(&schema), Some(properties))
@@ -5170,7 +5167,7 @@ mod tests {
         batch: &RecordBatch,
         context: &str,
     ) {
-        let properties = fixture_writer_properties(batch.num_rows(), &[]);
+        let properties = fixture_writer_properties(&[]);
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).unwrap_or_else(|error| panic!("{context} file: {error}")),
             schema,
@@ -5664,7 +5661,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot writer");
         writer.write(&batch).expect("hot batch write");
@@ -5769,7 +5766,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot causal file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot causal writer");
         writer.write(&batch).expect("hot causal write");
@@ -5986,10 +5983,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("compressible file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(
-                usize::try_from(requests * rows_per_request).expect("rows fit usize"),
-                &[],
-            )),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("compressible writer");
         for request in 0..requests {
@@ -6631,7 +6625,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot batch fixture file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot batch fixture writer");
         writer.write(&batch).expect("hot batch fixture write");

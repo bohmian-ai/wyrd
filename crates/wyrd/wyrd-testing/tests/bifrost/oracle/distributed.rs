@@ -2085,7 +2085,7 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
     let schema = builder.schema().clone();
     let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties_with_metadata(rows, metadata, &[]);
+    let properties = bifrost_writer_properties_with_metadata(metadata, &[]);
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     for batch in &batches {
         writer.write(batch)?;

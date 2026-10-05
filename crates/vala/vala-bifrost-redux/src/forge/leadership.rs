@@ -717,10 +717,11 @@ mod tests {
 
     /// A schedule operation holds the term slot from validation to its end.
     ///
-    /// The operation is paused after it selected the live term. Replacement
-    /// cannot take the slot while it is paused, so the operation completes
-    /// under an unrevoked term; once replacement lands, the same handler
-    /// refuses without running.
+    /// For each handler decision (notify commit, pull, and report) the
+    /// operation is paused after it selected the live term. Replacement cannot
+    /// take the slot while it is paused, so the operation completes under an
+    /// unrevoked term; once replacement lands, the same handler refuses
+    /// without running.
     ///
     /// # Panics
     ///
@@ -731,39 +732,45 @@ mod tests {
     async fn schedule_use_is_linearized_with_term_replacement() {
         let shutdown = CancellationToken::new();
         let leadership = leadership();
-        let held = Arc::new(term(&shutdown));
-        leadership.set_held(Some(Arc::clone(&held)), ForgeLeaderRevocation::Replaced);
-        let (entered, on_entered) = std::sync::mpsc::channel();
-        let (resume, on_resume) = std::sync::mpsc::channel::<()>();
-        let (leadership, held) = (&leadership, &held);
-        std::thread::scope(|scope| {
-            let operation = scope.spawn(move || {
-                leadership.with_term(Some(1), ForgeLeaderDecision::Pull, |_| {
-                    entered.send(()).expect("the test awaits entry");
-                    on_resume.recv().expect("the test resumes the operation");
-                    held.is_revoked()
-                })
+        for decision in [
+            ForgeLeaderDecision::Commit,
+            ForgeLeaderDecision::Pull,
+            ForgeLeaderDecision::Report,
+        ] {
+            let held = Arc::new(term(&shutdown));
+            leadership.set_held(Some(Arc::clone(&held)), ForgeLeaderRevocation::Replaced);
+            let (entered, on_entered) = std::sync::mpsc::channel();
+            let (resume, on_resume) = std::sync::mpsc::channel::<()>();
+            let (leadership, held) = (&leadership, &held);
+            std::thread::scope(|scope| {
+                let operation = scope.spawn(move || {
+                    leadership.with_term(Some(1), decision, |_| {
+                        entered.send(()).expect("the test awaits entry");
+                        on_resume.recv().expect("the test resumes the operation");
+                        held.is_revoked()
+                    })
+                });
+                on_entered.recv().expect("the operation selected its term");
+                assert!(
+                    leadership.held.try_write().is_err(),
+                    "a selected operation holds the slot against replacement"
+                );
+                let replacement =
+                    scope.spawn(|| leadership.set_held(None, ForgeLeaderRevocation::Replaced));
+                resume.send(()).expect("the operation is paused");
+                let revoked_inside = operation
+                    .join()
+                    .expect("operation thread")
+                    .expect("the live term serves the operation");
+                assert!(!revoked_inside, "the term stayed live through its use");
+                replacement.join().expect("replacement thread");
             });
-            on_entered.recv().expect("the operation selected its term");
-            assert!(
-                leadership.held.try_write().is_err(),
-                "a selected operation holds the slot against replacement"
-            );
-            let replacement =
-                scope.spawn(|| leadership.set_held(None, ForgeLeaderRevocation::Replaced));
-            resume.send(()).expect("the operation is paused");
-            let revoked_inside = operation
-                .join()
-                .expect("operation thread")
-                .expect("the live term serves the operation");
-            assert!(!revoked_inside, "the term stayed live through its use");
-            replacement.join().expect("replacement thread");
-        });
-        assert!(held.is_revoked());
-        let mut ran = false;
-        let refused = leadership.with_term(Some(1), ForgeLeaderDecision::Pull, |_| ran = true);
-        assert!(matches!(refused, Err(ForgeError::FenceLost { .. })));
-        assert!(!ran, "a revoked term runs no schedule operation");
+            assert!(held.is_revoked());
+            let mut ran = false;
+            let refused = leadership.with_term(Some(1), decision, |_| ran = true);
+            assert!(matches!(refused, Err(ForgeError::FenceLost { .. })));
+            assert!(!ran, "a revoked term runs no schedule operation");
+        }
     }
 
     /// Relinquishing revokes and removes the term so every handler refuses.

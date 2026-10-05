@@ -269,7 +269,32 @@ pub enum DataTypeSpec {
     /// Nested struct of named fields.
     #[cfg_attr(feature = "server", schema(no_recursion))]
     Struct(Vec<FieldSpec>),
+    /// Self-describing semi-structured value stored in the Parquet/Iceberg
+    /// Variant encoding.
+    ///
+    /// On the Arrow wire it is the canonical `arrow.parquet.variant` extension
+    /// type over a `metadata`/`value` binary struct. Each value keeps its own
+    /// type: integers stay integers, objects keep missing keys distinct from
+    /// null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and
+    /// [`VARIANT_MAX_ENCODED_BYTES`].
+    Variant,
 }
+
+/// Arrow extension name every Variant column carries on the wire.
+pub const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+
+/// Maximum Variant nesting depth, counting the root container as one.
+///
+/// A fixed contract constant, not configuration: a deeper value is refused
+/// with `WYRD_VALA_400_VARIANT_TOO_DEEP`.
+pub const VARIANT_MAX_DEPTH: u32 = 64;
+
+/// Maximum canonical encoded Variant bytes, metadata plus value.
+///
+/// A fixed contract constant, not configuration: a larger value is refused
+/// with `WYRD_VALA_413_VARIANT_TOO_LARGE` before queue reservation or durable
+/// write.
+pub const VARIANT_MAX_ENCODED_BYTES: u64 = 8_388_608;
 
 /// Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
 /// but carries a typed [`DataTypeSpec`] instead of a loose dtype string.

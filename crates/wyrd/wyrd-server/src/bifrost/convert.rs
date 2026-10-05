@@ -12,6 +12,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
+use vala_bifrost_redux::tables::fields::{
+    is_extension_key, is_variant, mark_variant, variant_storage,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
@@ -76,6 +79,7 @@ pub fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Struct(fields) => {
             DataType::Struct(fields.iter().map(field_to_arrow).collect())
         }
+        DataTypeSpec::Variant => variant_storage(),
     }
 }
 
@@ -140,12 +144,16 @@ pub fn data_type_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdError> {
 /// Metadata travels with the field, so a stable `PARQUET:field_id` supplied by
 /// a description survives the round trip into Arrow at every nesting depth.
 pub fn field_to_arrow(field: &FieldSpec) -> Field {
-    Field::new(
+    let arrow = Field::new(
         field.name.clone(),
         data_type_to_arrow(&field.data_type),
         field.nullable,
     )
-    .with_metadata(field.metadata.clone().into_iter().collect())
+    .with_metadata(field.metadata.clone().into_iter().collect());
+    match field.data_type {
+        DataTypeSpec::Variant => mark_variant(arrow),
+        _ => arrow,
+    }
 }
 
 /// Convert an Arrow [`Field`] back into a wire [`FieldSpec`].
@@ -155,13 +163,19 @@ pub fn field_to_arrow(field: &FieldSpec) -> Field {
 /// Returns [`WyrdError::Internal`] when the stored type is outside the
 /// register-accepted set, propagated from [`data_type_from_arrow`].
 pub fn field_from_arrow(field: &Field) -> Result<FieldSpec, WyrdError> {
+    let variant = is_variant(field);
     Ok(FieldSpec {
         name: field.name().clone(),
-        data_type: data_type_from_arrow(field.data_type())?,
+        data_type: if variant {
+            DataTypeSpec::Variant
+        } else {
+            data_type_from_arrow(field.data_type())?
+        },
         nullable: field.is_nullable(),
         metadata: field
             .metadata()
             .iter()
+            .filter(|(key, _)| !variant || !is_extension_key(key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     })

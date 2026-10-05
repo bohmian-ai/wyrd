@@ -10282,6 +10282,7 @@ version = "0.0.1"
 dependencies = [
  "arc-swap",
  "arrow",
+ "arrow-schema",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -10306,6 +10307,9 @@ dependencies = [
  "num-traits",
  "opendal 0.57.0",
  "parquet",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
  "prost",
  "rand 0.8.7",
  "rayon",

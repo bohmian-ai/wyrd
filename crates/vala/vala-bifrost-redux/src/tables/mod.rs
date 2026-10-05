@@ -457,6 +457,11 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
         ))
     };
     let data_type = match (field.data_type(), registered.field_type.as_ref()) {
+        // A Variant's `metadata`/`value` storage children carry no Iceberg
+        // field ids: the Variant is one logical Iceberg field.
+        (DataType::Struct(_), Type::Variant(_)) if fields::is_variant(field) => {
+            field.data_type().clone()
+        }
         (DataType::List(element), Type::List(list)) => {
             DataType::List(Arc::new(with_registered_id(element, &list.element_field)?))
         }
@@ -499,7 +504,9 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
             DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(..),
             _,
         )
-        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_)) => return Err(mismatch()),
+        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_) | Type::Variant(_)) => {
+            return Err(mismatch());
+        }
         (scalar, _) => scalar.clone(),
     };
     let mut metadata = field.metadata().clone();
@@ -627,9 +634,11 @@ const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
 ///
 /// The encoding is a version byte, the top-level field count, and then each
 /// field in declared order as: length-prefixed name, type bytes, nullability,
-/// sensitivity, its metadata entries other than `PARQUET:field_id` in
-/// ascending raw key-byte order, and finally its nested child count followed
-/// depth-first by the same record for each child. Every count and length is an
+/// sensitivity, its metadata entries other than `PARQUET:field_id` and the
+/// Arrow extension keys in ascending raw key-byte order, and finally its
+/// nested child count followed depth-first by the same record for each child.
+/// A Variant field writes the single tag `0x0d` and a zero child count, so
+/// only the logical schema is committed. Every count and length is an
 /// unsigned big-endian `u32`; fixed-binary widths are signed big-endian `i32`.
 /// Field ids are excluded because the registered Iceberg table, not the
 /// declaration, owns them.
@@ -667,15 +676,22 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 /// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
 /// or its type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
+    let variant = fields::is_variant(field);
     encode_len_prefixed(field.name().as_bytes(), out)?;
-    encode_data_type(field.data_type(), out)?;
+    if variant {
+        out.push(VARIANT_TYPE_TAG);
+    } else {
+        encode_data_type(field.data_type(), out)?;
+    }
     out.push(u8::from(field.is_nullable()));
     out.push(u8::from(sensitivity(field)?));
 
     let mut entries: Vec<(&String, &String)> = field
         .metadata()
         .iter()
-        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID)
+        .filter(|(key, _)| {
+            key.as_str() != fields::PARQUET_FIELD_ID && !fields::is_extension_key(key)
+        })
         .collect();
     out.extend_from_slice(&count_u32(entries.len())?.to_be_bytes());
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -684,13 +700,24 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
         encode_len_prefixed(value.as_bytes(), out)?;
     }
 
-    let children = child_fields(field.data_type());
+    let children = if variant {
+        None
+    } else {
+        child_fields(field.data_type())
+    };
     match children {
         Some(children) => encode_field_sequence(&children, out)?,
         None => out.extend_from_slice(&0_u32.to_be_bytes()),
     }
     Ok(())
 }
+
+/// Fingerprint tag of a Variant field.
+///
+/// A Variant commits only this byte: no storage children and no extension
+/// metadata, so per-file shredding layouts and the storage spelling of the
+/// `metadata`/`value` struct never change a table's fingerprint.
+const VARIANT_TYPE_TAG: u8 = 0x0d;
 
 /// Encode one pinned type tag and its inline parameters.
 ///

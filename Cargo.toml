@@ -227,6 +227,10 @@ lru = "=0.12.5"
 datafusion = "=55.0.0"
 datafusion-proto = "=55.0.0"
 parquet = "59.2"
+# Arrow-rs Variant model, kernels, and JSON conversion; same release line as `parquet`.
+parquet-variant = "59.3"
+parquet-variant-compute = "59.3"
+parquet-variant-json = "59.3"
 iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }

@@ -9,6 +9,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 
 use crate::catalog::BifrostCatalogError;
+use crate::tables::fields::{is_extension_key, is_variant};
 use crate::tables::managed_columns::is_managed_column;
 
 /// Reject user fields that collide with server-owned physical columns.
@@ -159,13 +160,19 @@ fn status_from_db(status: &str) -> Result<TableStatus, BifrostCatalogError> {
 /// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored type is
 /// not representable on the wire.
 fn field_to_spec(field: &Field) -> Result<FieldSpec, BifrostCatalogError> {
+    let variant = is_variant(field);
     Ok(FieldSpec {
         name: field.name().clone(),
-        data_type: data_type_from_arrow(field.data_type())?,
+        data_type: if variant {
+            DataTypeSpec::Variant
+        } else {
+            data_type_from_arrow(field.data_type())?
+        },
         nullable: field.is_nullable(),
         metadata: field
             .metadata()
             .iter()
+            .filter(|(key, _)| !variant || !is_extension_key(key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     })

@@ -6,12 +6,15 @@
 //! [`wyrd_spec::vala::api::FieldSpec`]. The PyO3 acquisition (Pydantic
 //! `model_json_schema()` / `pyarrow.Schema`) lives in `wyrd_client::bifrost` and calls these.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
 use serde_json::{Map, Value};
-use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit};
+use wyrd_spec::vala::api::{
+    BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit, VARIANT_EXTENSION_NAME,
+};
 
 use crate::error::WyrdQueueError;
 
@@ -240,13 +243,23 @@ fn free_form_dict() -> WyrdQueueError {
 /// Metadata is carried verbatim so a stable `PARQUET:field_id` survives at
 /// every nesting depth rather than only on top-level columns.
 fn field_to_spec(field: &Field) -> FieldSpec {
+    let variant = field.extension_type_name() == Some(VARIANT_EXTENSION_NAME);
     FieldSpec {
         name: field.name().clone(),
-        data_type: dtspec_from_arrow(field.data_type()),
+        data_type: if variant {
+            DataTypeSpec::Variant
+        } else {
+            dtspec_from_arrow(field.data_type())
+        },
         nullable: field.is_nullable(),
         metadata: field
             .metadata()
             .iter()
+            .filter(|(key, _)| {
+                !variant
+                    || (key.as_str() != EXTENSION_TYPE_NAME_KEY
+                        && key.as_str() != EXTENSION_TYPE_METADATA_KEY)
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     }
@@ -254,7 +267,9 @@ fn field_to_spec(field: &Field) -> FieldSpec {
 
 /// Project one wire declaration onto its Arrow field, metadata dropped.
 ///
-/// Name, nullability, and the exact type — everything that shapes an Arrow
+/// A Variant declaration keeps only the `arrow.parquet.variant` extension
+/// marker, which is its type rather than identity metadata. Name,
+/// nullability, and the exact type — everything that shapes an Arrow
 /// buffer — are reproduced at every depth. Field metadata is not: a
 /// `PARQUET:field_id` is the server's own physical identity, which it assigns
 /// at registration, re-derives on every stamp, and ignores on an incoming
@@ -265,11 +280,21 @@ fn field_to_spec(field: &Field) -> FieldSpec {
 /// This is therefore the lossy forward half of [`field_to_spec`], not its
 /// inverse.
 fn spec_to_field(spec: &FieldSpec) -> Field {
-    Field::new(
+    let field = Field::new(
         spec.name.as_str(),
         data_type_to_arrow(&spec.data_type),
         spec.nullable,
-    )
+    );
+    match spec.data_type {
+        DataTypeSpec::Variant => field.with_metadata(HashMap::from([
+            (
+                EXTENSION_TYPE_NAME_KEY.to_owned(),
+                VARIANT_EXTENSION_NAME.to_owned(),
+            ),
+            (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
+        ])),
+        _ => field,
+    }
 }
 
 fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
@@ -364,6 +389,12 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Struct(fields) => DataType::Struct(Fields::from(
             fields.iter().map(spec_to_field).collect::<Vec<_>>(),
         )),
+        // The unshredded `arrow.parquet.variant` storage; the extension marker
+        // is stamped on the enclosing field by `spec_to_field`.
+        DataTypeSpec::Variant => DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ])),
     }
 }
 

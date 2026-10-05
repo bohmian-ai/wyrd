@@ -14,7 +14,11 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use arrow_schema::extension::{
+    EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY, ExtensionType,
+};
+use parquet_variant_compute::VariantType;
 
 /// Arrow field metadata key Parquet and Iceberg read a field id from.
 ///
@@ -61,6 +65,56 @@ pub fn float64(name: &str, nullable: bool) -> Field {
 
 pub fn fixed_binary(name: &str, size: i32, nullable: bool) -> Field {
     Field::new(name, DataType::FixedSizeBinary(size), nullable)
+}
+
+/// Return the canonical Arrow storage of one unshredded Variant column.
+///
+/// The storage is a struct of two non-null `Binary` children, `metadata` then
+/// `value`: exactly the shape the Iceberg schema converter produces for an
+/// Iceberg `variant`, so a table round-tripped through the catalog keeps the
+/// same Arrow layout its writers use. The extension marker lives on the
+/// enclosing field, never on this type.
+#[must_use]
+pub fn variant_storage() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, false),
+    ]))
+}
+
+/// Declare one Variant field: canonical storage plus the
+/// `arrow.parquet.variant` extension marker.
+#[must_use]
+pub fn variant(name: &str, nullable: bool) -> Field {
+    mark_variant(Field::new(name, variant_storage(), nullable))
+}
+
+/// Stamp the `arrow.parquet.variant` extension marker onto a storage field.
+///
+/// The field keeps its name, nullability, storage type, and every other
+/// metadata entry; callers that rebuild a declared Variant from a wire
+/// description use this instead of restating the extension keys.
+#[must_use]
+pub fn mark_variant(field: Field) -> Field {
+    field.with_extension_type(VariantType)
+}
+
+/// Report whether a metadata key is one of Arrow's extension-type keys.
+///
+/// Schema identities and wire descriptions express a Variant through its type,
+/// so they drop these keys rather than committing the extension spelling.
+#[must_use]
+pub fn is_extension_key(key: &str) -> bool {
+    key == EXTENSION_TYPE_NAME_KEY || key == EXTENSION_TYPE_METADATA_KEY
+}
+
+/// Report whether a field carries the `arrow.parquet.variant` extension.
+///
+/// The extension name, not the storage struct, is what makes a column a
+/// Variant: a user Struct with `metadata`/`value` children stays a Struct.
+#[must_use]
+pub fn is_variant(field: &Field) -> bool {
+    field.extension_type_name() == Some(VariantType::NAME)
 }
 
 /// Projection and permission class of one canonical signal field.
@@ -126,6 +180,11 @@ pub enum CanonicalType {
     List(&'static CanonicalField),
     /// Nested record whose children declare its fields in order.
     Struct(&'static [CanonicalField]),
+    /// Self-describing semi-structured value in the Parquet/Iceberg Variant
+    /// encoding, carried on Arrow as the `arrow.parquet.variant` extension
+    /// over [`variant_storage`]. Its fingerprint commits only the type tag:
+    /// the storage children and any per-file shredding are not logical shape.
+    Variant,
 }
 
 impl CanonicalType {
@@ -156,6 +215,7 @@ impl CanonicalType {
                     .collect::<Vec<_>>()
                     .into(),
             ),
+            Self::Variant => variant_storage(),
         }
     }
 
@@ -227,16 +287,25 @@ impl CanonicalField {
 
     /// Project this entry into its Arrow field, stamping its semantic metadata.
     ///
+    /// A Variant entry also carries the `arrow.parquet.variant` extension
+    /// marker, which is what distinguishes it from a plain storage struct.
+    ///
     /// The `wyrd:sensitive` metadata is written on this field and, through
     /// [`CanonicalType::to_arrow`], on every nested child, so the whole tree
     /// carries its sensitivity into every schema-only consumer. No field id is
     /// written: the registered Iceberg table owns ids.
     #[must_use]
     pub fn to_arrow(&self) -> Field {
-        Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(HashMap::from([(
-            WYRD_SENSITIVE.to_owned(),
-            self.class.is_sensitive().to_string(),
-        )]))
+        let field = Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(
+            HashMap::from([(
+                WYRD_SENSITIVE.to_owned(),
+                self.class.is_sensitive().to_string(),
+            )]),
+        );
+        match self.ty {
+            CanonicalType::Variant => field.with_extension_type(VariantType),
+            _ => field,
+        }
     }
 }
 

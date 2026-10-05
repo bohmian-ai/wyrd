@@ -1,7 +1,7 @@
 ---
 id: TASK-PACKET-R2
 kind: remediation
-status: ready
+status: review
 spec: SPEC-forge-concurrent-planning
 spec_revision: 12
 parent_task: packet-wide
@@ -160,3 +160,58 @@ delete, ignore, or allowlist a failing behavioral test.
 - No broad fork cleanup beyond symbols made unnecessary by Wyrd's consumed
   seam.
 - No production behavior change for the two documentation findings.
+
+## Implementation Evidence
+
+Commits, oldest first: `0aba11f67` (FIND-PACKET-1, FIND-PACKET-6),
+`a26fda2e3` and `3f591937e` (FIND-TASK-001-1), `0e1968570`
+(FIND-TASK-005-R1-3), `3a196c103` (FIND-TASK-002-2 pin). Fork commit
+`bohmian-ai/iceberg-compaction@35f037e5413a3dfbffb996fbb8c882da79644804` on
+`wyrd/narrow-managed-seam`, parent `380a4d0`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-1: handler use linearized with the live term | `forge/leadership.rs` `with_term` holds the slot read guard across validation and the synchronous schedule operation; `set_held` takes the write guard; `accept`, `serve_pull`, `serve_report` use `with_term` | `forge::leadership::tests::schedule_use_is_linearized_with_term_replacement` (Commit, Pull, Report each paused after term selection; replacement cannot take the slot; afterwards each refuses without running) | PASS |
+| FIND-TASK-001-1: scheduler exit ends the local term before backoff | `forge/scheduler.rs` `ForgeRunGuard` drop calls `ForgeLeadership::relinquish` (revoke and remove, revocation `scheduler_stopped`) before releasing `running`; SQL row lapses | `forge::leadership::tests::relinquished_term_refuses_every_handler`; `forge::production_routes::failed_scheduler_ends_its_term_before_restart` (panic after acquisition; during backoff notify/pull/report refuse; standby acquires after the row lapses; rebuilt scheduler stays standby; aborted rebuilt holder revokes). RED: with `relinquish` disabled the journey fails at `term.is_revoked()` | PASS |
+| FIND-TASK-002-2: fork exposes only the consumed seam | fork `core/src/managed/boundary.rs` drops `attempt_id`, `context`, `load_table`, `plan_with_report` and the stored `context`; `core/src/compaction/mod.rs` drops `Compaction::plan_compaction_with_report`; `new`, `rewrite`, and `CompactionPlanner::plan_compaction_with_report` kept. Wyrd `Cargo.toml`/`Cargo.lock` change only the two pin lines | fork: `cargo fmt --all -- --check` (pinned nightly) clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `make unit-test` scope 151/151; Wyrd: managed rewrite integration 17/17, managed lib 31/31, `mise run test:bifrost:journey:forge` 23/23 | PASS |
+| FIND-TASK-005-R1-3: lease-bounded authority, unknown outcome bars cuts | migration `20260910000025` `oracle_acquire_table_cut` raises 55000 when the tenant's requested `table_uid` has expiration claims; `oracle_reader_authority.rs` maps it to `SqlError::Conflict`; `BifrostCatalogError::UnresolvedExpiry` maps to `QueryVisibilityUnavailable`; `forge/expire.rs` bounds the exclusive scope by `lease_ttl`, settles or resets known outcomes under the held authority, resets unsubmitted failures, and keeps claims `Prepared` only for a submitted commit of unknown acceptance | `forge::snapshot_expiration::accepted_expiry_past_the_lease_bound_bars_cuts_until_reconciled` and `forge::snapshot_expiration::rejected_expiry_of_unknown_outcome_bars_cuts_until_reconciled` (claims retained; cut refused with `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` and no active read; same-tenant ordinary table and other tenant's same-named table acquire; takeover reconciliation settles; later cut equals the catalog pointer). RED: with the SQL barrier disabled the rejected case fails at the refusal assertion. `catalog::error::tests::unresolved_expiry_maps_to_visibility_unavailable`. Existing expiry, cleanup, reader-ordering and production-route suites 36/36; `pg_forge_operations` + `pg_oracle_membership` 13/13 | PASS |
+| FIND-PACKET-1: supervisor docs name leader-stream ownership | `oracle/analytical_supervisor.rs` module doc | scan: doc states the leader query stream owns the graph lifetime and revokes followers before releasing the active-read claim; "This module does not own query lifetime"; no remaining supervisor-owns-lifetime wording | PASS |
+| FIND-PACKET-6: packet authority metadata | `tasks/README.md`, `TASK-004` front matter | scan: README names revision 12 as current authority; every task has `spec_revision` (001–004: 6, 005-R1: 10) | PASS |
+
+Focused commands (Postgres-backed ones run inside
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && …'`):
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::schedule_use_is_linearized_with_term_replacement)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::relinquished_term_refuses_every_handler)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=catalog::error::tests::unresolved_expiry_maps_to_visibility_unavailable)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E 'test(=forge::production_routes::failed_scheduler_ends_its_term_before_restart)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E 'test(=forge::snapshot_expiration::accepted_expiry_past_the_lease_bound_bars_cuts_until_reconciled)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E 'test(=forge::snapshot_expiration::rejected_expiry_of_unknown_outcome_bars_cuts_until_reconciled)'
+```
+
+Non-goals held: no new table, claim type, protocol, polling or retry loop; no
+query-lifetime owner; the authority hold is bounded by `lease_ttl`; the
+object-delete uncertainty rule and its tests are unchanged; the fork change
+deletes only the listed symbols; findings 4 and 5 change docs and metadata only.
+
+Limits:
+- The fork's Docker integration crate (`make integration-test`) cannot start
+  here: Docker Hub refuses its pinned `minio/minio:RELEASE.2024-03-07T00-43-48Z`
+  image. No integration test names a deleted symbol; the fork's CI unit scope
+  passes.
+- A rejected commit cannot reach the lease bound itself: the commit is bounded
+  by `iceberg_total_retry_timeout`, which `ForgeConfig::validate` keeps below
+  `lease_ttl`. The rejected case therefore reaches unknown acceptance through
+  that commit timeout, and the test lapses the lease durably before
+  reconciliation.
+
+Final lane: `mise run verify:bifrost` at `3f591937e` exited 0 with
+"9/9 lanes passed" (redux integration 909/909, Forge journey 23/23, and every
+other Bifrost tier and language surface green).
+
+Lanes not run, by owner decision on 2026-10-05: `mise run gate`,
+`mise run test:principals:integration` (no served OpenAPI, route, or wire type
+changed; `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` already existed),
+standalone `codegen:check` and boundary checks, and
+`bench:bifrost:forge-capacity`.

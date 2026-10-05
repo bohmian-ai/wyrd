@@ -1508,6 +1508,16 @@ table on `(data_tenant_id, result_id)`.
     error. Python is synchronous; Rust and TypeScript await it.
   - `architecture/wyrd-design.md` documents `observe.verify` beside `drift`,
     `eval`, and `record`.
+  - Opening a run on one Card is a single step: Python `state.run("agent")`
+    takes the Card alias as its first positional argument (today it is the
+    keyword-only `card=`), matching TypeScript `state.run("agent")` and Rust
+    `state.run_for_card("agent")`. The canonical example is:
+
+    ```python
+    with state.run("agent") as agent:
+        judgment = agent.observe.verify("answer-is-yes", {"answer": "yes"})
+    assert judgment.passed
+    ```
 - **REQ-189**: The `Verification` client handle (`get_binding`, `start_run`,
   `get_run`, `execute`) and the Python `wyrd.verification` module MUST be
   removed from the Rust, Python, and TypeScript SDKs, their exports, and their

@@ -2479,7 +2479,7 @@ impl Oracle {
         }
         // Published only after activation and immediately before dispatch, so
         // no follower is charged for a graph that never opened.
-        if let Some(ownership) = admitted.analytical.as_ref() {
+        if let Some(ownership) = admitted.analytical.as_mut() {
             ownership.publish_participants().await?;
         }
         let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());

@@ -2302,9 +2302,15 @@ pub(super) struct AnalyticalGraphLifecycle {
     participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// The participant grants, reserved at most once and held until revoked.
     ///
-    /// `None` inside the cell is a refused reservation, kept so a repeated
-    /// publish refuses again instead of charging any follower a second time.
-    grants: tokio::sync::OnceCell<Option<AnalyticalParticipantGrants>>,
+    /// `None` both before reservation and after a refusal or revocation;
+    /// [`Self::reserved`] tells them apart. Held by value and only touched
+    /// through `&mut self`, so the leader stream owns every grant outright.
+    grants: Option<AnalyticalParticipantGrants>,
+    /// Whether a reservation round has completed, granted or refused.
+    ///
+    /// Kept so a repeated publish after a refusal refuses again instead of
+    /// charging any follower a second time.
+    reserved: bool,
     /// The graph's own attempt, joined by settlement and aborted by drop.
     attempt: Option<AnalyticalAttemptGuard>,
     /// The graph's own cancellation child, shared with every descendant.
@@ -2399,7 +2405,8 @@ impl AnalyticalGraphLifecycle {
             remote,
             request,
             participants: Arc::new(std::sync::OnceLock::new()),
-            grants: tokio::sync::OnceCell::new(),
+            grants: None,
+            reserved: false,
             attempt,
             cancel,
             deadline,
@@ -2449,7 +2456,7 @@ impl AnalyticalGraphLifecycle {
     /// is initialized once and every later call reads its verdict — so an
     /// orchestration that re-enters this before dispatch cannot charge a
     /// follower twice. Cancelling the returned future mid-round drops every
-    /// grant that round took.
+    /// grant that round took and leaves the lifecycle unreserved.
     ///
     /// # Errors
     ///
@@ -2457,11 +2464,16 @@ impl AnalyticalGraphLifecycle {
     /// longer active, and [`BifrostError::QueryAdmissionRejected`] when a
     /// participant declined, the placement could not be retried within the
     /// deadline or cancellation, or the cut could not be frozen.
-    pub(super) async fn publish_participants(&self) -> Result<(), BifrostError> {
+    pub(super) async fn publish_participants(&mut self) -> Result<(), BifrostError> {
         self.supervisor.ensure_graph_active(self.graph)?;
-        match self.grants.get_or_init(|| self.reserve()).await {
-            Some(_) => Ok(()),
-            None => Err(BifrostError::QueryAdmissionRejected),
+        if !self.reserved {
+            self.grants = self.reserve().await;
+            self.reserved = true;
+        }
+        if self.grants.is_some() {
+            Ok(())
+        } else {
+            Err(BifrostError::QueryAdmissionRejected)
         }
     }
 
@@ -2486,7 +2498,7 @@ impl AnalyticalGraphLifecycle {
     /// Returns the detail recorded against the graph when the fold does not
     /// complete before the deadline, or when the follower-metric rewrite
     /// itself fails.
-    async fn fold_physical_metrics(&self) -> Result<(), String> {
+    async fn fold_physical_metrics(&mut self) -> Result<(), String> {
         let Some(fold) = self.supervisor.take_metric_fold(self.graph) else {
             return Ok(());
         };
@@ -2571,6 +2583,12 @@ impl AnalyticalGraphLifecycle {
         // Closing every admit stream is the release: each follower drops its
         // grant and cancels whatever it built on it.
         drop(self.grants.take());
+
+        #[cfg(feature = "test-support")]
+        super::planner::record_leader_ownership(
+            self.graph.public_query_id.as_uuid(),
+            super::planner::LeaderOwnershipEvent::GraphRevoked,
+        );
         let mut running_query = None;
         if failure.is_none() {
             match self.release().release().await {
@@ -2641,7 +2659,7 @@ impl AnalyticalGraphLifecycle {
     /// Returns `None` when a participant failed ambiguously, a refusal could
     /// not be retried within the deadline or cancellation, or the cut could
     /// not be frozen. Every grant taken is already dropped by then.
-    async fn reserve(&self) -> Option<AnalyticalParticipantGrants> {
+    async fn reserve(&mut self) -> Option<AnalyticalParticipantGrants> {
         if self.remote.is_empty() {
             let _ = self.participants.set(Arc::new(
                 AnalyticalParticipantCut::freeze(HashMap::new())
@@ -2649,7 +2667,7 @@ impl AnalyticalGraphLifecycle {
             ));
             return Some(AnalyticalParticipantGrants::default());
         }
-        let Some(transports) = self.transports.as_ref() else {
+        let Some(transports) = self.transports.clone() else {
             tracing::error!(
                 "Oracle analytical leader has no peer transport to reserve participants through"
             );
@@ -2659,7 +2677,7 @@ impl AnalyticalGraphLifecycle {
             let mut grants = AnalyticalParticipantGrants {
                 grants: Vec::with_capacity(self.remote.len()),
             };
-            let destinations = match self.reserve_round(transports, &mut grants).await {
+            let destinations = match self.reserve_round(&transports, &mut grants).await {
                 Ok(destinations) => destinations,
                 Err(None) => return None,
                 Err(Some(rejected)) => {
@@ -2709,7 +2727,7 @@ impl AnalyticalGraphLifecycle {
     /// deadline expiry, or any transport or contract failure, none of which is
     /// retried as capacity.
     async fn reserve_round(
-        &self,
+        &mut self,
         transports: &super::dispatcher::OraclePeerTransportDirectory,
         grants: &mut AnalyticalParticipantGrants,
     ) -> Result<
@@ -2804,6 +2822,11 @@ impl Drop for AnalyticalGraphLifecycle {
         self.close_exchanges();
         drop(self.grants.take());
         drop(self.attempt.take());
+        #[cfg(feature = "test-support")]
+        super::planner::record_leader_ownership(
+            self.graph.public_query_id.as_uuid(),
+            super::planner::LeaderOwnershipEvent::GraphRevoked,
+        );
         drop(self.supervisor.take_metric_fold(self.graph));
         self.release().reclaim();
     }
@@ -4202,7 +4225,7 @@ mod tests {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
         let leased = lease_over_lossy_peers(&fixture, &oracle, accepted);
-        let (admitted, ownership, transport) = *leased;
+        let (admitted, mut ownership, transport) = *leased;
         let published = Box::pin(ownership.publish_participants()).await;
         if accepted == 0 {
             assert!(
@@ -4316,7 +4339,7 @@ mod tests {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
         let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
-        let (admitted, ownership, transport) = *leased;
+        let (admitted, mut ownership, transport) = *leased;
         ownership
             .publish_participants()
             .await
@@ -4403,7 +4426,7 @@ mod tests {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
         let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
-        let (admitted, ownership, transport) = *leased;
+        let (admitted, mut ownership, transport) = *leased;
         ownership
             .publish_participants()
             .await
@@ -4493,7 +4516,7 @@ mod tests {
         let fixture = GraphFixture::new(Utc::now());
         let oracle = fixture_oracle_role();
         let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
-        let (admitted, ownership, _transport) = *leased;
+        let (admitted, mut ownership, _transport) = *leased;
         ownership
             .publish_participants()
             .await
@@ -4573,7 +4596,7 @@ mod tests {
         let oracle = fixture_oracle_role();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
-        let (admitted, ownership, _transport) = *leased;
+        let (admitted, mut ownership, _transport) = *leased;
         ownership
             .publish_participants()
             .await
@@ -5744,7 +5767,7 @@ mod tests {
         let oracle = fixture_oracle_role();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
-        let (admitted, ownership, transport) = *leased;
+        let (admitted, mut ownership, transport) = *leased;
         ownership
             .publish_participants()
             .await
@@ -5854,12 +5877,13 @@ mod tests {
     /// never publishes its reservation verdict.
     async fn assert_cancellation_interrupts_a_pending_reservation() {
         let expires_at = Utc::now() + chrono::Duration::seconds(60);
-        let fixture = ReservationFixture::start_bounded(
+        let mut fixture = ReservationFixture::start_bounded(
             2,
             expires_at,
             tokio::time::Instant::now() + Duration::from_mins(10),
         );
         fixture.transport.hang_reserves();
+        let participants = fixture.lifecycle.participants();
         let publish = fixture.lifecycle.publish_participants();
         tokio::pin!(publish);
         assert!(
@@ -5896,7 +5920,7 @@ mod tests {
             "cancellation stops reservation instead of charging the next participant"
         );
         assert!(
-            fixture.lifecycle.participants().get().is_none(),
+            participants.get().is_none(),
             "no partial cut is ever published"
         );
     }
@@ -5910,7 +5934,7 @@ mod tests {
     async fn assert_the_deadline_interrupts_a_pending_reservation() {
         let expires_at = Utc::now() + chrono::Duration::seconds(60);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let fixture = ReservationFixture::start_bounded(2, expires_at, deadline);
+        let mut fixture = ReservationFixture::start_bounded(2, expires_at, deadline);
         fixture.transport.hang_reserves();
         let refused = fixture
             .lifecycle
@@ -6361,7 +6385,7 @@ mod tests {
     /// Panics when a participant is reserved more than once, when the published
     /// cut does not carry the follower's own reservation identity, or when a
     /// repeated publish charges a follower again.
-    async fn assert_reserved_once_and_published(fixture: &ReservationFixture) {
+    async fn assert_reserved_once_and_published(fixture: &mut ReservationFixture) {
         let url = fixture.remote[0].0.clone();
         fixture
             .lifecycle
@@ -6411,7 +6435,7 @@ mod tests {
     /// Panics when the attempt is not refused, when a release is inexact, when
     /// a partial cut is published, or when acknowledged cleanup is retained.
     async fn assert_partial_reservation_releases_exactly(expires_at: DateTime<Utc>) {
-        let refused = ReservationFixture::start(1, expires_at);
+        let mut refused = ReservationFixture::start(1, expires_at);
         refused.transport.lose_refused_peers();
         let error = refused
             .lifecycle
@@ -6455,7 +6479,7 @@ mod tests {
     /// early, late, or missing, or the attempt outlives its deadline.
     async fn assert_refused_round_retries_within_deadline(expires_at: DateTime<Utc>) {
         let started = tokio::time::Instant::now();
-        let refused = ReservationFixture::start_bounded(
+        let mut refused = ReservationFixture::start_bounded(
             1,
             expires_at,
             started + Duration::from_millis(2_500),
@@ -6511,9 +6535,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn participant_cut_is_reserved_once_immediately_before_dispatch() {
         let expires_at = Utc::now() + chrono::Duration::seconds(60);
-        let selected = ReservationFixture::start(2, expires_at);
+        let mut selected = ReservationFixture::start(2, expires_at);
         assert_nothing_reserved_before_selection(&selected).await;
-        assert_reserved_once_and_published(&selected).await;
+        assert_reserved_once_and_published(&mut selected).await;
         drop(selected);
         assert_partial_reservation_releases_exactly(expires_at).await;
         assert_refused_round_retries_within_deadline(expires_at).await;
@@ -6533,11 +6557,12 @@ mod tests {
     /// when a cut is published.
     #[tokio::test(start_paused = true)]
     async fn cancellation_during_peer_capacity_wait_stops_retry() {
-        let fixture = ReservationFixture::start_bounded(
+        let mut fixture = ReservationFixture::start_bounded(
             1,
             Utc::now() + chrono::Duration::seconds(60),
             tokio::time::Instant::now() + Duration::from_mins(10),
         );
+        let participants = fixture.lifecycle.participants();
         let publish = fixture.lifecycle.publish_participants();
         tokio::pin!(publish);
         assert!(
@@ -6590,7 +6615,7 @@ mod tests {
             "the round's one acceptance is returned exactly once"
         );
         assert!(
-            fixture.lifecycle.participants().get().is_none(),
+            participants.get().is_none(),
             "a cancelled placement publishes no cut"
         );
     }
@@ -7894,7 +7919,7 @@ impl AnalyticalAttemptOwnership {
     ///
     /// Returns the error reported by
     /// `AnalyticalGraphLifecycle::publish_participants`.
-    pub async fn publish_participants(&self) -> Result<(), BifrostError> {
+    pub async fn publish_participants(&mut self) -> Result<(), BifrostError> {
         self.lifecycle.publish_participants().await
     }
 

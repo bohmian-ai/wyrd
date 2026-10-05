@@ -4648,14 +4648,67 @@ async fn await_no_active_reads(
     }
 }
 
+/// Proves the leader revoked each recorded Analytical graph before its claim.
+///
+/// Drains this process's leader ownership log and, for every query whose
+/// graph recorded a revocation, requires that revocation to precede the first
+/// release of the same query's active-read claim. Both transitions are
+/// appended synchronously where they happen, so a claim released while a
+/// follower grant or local driver is still owned is recorded first and fails
+/// here. `expected` is the number of Analytical graphs `case` must have
+/// produced, so a case that never reached a graph cannot pass vacuously.
+///
+/// # Errors
+/// Returns an error naming `case` when a graph count differs from `expected`,
+/// a claim release precedes its graph's revocation, or a revoked graph's
+/// claim never began releasing.
+fn assert_graphs_revoked_before_claims(case: &str, expected: usize) -> Result<(), JourneyError> {
+    use vala_bifrost_redux::oracle::planner::{
+        LeaderOwnershipEvent, take_leader_ownership_order_for_test,
+    };
+    let order = take_leader_ownership_order_for_test();
+    let position = |query: uuid::Uuid, event: LeaderOwnershipEvent| {
+        order
+            .iter()
+            .position(|recorded| *recorded == (query, event))
+    };
+    let graphs: BTreeSet<uuid::Uuid> = order
+        .iter()
+        .filter(|(_, event)| *event == LeaderOwnershipEvent::GraphRevoked)
+        .map(|(query, _)| *query)
+        .collect();
+    if graphs.len() != expected {
+        return Err(format!(
+            "{case}: {} Analytical graphs were revoked, not {expected}: {order:?}",
+            graphs.len()
+        )
+        .into());
+    }
+    for query in graphs {
+        let revoked = position(query, LeaderOwnershipEvent::GraphRevoked);
+        let released = position(query, LeaderOwnershipEvent::ClaimReleaseStarted)
+            .ok_or_else(|| format!("{case}: query {query} never released its claim: {order:?}"))?;
+        if revoked.is_none_or(|revoked| revoked > released) {
+            return Err(format!(
+                "{case}: query {query} released its claim before revoking its graph: {order:?}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Proves one inseparable cut-and-claim owner holds active reads to the end.
 ///
 /// An Analytical graph whose follower task is held keeps its single active
 /// read; releasing the follower lets the query finish, and the read is already
 /// gone when the caller receives the terminal frame. A caller that drops the
 /// query while that follower is still held releases its read once the drop
-/// reaches the owner. A query dropped at its post-pin boundary — after the
+/// reaches the owner. A caller that drops an already returned stream releases
+/// its read the same way. A query dropped at its post-pin boundary — after the
 /// claim committed but before any owner received it — releases its row too.
+/// In every case with a graph, the leader's ownership log shows that graph
+/// revoked every follower and local driver before its claim began releasing.
 ///
 /// # Errors
 /// Returns cluster, ingest, or query errors.
@@ -4706,6 +4759,7 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
         deadline_ms: None,
     };
 
+    drop(vala_bifrost_redux::oracle::planner::take_leader_ownership_order_for_test());
     // Success: the follower is held, so the graph cannot produce its first
     // batch; once it is let go, the terminal arrives only after the read was
     // released. The query runs inside the join because its first batch waits
@@ -4741,6 +4795,7 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
     };
     let (class, ()) = tokio::try_join!(drain, hold)?;
     assert_eq!(class, Some(QueryClass::Analytical));
+    assert_graphs_revoked_before_claims("a settled query", 1)?;
 
     // Caller drop: dropping the query while its follower still reads releases
     // the row; nothing can consume a result from the dropped leader.
@@ -4755,6 +4810,16 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
     cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
     await_baseline(&cluster, HELD_CUT_LEADER, leader_baseline).await?;
     await_no_active_reads(&cluster, &binding, "a dropped caller").await?;
+    assert_graphs_revoked_before_claims("a dropped caller", 1)?;
+
+    // Stream drop: the caller received the leader stream and drops it unread,
+    // so the stream's own owner collapses the graph and then the claim.
+    let stream = engine
+        .query_sql(query_context(tenant)?, request.clone())
+        .await?;
+    drop(stream);
+    await_no_active_reads(&cluster, &binding, "a dropped stream").await?;
+    assert_graphs_revoked_before_claims("a dropped stream", 1)?;
 
     // Drop at the post-pin boundary: the claim committed but no owner
     // received it, and the dropped pin still releases it.
@@ -4772,6 +4837,7 @@ async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(),
     }
     cluster.release_preparation_pause(HELD_CUT_LEADER)?;
     await_no_active_reads(&cluster, &binding, "a dropped pin").await?;
+    assert_graphs_revoked_before_claims("a dropped pin", 0)?;
     cluster.shutdown().await
 }
 

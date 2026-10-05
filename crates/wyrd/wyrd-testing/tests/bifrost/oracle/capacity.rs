@@ -304,10 +304,10 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     }
 
     await_clean_nodes(&cluster).await?;
-    // Query-owned leases, including each query runtime's empty spill
-    // directory, live until coordinator end-of-stream and cache invalidation
-    // (bifrost-design.md), which can trail graph release. The exact baseline
-    // is therefore observed under the clean-node bound rather than sampled once.
+    // A graph releases only after every holder of its query runtime, and so
+    // its spill directory, has dropped. The exact baseline is still observed
+    // under the clean-node bound because an Interactive query's server-side
+    // stream is dropped after the client has read its terminal.
     let mut settled = ownership_baseline(&cluster).await?;
     for _ in 0..CLEAN_NODE_POLLS {
         if settled == baseline {

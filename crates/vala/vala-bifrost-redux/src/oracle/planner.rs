@@ -106,6 +106,53 @@ impl std::fmt::Debug for ActiveReadClaim {
     }
 }
 
+/// One leader-side ownership transition, recorded in order for test journeys.
+///
+/// Journeys read the order through [`take_leader_ownership_order_for_test`] to
+/// prove a query's active-read claim begins releasing only after its
+/// Analytical graph revoked every follower and stopped every local driver.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderOwnershipEvent {
+    /// The query's Analytical graph dropped every participant grant and joined
+    /// or aborted every local driver.
+    GraphRevoked,
+    /// The query's active-read claim began its release.
+    ClaimReleaseStarted,
+}
+
+/// Process-wide ordered log of [`LeaderOwnershipEvent`]s keyed by query id.
+///
+/// Test-support only: appended synchronously at each transition, so the
+/// recorded order is the order the transitions happened in on this process.
+#[cfg(feature = "test-support")]
+static LEADER_OWNERSHIP_ORDER: std::sync::Mutex<Vec<(uuid::Uuid, LeaderOwnershipEvent)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Appends one transition for `query_id` to the test-support ordering log.
+///
+/// A poisoned log records nothing; the journey reading it then fails on the
+/// missing event rather than this owner panicking.
+#[cfg(feature = "test-support")]
+pub(crate) fn record_leader_ownership(query_id: uuid::Uuid, event: LeaderOwnershipEvent) {
+    if let Ok(mut order) = LEADER_OWNERSHIP_ORDER.lock() {
+        order.push((query_id, event));
+    }
+}
+
+/// Drains every leader ownership transition recorded on this process so far.
+///
+/// Returned in the order the transitions happened, each tagged with the query
+/// id that is both the Analytical graph's public id and the claim's owner id.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn take_leader_ownership_order_for_test() -> Vec<(uuid::Uuid, LeaderOwnershipEvent)> {
+    LEADER_OWNERSHIP_ORDER
+        .lock()
+        .map(|mut order| std::mem::take(&mut *order))
+        .unwrap_or_default()
+}
+
 impl ActiveReadClaim {
     /// Deletes every active read this query holds.
     ///
@@ -115,6 +162,8 @@ impl ActiveReadClaim {
     /// protective until PostgreSQL-time abandonment reclaims them.
     pub(crate) async fn release(mut self) {
         self.released = true;
+        #[cfg(feature = "test-support")]
+        record_leader_ownership(self.query_id, LeaderOwnershipEvent::ClaimReleaseStarted);
         Self::release_rows(&self.catalog, self.tenant, self.query_id).await;
     }
 
@@ -144,6 +193,8 @@ impl Drop for ActiveReadClaim {
         if self.released {
             return;
         }
+        #[cfg(feature = "test-support")]
+        record_leader_ownership(self.query_id, LeaderOwnershipEvent::ClaimReleaseStarted);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };

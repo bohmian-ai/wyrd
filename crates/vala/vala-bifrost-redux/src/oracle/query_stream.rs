@@ -416,9 +416,13 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         mut running_query,
         active_reads,
     } = input;
+    let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
+    // Built before the generator, never inside it: a stream dropped before its
+    // first poll drops only its captures, in an unspecified order, so the two
+    // owners must already be one captured value whose `Drop` fixes the order.
+    let owners = LeaderStreamOwners::new(admitted, active_reads);
     let frames = async_stream::stream! {
-        let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
-        let mut owners = LeaderStreamOwners::new(admitted, active_reads);
+        let mut owners = owners;
         // Re-bound after `owners` on purpose. When a consumer walks away the
         // generator state is dropped in reverse declaration order, so the plan's
         // `RecordBatch` stream must be declared last to release its memory-pool

@@ -144,3 +144,117 @@ is aborted before release, and no consumer receives data after drop.**
 - Test-only raw `bifrost_tables` SQL remains in integration support and diagnostics, outside production code.
 - `forge/expire.rs::retry_committed_expiry` was extracted only to satisfy `clippy::too_many_lines`, with no behavior change.
 - Non-goals stayed excluded: no epochs, IO gates, advisory locks, per-query sessions or second protocol, no reintroduced deletion claims, and no gc.rs changes (TASK-001-R1 owns it).
+
+## Follow-up evidence (coordinator review before task review)
+
+### 1. Claim-after-revocation ordering is now tested
+
+- Seam (test-support only): `oracle/planner.rs` adds `LeaderOwnershipEvent` and
+  `take_leader_ownership_order_for_test`. Each transition is appended
+  synchronously where it happens:
+  - `GraphRevoked` is appended in `AnalyticalGraphLifecycle::settle`, after
+    grants drop and the attempt join, and in its `Drop`, after grants drop and
+    drivers abort.
+  - `ClaimReleaseStarted` is appended in `ActiveReadClaim::release` and in
+    `ActiveReadClaim::drop`.
+- Journey: `distributed::held_cut_owns_active_reads_until_all_descendants_settle`
+  now asserts, per query id, that the graph revocation precedes the claim
+  release in each case:
+  - settled query;
+  - dropped caller;
+  - new: a returned leader stream dropped unread;
+  - dropped pin, where no graph is expected.
+- Red/green: with `LeaderStreamOwners::drop` inverted, the journey failed with
+  `a dropped stream: query … released its claim before revoking its graph:
+  [(…, ClaimReleaseStarted), (…, GraphRevoked)]`. With the correct order it
+  passed (3/3 runs).
+- The red run exposed a real gap, now fixed. The owners were built inside the
+  `stream!` generator, so a stream dropped before its first poll dropped
+  `admitted` and `active_reads` as separate captures in unspecified order.
+  `build_frames` now constructs `LeaderStreamOwners` before the generator, so
+  its `Drop` fixes the order on every drop path.
+
+### 2. `ParticipantGrant` Mutex removed
+
+- The grants are now held by value:
+  `AnalyticalGraphLifecycle.grants: Option<AnalyticalParticipantGrants>` plus a
+  `reserved: bool` (a completed round, granted or refused; avoids
+  `clippy::option_option`).
+- `publish_participants`, `reserve`, `reserve_round` and
+  `fold_physical_metrics` take `&mut self`. A `Send` future then needs only
+  `Self: Send`, not `Sync`.
+- The production caller uses `admitted.analytical.as_mut()`.
+- `dispatcher.rs` is back to its base `_stream: Box<dyn Send>`.
+
+### 3. Raw `bifrost_tables` SQL outside `vala-sql`
+
+Every remaining hit is test-only:
+
+- `wyrd-server/tests/*` and `pg_invocation_tests.rs`;
+- `vala-bifrost-redux/tests/integration/forge/support.rs`;
+- `wyrd-testing` (both `src/server.rs` harness helpers and `tests/…`).
+
+`wyrd-testing` is consumed only as a dev-dependency, or behind the Python SDK
+`testing` feature. No production code changed for this item.
+
+### 4. Exclusive-authority hold bound
+
+| Path | Objects deleted per hold | Hold scope |
+|---|---|---|
+| Expired cleanup (`worker.rs::drain_expired_cleanup`) | 1 | The authority is taken per candidate. It covers one prove (protection load, one stat, fence) and one delete, then is committed before settlement. |
+| Orphan GC (`orphan_gc.rs::delete_gc_batch`) | at most `max_gc_candidates_per_batch` (default 256) | One hold per prepared batch, covering at most 2 object-store calls (stat + delete) and 2 lease fences per candidate. Fresh runs also stop at the run deadline at a candidate boundary. |
+| Snapshot expiry (`expire.rs`) | 0 objects | One Iceberg metadata commit. File deletion is deferred to expired cleanup. |
+
+- The orphan-GC hold is already bounded per batch by the existing cap; no
+  config knob was added.
+- Worst case for one orphan hold: 256 × (stat + delete + 2 fences).
+  `wyrd-storage` sets no per-request object-store timeout, so wall time is
+  256 × the backend's per-request latency. That is about 1–2 s at typical
+  ~2–5 ms S3 latencies, but it is unbounded if the backend hangs.
+
+### 5. Capacity journey spill-directory flake
+
+- Symptom: `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+  intermittently ends with `spill_directories` 3 → 4 after the clean-node poll.
+- Evidence (WYRD_LOG plus temporary `strong_count` probes, since removed):
+  - every release in passing runs logged exactly 3 strong refs on the graph's
+    `Arc<RuntimeEnv>`, on all three nodes;
+  - those 3 are the graph's own: `AnalyticalGraphState::runtime`, the
+    envelope's `OracleQueryResources::execution`, and the follower
+    `AnalyticalRuntimeRegistry` entry;
+  - the leader's settle probes also logged 3 at every stage, so no leader
+    holder was involved in this journey.
+- Cause: release was gated only on the envelope's nested memory
+  (`graph_children_debt`). The per-query `datafusion-*` spill directory belongs
+  to the `RuntimeEnv`'s `DiskManager` and is removed only when its last `Arc`
+  drops. A follower's upstream task context (`TaskData.task_ctx`, kept in the
+  coordinator-channel task, a pending cache invalidation, or a late
+  `ExecuteTask` resolve) can hold the runtime after every reservation has
+  returned. The graph then released and left the directory to trail it. The
+  read-only diagnostician's ranked report gives this as the first cause.
+- Rejected fix (tried first, then reverted): gating graph release on
+  `Arc::strong_count` beyond the graph's own 3 references. It turned three
+  Oracle journeys red: two `analytical_lifecycle` journeys and
+  `distributed::published_workers_and_live_scribes_share_one_plan`. Each logged
+  "not confirmed drained … memory_bytes=0". Legitimate holders, such as the
+  leader's executing plan and upstream task caches, outlive settlement by
+  design, so waiting for them retains healthy graphs as residue.
+- Fix site: the query envelope, `OracleQueryResources` (`resources.rs`).
+  - Its `Drop` now calls `OracleExecution::remove_spill_directories`, which
+    removes the runtime's `DiskManager::temp_dir_paths()` synchronously.
+  - The graph owns this envelope, so the directory is removed in the same
+    `release_graph` collapse that returns the envelope, whoever still holds
+    the `RuntimeEnv`. Interactive queries get the same at their envelope drop.
+  - A late holder that spills afterwards gets an IO error on a query that is
+    already over. `TempDir`'s own later drop ignores the missing path.
+  - No poll bound changed. The capacity comment that blamed trailing cache
+    invalidation was corrected.
+- Proof:
+  - New `resources::tests::query_spill_directory_ends_with_its_envelope_not_its_runtime`.
+    It is red with the removal disabled (the directory survives while a
+    runtime holder lives) and green with it.
+  - All 231 `oracle::` and `resources::` unit tests pass.
+  - `mise run test:bifrost:journey:oracle` passed 49/49, including the held-cut
+    and capacity journeys.
+  - The exact capacity journey passed 6/6 on the normal lane with WYRD_LOG on.
+  - `mise run test:bifrost:journey:forge` passed 21/21.

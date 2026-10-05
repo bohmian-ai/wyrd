@@ -304,11 +304,16 @@ fn child<'struct_array, A: Array + 'static>(
 
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
+    use arrow::array::{Array, Int64Array, ListArray, StringArray, StructArray};
+    use arrow::record_batch::RecordBatch;
     use wyrd_runtime::Permission;
+    use wyrd_tonic::otlp::common::v1::KeyValue;
+    use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        OtlpJourney, assert_maximal_span_row, export_traces_over_grpc, support,
-        support::{GRPC_SPAN, SPANS_TABLE},
+        OtlpJourney, assert_maximal_span_row, column, export_traces_over_grpc, support,
+        support::{GRPC_SPAN, SPANS_TABLE, assert_variant_probe},
     };
 
     /// Every canonical span column that carries caller content.
@@ -594,6 +599,224 @@ mod pg_tests {
         assert_eq!(
             resource.get("service.name").map(String::as_str),
             Some(support::STOCK_SERVICE_NAME)
+        );
+
+        journey.shutdown().await;
+    }
+
+    /// Instrumentation scope of the accepted Variant trace export.
+    const VARIANT_TRACE_SCOPE: &str = "wyrd.tests.variant.trace";
+    /// Instrumentation scope of the mixed export carrying an oversized span.
+    const VARIANT_REJECTED_TRACE_SCOPE: &str = "wyrd.tests.variant.trace.rejected";
+
+    /// Builds one Variant journey span under `span_id`.
+    ///
+    /// Every Variant collection the span carries is filled by the caller, so
+    /// the accepted and the oversized spans share every other field.
+    fn variant_span(
+        start: i64,
+        span_id: u8,
+        name: &str,
+        attributes: Vec<KeyValue>,
+        events: Vec<Event>,
+        links: Vec<Link>,
+    ) -> Span {
+        Span {
+            trace_id: vec![0x5a; 16],
+            span_id: vec![span_id; 8],
+            name: name.to_owned(),
+            kind: support::SPAN_KIND,
+            start_time_unix_nano: u64::try_from(start).expect("the anchor instant is positive"),
+            end_time_unix_nano: u64::try_from(start + support::SPAN_DURATION_NANOS)
+                .expect("the anchor instant is positive"),
+            attributes,
+            events,
+            links,
+            ..Span::default()
+        }
+    }
+
+    /// Wraps spans in the Variant journey resource and the named scope.
+    fn variant_resource_spans(scope: &str, spans: Vec<Span>) -> Vec<ResourceSpans> {
+        vec![ResourceSpans {
+            resource: Some(support::variant_resource()),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(support::variant_scope(scope)),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: support::RESOURCE_SCHEMA_URL.to_owned(),
+        }]
+    }
+
+    /// The accepted span: probes on every Variant collection plus every HTTP
+    /// and exception convention the ledger promotes.
+    fn promoted_variant_span(start: i64) -> Span {
+        let mut attributes = support::variant_probe_attributes("span");
+        attributes.extend([
+            support::string_attribute("http.request.method", "GET"),
+            support::string_attribute("http.route", "/orders/{id}"),
+            support::int_attribute("http.response.status_code", 503),
+            support::string_attribute("url.full", "https://orders.example/orders/7"),
+        ]);
+        let mut exception = support::variant_probe_attributes("event");
+        exception.extend([
+            support::string_attribute("exception.type", "TimeoutError"),
+            support::string_attribute("exception.message", "upstream timed out"),
+            support::string_attribute("exception.stacktrace", "at orders::fetch"),
+        ]);
+        variant_span(
+            start,
+            0x61,
+            "variant-span",
+            attributes,
+            vec![Event {
+                time_unix_nano: u64::try_from(start + support::EVENT_OFFSET_NANOS)
+                    .expect("the anchor instant is positive"),
+                name: "exception".to_owned(),
+                attributes: exception,
+                dropped_attributes_count: 0,
+            }],
+            vec![Link {
+                trace_id: support::LINK_TRACE_ID.to_vec(),
+                span_id: support::LINK_SPAN_ID.to_vec(),
+                attributes: support::variant_probe_attributes("link"),
+                ..Link::default()
+            }],
+        )
+    }
+
+    /// Asserts the span's own, event, and link Variant collections and its
+    /// promoted HTTP and exception columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Variant collection loses a probe rule or a promoted
+    /// column differs from the convention that was sent.
+    fn assert_variant_span_row(row: &RecordBatch) {
+        assert_variant_probe(
+            &support::variant_json(column::<StructArray>(row, "attributes")),
+            "span",
+        );
+        let event = column::<ListArray>(row, "events").value(0);
+        let event = event
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("an event element is a struct");
+        assert_variant_probe(
+            &support::variant_json(super::child::<StructArray>(event, "attributes")),
+            "event",
+        );
+        let link = column::<ListArray>(row, "links").value(0);
+        let link = link
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a link element is a struct");
+        assert_variant_probe(
+            &support::variant_json(super::child::<StructArray>(link, "attributes")),
+            "link",
+        );
+        support::assert_variant_envelope(row);
+
+        for (name, expected) in [
+            ("http_request_method", "GET"),
+            ("http_route", "/orders/{id}"),
+            ("url_full", "https://orders.example/orders/7"),
+            ("exception_type", "TimeoutError"),
+            ("exception_message", "upstream timed out"),
+            ("exception_stacktrace", "at orders::fetch"),
+        ] {
+            assert_eq!(
+                column::<StringArray>(row, name).value(0),
+                expected,
+                "the span convention is promoted into `{name}`"
+            );
+        }
+        assert_eq!(
+            column::<Int64Array>(row, "http_response_status_code").value(0),
+            503
+        );
+    }
+
+    /// Span Variant collections and promoted conventions are queryable.
+    ///
+    /// One span exported over OTLP/gRPC carries the fidelity probe — exact
+    /// `i64` extremes, a present unset key, a repeated key — on its own
+    /// attributes, its exception event, its link, its resource, and its scope,
+    /// plus every promoted resource, HTTP, and exception convention and one
+    /// typed entity reference. After the real flush, canonical SQL returns
+    /// whole Variant columns that decode to exactly those values, and every
+    /// promoted column holds its convention.
+    ///
+    /// A second export pairs a valid sibling with a span whose attribute
+    /// exceeds the Variant size limit: the collector reports exactly that span
+    /// rejected under the stable Variant code, and only the sibling is stored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the export is refused, a Variant value or promoted column
+    /// differs, or the oversized span is not rejected with its code.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn span_variant_fields_and_promotions_are_queryable() {
+        let journey = OtlpJourney::start().await;
+        let start = support::anchor_nanos();
+
+        let partial = export_traces_over_grpc(
+            &journey,
+            variant_resource_spans(VARIANT_TRACE_SCOPE, vec![promoted_variant_span(start)]),
+        )
+        .await;
+        assert!(
+            partial.is_none_or(|partial| partial.rejected_spans == 0),
+            "a wholly valid Variant export reports no rejected span"
+        );
+
+        let oversized = variant_span(
+            start,
+            0x63,
+            "variant-oversized",
+            vec![support::oversized_attribute()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let sibling = variant_span(
+            start,
+            0x62,
+            "variant-sibling",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let partial = export_traces_over_grpc(
+            &journey,
+            variant_resource_spans(VARIANT_REJECTED_TRACE_SCOPE, vec![sibling, oversized]),
+        )
+        .await
+        .expect("an export with an oversized span reports partial success");
+        assert_eq!(
+            partial.rejected_spans, 1,
+            "only the oversized span is rejected"
+        );
+        support::assert_too_large_reason(&partial.error_message);
+
+        journey.publish().await;
+        let row = journey
+            .query_one_row(&format!(
+                "SELECT * FROM {SPANS_TABLE} WHERE scope_name = '{VARIANT_TRACE_SCOPE}'"
+            ))
+            .await;
+        assert_variant_span_row(&row);
+
+        let stored = journey
+            .query_one_row(&format!(
+                "SELECT name FROM {SPANS_TABLE} WHERE scope_name = '{VARIANT_REJECTED_TRACE_SCOPE}'"
+            ))
+            .await;
+        assert_eq!(
+            column::<StringArray>(&stored, "name").value(0),
+            "variant-sibling",
+            "the valid sibling commits and the oversized span is absent"
         );
 
         journey.shutdown().await;

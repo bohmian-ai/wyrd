@@ -3,7 +3,7 @@
 use wyrd_tonic::otlp::metrics::v1::ResourceMetrics;
 use wyrd_tonic::otlp::metrics_service::metrics_service_client::MetricsServiceClient;
 use wyrd_tonic::otlp::metrics_service::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::transport::Channel;
@@ -11,15 +11,35 @@ use wyrd_tonic::tonic::transport::Channel;
 use super::support::OtlpJourney;
 use super::trace_export_http::{HttpEncoding, post_otlp};
 
-/// Sends one OTLP metric export through the bound gRPC collector route.
+/// Sends one wholly valid OTLP metric export through the bound gRPC route.
 ///
 /// # Panics
 ///
-/// Panics when the transport cannot be dialed or the export is refused.
+/// Panics when the transport cannot be dialed, the export is refused, or the
+/// collector rejects any data point.
 pub(super) async fn export_metrics_over_grpc(
     journey: &OtlpJourney,
     resource_metrics: Vec<ResourceMetrics>,
 ) {
+    let partial = export_metrics_partially_over_grpc(journey, resource_metrics).await;
+    assert!(
+        partial.is_none_or(|partial| partial.rejected_data_points == 0),
+        "a wholly valid export reports no rejected data point"
+    );
+}
+
+/// Sends one OTLP metric export through the bound gRPC collector route.
+///
+/// Returns the partial success the collector reported, so a caller can
+/// assert which data points were rejected and why.
+///
+/// # Panics
+///
+/// Panics when the transport cannot be dialed or the export is refused.
+pub(super) async fn export_metrics_partially_over_grpc(
+    journey: &OtlpJourney,
+    resource_metrics: Vec<ResourceMetrics>,
+) -> Option<ExportMetricsPartialSuccess> {
     let channel = Channel::from_shared(journey.grpc_url())
         .expect("the bound gRPC URL is a valid endpoint")
         .connect()
@@ -32,16 +52,12 @@ pub(super) async fn export_metrics_over_grpc(
             .parse()
             .expect("the minted bearer is valid ASCII metadata"),
     );
-    let partial = MetricsServiceClient::new(channel)
+    MetricsServiceClient::new(channel)
         .export(request)
         .await
         .expect("the collector accepts the metric export")
         .into_inner()
-        .partial_success;
-    assert!(
-        partial.is_none_or(|partial| partial.rejected_data_points == 0),
-        "a wholly valid export reports no rejected data point"
-    );
+        .partial_success
 }
 
 /// Posts one metric export in the requested HTTP encoding.
@@ -123,6 +139,11 @@ mod pg_tests {
         StringArray, StructArray,
     };
     use arrow::record_batch::RecordBatch;
+    use wyrd_tonic::otlp::common::v1::KeyValue;
+    use wyrd_tonic::otlp::metrics::v1::{
+        Exemplar, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, exemplar, metric,
+        number_data_point,
+    };
 
     use super::super::support::{
         self, EXEMPLAR_INT_VALUE, EXPONENTIAL_COUNT, EXPONENTIAL_HISTOGRAM_METRIC, EXPONENTIAL_MAX,
@@ -136,10 +157,13 @@ mod pg_tests {
         METRICS_TABLE, OtlpJourney, RESOURCE_DROPPED_ATTRIBUTES, RESOURCE_SCHEMA_URL,
         SCOPE_DROPPED_ATTRIBUTES, SCOPE_SCHEMA_URL, SCOPE_VERSION, SUM_DOUBLE_METRIC,
         SUM_DOUBLE_VALUE, SUM_INT_METRIC, SUM_INT_VALUE, SUM_IS_MONOTONIC, SUMMARY_COUNT,
-        SUMMARY_METRIC, SUMMARY_QUANTILES, SUMMARY_SUM, column, row_by_string,
+        SUMMARY_METRIC, SUMMARY_QUANTILES, SUMMARY_SUM, assert_variant_probe, column,
+        row_by_string,
     };
     use super::super::trace_export_http::HttpEncoding;
-    use super::{export_metrics_over_grpc, export_metrics_over_http};
+    use super::{
+        export_metrics_over_grpc, export_metrics_over_http, export_metrics_partially_over_grpc,
+    };
 
     /// Reads one child column out of a single-row struct value.
     ///
@@ -644,6 +668,179 @@ mod pg_tests {
                 .sum::<i64>(),
             1,
             "the one recorded measurement lands in exactly one bucket"
+        );
+
+        journey.shutdown().await;
+    }
+
+    /// Instrumentation scope of the accepted Variant metric export.
+    const VARIANT_METRIC_SCOPE: &str = "wyrd.tests.variant.metric";
+    /// Instrumentation scope of the mixed export carrying oversized metadata.
+    const VARIANT_REJECTED_METRIC_SCOPE: &str = "wyrd.tests.variant.metric.rejected";
+
+    /// Builds one integer gauge whose points carry the given exemplars.
+    ///
+    /// `points` is the number of identical points, so a metric-level failure
+    /// is visible as a rejection of each of them.
+    fn variant_gauge(
+        time: i64,
+        name: &str,
+        metadata: Vec<KeyValue>,
+        points: usize,
+        exemplars: &[Exemplar],
+    ) -> Metric {
+        let observed = u64::try_from(time).expect("the anchor instant is positive");
+        Metric {
+            name: name.to_owned(),
+            metadata,
+            data: Some(metric::Data::Gauge(Gauge {
+                data_points: (0..points)
+                    .map(|_| NumberDataPoint {
+                        attributes: support::variant_probe_attributes("point"),
+                        time_unix_nano: observed,
+                        exemplars: exemplars.to_vec(),
+                        value: Some(number_data_point::Value::AsInt(i64::MAX)),
+                        ..NumberDataPoint::default()
+                    })
+                    .collect(),
+            })),
+            ..Metric::default()
+        }
+    }
+
+    /// Wraps metrics in the Variant journey resource and the named scope.
+    fn variant_resource_metrics(scope: &str, metrics: Vec<Metric>) -> Vec<ResourceMetrics> {
+        vec![ResourceMetrics {
+            resource: Some(support::variant_resource()),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(support::variant_scope(scope)),
+                metrics,
+                schema_url: String::new(),
+            }],
+            schema_url: support::RESOURCE_SCHEMA_URL.to_owned(),
+        }]
+    }
+
+    /// The one exemplar whose filtered attributes carry the fidelity probe.
+    fn variant_exemplar(time: i64) -> Exemplar {
+        Exemplar {
+            filtered_attributes: support::variant_probe_attributes("exemplar"),
+            time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),
+            value: Some(exemplar::Value::AsInt(i64::MIN)),
+            ..Exemplar::default()
+        }
+    }
+
+    /// Asserts one stored point's metadata, point, exemplar, and envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Variant collection loses a probe rule or a promoted
+    /// resource column differs.
+    fn assert_variant_point(row: &RecordBatch) {
+        assert_variant_probe(
+            &support::variant_json(column::<StructArray>(row, "metadata")),
+            "metadata",
+        );
+        assert_variant_probe(
+            &support::variant_json(column::<StructArray>(row, "attributes")),
+            "point",
+        );
+        let exemplars = list_values(row, "exemplars");
+        let exemplars = exemplars
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("exemplars are stored as structs");
+        assert_eq!(exemplars.len(), 1, "the one exemplar is stored once");
+        assert_variant_probe(
+            &support::variant_json(child::<StructArray>(exemplars, "filtered_attributes")),
+            "exemplar",
+        );
+        support::assert_variant_envelope(row);
+    }
+
+    /// Metric Variant fields and promoted conventions are queryable.
+    ///
+    /// One integer gauge exported over OTLP/gRPC carries the fidelity probe on
+    /// its metadata, its point attributes, its exemplar's filtered attributes,
+    /// its resource, and its scope, plus the promoted resource conventions
+    /// and one typed entity reference. After the real flush, canonical SQL
+    /// returns whole Variant columns that decode to exactly those values and
+    /// every promoted resource column holds its convention.
+    ///
+    /// A second export over OTLP/gRPC pairs a valid sibling metric
+    /// with a two-point metric whose metadata exceeds the Variant size limit:
+    /// metadata is shared by every point of its metric, so the collector
+    /// reports both points rejected under the stable Variant code, and only the
+    /// sibling's point is stored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export is refused, a stored value differs, or the
+    /// oversized metric's points are not rejected with the code.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn metric_variant_fields_and_promotions_are_queryable() {
+        let journey = OtlpJourney::start().await;
+        let time = support::anchor_nanos();
+
+        export_metrics_over_grpc(
+            &journey,
+            variant_resource_metrics(
+                VARIANT_METRIC_SCOPE,
+                vec![variant_gauge(
+                    time,
+                    "wyrd.variant.gauge",
+                    support::variant_probe_attributes("metadata"),
+                    1,
+                    &[variant_exemplar(time)],
+                )],
+            ),
+        )
+        .await;
+
+        let partial = export_metrics_partially_over_grpc(
+            &journey,
+            variant_resource_metrics(
+                VARIANT_REJECTED_METRIC_SCOPE,
+                vec![
+                    variant_gauge(time, "wyrd.variant.sibling", Vec::new(), 1, &[]),
+                    variant_gauge(
+                        time,
+                        "wyrd.variant.oversized",
+                        vec![support::oversized_attribute()],
+                        2,
+                        &[],
+                    ),
+                ],
+            ),
+        )
+        .await
+        .expect("an export with oversized metadata reports partial success");
+        assert_eq!(
+            partial.rejected_data_points, 2,
+            "every point of the oversized metric is rejected"
+        );
+        support::assert_too_large_reason(&partial.error_message);
+
+        journey.publish().await;
+        let row = journey
+            .query_one_row(&format!(
+                "SELECT * FROM {METRICS_TABLE} WHERE scope_name = '{VARIANT_METRIC_SCOPE}'"
+            ))
+            .await;
+        assert_variant_point(&row);
+
+        let stored = journey
+            .query_one_row(&format!(
+                "SELECT metric_name FROM {METRICS_TABLE} \
+                 WHERE scope_name = '{VARIANT_REJECTED_METRIC_SCOPE}'"
+            ))
+            .await;
+        assert_eq!(
+            column::<StringArray>(&stored, "metric_name").value(0),
+            "wyrd.variant.sibling",
+            "the valid sibling commits and the oversized metric is absent"
         );
 
         journey.shutdown().await;

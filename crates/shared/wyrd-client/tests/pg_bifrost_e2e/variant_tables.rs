@@ -9,7 +9,9 @@ mod pg_tests {
 
     use std::collections::BTreeMap;
 
-    use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow::array::{
+        ArrayRef, AsArray, BinaryArray, Int64Array, RecordBatch, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -517,9 +519,37 @@ mod pg_tests {
         value
     }
 
-    /// Variant bytes sent straight to the server, skipping the SDK's checks,
-    /// are refused before anything is stored: malformed, too deep, and too
-    /// large. A valid batch on the same path is stored.
+    /// Return `batch` with the column named like `field` replaced by
+    /// `field` and `column`, keeping every other column unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch has no such column or Arrow refuses the result.
+    fn with_column(batch: &RecordBatch, field: Field, column: ArrayRef) -> RecordBatch {
+        let index = batch
+            .schema()
+            .index_of(field.name())
+            .expect("column exists");
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        let mut columns = batch.columns().to_vec();
+        fields[index] = field;
+        columns[index] = column;
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("batch builds")
+    }
+
+    /// Variant data sent straight to the server, skipping the SDK's checks,
+    /// is refused before anything is stored. Variant identity must match the
+    /// registered table: a `payload` Variant sent without its extension or
+    /// with a foreign one, and the Variant extension on the ordinary `point`
+    /// Struct or its nested `label`, are unsupported types — even ahead of
+    /// malformed bytes in an earlier column. Malformed, too deep, and too
+    /// large Variant bytes get their own errors. A valid batch on the same
+    /// path is stored.
     #[tokio::test]
     async fn server_refuses_unstorable_variant_bytes_sent_directly() {
         let events = Events::start().await;
@@ -554,24 +584,88 @@ mod pg_tests {
         }
         let deep = EncodedVariant::from_json(&deep).expect("64 levels encode");
         let small = EncodedVariant::from_json(&json!(1)).expect("encodes");
-        for (cell, expected) in [
+        let schema = valid.schema();
+        let payload_field = schema.field(payload).clone();
+        let payload_bytes = |cell: ArrayRef| with_column(&valid, payload_field.clone(), cell);
+        let labelled = |field: Field, extension: &str| {
+            field.with_metadata(std::collections::HashMap::from([(
+                "ARROW:extension:name".to_owned(),
+                extension.to_owned(),
+            )]))
+        };
+        let point_field = schema
+            .field_with_name("point")
+            .expect("point column")
+            .clone();
+        let point = valid
+            .column_by_name("point")
+            .expect("point column")
+            .as_struct()
+            .clone();
+        let (children, point_columns, point_nulls) = point.into_parts();
+        let children: arrow_schema::Fields = children
+            .iter()
+            .map(|child| match child.name().as_str() {
+                "label" => labelled(child.as_ref().clone(), "arrow.parquet.variant"),
+                _ => child.as_ref().clone(),
+            })
+            .collect();
+        let nested_label = Arc::new(
+            StructArray::try_new(children.clone(), point_columns, point_nulls)
+                .expect("point rebuilds"),
+        ) as ArrayRef;
+        let unsupported = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE";
+        for (batch, expected) in [
             (
-                variant_cell(small.metadata(), &[0xFF]),
+                with_column(
+                    &valid,
+                    payload_field.clone().with_metadata(Default::default()),
+                    Arc::clone(valid.column(payload)),
+                ),
+                unsupported,
+            ),
+            (
+                with_column(
+                    &valid,
+                    labelled(payload_field.clone(), "acme.variant"),
+                    Arc::clone(valid.column(payload)),
+                ),
+                unsupported,
+            ),
+            (
+                with_column(
+                    &payload_bytes(variant_cell(small.metadata(), &[0xFF])),
+                    labelled(point_field.clone(), "arrow.parquet.variant"),
+                    Arc::clone(valid.column_by_name("point").expect("point column")),
+                ),
+                unsupported,
+            ),
+            (
+                with_column(
+                    &valid,
+                    point_field
+                        .clone()
+                        .with_data_type(DataType::Struct(children)),
+                    nested_label,
+                ),
+                unsupported,
+            ),
+            (
+                payload_bytes(variant_cell(small.metadata(), &[0xFF])),
                 "WYRD_VALA_400_VARIANT_INVALID_JSON",
             ),
             (
-                variant_cell(deep.metadata(), &wrap_in_array(deep.value())),
+                payload_bytes(variant_cell(deep.metadata(), &wrap_in_array(deep.value()))),
                 "WYRD_VALA_400_VARIANT_TOO_DEEP",
             ),
             (
-                variant_cell(small.metadata(), &vec![0; 8 * 1024 * 1024 + 1]),
+                payload_bytes(variant_cell(
+                    small.metadata(),
+                    &vec![0; 8 * 1024 * 1024 + 1],
+                )),
                 "WYRD_VALA_413_VARIANT_TOO_LARGE",
             ),
         ] {
-            let mut columns = valid.columns().to_vec();
-            columns[payload] = cell;
-            let batch = RecordBatch::try_new(valid.schema(), columns).expect("batch builds");
-
             direct
                 .enqueue_batch(&events.table, batch, None)
                 .expect("the SDK sends the batch unchanged");

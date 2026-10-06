@@ -566,8 +566,8 @@ fn decode_rows(
             table: "resolved ingress table".to_owned(),
         });
     }
-    if context.definition.is_none() {
-        enforce_dynamic_variants(rows)?;
+    if let (None, Some(registered)) = (context.definition, context.registered_schema) {
+        enforce_dynamic_variants(rows, registered)?;
     }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
@@ -580,31 +580,40 @@ fn decode_rows(
     }
 }
 
-/// Validates a dynamic table's Variant values at the trust boundary.
+/// Validates a dynamic table's Variant identity and values at the trust boundary.
 ///
 /// A dynamic table has no built-in validator, and the fingerprint compares
-/// storage types only, so this is where its Variant cells are read before
-/// admission. Every supplied field marked as a Variant, top level or nested
-/// in a Struct or List, goes through
-/// [`crate::tables::validate_declared_variants`], the same walk built-in
-/// validators run, so each present value must decode within the encoding,
-/// depth, and size limits. A registered Variant supplied without its
-/// extension is left to field-id stamping, which refuses it against the
-/// registered schema. It runs after the fingerprint check and before card
-/// scope, stamping, dispatch, or any WAL mutation, and reads the batch only.
+/// storage types only, so this is where its Variant contract is enforced
+/// before admission. The registered Iceberg schema, converted to Arrow by
+/// iceberg-rust, is the declaration: never the supplied schema. Every
+/// supplied field goes through [`crate::tables::validate_declared_variants`],
+/// the same walk built-in validators run, so Variant identity must match the
+/// registration at every Struct and List path and each present Variant value
+/// must decode within the encoding, depth, and size limits. It runs after the
+/// fingerprint check and before card scope, stamping, dispatch, or any WAL
+/// mutation, and reads the batch only.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::ContractViolation`] carrying the catalogued Variant
-/// refusal for the first failing value in row, then field, order.
-fn enforce_dynamic_variants(rows: &RecordBatch) -> Result<(), ScribeError> {
-    let supplied: Vec<Field> = rows
-        .schema()
+/// Returns [`ScribeError::FingerprintMismatch`] when the registered schema
+/// has no Arrow form, and [`ScribeError::ContractViolation`] carrying the
+/// catalogued unsupported-type refusal for mismatched Variant identity, else
+/// the Variant refusal for the first failing value in row, then field, order.
+fn enforce_dynamic_variants(
+    rows: &RecordBatch,
+    registered: &IcebergSchema,
+) -> Result<(), ScribeError> {
+    let declared = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
+        ScribeError::FingerprintMismatch {
+            table: "resolved ingress table".to_owned(),
+        }
+    })?;
+    let declared: Vec<Field> = declared
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect();
-    crate::tables::validate_declared_variants(&supplied, rows)
+    crate::tables::validate_declared_variants(&declared, rows)
         .map_err(ScribeError::ContractViolation)
 }
 

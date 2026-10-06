@@ -18,10 +18,10 @@ import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk
 import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
 import { startTestServer } from "@wyrd/testing";
-import { tableFromIPC } from "apache-arrow";
+import { RecordBatch, Struct, makeBuilder, makeData, tableFromIPC } from "apache-arrow";
 import { describe, expect, it } from "vitest";
 
-import { Bifrost, IncompleteQueryStreamError, WyrdError } from "@wyrd/sdk";
+import { Bifrost, IncompleteQueryStreamError, TableConfig, WyrdError } from "@wyrd/sdk";
 
 describe("Oracle query journey", () => {
   it("uses the public SDK against an in-process Wyrd server", async () => {
@@ -534,9 +534,76 @@ describe("Variant query journey", () => {
         },
       ]);
 
-      await expect(
-        reader.sql(`SELECT parse_json('{bad') AS v ${where}`),
-      ).rejects.toMatchObject({ code: "WYRD_VALA_400_VARIANT_INVALID_JSON" });
+      const early = await reader
+        .sql(`SELECT parse_json('{bad') AS v ${where}`)
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      expect(early).toMatchObject({ code: "WYRD_VALA_400_VARIANT_INVALID_JSON" });
+
+      // A failure after a delivered batch keeps the pre-stream problem: one
+      // published object streams 8192-row batches in id order, so rows from
+      // id 8192 fail only in the second batch. An unrelated late cast failure
+      // stays generic, and neither result is returned partially.
+      const lateFqn = `vala.datasets.variant_late_${Date.now().toString(36)}`;
+      const writer = await Bifrost.connect({
+        table: TableConfig.fromJsonSchema(lateFqn, {
+          type: "object",
+          properties: { id: { type: "integer" } },
+          required: ["id"],
+        }),
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      expect(await writer.register()).toBe("created");
+      const lateSchema = writer.table!.arrowSchema;
+      const ids = makeBuilder({ type: lateSchema.fields[0]!.type });
+      for (let id = 0n; id < 10_000n; id += 1n) ids.append(id);
+      ids.finish();
+      await writer.writeBatch(
+        lateFqn,
+        new RecordBatch(
+          lateSchema,
+          makeData({
+            type: new Struct(lateSchema.fields),
+            length: 10_000,
+            children: [ids.flush()],
+          }),
+        ),
+      );
+      await writer.shutdown();
+      server.waitForBifrostPublication();
+      const { code, status, detail, details } = early as WyrdError;
+      for (const [value, expected] of [
+        [
+          "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
+          { code, status, detail, details },
+        ],
+        [
+          "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
+          {
+            code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+            details: { variant: "query_execution_failed" },
+          },
+        ],
+      ] as const) {
+        const sql = `SELECT id, ${value} AS v FROM ${lateFqn}`;
+        let delivered = 0;
+        const streamed = await (async () => {
+          for await (const batch of await reader.stream({ sql })) {
+            delivered += batch.numRows;
+          }
+        })().then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        expect(delivered, "one valid batch preceded the failure").toBe(8192);
+        expect(streamed).toBeInstanceOf(WyrdError);
+        expect(streamed).toMatchObject(expected);
+        await expect(reader.sql(sql)).rejects.toMatchObject(expected);
+      }
     } finally {
       server.shutdown();
     }

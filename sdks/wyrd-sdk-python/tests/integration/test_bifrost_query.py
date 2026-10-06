@@ -462,7 +462,8 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
     Arrow terminal keeps the Variant extension, the typed terminal decodes
     every Variant into ``dict``, ``list``, and exact ``int`` values, Struct
     access stays exact, and ``parse_json`` over invalid JSON is the stable
-    Variant error while ``try_parse_json`` is null.
+    Variant error, before the first batch or after a delivered one, while
+    ``try_parse_json`` is null.
     """
 
     import os
@@ -474,7 +475,7 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from pydantic import BaseModel
-    from wyrd.bifrost import Bifrost
+    from wyrd.bifrost import Bifrost, TableConfig
 
     scope = f"wyrd.python.variant.{uuid.uuid4().hex}"
     traces = TracerProvider(resource=Resource.create({"service.name": SERVICE}))
@@ -549,3 +550,57 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
     with pytest.raises(WyrdError) as invalid:
         reader.sql(f"SELECT parse_json('{{bad') AS v {where}")
     assert invalid.value.code == "WYRD_VALA_400_VARIANT_INVALID_JSON"
+
+    # A failure after a delivered batch keeps the pre-stream problem: one
+    # published object streams 8192-row batches in id order, so rows from id
+    # 8192 fail only in the second batch. An unrelated late cast failure stays
+    # generic, and neither result is returned partially.
+    class LateRow(BaseModel):
+        id: int
+        value: str
+
+    late_fqn = f"vala.datasets.variant_late_{uuid.uuid4().hex}"
+    writer = Bifrost(
+        TableConfig(LateRow, late_fqn),
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.api_key,
+    )
+    assert writer.register() == "created"
+    writer.write_batch(
+        late_fqn,
+        pyarrow.record_batch(
+            [pyarrow.array(range(10_000), pyarrow.int64()), pyarrow.array(["batch"] * 10_000)],
+            schema=pyarrow.schema(
+                [
+                    pyarrow.field("id", pyarrow.int64(), nullable=False),
+                    pyarrow.field("value", pyarrow.string(), nullable=False),
+                ]
+            ),
+        ),
+    )
+    writer.shutdown()
+    wyrd_server.flush_bifrost()
+    early = invalid.value
+    for value, expected in [
+        ("parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)", early),
+        ("CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)", None),
+    ]:
+        sql = f"SELECT id, {value} AS v FROM {late_fqn}"
+        delivered = 0
+        with pytest.raises(WyrdError) as streamed:
+            for batch in reader.stream(sql):
+                delivered += batch.num_rows
+        assert delivered == 8192, "one valid batch preceded the failure"
+        with pytest.raises(WyrdError) as collected:
+            reader.sql(sql)
+        for late in (streamed.value, collected.value):
+            if expected is None:
+                assert late.code == "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
+                assert late.details == {"variant": "query_execution_failed"}
+            else:
+                assert (late.code, late.status, late.detail, late.details) == (
+                    expected.code,
+                    expected.status,
+                    expected.detail,
+                    expected.details,
+                )

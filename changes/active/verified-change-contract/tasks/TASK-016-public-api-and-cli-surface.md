@@ -205,7 +205,7 @@ TASK-016 has no dependency on TASK-017. Merge TASK-016 first; TASK-017 then buil
 
 ## Implementation Evidence
 
-Commits: `4d17b274b`, `ea13a8824`, `eaf24f690`, `fabe5005e`, `82972f9f9`, `91db2d817`, `51baa7f21`, `1d42a1e1b`, `1090580f2`, `f1a6d4d11`, `53d044191`, `c64294b1d`.
+Commits: `4d17b274b`, `ea13a8824`, `eaf24f690`, `fabe5005e`, `82972f9f9`, `91db2d817`, `51baa7f21`, `1d42a1e1b`, `1090580f2`, `f1a6d4d11`, `c64294b1d`, `41ae7eb91`, `71fe71c35` (`53d044191` reverted by `41ae7eb91`).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -218,19 +218,21 @@ Commits: `4d17b274b`, `ea13a8824`, `eaf24f690`, `fabe5005e`, `82972f9f9`, `91db2
 | S7 / REQ-197, REQ-198, AC-053: `access_token()` on every client; emits stay non-blocking | `wyrd-client/src/client.rs`; Python `src/client.rs`; TS `native/src/client.rs` | `client::tests::access_token_uses_the_shared_refreshing_auth_path`; `observe::tests::*` queue-full regression | PASS |
 | S8 / REQ-200, REQ-206, AC-054: ordered bind params on the public request, forwarded without interpolation; no SDK history API | `wyrd-spec/src/vala/api.rs`; `wyrd-client/src/bifrost/query.rs`; Python/TS projections; server query forwarding | `vala::api::tests::query_bind_values_round_trip_in_order`; `bifrost::query::tests::sql_forwards_bind_values_without_interpolation` | PASS (seam: see limits) |
 | S9 / REQ-201, AC-055: every built-in ensured at tenant provisioning and at startup | `wyrd-server/src/components/platform/builtins.rs`, `provisioning.rs`, `boot/mod.rs` | `platform_admin_e2e::new_and_existing_tenants_receive_every_builtin`; `catalog::bifrost_catalog::production_pin_tests::every_builtin_is_created_through_ensure_builtin`; vala-bifrost-redux lib 809 passed | PASS |
-| S10 / REQ-205, AC-058: stock OTLP exporters authenticate with `x-wyrd-api-key` per request past token lifetime; no other route accepts it | `wyrd-server/src/components/auth/otlp_api_key.rs`; `http/router.rs` OTLP group; `grpc/otlp.rs` | `trace_export::pg_tests::stock_exporter_authenticates_with_api_key_after_token_lifetime` (full module path; the task's bare selector matches nothing) | PASS |
+| S10 / REQ-205, AC-058: stock OTLP exporters authenticate with `x-wyrd-api-key` per request past token lifetime; no other route accepts it | `ExchangeApiKey::authenticate` → `TenantTokenIssuer::verify` (shared principal resolution with `issue`; `IssuingKey::access_claims` shares claim shaping with signing; `AccessTokenClaims::into_verified`) — no token minted; `TokenGrants::api_key_principal` shared by `require_otlp_authenticated` (HTTP OTLP group only) and `grpc/otlp.rs` `OtlpGrpcAuthentication` → `Gate::admit_otlp_verified`; bearer wins when present | `trace_export::pg_tests::stock_exporter_authenticates_with_api_key_after_token_lifetime` (gRPC + HTTP, unknown key 401, non-OTLP route refuses the header; full module path, the task's bare selector matches nothing); wyrd-auth/wyrd-auth-issue/vala-bifrost-redux lib 964 passed; wyrd-server auth/otlp/grpc lib 154 passed; `test:principals:integration` (served OpenAPI) | PASS |
 | S11 / REQ-195: test servers expose exactly `flush_bifrost`, `wait_for_baseline`, `make_binding_due` | `wyrd-testing/src/server.rs`; Python `src/testing.rs`; TS `native-testing/src/lib.rs` | `server::tests::public_controls_are_the_three_sanctioned_operations`; `codegen:check`; `ts:napi:check` | PASS |
 
 Declared deviations (user-approved):
 
 - `crates/vala/vala-bifrost-redux/**` was edited despite the prohibition. `vala.dev.agent_traces` declared reserved `run_id`, so REQ-201 could not ensure every built-in. The user chose to delete the table (no producer or consumer), with its `CodeAxis` correlation policy, `BifrostNamespace::Dev`, `wyrd-spec` `vala::dev` row, `CorrelationContext`, and `DevSessionId`; built-ins go from 11 to 10. The user also chose to delete lazy `ensure_builtin` call sites in `scribe/ingress.rs` and `describe_table`; built-ins are created only at provisioning and boot, and a missing built-in returns the existing table-not-found error.
 - Two vala test literals gained `params: Vec::new()` for the extended query request.
+- `vala-bifrost-redux` `gate/{auth.rs,mod.rs}`: `AuthContext::from_verified` (shared by bearer auth) and `Gate::admit_otlp_verified`, so an API-key OTLP/gRPC call keeps Gate's readiness check and context shape.
+- SHA-256 hard cut: tenant API keys and platform credentials are stored as SHA-256 hex and compared in constant time through `wyrd_auth_issue::{hash_secret, secret_matches}`, the same pair refresh tokens and CLI login codes now use. Migration `20261006000000_sha256_credential_verifiers.sql` revokes every Argon2-hashed row; no legacy verify path. `wyrd-auth/src/credential_verify.rs` (dummy-Argon2 equal-cost refusal) is deleted with its blocking-pool and verification-count/timing tests; the refusal-indistinguishability assertions are kept.
 
 Material limits:
 
 - Bind values are carried and forwarded, but Oracle does not yet execute them: a `$1` query fails with `QueryExecutionFailed`. Execution belongs to `SPEC-bifrost-variant`.
 - `ArtifactManifestEntry.sha256`/`size_bytes` are optional on the wire; the client fills them and the server refuses unfilled entries.
-- OTLP API-key authentication runs the token endpoint's Argon2id grant, issuance and one audit event per export request.
+- An OTLP API-key request costs one prefix lookup, one SHA-256, the principal/role/permission reads, and a `last_used_at` write; no per-request cache. It stages no token-exchange audit (no token is minted); the request's own permission decisions are audited as for bearer callers.
 - The TS testing controls throw a WyrdError-shaped error (`name`, `code`, `details`), not an `instanceof` `@wyrd/sdk` `WyrdError`.
 - Several RED steps were not observed failing because concurrent compile breaks blocked builds until production code had landed.
 - TASK-017 owns the client-facing Rust/Python/TypeScript journeys, including moving journeys from subprocess/raw HTTP to the in-process CLI functions; integrated AC-054 consumes the later Bifrost bind-execution seam.

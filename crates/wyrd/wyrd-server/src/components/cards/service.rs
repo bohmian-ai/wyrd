@@ -389,12 +389,12 @@ fn verify_card_read_integrity(
             Ok(ArtifactManifestEntry {
                 relative_path: RelativeArtifactPath::new(&path.relative_path)
                     .map_err(WyrdError::from)?,
-                sha256: entry.sha256.clone(),
-                size_bytes: u64::try_from(entry.size_bytes).map_err(|_| {
+                sha256: Some(entry.sha256.clone()),
+                size_bytes: Some(u64::try_from(entry.size_bytes).map_err(|_| {
                     WyrdError::registry_invalid_card_spec(
                         "stored artifact inventory has a negative byte size",
                     )
-                })?,
+                })?),
                 content_type: entry.content_type.clone(),
             })
         })
@@ -2555,8 +2555,8 @@ mod tests {
         let manifest = vec![ArtifactManifestEntry {
             relative_path: RelativeArtifactPath::new("weights.bin")
                 .expect("test_setup: artifact path is valid"),
-            sha256: "YQ==".to_owned(),
-            size_bytes: 1,
+            sha256: Some("YQ==".to_owned()),
+            size_bytes: Some(1),
             content_type: Some("application/octet-stream".to_owned()),
         }];
         let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
@@ -2777,7 +2777,7 @@ mod tests {
     #[test]
     fn read_integrity_rejects_inventory_hash_divergence() {
         let (card, mut manifest, spec_hash, artifact_hash) = matching_read_integrity_values();
-        manifest[0].sha256 = "Yg==".to_owned();
+        manifest[0].sha256 = Some("Yg==".to_owned());
 
         let error = verify_card_hashes(&spec_hash, Some(&artifact_hash), &card, &manifest)
             .expect_err("inventory divergence must reject the read");

@@ -286,6 +286,14 @@ pub async fn insert_card_row(
 }
 
 /// Insert manifest rows in the same transaction as their card.
+///
+/// The client computes every authored-omitted digest and size before
+/// registration, so each entry on the wire carries both.
+///
+/// # Errors
+/// Returns `RegistryInvalidCardSpec` when an entry lacks `sha256` or
+/// `size_bytes`, `RegistrySpecTooLarge` when a size exceeds `i64`, and a
+/// registry database error when the insert fails.
 pub async fn insert_artifact_manifest_rows(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
@@ -297,13 +305,18 @@ pub async fn insert_artifact_manifest_rows(
     let rows = artifacts
         .iter()
         .map(|artifact| {
-            let size = i64::try_from(artifact.size_bytes).map_err(|_| {
+            let (Some(sha256), Some(size_bytes)) = (&artifact.sha256, artifact.size_bytes) else {
+                return Err(WyrdError::registry_invalid_card_spec(
+                    "artifact manifest entries must carry sha256 and size_bytes",
+                ));
+            };
+            let size = i64::try_from(size_bytes).map_err(|_| {
                 WyrdError::registry_spec_too_large(
-                    usize::try_from(artifact.size_bytes).unwrap_or(usize::MAX),
+                    usize::try_from(size_bytes).unwrap_or(usize::MAX),
                     usize::try_from(i64::MAX).unwrap_or(usize::MAX),
                 )
             })?;
-            Ok((artifact, size))
+            Ok((artifact, sha256, size))
         })
         .collect::<Result<Vec<_>, WyrdError>>()?;
     let mut query = QueryBuilder::<sqlx::Postgres>::new(
@@ -311,13 +324,13 @@ pub async fn insert_artifact_manifest_rows(
          (manifest_id, data_tenant_id, card_uid, relative_path, expected_sha256, size_bytes, \
           content_type, upload_status) ",
     );
-    query.push_values(rows, |mut values, (artifact, size)| {
+    query.push_values(rows, |mut values, (artifact, sha256, size)| {
         values
             .push_bind(Uuid::now_v7())
             .push("wyrd.current_tenant()")
             .push_bind(card_uid.as_uuid())
             .push_bind(artifact.relative_path.as_str())
-            .push_bind(&artifact.sha256)
+            .push_bind(sha256)
             .push_bind(size)
             .push_bind(&artifact.content_type)
             .push_bind("awaiting_init");

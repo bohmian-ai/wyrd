@@ -56,8 +56,8 @@ pub fn build_artifact_manifest(
         let (sha256, size_bytes) = hash_file(&path)?;
         entries.push(ArtifactManifestEntry {
             relative_path: relative_path.clone(),
-            sha256,
-            size_bytes,
+            sha256: Some(sha256),
+            size_bytes: Some(size_bytes),
             content_type: None,
         });
         sources.insert(relative_path, path);
@@ -146,12 +146,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["nested/a.bin", "z.bin"]
         );
-        assert_eq!(manifest.entries[0].size_bytes, 3);
+        assert_eq!(manifest.entries[0].size_bytes, Some(3));
         let mut digest = Sha256::new();
         digest.update(b"abc");
         assert_eq!(
             manifest.entries[0].sha256,
-            base64::engine::general_purpose::STANDARD.encode(digest.finalize())
+            Some(base64::engine::general_purpose::STANDARD.encode(digest.finalize()))
         );
         assert_eq!(manifest.sources.len(), 2);
     }

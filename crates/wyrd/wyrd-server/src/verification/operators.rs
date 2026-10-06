@@ -36,7 +36,9 @@ use wyrd_spec::card::operator::{
 };
 use wyrd_spec::card::verifier::VerificationBinding;
 use wyrd_spec::envelope::Spec;
-use wyrd_spec::operator_connection::{ConnectionSecret, HttpsOrigin, OperatorConnectionStatus};
+use wyrd_spec::operator_connection::{
+    ConnectionSecret, HttpsOrigin, OperatorConnectionConfig, OperatorConnectionStatus,
+};
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
 use wyrd_sql::queries::cards::get_card_by_uid;
@@ -269,12 +271,13 @@ impl OperatorWorker {
             Ok(spec) => spec,
             Err(attempt) => return attempt,
         };
-        let secret = match self.credential(tenant, &spec).await {
-            Ok(secret) => secret,
+        let (secret, origin) = match self.credential(tenant, &spec).await {
+            Ok(Some((secret, origin))) => (Some(secret), origin),
+            Ok(None) => (None, None),
             Err(attempt) => return attempt,
         };
         self.delivery
-            .send(&spec, secret.as_ref(), &context, timeout)
+            .send(&spec, secret.as_ref(), origin.as_ref(), &context, timeout)
             .await
     }
 
@@ -328,7 +331,10 @@ impl OperatorWorker {
 
     /// Re-check the connection authority and decrypt the latest credential.
     ///
-    /// Returns `None` for an Operator that names no connection. The same
+    /// Returns the credential with the connection's stored `http` origin
+    /// (`None` for other providers), read fresh for this attempt so a
+    /// path-only URL follows the connection. Returns `None` for an Operator
+    /// that names no connection. The same
     /// predicate registration used runs before decryption, so a disabled,
     /// renamed-provider, or re-pointed connection fails closed here.
     ///
@@ -340,7 +346,7 @@ impl OperatorWorker {
         &self,
         tenant: DataTenantId,
         spec: &OperatorSpec,
-    ) -> Result<Option<ConnectionSecret>, Attempt> {
+    ) -> Result<Option<(ConnectionSecret, Option<HttpsOrigin>)>, Attempt> {
         let Some((provider, name)) = spec.connection() else {
             return Ok(None);
         };
@@ -381,9 +387,14 @@ impl OperatorWorker {
                     "the stored credential failed authentication",
                 ),
             })?;
-        serde_json::from_slice(&plaintext).map(Some).map_err(|_| {
+        let origin = match stored.view.config {
+            OperatorConnectionConfig::Http { origin, .. } => Some(origin),
+            OperatorConnectionConfig::Slack { .. } | OperatorConnectionConfig::PagerDuty {} => None,
+        };
+        let secret = serde_json::from_slice(&plaintext).map_err(|_| {
             Attempt::terminal(CREDENTIAL_INVALID, "the stored credential is malformed")
-        })
+        })?;
+        Ok(Some((secret, origin)))
     }
 
     /// Apply one attempt's fenced settlement and return its telemetry label.
@@ -533,11 +544,15 @@ impl OperatorDelivery {
 
     /// Render and send one Operator action with its optional credential.
     ///
+    /// `origin` is the named `http` connection's stored origin for this
+    /// attempt; a path-only HTTP URL is sent there.
+    ///
     /// Never fails: every failure is classified into an [`Attempt`].
     pub async fn send(
         &self,
         spec: &OperatorSpec,
         secret: Option<&ConnectionSecret>,
+        origin: Option<&HttpsOrigin>,
         context: &OperatorFailureContext,
         timeout: Duration,
     ) -> Attempt {
@@ -596,11 +611,17 @@ impl OperatorDelivery {
                         seconds.min(MAX_ATTEMPT_SECONDS),
                     )))
                 });
-                let request =
-                    match HttpRequest::render(*method, url, headers, body.as_ref(), context) {
-                        Ok(request) => request,
-                        Err(reason) => return Attempt::terminal(INVALID_REQUEST, &reason),
-                    };
+                let request = match HttpRequest::render(
+                    *method,
+                    url,
+                    origin,
+                    headers,
+                    body.as_ref(),
+                    context,
+                ) {
+                    Ok(request) => request,
+                    Err(reason) => return Attempt::terminal(INVALID_REQUEST, &reason),
+                };
                 let credential = auth
                     .as_ref()
                     .zip(secret)
@@ -778,21 +799,29 @@ struct HttpRequest {
 impl HttpRequest {
     /// Render the authored request against `context`.
     ///
-    /// The effective URL must keep the template's literal origin, so a
-    /// rendered value can never re-point a credential. No credential is
-    /// touched here.
+    /// A path-only (`/`-prefixed) `url` is joined to the connection
+    /// `origin`; any other `url` keeps its literal origin. The effective URL
+    /// must keep that origin, so a rendered value can never re-point a
+    /// credential. No credential is touched here.
     ///
     /// # Errors
-    /// Returns a reason for an invalid template, URL, or header.
+    /// Returns a reason for an invalid template, URL, or header, or a
+    /// path-only URL without a connection origin.
     fn render(
         method: HttpMethod,
         url: &str,
+        origin: Option<&HttpsOrigin>,
         headers: &BTreeMap<String, String>,
         body: Option<&Value>,
         context: &OperatorFailureContext,
     ) -> Result<Self, String> {
-        let origin = operator_url_origin(url)?;
-        let url = Url::parse(&context.render(url)?).map_err(|error| error.to_string())?;
+        let (origin, url) = if url.starts_with('/') {
+            let origin = origin.ok_or("a path-only URL requires an http connection origin")?;
+            (origin.clone(), format!("{}{url}", origin.as_str()))
+        } else {
+            (operator_url_origin(url)?, url.to_owned())
+        };
+        let url = Url::parse(&context.render(&url)?).map_err(|error| error.to_string())?;
         if HttpsOrigin::of_url(&url).ok().as_ref() != Some(&origin) {
             return Err("the rendered URL changed its origin".to_owned());
         }
@@ -1083,6 +1112,28 @@ mod tests {
         assert!(render_json(&drift, &context()).is_err());
     }
 
+    /// A path-only URL renders onto the connection origin it is given and is
+    /// refused without one; an absolute URL keeps its literal origin.
+    #[test]
+    fn path_only_url_renders_onto_the_connection_origin() {
+        let origin = HttpsOrigin::parse("https://staging.example.com").expect("origin");
+        let render = |url: &str, origin: Option<&HttpsOrigin>| {
+            HttpRequest::render(
+                HttpMethod::Post,
+                url,
+                origin,
+                &BTreeMap::new(),
+                None,
+                &context(),
+            )
+        };
+        let request = render("/v1/hook", Some(&origin)).expect("path-only renders");
+        assert_eq!(request.url.as_str(), "https://staging.example.com/v1/hook");
+        assert!(render("/v1/hook", None).is_err());
+        let absolute = render("https://hooks.example.com/x", Some(&origin)).expect("absolute");
+        assert_eq!(absolute.url.as_str(), "https://hooks.example.com/x");
+    }
+
     /// An HTTP Operator posting to `url` with a header credential.
     ///
     /// # Panics
@@ -1112,6 +1163,7 @@ mod tests {
             .send(
                 &hook(url),
                 Some(&secret()),
+                None,
                 &context(),
                 Duration::from_secs(5),
             )

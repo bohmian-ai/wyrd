@@ -85,4 +85,3 @@ run check:pyo3-scope`, `mise run check:unwrap-audit`, and `mise run
 check:clippy-allow-audit`; all passed. No Cargo test, code-generation, database,
 Python, TypeScript, or documentation lane was rerun in r6. Runtime proof is
 therefore the recorded r5 evidence, not an independent r6 execution.
-

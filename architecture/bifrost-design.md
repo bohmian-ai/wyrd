@@ -166,7 +166,9 @@ exact fractional or wider numbers travel as strings. A raw object is canonical
 or `WYRD_VALA_400_VARIANT_INVALID_JSON`: its resolved field names strictly
 increase whether or not the metadata dictionary is sorted, and every field
 value owns its own bytes, never shared with or overlapping another field's.
-Validation of raw bytes is iterative and linear in their size, and every
+Validation of raw bytes is iterative and bounded by the fixed size limit, and
+because no two fields may share or overlap bytes a value cannot describe more
+nodes than its bytes hold, so rendering work cannot be amplified. Every
 stored-Variant reader and renderer applies it before decoding, so a hostile
 cell is an error rather than unbounded work.
 

@@ -304,7 +304,7 @@ Commits: `679502cc0`, `0db3afad5`, `8121e0405`, `fec6d5cf4`, `db65d41cc`,
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| `FIND-TASK-001-4` | `architecture/bifrost-design.md` Storage format and Variant (raw numeric domain, canonical objects, linear validation for every reader, size → invalid → numeric → depth, JSON syntax at any depth) and the nullable-Struct bullet (whole-or-absent, partial refused before ACK); `validate_declared_variants` `# Errors` | `docs:check`, review of text against spec rev 13 | PASS |
+| `FIND-TASK-001-4` | `architecture/bifrost-design.md` Storage format and Variant (raw numeric domain, canonical objects, iterative size-bounded non-amplifying validation for every reader, size → invalid → numeric → depth, JSON syntax at any depth) and the nullable-Struct bullet (whole-or-absent, partial refused before ACK); `validate_declared_variants` `# Errors` | `docs:check`, review of text against spec rev 13 | PASS |
 | `FIND-TASK-001-14` | `tests/gateway/peer.rs` `submit_partial_resolved_model`; `tests/bifrost/server/verification_runtime.rs` refused upstream call with null `resolved_model` children on hot and published reads; no production change | `peer::oracle_only_gateway_captures_through_the_peer_scribe`, `verification_runtime::typed_builtin_payloads_are_queryable`, `capture::tests::unresolved_call_nulls_resolved_model_children` | PASS |
 | `FIND-TASK-001-16` | `EncodedVariant::validate` (size, `scan_encoded`, `Variant::try_new`), `object_field_slots` gives every object field its own byte slot; node budget removed; `variant_bytes_to_json`, `mask_placeholders`, `variant_cell_to_json`, `VariantJsonEncoderFactory` run `validate` first | `variant::tests::raw_shared_field_values_are_refused`, `renderers_refuse_hostile_stored_variants`; raw-IPC cases in `builtin_variant_columns_are_refused_before_ack` | PASS |
 | `FIND-TASK-001-18` | `from_json` depth-bounded preflight `nests_past_limit` + `within_depth_limit` pruned copy; `from_json_text` relies on serde_json's iterative `RawValue` scan | `variant::tests::json_depth_is_decided_by_wyrd_at_any_depth`; `oracle::variant_sql::tests::parse_json_classifies_deep_and_oversized_text`; `refuse_json_rows` deep 129/10,000 | PASS |
@@ -340,7 +340,7 @@ All cargo/mise commands ran with
 ### Deviations and limits
 
 - **No stacker.** serde_json's `RawValue` parse uses the iterative `ignore_value` with no recursion limit, so deep text already reaches Wyrd's decision; the real overflow was serializing a deep `Value`, fixed by the bounded preflight and pruned copy.
-- **Quadratic numeric scan.** `scan_numbers` costs depth × subtree size; bounded by the 8 MB size limit and marked with a `ponytail:` comment. Proven to 10,000 levels.
+- **Quadratic numeric scan.** `scan_numbers` costs depth × subtree size; marked with a `ponytail:` comment. Proven to 10,000 levels. Superseded by TASK-001-R7: the JSON walk is now proportional to the text.
 - **Oracle classes** are proven in the in-memory Oracle session test; the published journey already proves error transport and uses the same UDF.
 - **Product effect:** OTLP spans, logs and metrics carrying a NaN or infinite attribute or body value are now rejected per record (partial success), matching canonical Arrow input.
 

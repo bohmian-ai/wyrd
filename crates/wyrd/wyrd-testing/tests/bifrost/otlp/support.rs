@@ -1249,6 +1249,9 @@ pub(super) fn decode_attributes(array: &StructArray) -> HashMap<String, String> 
 
 /// Stable code a record carries when one of its Variant values is too large.
 pub(super) const VARIANT_TOO_LARGE: &str = "WYRD_VALA_413_VARIANT_TOO_LARGE";
+/// Stable code a record carries when one of its Variant numbers is outside
+/// the exact numeric domain, such as a NaN or infinite double.
+pub(super) const VARIANT_NUMERIC_OUT_OF_RANGE: &str = "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE";
 /// Promoted `service.version` of the Variant journey resource.
 pub(super) const VARIANT_SERVICE_VERSION: &str = "1.4.2";
 /// Promoted `deployment.environment.name` of the Variant journey resource.
@@ -1435,14 +1438,14 @@ pub(super) fn assert_variant_envelope(row: &RecordBatch) {
     );
 }
 
-/// Asserts a partial-success reason starts with the Variant size code.
+/// Asserts a partial-success reason starts with one stable Variant code.
 ///
 /// # Panics
 ///
-/// Panics when the reason does not lead with the stable code.
-pub(super) fn assert_too_large_reason(reason: &str) {
+/// Panics when the reason does not lead with `code`.
+pub(super) fn assert_variant_reason(reason: &str, code: &str) {
     assert!(
-        reason.starts_with(&format!("{VARIANT_TOO_LARGE}: ")),
+        reason.starts_with(&format!("{code}: ")),
         "the rejection reason leads with the stable Variant code: {reason}"
     );
 }

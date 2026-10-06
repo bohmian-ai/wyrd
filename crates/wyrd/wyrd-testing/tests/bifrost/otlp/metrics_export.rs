@@ -829,7 +829,7 @@ mod pg_tests {
             partial.rejected_data_points, 2,
             "every point of the oversized metric is rejected"
         );
-        support::assert_too_large_reason(&partial.error_message);
+        support::assert_variant_reason(&partial.error_message, support::VARIANT_TOO_LARGE);
 
         journey.publish().await;
         let row = journey

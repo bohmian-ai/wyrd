@@ -33,9 +33,18 @@ Never use that exception to bypass an active approved spec.
 Implement the smallest cohesive change satisfying the acceptance criteria. Make
 local decisions yourself, including helper decomposition, private signatures,
 module placement inside the established owner, local control flow, use of
-already-approved dependencies, and test or fixture structure. Reuse the nearest
-repository behavior before adding code, abstractions, configuration, features,
-or dependencies.
+already-approved dependencies, and test or fixture structure.
+
+Reuse is mandatory. Before adding any type, function, module, conversion,
+encoder/decoder, validator, error type or mapping, rendering, schema/type
+mapping, wire field, helper, test fixture, configuration, or dependency, search
+for the existing owner of that behavior in the repository (CodeGraph when
+`.codegraph/` exists, otherwise `git grep`) and in the installed dependencies'
+public APIs. When an owner exists, extend it there; do not add a parallel path,
+a per-case branch beside the general one, or a copy in another caller. When the
+same logic is needed in two places, put it once at the shared owner. A parallel
+mechanism is a defect even when it works, and the task reviewer's `reuse-rev`
+blocks on it.
 
 For non-trivial behavior, work one observable scenario at a time:
 
@@ -91,7 +100,14 @@ Append compact evidence to the task or remediation task:
 | `<criterion>` | `<location>` | `<test or check>` | `PASS | FAIL` |
 
 Also confirm that every non-goal remained excluded and no unrelated file was
-changed. Record commands and material limits without narrating implementation.
+changed. List every new type, function, module, and dependency in the diff with
+the owner searched and why it is the single owner rather than an extension of
+an existing one:
+
+| New item | Owners searched | Why new |
+|---|---|---|
+
+Record commands and material limits without narrating implementation.
 
 Return `IMPLEMENTED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED` with the task path,
 verification status, material risk, and diff or commit reference. Create a

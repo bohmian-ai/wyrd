@@ -222,10 +222,10 @@ impl RowPreflight {
     /// all-null with its declared type. A declared Variant column passes when
     /// it already carries the `arrow.parquet.variant` extension (the server
     /// validates its bytes) and is encoded from `Utf8`/`LargeUtf8` JSON text
-    /// exactly as a row value is; a null text is a null Variant. Every other
-    /// supplied column must already have its declared logical type, and is
-    /// retyped to the complete declared field, so a writer's default-nullable
-    /// Arrow fields and its own List item names fit the declaration.
+    /// exactly as a row value is; a null text is a null Variant. Every
+    /// supplied column takes its declared nullability, so a writer's
+    /// default-nullable Arrow field fits a required column, and otherwise
+    /// keeps its type, which the server checks.
     ///
     /// # Errors
     ///
@@ -235,10 +235,8 @@ impl RowPreflight {
     /// returns the refusal on the earliest input row, ties going to the
     /// earlier declared field, as [`Self::prepare`] does:
     /// [`WyrdQueueError::SchemaParse`] for an omitted non-nullable column
-    /// (row 0) or a null in one or under any declared non-null child or item;
-    /// `BIFROST_UNSUPPORTED_TYPE` (row 0) for a column whose type differs
-    /// from its declaration, including a declared Variant column that is
-    /// neither the extension nor text; or the
+    /// (row 0) or a null in one; `BIFROST_UNSUPPORTED_TYPE` (row 0) for a
+    /// declared Variant column that is neither the extension nor text; or the
     /// catalogued Variant error for unstorable text. Returns
     /// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
     /// columns.
@@ -298,147 +296,39 @@ impl RowPreflight {
 
 /// Conform one supplied batch column to its declared field.
 ///
-/// A Variant declaration supplied as JSON text is encoded row by row into the
-/// extension. Any other column must already have the declared logical type
-/// per [`conforms`]: Variant identity where declared, exact scalar types,
-/// Struct children by name, and List items by position. No value is coerced.
-/// A conforming column is retyped by Arrow's `cast` to the complete declared
-/// field — child names, order, nullability, and extension metadata — which
-/// moves no value because the types already match.
+/// The column takes the declared nullability. A Variant declaration supplied
+/// as JSON text is encoded row by row into the extension; any other column
+/// keeps its own type for the server to check.
 ///
 /// # Errors
 ///
-/// Returns `BIFROST_UNSUPPORTED_TYPE` at row 0 for a column that does not
-/// conform, else the earliest-row refusal among a null under any declared
-/// non-null field or item (see [`first_missing`]) and the encoding of every
-/// text value, and a schema-parse refusal at row 0 if Arrow cannot retype it.
+/// Returns the earliest-row refusal among a null on a non-nullable field and
+/// the encoding of every text value, or `BIFROST_UNSUPPORTED_TYPE` at row 0
+/// for a Variant declaration supplied as neither the extension nor text.
 fn conform_column(
     declared: &Field,
     supplied: &Field,
     column: &ArrayRef,
 ) -> Result<(FieldRef, ArrayRef), Failure> {
-    let rows: Vec<Option<usize>> = (0..column.len()).map(Some).collect();
-    if is_variant(declared) && !is_variant(supplied) {
-        let missing = first_missing(declared, declared.name(), column.as_ref(), &rows);
-        return match (encode_text_column(declared, supplied, column), missing) {
-            (Ok(conformed), None) => Ok(conformed),
-            (Ok(_), Some(missing)) => Err(missing),
-            (Err(failure), missing) => Err(failure.after(missing)),
-        };
-    }
-    if !conforms(declared, supplied) {
-        return Err(unsupported(supplied));
-    }
-    if let Some(missing) = first_missing(declared, declared.name(), column.as_ref(), &rows) {
-        return Err(missing);
-    }
-    let retyped = cast(column, declared.data_type()).map_err(|e| Failure {
-        row: 0,
-        error: arrow_failure(e),
-    })?;
-    Ok((Arc::new(declared.clone()), retyped))
-}
-
-/// Report whether `supplied` has `declared`'s logical type.
-///
-/// Variant identity must agree, and scalar types must be equal. Struct
-/// children match by name, in any order, and must be the same set; a List
-/// item matches by position, whatever the writer named it. Nullability and
-/// other metadata are not compared: [`conform_column`] applies the
-/// declaration's and checks the actual nulls.
-fn conforms(declared: &Field, supplied: &Field) -> bool {
-    if is_variant(declared) != is_variant(supplied) {
-        return false;
-    }
-    match (declared.data_type(), supplied.data_type()) {
-        (DataType::Struct(declared), DataType::Struct(supplied)) => {
-            declared.len() == supplied.len()
-                && declared.iter().all(|child| {
-                    supplied
-                        .find(child.name())
-                        .is_some_and(|(_, supplied)| conforms(child, supplied))
-                })
-        }
-        (DataType::List(declared), DataType::List(supplied)) => conforms(declared, supplied),
-        (declared, supplied) => declared == supplied,
-    }
-}
-
-/// Find the earliest input row holding a null under a declared non-null
-/// field or item, at any depth below `declared`.
-///
-/// `rows[i]` is the input row of value `i` of `column`, or `None` when a null
-/// enclosing struct or list excuses it, as it does for a row value. Struct
-/// children are found by name and List items take their list's row, so the
-/// refusal names the same dotted path and row that [`RowPreflight::prepare`]
-/// names for the same value. A Variant is a leaf. `column` must conform to
-/// `declared`.
-fn first_missing(
-    declared: &Field,
-    path: &str,
-    column: &dyn Array,
-    rows: &[Option<usize>],
-) -> Option<Failure> {
-    let mut first = (!declared.is_nullable())
-        .then(|| {
-            rows.iter()
-                .enumerate()
-                .find_map(|(index, row)| row.filter(|_| column.is_null(index)))
-        })
+    let missing = (!declared.is_nullable())
+        .then(|| (0..column.len()).find(|&row| column.is_null(row)))
         .flatten()
         .map(|row| Failure {
             row,
-            error: missing_required(path, row),
+            error: missing_required(declared.name(), row),
         });
-    let present: Vec<Option<usize>> = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| row.filter(|_| column.is_valid(index)))
-        .collect();
-    let mut nested = |child: &Field, path: &str, values: &dyn Array, rows: &[Option<usize>]| {
-        if let Some(missing) = first_missing(child, path, values, rows) {
-            first = Some(missing.after(first.take()));
-        }
+    let conformed = if is_variant(declared) && !is_variant(supplied) {
+        encode_text_column(declared, supplied, column)
+    } else {
+        Ok((
+            Arc::new(supplied.clone().with_nullable(declared.is_nullable())),
+            Arc::clone(column),
+        ))
     };
-    match declared.data_type() {
-        _ if is_variant(declared) => {}
-        DataType::Struct(children) => {
-            let column = column.as_struct();
-            for child in children {
-                if let Some(values) = column.column_by_name(child.name()) {
-                    nested(
-                        child,
-                        &child_path(path, child.name()),
-                        values.as_ref(),
-                        &present,
-                    );
-                }
-            }
-        }
-        DataType::List(item) => {
-            let list = column.as_list::<i32>();
-            // Offsets start at the first item, which need not be index 0.
-            let first_item = list.value_offsets().first().copied().unwrap_or(0);
-            let mut item_rows = vec![None; usize::try_from(first_item).unwrap_or(0)];
-            for (row, length) in present.iter().zip(list.offsets().lengths()) {
-                item_rows.extend(std::iter::repeat_n(*row, length));
-            }
-            item_rows.resize(list.values().len(), None);
-            nested(item, path, list.values().as_ref(), &item_rows);
-        }
-        _ => {}
-    }
-    first
-}
-
-/// The refusal for a column whose type does not conform to its declaration.
-fn unsupported(supplied: &Field) -> Failure {
-    Failure {
-        row: 0,
-        error: WyrdQueueError::Contract(BifrostError::UnsupportedType {
-            field: supplied.name().clone(),
-            data_type: supplied.data_type().to_string(),
-        }),
+    match (conformed, missing) {
+        (Ok(conformed), None) => Ok(conformed),
+        (Ok(_), Some(missing)) => Err(missing),
+        (Err(failure), missing) => Err(failure.after(missing)),
     }
 }
 
@@ -456,7 +346,13 @@ fn encode_text_column(
     column: &ArrayRef,
 ) -> Result<(FieldRef, ArrayRef), Failure> {
     if !matches!(supplied.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-        return Err(unsupported(supplied));
+        return Err(Failure {
+            row: 0,
+            error: WyrdQueueError::Contract(BifrostError::UnsupportedType {
+                field: supplied.name().clone(),
+                data_type: supplied.data_type().to_string(),
+            }),
+        });
     }
     let text = cast(column, &DataType::Utf8View).map_err(|e| Failure {
         row: 0,
@@ -1366,144 +1262,6 @@ mod batch_builder_tests {
             .expect_err("id is required");
         assert_eq!(null.code(), "WYRD_VALA_400_SCHEMA_PARSE");
         assert!(null.to_string().contains("row 1 field `id`"), "{null}");
-    }
-
-    /// Runtime-authored ordinary columns take the declared type identity or
-    /// are refused. A wrong scalar or nested type is an unsupported type; a
-    /// null under a declared non-null Struct child or List item is refused at
-    /// its row, as the same row insert is, unless a null parent excuses it;
-    /// and a compatible Struct with reordered nullable children and a List
-    /// with a writer-named nullable item come out with the declared fields.
-    #[test]
-    fn batch_columns_conform_to_declared_types() {
-        use std::sync::Arc;
-
-        use arrow::array::{ArrayRef, RecordBatch, StringArray};
-        use arrow::buffer::{NullBuffer, OffsetBuffer};
-
-        let point = Fields::from(vec![
-            Field::new("x", DataType::Int64, false),
-            Field::new("label", DataType::Utf8, true),
-        ]);
-        let declared = Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("point", DataType::Struct(point), true),
-            Field::new_list("tags", Field::new_list_field(DataType::Utf8, false), true),
-        ]);
-        let preflight = RowPreflight::new(&declared);
-        // A runtime writer's shapes: every child nullable, its own order and
-        // item name.
-        let authored = |x: Vec<Option<i64>>, point_nulls: Option<NullBuffer>, tag: Option<&str>| {
-            let children = Fields::from(vec![
-                Field::new("label", DataType::Utf8, true),
-                Field::new("x", DataType::Int64, true),
-            ]);
-            let point = StructArray::new(
-                children,
-                vec![
-                    Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
-                    Arc::new(Int64Array::from(x)),
-                ],
-                point_nulls,
-            );
-            let tags = ListArray::new(
-                Arc::new(Field::new("element", DataType::Utf8, true)),
-                OffsetBuffer::from_lengths([1, 0]),
-                Arc::new(StringArray::from(vec![tag])),
-                None,
-            );
-            RecordBatch::try_from_iter([
-                ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
-                ("point", Arc::new(point)),
-                ("tags", Arc::new(tags)),
-            ])
-            .expect("batch builds")
-        };
-
-        let conformed = preflight
-            .prepare_batch(&authored(vec![Some(1), Some(2)], None, Some("t")))
-            .expect("compatible columns conform");
-        for name in ["id", "point", "tags"] {
-            assert_eq!(
-                conformed.schema().field_with_name(name).expect("declared"),
-                declared.field_with_name(name).expect("declared"),
-            );
-        }
-        let point = conformed.column(1).as_struct();
-        assert_eq!(
-            point
-                .column_by_name("x")
-                .expect("x")
-                .as_primitive::<Int64Type>()
-                .values(),
-            &[1, 2]
-        );
-        assert_eq!(
-            conformed
-                .column(2)
-                .as_list::<i32>()
-                .value(0)
-                .as_string::<i32>()
-                .value(0),
-            "t"
-        );
-
-        let excused = preflight.prepare_batch(&authored(
-            vec![None, Some(2)],
-            Some(NullBuffer::from(vec![false, true])),
-            Some("t"),
-        ));
-        assert!(excused.is_ok(), "a null point excuses its x: {excused:?}");
-
-        let null_x = preflight
-            .prepare_batch(&authored(vec![Some(1), None], None, Some("t")))
-            .expect_err("point.x is required");
-        let row_null_x = RowPreflight::new(&declared)
-            .prepare(
-                &[r#"{"id": 1}"#, r#"{"id": 2, "point": {"x": null}}"#],
-                None,
-                None,
-            )
-            .expect_err("point.x is required");
-        assert_eq!(null_x.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-        assert_eq!(null_x.to_string(), row_null_x.to_string());
-        assert!(
-            null_x.to_string().contains("row 1 field `point.x`"),
-            "{null_x}"
-        );
-
-        let null_tag = preflight
-            .prepare_batch(&authored(vec![Some(1), None], None, None))
-            .expect_err("tag items are required");
-        assert!(
-            null_tag.to_string().contains("row 0 field `tags`"),
-            "{null_tag}"
-        );
-
-        let wrong_scalar = RecordBatch::try_from_iter([(
-            "id",
-            Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
-        )])
-        .expect("batch builds");
-        let wrong_nested = RecordBatch::try_from_iter([
-            ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
-            (
-                "point",
-                Arc::new(StructArray::from(vec![(
-                    Arc::new(Field::new("x", DataType::Utf8, true)),
-                    Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
-                )])),
-            ),
-        ])
-        .expect("batch builds");
-        for (batch, field) in [(wrong_scalar, "id"), (wrong_nested, "point")] {
-            let refused = preflight.prepare_batch(&batch).expect_err("type differs");
-            assert_eq!(refused.code(), "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE");
-            assert!(
-                refused.to_string().contains(&format!("for field {field}")),
-                "{refused}"
-            );
-        }
     }
 
     /// A batch naming a column twice is refused rather than keeping one of

@@ -33,13 +33,12 @@ use chrono::{DateTime, Datelike as _, Utc};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::tables::{AgentTracesTable, DomainTable};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
-use vala_sql::queries::audit_staging::append_audit;
+use vala_sql::queries::audit_staging::{append_audit, entry_hash};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
@@ -1159,24 +1158,34 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
         &vec![vec![trace.messages, trace.tool_io]],
     )?;
 
-    // Audit: the stored detail decodes to the hashed JSON, and the stored
-    // columns reproduce the row's own entry hash.
+    // Audit: the stored detail decodes to the hashed JSON, and the staging
+    // writer's own hash over it at the stored chain position reproduces the
+    // row's entry hash.
     let audit = journey
         .rows(format!(
-            "SELECT {} FROM vala.system.audit_log WHERE operation = '{}'",
-            RetainedAuditRow::COLUMNS,
-            decision.operation
+            "SELECT seq, prev_hash, detail, entry_hash FROM vala.system.audit_log \
+             WHERE operation = '{}'",
+            decision.event.operation
         ))
         .await?;
-    let [audit] = audit.as_slice() else {
+    let [row] = audit.as_slice() else {
         return Err(format!("one retained decision expected: {audit:?}").into());
     };
-    let audit = RetainedAuditRow::from_row(audit)?;
-    expect_eq("audit detail", &audit.detail, &decision.detail)?;
+    let [seq, Value::String(prev_hash), detail, stored_hash] = row.as_slice() else {
+        return Err(format!("an audit row has the wrong columns: {row:?}").into());
+    };
+    expect_eq("audit detail", detail, &decision.detail)?;
+    let recomputed = entry_hash(
+        &hex::decode(prev_hash)?,
+        seq.as_i64().ok_or("the audit seq is not an integer")?,
+        &decision.event,
+        None,
+        Some(&serde_jcs::to_string(detail)?),
+    );
     expect_eq(
         "audit entry hash",
-        &audit.recomputed_entry_hash()?,
-        &audit.entry_hash,
+        &json!(hex::encode(recomputed)),
+        stored_hash,
     )?;
 
     journey.server.shutdown().await?;
@@ -1772,115 +1781,10 @@ struct WrittenTrace {
 
 /// The appended audit decision and its native detail.
 struct AppendedDecision {
-    /// Operation name unique to this journey.
-    operation: String,
+    /// The staged event whose entry hash the retained row must reproduce.
+    event: AuditEvent,
     /// The detail's canonical JSON, the value the entry hash covers.
     detail: Value,
-}
-
-/// One retained `vala.system.audit_log` row, decoded to JSON values.
-///
-/// Owns the stored hash-chain inputs so the entry hash can be recomputed from
-/// exactly what retained history stores.
-#[derive(Debug)]
-struct RetainedAuditRow {
-    /// The row's stored columns, in [`Self::COLUMNS`] order.
-    cells: Vec<Value>,
-    /// The stored `entry_hash` as lowercase hex.
-    entry_hash: Value,
-    /// The stored detail, decoded from its Variant.
-    detail: Value,
-}
-
-impl RetainedAuditRow {
-    /// Projection that reads every hash input plus the stored entry hash.
-    const COLUMNS: &'static str = "seq, prev_hash, request_id, trace_id, operation, resource, \
-         audit_card_ref, audit_principal_id, principal_kind, permission, outcome, detail, \
-         credential_id, entry_hash";
-
-    /// Take one decoded row in [`Self::COLUMNS`] order.
-    ///
-    /// # Errors
-    /// Returns an error when the row does not have every projected column.
-    fn from_row(row: &[Value]) -> Result<Self, ServerJourneyError> {
-        let [.., detail, _, entry_hash] = row else {
-            return Err(format!("an audit row is missing columns: {row:?}").into());
-        };
-        if row.len() != 14 {
-            return Err(format!("an audit row has {} columns: {row:?}", row.len()).into());
-        }
-        Ok(Self {
-            cells: row.to_vec(),
-            entry_hash: entry_hash.clone(),
-            detail: detail.clone(),
-        })
-    }
-
-    /// Recompute the SHA-256 entry hash from the stored columns.
-    ///
-    /// The preimage is the previous hash bytes, the big-endian sequence, then
-    /// each field length-prefixed in staging order: request id, optional
-    /// trace id, operation, resource, optional card ref, the principal UUID
-    /// bytes, principal kind, permission, outcome, the optional detail's
-    /// canonical JSON, and the optional credential id. An optional field is
-    /// a `0` byte when absent and a `1` byte before its length-prefixed text.
-    ///
-    /// # Errors
-    /// Returns an error when a stored column has the wrong JSON type, the
-    /// previous hash is not hex, or the principal is not a UUID.
-    fn recomputed_entry_hash(&self) -> Result<Value, ServerJourneyError> {
-        let text = |index: usize| -> Result<&str, ServerJourneyError> {
-            self.cells[index]
-                .as_str()
-                .ok_or_else(|| format!("audit column {index} is not text: {:?}", self.cells).into())
-        };
-        let optional = |index: usize| -> Result<Option<&str>, ServerJourneyError> {
-            if self.cells[index].is_null() {
-                return Ok(None);
-            }
-            text(index).map(Some)
-        };
-        let seq = self.cells[0]
-            .as_i64()
-            .ok_or("the audit seq is not an integer")?;
-        let detail = if self.detail.is_null() {
-            None
-        } else {
-            Some(serde_jcs::to_string(&self.detail)?)
-        };
-        let mut preimage = hex::decode(text(1)?)?;
-        preimage.extend_from_slice(&seq.to_be_bytes());
-        push_text(&mut preimage, text(2)?);
-        push_optional(&mut preimage, optional(3)?);
-        push_text(&mut preimage, text(4)?);
-        push_text(&mut preimage, text(5)?);
-        push_optional(&mut preimage, optional(6)?);
-        preimage.extend_from_slice(uuid::Uuid::parse_str(text(7)?)?.as_bytes());
-        push_text(&mut preimage, text(8)?);
-        push_text(&mut preimage, text(9)?);
-        push_text(&mut preimage, text(10)?);
-        push_optional(&mut preimage, detail.as_deref());
-        push_optional(&mut preimage, optional(12)?);
-        Ok(json!(hex::encode(Sha256::digest(&preimage))))
-    }
-}
-
-/// Append `value` to an audit hash preimage with its big-endian `u64` length.
-fn push_text(preimage: &mut Vec<u8>, value: &str) {
-    preimage.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    preimage.extend_from_slice(value.as_bytes());
-}
-
-/// Append an optional audit hash input: `0` when absent, else `1` and the
-/// length-prefixed text.
-fn push_optional(preimage: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        None => preimage.push(0),
-        Some(value) => {
-            preimage.push(1);
-            push_text(preimage, value);
-        }
-    }
 }
 
 /// One bound server with a mock gateway upstream, and the tenant whose
@@ -2278,7 +2182,7 @@ impl TypedPayloadJourney {
         let event = AuditEvent::new(
             RequestId::now_v7(),
             None,
-            operation.clone(),
+            operation,
             "vala.oracle.admission".to_owned(),
             None,
             PrincipalId::new(uuid::Uuid::now_v7()),
@@ -2291,7 +2195,7 @@ impl TypedPayloadJourney {
         append_audit(&mut conn, &event).await?;
         conn.commit().await?;
         Ok(AppendedDecision {
-            operation,
+            event,
             detail: serde_json::from_str(&audit_detail_canonical_json(&detail))?,
         })
     }

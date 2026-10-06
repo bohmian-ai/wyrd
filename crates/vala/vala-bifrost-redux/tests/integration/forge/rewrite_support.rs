@@ -14,8 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestList, ManifestListWriter, PartitionKey,
-    Schema as IcebergSchema, TableProperties,
+    DataFile, DataFileFormat, PartitionKey, Schema as IcebergSchema, TableProperties,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
@@ -588,15 +587,12 @@ fn position_delete_schema() -> IcebergSchema {
 const SEAM_NOT_PORTABLE: &str =
     "the Forge rewrite output seam is bound to one test process and cannot be serialized";
 
-/// What the seam does to the output whose ordinal it was armed for, or to
-/// the manifest lists it serves.
+/// What the seam does to the output whose ordinal it was armed for.
 ///
-/// The output variants act at a real boundary the managed core drives: an
-/// output is opened, or an opened output is closed. Neither fabricates a state
-/// the core could not reach on its own, which is what keeps the resulting
-/// outcome the production one rather than an injected shape.
-/// [`Self::UnassignRowIds`] alone serves a table state Bifrost never writes,
-/// because no v3 table it creates can yield a rewrite batch without lineage.
+/// Both variants act at a real boundary the managed core drives: an output is
+/// opened, or an opened output is closed. Neither fabricates a state the core
+/// could not reach on its own, which is what keeps the resulting outcome the
+/// production one rather than an injected shape.
 #[derive(Debug, Clone)]
 pub(crate) enum RewriteOutputBreak {
     /// Cancels `token` as the `ordinal`-th rewrite output opens.
@@ -619,13 +615,6 @@ pub(crate) enum RewriteOutputBreak {
         /// One-based open order of the output whose close is refused.
         ordinal: usize,
     },
-    /// Serves every manifest list with no data manifest's `first_row_id`
-    /// assigned, as a table upgraded to v3 from v2 still carries.
-    ///
-    /// Every data file then reads back null `_row_id` and
-    /// `_last_updated_sequence_number`, which reaches the rewrite core through
-    /// the real reader. Outputs are counted and never broken.
-    UnassignRowIds,
 }
 
 /// Storage adapter that delegates every operation and can break one output.
@@ -688,13 +677,6 @@ impl RewriteOutputSeam {
             .expect("invariant: the rewrite seam outlives its own calls")
     }
 
-    /// Returns whether `path` names a snapshot's manifest list.
-    fn is_manifest_list(path: &str) -> bool {
-        path.rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with("snap-"))
-    }
-
     /// Returns whether `path` names a rewrite output rather than any other object.
     fn is_rewrite_output(path: &str) -> bool {
         path.contains(vala_bifrost_redux::catalog::layout::FORGE_DATA_MARKER)
@@ -717,7 +699,7 @@ impl RewriteOutputSeam {
                 false
             }
             RewriteOutputBreak::FailAtClose { ordinal } => opened == *ordinal,
-            RewriteOutputBreak::CancelAtOpen { .. } | RewriteOutputBreak::UnassignRowIds => false,
+            RewriteOutputBreak::CancelAtOpen { .. } => false,
         }
     }
 }
@@ -757,20 +739,9 @@ impl iceberg::io::Storage for RewriteOutputSeam {
         self.inner.new_input(path)?.metadata().await
     }
 
-    /// Delegates a whole-object read, serving a manifest list without
-    /// row-id assignments when armed with [`RewriteOutputBreak::UnassignRowIds`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates the delegated read and the manifest-list rewrite failures.
+    /// Delegates a whole-object read unchanged.
     async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
-        let bytes = self.inner.new_input(path)?.read().await?;
-        if matches!(self.breakage, RewriteOutputBreak::UnassignRowIds)
-            && Self::is_manifest_list(path)
-        {
-            return without_row_id_assignment(&bytes).await;
-        }
-        Ok(bytes)
+        self.inner.new_input(path)?.read().await
     }
 
     /// Delegates continuous reading unchanged.
@@ -843,31 +814,6 @@ impl iceberg::io::Storage for RewriteOutputSeam {
     fn new_output(&self, path: &str) -> iceberg::Result<iceberg::io::OutputFile> {
         Ok(iceberg::io::OutputFile::new(self.shared(), path.to_owned()))
     }
-}
-
-/// Re-encodes one v3 manifest list with every data manifest's `first_row_id`
-/// unset.
-///
-/// The list goes through Iceberg's own parser and writer. A writer with no
-/// next row id leaves each unset `first_row_id` unset, which is how Iceberg
-/// writes the list of a table without row lineage. The list-level snapshot
-/// ids are not read when planning, so they are left zero.
-///
-/// # Errors
-///
-/// Propagates the manifest-list parse and the in-memory write failures.
-async fn without_row_id_assignment(bytes: &[u8]) -> iceberg::Result<bytes::Bytes> {
-    let manifests = ManifestList::parse_with_version(bytes, FormatVersion::V3)?;
-    let memory = iceberg::io::FileIO::new_with_memory();
-    let path = "memory://unassigned/snap.avro";
-    let mut writer =
-        ManifestListWriter::v3(memory.new_output(path)?.writer().await?, 0, None, 0, None);
-    writer.add_manifests(manifests.consume_entries().into_iter().map(|mut manifest| {
-        manifest.first_row_id = None;
-        manifest
-    }))?;
-    writer.close().await?;
-    memory.new_input(path)?.read().await
 }
 
 /// A real writer whose close is refused after every byte was accepted.

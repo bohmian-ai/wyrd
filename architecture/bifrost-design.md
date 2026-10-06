@@ -941,9 +941,7 @@ Forge reads the hidden `_row_id` and `_last_updated_sequence_number` beside
 the logical projection, carries them in its internal physical batch, and
 writes those exact values for every surviving row, so a row keeps its lineage
 identity across any number of rewrites. Lineage evidence stays in the output
-`DataFile`s; the five-field handoff is unchanged. A missing, null, or
-mistyped lineage column in any input batch fails the rewrite before commit and
-publishes nothing.
+`DataFile`s; the five-field handoff is unchanged.
 
 The commit adapter derives delete-file disposition from the immutable base
 snapshot and the applied-delete evidence; the handoff remains exactly five

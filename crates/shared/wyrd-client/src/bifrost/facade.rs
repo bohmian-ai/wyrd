@@ -1146,7 +1146,8 @@ mod tests {
     /// admission. Utf8 and LargeUtf8 JSON text and the extension reach the
     /// server as the Variant extension, while a same-shaped text column the
     /// table does not declare as Variant stays text. Invalid JSON, a wrong wire
-    /// type, and a failed describe refuse before any send or byte reservation.
+    /// type, a column supplied twice, and a failed describe refuse before any
+    /// send or byte reservation.
     ///
     /// # Panics
     ///
@@ -1218,6 +1219,17 @@ mod tests {
                     Arc::new(Int64Array::from(vec![1])),
                 ),
                 "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
+            ),
+            (
+                RecordBatch::try_from_iter([
+                    (
+                        "payload",
+                        Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                    ),
+                    ("payload", Arc::new(StringArray::from(vec!["2"]))),
+                ])
+                .expect("Arrow allows duplicate names"),
+                "WYRD_VALA_400_SCHEMA_PARSE",
             ),
         ];
         for (input, code) in &refused {

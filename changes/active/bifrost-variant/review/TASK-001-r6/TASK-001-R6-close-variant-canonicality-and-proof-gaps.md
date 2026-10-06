@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R6
 kind: remediation
-status: ready
+status: review
 spec: SPEC-bifrost-variant
 spec_revision: 13
 requirements: [REQ-003, REQ-004, REQ-006, REQ-008, REQ-009, REQ-019, INV-002, INV-007, AC-003, AC-005]
@@ -296,3 +296,67 @@ Do not rerun unaffected SDK/MCP journeys solely for the server-owned raw
 validation changes; the shared renderer and raw-IPC/Oracle proofs own those
 paths. Record every command, selected test count, and exit status in this file's
 implementation evidence.
+
+## Implementation evidence
+
+Commits: `679502cc0`, `0db3afad5`, `8121e0405`, `fec6d5cf4`, `db65d41cc`,
+`df74821aa` (base `b4ea01848`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-4` | `architecture/bifrost-design.md` Storage format and Variant (raw numeric domain, canonical objects, linear validation for every reader, size → invalid → numeric → depth, JSON syntax at any depth) and the nullable-Struct bullet (whole-or-absent, partial refused before ACK); `validate_declared_variants` `# Errors` | `docs:check`, review of text against spec rev 13 | PASS |
+| `FIND-TASK-001-14` | `tests/gateway/peer.rs` `submit_partial_resolved_model`; `tests/bifrost/server/verification_runtime.rs` refused upstream call with null `resolved_model` children on hot and published reads; no production change | `peer::oracle_only_gateway_captures_through_the_peer_scribe`, `verification_runtime::typed_builtin_payloads_are_queryable`, `capture::tests::unresolved_call_nulls_resolved_model_children` | PASS |
+| `FIND-TASK-001-16` | `EncodedVariant::validate` (size, `scan_encoded`, `Variant::try_new`), `object_field_slots` gives every object field its own byte slot; node budget removed; `variant_bytes_to_json`, `mask_placeholders`, `variant_cell_to_json`, `VariantJsonEncoderFactory` run `validate` first | `variant::tests::raw_shared_field_values_are_refused`, `renderers_refuse_hostile_stored_variants`; raw-IPC cases in `builtin_variant_columns_are_refused_before_ack` | PASS |
+| `FIND-TASK-001-18` | `from_json` depth-bounded preflight `nests_past_limit` + `within_depth_limit` pruned copy; `from_json_text` relies on serde_json's iterative `RawValue` scan | `variant::tests::json_depth_is_decided_by_wyrd_at_any_depth`; `oracle::variant_sql::tests::parse_json_classifies_deep_and_oversized_text`; `refuse_json_rows` deep 129/10,000 | PASS |
+| `FIND-TASK-001-21` | R5 file `status: review` | file diff | PASS |
+| `FIND-TASK-001-24` | `scan_encoded` numeric arms: Decimal4/8 → `decimal`, Decimal16 only scale 0 in `i64::MAX+1..=u64::MAX`, non-finite Float/Double → `double` | `variant::tests::raw_numbers_outside_the_json_domain_are_refused`; raw-IPC Decimal4/Decimal8/NaN/infinite cases with accepted `u64::MAX` + Float 1.5 sentinel; `logs::tests::non_finite_log_body_rejects_only_its_record` | PASS |
+| `FIND-TASK-001-25` | `from_json_text` builds, checks size, then `found.finish()` | `variant::tests::json_size_outranks_numeric_and_depth`; Oracle 8 MB cases; `refuse_json_rows` oversize cases | PASS |
+| `FIND-TASK-001-26` | `name <= previous` is invalid for sorted and unsorted metadata | `variant::tests::raw_repeated_field_names_are_refused`; raw-IPC "two fields resolving to one name" | PASS |
+
+### Commands
+
+All cargo/mise commands ran with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd-bifrost-variant/target`.
+
+| Command | Exit | Count |
+|---|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-queue --lib` | 0 | 68 passed |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib'` | 0 | 847 passed |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::variant_sql::tests::parse_json_classifies_deep_and_oversized_text)'` | 0 | 1 passed |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::logs::tests::non_finite_log_body_rejects_only_its_record)'` (within `test(/^tables::logs::/)`, 3 passed) | 0 | 1 passed |
+| `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/unresolved_call_nulls_resolved_model_children/)'` | 0 | 1 passed |
+| `WYRD_LOG=info,vala_bifrost_redux=debug scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=verification_runtime::typed_builtin_payloads_are_queryable) \| test(=verification_runtime::builtin_variant_columns_are_refused_before_ack)"'` | 0 | 2 passed |
+| same wrapper, `-p wyrd-testing --test gateway -P journey --run-ignored=all -E 'test(=peer::oracle_only_gateway_captures_through_the_peer_scribe)'` | 0 | 1 passed |
+| `mise run fmt` / `lints` / `codegen:check` / `check:skills-sync` / `docs:check` | 0 each | — |
+| `git diff --check b4ea01848 HEAD` | 0 | — |
+
+### Diagnosis — `tables::logs::tests::maximal_log_projection_preserves_body_context_and_presence`
+
+- **Symptom:** accepted records 7, expected 8.
+- **Evidence:** `logs/mod.rs` fixture body `DoubleValue(f64::from_bits(0x7ff8_0000_0000_0001))`; `signal.rs` `finish_variant` → `EncodedVariant::from_bytes`.
+- **Cause:** the new non-finite `double` refusal applies to OTLP projection, which shares the canonical gate (REQ-011), so the NaN-bodied record is rejected as designed.
+- **Fix site:** the fixture; a fresh read-only diagnostician confirmed this and found no other caller feeding non-finite or Decimal4/8 into the gate. The fixture now uses `-0.0`, and a new unit test proves a NaN body rejects only its record with `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`.
+
+### Deviations and limits
+
+- **No stacker.** serde_json's `RawValue` parse uses the iterative `ignore_value` with no recursion limit, so deep text already reaches Wyrd's decision; the real overflow was serializing a deep `Value`, fixed by the bounded preflight and pruned copy.
+- **Quadratic numeric scan.** `scan_numbers` costs depth × subtree size; bounded by the 8 MB size limit and marked with a `ponytail:` comment. Proven to 10,000 levels.
+- **Oracle classes** are proven in the in-memory Oracle session test; the published journey already proves error transport and uses the same UDF.
+- **Product effect:** OTLP spans, logs and metrics carrying a NaN or infinite attribute or body value are now rejected per record (partial success), matching canonical Arrow input.
+
+### Non-goals
+
+No public API, configuration, migration, compatibility schema, parser,
+renderer, per-language validation, TASK-002/TASK-003 change, or finding-13
+revival. Only the files listed in the commits above changed.
+
+### New items
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `EncodedVariant::validate` | `wyrd-queue::variant` (`from_bytes`, `scan_encoded`, renderers) | single borrowing gate the constructor and every renderer share |
+| `within_size_limit` | `EncodedVariant` size checks | one size rule for built and raw values |
+| `object_field_slots` | `parquet-variant` `VariantObject` (exposes no field byte ranges) | non-overlap needs raw offsets |
+| `nests_past_limit`, `within_depth_limit` | `scan_numbers`, serde_json recursion limit | bounded depth decision for `Value` before serialization |
+| test helpers `metadata`, `object`, `nested_text`, `nested_value`, `drop_nested` | existing `variant.rs` tests | build hostile raw bytes and deep values |
+| journey helpers `variant_object`, `variant_metadata`, `primitive`, `submit_partial_resolved_model` | `verification_runtime.rs`, `peer.rs` | raw-IPC cases and the direct peer write the client cannot produce |

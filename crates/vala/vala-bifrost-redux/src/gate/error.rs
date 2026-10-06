@@ -9,8 +9,8 @@
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_tonic::error::WYRD_ERROR_HEADER;
-use wyrd_tonic::tonic::metadata::{BinaryMetadataValue, MetadataValue};
+use wyrd_tonic::error::wyrd_error_to_status;
+use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
@@ -362,8 +362,8 @@ impl IngestError {
 
     /// Render as a `tonic::Status` with the canonical code in `ErrorInfo`.
     ///
-    /// The public error's `problem+json` is also attached as the
-    /// `wyrd-error-bin` header every Wyrd gRPC surface carries, so a typed
+    /// The public error's `problem+json` header comes from the shared
+    /// `wyrd_error_to_status` producer every Wyrd gRPC surface uses, so a typed
     /// refusal such as a Variant violation reaches the client with its exact
     /// details rather than only its code.
     ///
@@ -379,13 +379,10 @@ impl IngestError {
             WYRD_ERROR_DOMAIN,
             [] as [(String, String); 0],
         );
-        let mut status =
-            Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details);
-        if let Ok(problem) = serde_json::to_vec(&public.as_problem_json()) {
-            status
-                .metadata_mut()
-                .insert_bin(WYRD_ERROR_HEADER, BinaryMetadataValue::from_bytes(&problem));
-        }
+        let code = grpc_code_for_wyrd(&public);
+        let message = public.to_string();
+        let metadata = wyrd_error_to_status(public, None).metadata().clone();
+        let mut status = Status::with_error_details_and_metadata(code, message, details, metadata);
         if retryable_busy {
             status
                 .metadata_mut()
@@ -447,7 +444,7 @@ mod tests {
     use super::IngestError;
     use crate::contracts::ScribeError;
     use wyrd_spec::vala::error::BifrostError;
-    use wyrd_tonic::error::WYRD_ERROR_HEADER;
+    use wyrd_tonic::error::wyrd_error_to_status;
     use wyrd_tonic::tonic::Code;
     use wyrd_tonic::tonic_types::StatusExt;
 
@@ -660,7 +657,7 @@ mod tests {
     }
 
     /// Assert that every ingest condition has one Wyrd identity and matching
-    /// gRPC status, `ErrorInfo`, and `problem+json` header projection.
+    /// gRPC status, `ErrorInfo`, and shared `problem+json` header projection.
     ///
     /// # Panics
     ///
@@ -679,16 +676,15 @@ mod tests {
                 .get_details_error_info()
                 .expect("canonical ingest status carries ErrorInfo");
             assert_eq!(info.reason, expected_code, "ErrorInfo drift for {public}");
-            let problem = grpc
+            let headers = grpc.metadata().clone().into_headers();
+            let shared = wyrd_error_to_status(public.clone(), None)
                 .metadata()
-                .get_bin(WYRD_ERROR_HEADER)
-                .and_then(|value| value.to_bytes().ok())
-                .expect("canonical ingest status carries its problem");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&problem).expect("problem is JSON"),
-                public.as_problem_json(),
-                "problem drift for {public}"
-            );
+                .clone()
+                .into_headers();
+            assert!(!shared.is_empty(), "shared producer attaches the problem");
+            for (name, value) in &shared {
+                assert_eq!(headers.get(name), Some(value), "problem drift for {public}");
+            }
         }
     }
 

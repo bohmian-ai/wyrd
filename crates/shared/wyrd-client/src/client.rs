@@ -18,7 +18,7 @@ use std::sync::Arc;
 use secrecy::SecretString;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use wyrd_spec::auth::TokenAudience;
+use wyrd_spec::auth::{SecretBearer, TokenAudience};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
@@ -326,6 +326,22 @@ impl WyrdClient {
         Arc::clone(&self.auth)
     }
 
+    /// Return a current bearer for this client's credential.
+    ///
+    /// Hands the token to a third-party client, such as an OpenAI SDK pointed
+    /// at the Gateway. The value comes from the shared [`AuthMiddleware`]: a
+    /// fresh cached token is returned as-is, otherwise the middleware
+    /// exchanges or renews it first. Nothing is cached here, so a caller that
+    /// holds the token past its expiry calls this again for a fresh one. The
+    /// returned [`SecretBearer`] redacts itself in `Debug`.
+    ///
+    /// # Errors
+    /// Returns the server's stable error when it refuses the credential, or a
+    /// transport error when `/auth/token` cannot be reached.
+    pub async fn access_token(&self) -> Result<SecretBearer, WyrdError> {
+        self.auth.bearer().await.map_err(AuthError::into_wyrd)
+    }
+
     /// The effective HTTP server URL this client sends requests to.
     #[must_use]
     pub fn server_url(&self) -> &str {
@@ -362,5 +378,60 @@ impl WyrdClient {
     ) -> Result<crate::transport::grpc::GrpcConnection, WyrdClientError> {
         crate::transport::grpc::GrpcConnection::connect(&self.grpc_config, Arc::clone(&self.auth))
             .await
+    }
+}
+
+/// Unit tests for the assembled client's token surface.
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::WyrdClient;
+    use crate::auth::AuthMiddleware;
+    use crate::config::{ClientConfig, TokenCacheMode};
+    use crate::transport::credential::ResolvedCredential;
+    use crate::transport::http::HttpTransport;
+
+    /// `access_token` reads through the shared [`AuthMiddleware`]: an API key
+    /// is exchanged at `/auth/token`, a token inside the refresh skew is
+    /// re-exchanged on the next call rather than served from any client-side
+    /// copy (the mock expects exactly two exchanges), and the bearer's `Debug`
+    /// stays redacted.
+    #[tokio::test]
+    async fn access_token_uses_the_shared_refreshing_auth_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gateway-bearer",
+                "token_type": "Bearer",
+                "expires_in": 1
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = ClientConfig::default();
+        config.http.base_url = server.uri();
+        config.token_cache = TokenCacheMode::InMemory;
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::ApiKey("api-key-value".to_owned().into()),
+        )
+        .expect("middleware builds");
+        let http = HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
+        let client = WyrdClient::from_parts(auth, http, config.grpc);
+
+        let first = client.access_token().await.expect("first exchange");
+        let second = client.access_token().await.expect("stale token refreshes");
+
+        assert_eq!(first.expose(), "gateway-bearer");
+        assert_eq!(second.expose(), "gateway-bearer");
+        assert!(
+            !format!("{first:?}").contains("gateway-bearer"),
+            "Debug must redact the bearer"
+        );
     }
 }

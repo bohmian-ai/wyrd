@@ -49,6 +49,18 @@ class WyrdClient:
         """
         ...
 
+    def access_token(self) -> str:
+        """Return a current bearer for this client's credential.
+
+        Hand it to a third-party client, such as an OpenAI SDK pointed at the
+        Gateway. The token is renewed in Rust when it nears expiry, so call
+        this again rather than holding the value.
+
+        Raises:
+            WyrdError: the server's stable code when it refuses the credential.
+        """
+        ...
+
     def on_behalf_of(
         self,
         subject_token: str,

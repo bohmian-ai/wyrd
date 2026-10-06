@@ -53,6 +53,15 @@ impl NativeWyrdClientResult {
 /// `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
 /// metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
 /// has saved logins but none for `tenant`.
+/// Closed result of reading one client's current bearer: a token or a catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeAccessTokenResult {
+    /// Current bearer when the auth path produced one.
+    pub token: Option<String>,
+    /// Catalog failure otherwise.
+    pub error: Option<NativeWyrdError>,
+}
+
 #[napi]
 pub fn connect_wyrd_client(
     server_url: Option<String>,
@@ -86,6 +95,25 @@ impl NativeWyrdClient {
     #[napi(getter)]
     pub fn grpc_url(&self) -> String {
         self.client.grpc_url().to_owned()
+    }
+
+    /// Returns a current bearer for this client's credential.
+    ///
+    /// Reads through the Rust client's shared auth middleware, so an expired
+    /// token is renewed there; nothing is cached in Node. A refusal or
+    /// transport failure is returned as catalog metadata.
+    #[napi]
+    pub async fn access_token(&self) -> NativeAccessTokenResult {
+        match self.client.access_token().await {
+            Ok(bearer) => NativeAccessTokenResult {
+                token: Some(bearer.expose().to_owned()),
+                error: None,
+            },
+            Err(error) => NativeAccessTokenResult {
+                token: None,
+                error: Some(NativeWyrdError::from_wyrd(&error)),
+            },
+        }
     }
 
     /// Returns a client that acts for the holder of `subject_token`.

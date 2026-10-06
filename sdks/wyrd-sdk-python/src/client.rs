@@ -71,6 +71,21 @@ impl PyWyrdClient {
         self.inner.grpc_url()
     }
 
+    /// Return a current bearer for this client's credential.
+    ///
+    /// Reads through the Rust client's shared auth middleware with the GIL
+    /// released, so an expired token is renewed there; nothing is cached on
+    /// the Python side.
+    ///
+    /// # Errors
+    /// Raises the server's stable error when it refuses the credential, or a
+    /// transport error when the token endpoint cannot be reached.
+    fn access_token(&self, py: Python<'_>) -> WyrdPyResult<String> {
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.access_token()))
+            .map(|bearer| bearer.expose().to_owned())
+            .map_err(WyrdPyError::from)
+    }
+
     /// Return a client that acts for the holder of `subject_token`.
     ///
     /// This client's credential is the actor. The first RFC 8693 exchange runs

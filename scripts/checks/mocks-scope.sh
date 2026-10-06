@@ -1,27 +1,13 @@
 #!/usr/bin/env bash
-# WHY THIS FILE EXISTS: mock libraries (mockall, wiremock, mockito) are
-# test-only tools. Declared as a regular dependency, a mock crate becomes a
-# transitive dependency of every downstream consumer and can reach a
-# production build. Declared under [dev-dependencies], the compiler already
-# refuses any non-test use, so source files need no allowlist.
+# WHY THIS FILE EXISTS: mock crates (mockall, wiremock, mockito) must never
+# reach a production build. Test-only use needs no listing: a
+# [dev-dependencies] crate cannot compile into non-test code.
 #
-# WHAT IT CHECKS: no workspace package other than wyrd-testing, the test
-# harness crate, declares a mock crate as a normal or build dependency.
+# WHAT IT CHECKS: no mock crate appears in the normal/build dependency graph
+# of any workspace package except the test harnesses wyrd-testing and
+# wyrd-sdk-ts-testing.
 set -euo pipefail
-
-command -v jq >/dev/null || { echo 'check:mocks-scope requires jq'; exit 1; }
-
-leaks=$(cargo metadata --format-version=1 --no-deps --locked |
-  jq -r '.packages[]
-         | select(.name != "wyrd-testing")
-         | .name as $package
-         | .dependencies[]
-         | select(.name | test("^(mockall|wiremock|mockito)$"))
-         | select(.kind != "dev")
-         | "\($package): \(.name) (\(.kind // "normal"))"')
-
-if [[ -n "$leaks" ]]; then
-  echo 'mock dependency declared outside [dev-dependencies]:'
-  echo "$leaks"
-  exit 1
-fi
+graph=$(cargo tree --locked --workspace \
+  --exclude wyrd-testing --exclude wyrd-sdk-ts-testing \
+  -e normal,build --prefix none)
+! grep -E '^(mockall|wiremock|mockito) ' <<<"$graph"

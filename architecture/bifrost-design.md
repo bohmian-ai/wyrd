@@ -155,13 +155,34 @@ back exactly without `serde_json` `arbitrary_precision`. A value
 nested beyond 64 containers is `WYRD_VALA_400_VARIANT_TOO_DEEP`, one whose
 encoded metadata plus value exceeds 8,388,608 bytes is
 `WYRD_VALA_413_VARIANT_TOO_LARGE`, and undecodable bytes are
-`WYRD_VALA_400_VARIANT_INVALID_JSON`. Scribe repeats the extension, size,
-encoding, and depth checks over every declared Variant of a built-in table at
-its admission boundary, before the batch is acknowledged, because a raw Arrow
-writer can skip client preparation and the fingerprint compares storage types
-only. Extension identity is checked across all fields first, then each value
-in row and field order for size, encoding, and depth; the first failure names
-the field, row, and path.
+`WYRD_VALA_400_VARIANT_INVALID_JSON`.
+
+Raw Variant bytes are held to the same domain. A raw number must be one JSON
+input could produce: an integer, a finite Float or Double, or a scale-zero
+Decimal16 in `i64::MAX + 1..=u64::MAX`. Decimal4, Decimal8, any other
+Decimal16 (`numeric_kind: "decimal"`), and a NaN or infinite Float or Double
+(`numeric_kind: "double"`) are `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`;
+exact fractional or wider numbers travel as strings. A raw object is canonical
+or `WYRD_VALA_400_VARIANT_INVALID_JSON`: its resolved field names strictly
+increase whether or not the metadata dictionary is sorted, and every field
+value owns its own bytes, never shared with or overlapping another field's.
+Validation of raw bytes is iterative and linear in their size, and every
+stored-Variant reader and renderer applies it before decoding, so a hostile
+cell is an error rather than unbounded work.
+
+One value reports one failure in a fixed order: size, then invalid JSON or
+encoding, then numeric range, then depth, wherever each sits in the value.
+JSON size counts the bytes actually built from accepted members; a refused
+number or an over-depth container adds none. JSON syntax is decided at any
+nesting depth, so valid JSON past the limit is too deep, never invalid, and
+`try_parse_json` maps only invalid JSON to null.
+
+Scribe repeats the extension, size, encoding, numeric, and depth checks over
+every declared Variant of a built-in table at its admission boundary, before
+the batch is acknowledged, because a raw Arrow writer can skip client
+preparation and the fingerprint compares storage types only. Extension
+identity is checked across all fields first, then each value in row and field
+order in the order above; the first failure names the field, row, and path.
 
 Built-in tables store open caller content as Variant and closed shapes as
 typed columns:
@@ -182,6 +203,15 @@ typed columns:
   nullable Structs: `drift_report` (`method`, Variant `features`, `verdict`) and
   `eval_summary` (task counts, `pass_rate`, `duration_ms`). A scored result sets
   exactly the one its implementation owns.
+- Every nullable built-in Struct — `drift_report`, `eval_summary`, the
+  `vala.metrics.points` bucket sets, and `vala.gateway.calls`
+  `resolved_model` — has nullable children, because a required Parquet leaf
+  under a null parent reads back as another row's value through a field
+  query. The Struct is whole or absent: a present one sets every child its
+  shape requires and an absent one nulls every child, so `s['child']` reads
+  SQL null for an absent Struct on hot and published data alike. Admission
+  refuses a batch with a partial Struct before ACK with
+  `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
 - `vala.dev.agent_traces` `messages` and `tool_io`, `vala.eval.observations`
   `context` and `media`, `vala.eval.result_items` `actual` and `expected`,
   `vala.gateway.calls` `request_payload` and `response_payload`, and

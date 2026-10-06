@@ -213,7 +213,8 @@ pub struct BuiltinTableDefinition {
 /// Returns [`BifrostError::UnsupportedType`] naming the top-level field when
 /// a field holding a Variant arrives without the extension or in a storage
 /// layout other than the declared one, and the catalogued Variant error
-/// (size, encoding, or depth) for the first stored value that fails.
+/// (size, encoding or canonical form, numeric range, or depth, in that
+/// order) for the first stored value that fails.
 pub(crate) fn validate_declared_variants(
     declared: &[Field],
     batch: &RecordBatch,

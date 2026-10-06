@@ -256,15 +256,15 @@ datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusi
 # Parquet read planner) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "41e1ecf4156499124edfef0d9a4941d56ca5c697" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "924d571db0c5cb4b025027b82699f9fade846ec8" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

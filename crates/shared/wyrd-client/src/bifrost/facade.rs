@@ -1146,8 +1146,9 @@ mod tests {
     /// admission. Utf8 and LargeUtf8 JSON text and the extension reach the
     /// server as the Variant extension, while a same-shaped text column the
     /// table does not declare as Variant stays text. Invalid JSON, a wrong wire
-    /// type, a column supplied twice, and a failed describe refuse before any
-    /// send or byte reservation.
+    /// type for the Variant or the ordinary `note` column, a column supplied
+    /// twice, and a failed describe refuse before any send or byte
+    /// reservation.
     ///
     /// # Panics
     ///
@@ -1218,6 +1219,17 @@ mod tests {
                     Field::new("payload", DataType::Int64, true),
                     Arc::new(Int64Array::from(vec![1])),
                 ),
+                "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
+            ),
+            (
+                RecordBatch::try_from_iter([
+                    (
+                        "payload",
+                        Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                    ),
+                    ("note", Arc::new(Int64Array::from(vec![1]))),
+                ])
+                .expect("batch builds"),
                 "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
             ),
             (

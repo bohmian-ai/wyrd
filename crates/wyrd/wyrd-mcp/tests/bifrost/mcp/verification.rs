@@ -396,7 +396,7 @@ mod pg_tests {
     /// that `result_id`, both with null `owner_card_uid` and `binding_id` and
     /// the exact subject UID. A reader is refused the start; another tenant's
     /// administrator can neither start the run nor read it back, and its
-    /// `bifrost.query` sees no result table.
+    /// `bifrost.query` reads its own provisioned, empty result table.
     ///
     /// # Errors
     ///
@@ -574,20 +574,15 @@ mod pg_tests {
             foreign_read.contains("WYRD_VERIFICATION_404_RUN_NOT_FOUND"),
             "another tenant cannot read the run: {foreign_read}"
         );
-        let foreign_query = refusal(
-            foreign_client
-                .call_tool(call(
-                    QUERY,
-                    serde_json::json!({
-                        "sql": "SELECT result_id FROM vala.verification.results",
-                        "max_rows": 10,
-                    }),
-                )?)
-                .await,
-        )?;
-        assert!(
-            foreign_query.contains("WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
-            "no result crosses tenants: {foreign_query}"
+        let foreign_rows = rows(
+            &foreign_client,
+            "SELECT result_id FROM vala.verification.results".to_owned(),
+        )
+        .await?;
+        assert_eq!(
+            foreign_rows,
+            serde_json::json!([]),
+            "no result crosses tenants"
         );
         foreign_client.cancel().await?;
         server.shutdown().await?;

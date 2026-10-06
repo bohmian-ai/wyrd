@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError};
-use vala_bifrost_redux::tables::builtin_tables;
+use vala_bifrost_redux::tables::{AuditLogTable, DomainTable, builtin_tables};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::platform::tenants::list_active_tenant_ids;
 use wyrd_sql::{OperatorPool, SqlError};
@@ -59,7 +59,9 @@ impl BuiltinTables {
 
     /// Ensure every canonical built-in exists for one tenant.
     ///
-    /// Each ensure is idempotent, so a repeat — a resumed provisioning or a
+    /// [`DataTenantId::SYSTEM_OWNER`] receives only the audit log, the one
+    /// table the catalog lets it own: system-attributed security decisions are
+    /// published there. Each ensure is idempotent, so a repeat — a resumed provisioning or a
     /// restart — registers nothing new and returns success. Tables are ensured
     /// in inventory order and the first failure stops the loop; tables ensured
     /// before it remain registered, which a retry absorbs.
@@ -68,7 +70,12 @@ impl BuiltinTables {
     /// Returns [`BuiltinTablesError::Catalog`] when the catalog cannot ensure a
     /// built-in for `tenant`.
     pub async fn ensure_tenant(&self, tenant: DataTenantId) -> Result<(), BuiltinTablesError> {
-        for definition in builtin_tables() {
+        let system_owner = tenant == DataTenantId::SYSTEM_OWNER;
+        for definition in builtin_tables().iter().filter(|definition| {
+            !system_owner
+                || (definition.namespace == AuditLogTable::NAMESPACE
+                    && definition.name == AuditLogTable::NAME)
+        }) {
             self.catalog
                 .ensure_builtin(tenant, definition)
                 .await
@@ -82,9 +89,8 @@ impl BuiltinTables {
     /// Startup reconciliation: lists the active tenants on the operator
     /// boundary, which alone may read the directory, then ensures each
     /// tenant's inventory under that tenant's own catalog binding. Suspended
-    /// and deleted tenants are skipped, matching every other startup sweep, as
-    /// is [`DataTenantId::SYSTEM_OWNER`]: it attributes platform records and
-    /// owns no data-tenant table binding.
+    /// and deleted tenants are skipped, matching every other startup sweep.
+    /// [`DataTenantId::SYSTEM_OWNER`] is included for its audit log.
     ///
     /// # Errors
     /// Returns [`BuiltinTablesError::Directory`] when the directory read fails
@@ -94,9 +100,6 @@ impl BuiltinTables {
     pub async fn reconcile(&self, directory: &OperatorPool) -> Result<(), BuiltinTablesError> {
         // ponytail: sequential per tenant; bound-concurrent if startup with many tenants is slow.
         for tenant in list_active_tenant_ids(directory).await? {
-            if tenant == DataTenantId::SYSTEM_OWNER {
-                continue;
-            }
             self.ensure_tenant(tenant).await?;
         }
         Ok(())

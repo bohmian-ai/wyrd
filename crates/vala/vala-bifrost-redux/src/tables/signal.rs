@@ -11,8 +11,8 @@
 //! typed accumulators that turn projected rows into Arrow arrays.
 
 use arrow::array::{
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
-    Int64Array, ListArray, StringArray, StructArray,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+    StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -469,7 +469,10 @@ impl ScopeEnvelope {
     /// row that repeats it.
     #[must_use]
     pub fn repeated_bytes(&self) -> usize {
-        self.name.len() + self.version.len() + self.attributes.encoded_bytes() + self.schema_url.len()
+        self.name.len()
+            + self.version.len()
+            + self.attributes.encoded_bytes()
+            + self.schema_url.len()
     }
 }
 

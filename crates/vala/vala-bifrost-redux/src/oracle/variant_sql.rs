@@ -46,11 +46,11 @@ use parquet_variant_compute::{
     GetOptions, VariantArray, VariantArrayBuilder, unshred_variant, variant_get,
 };
 use parquet_variant_json::VariantToJson;
-use wyrd_spec::vala::BifrostError;
 use wyrd_queue::variant::{
     EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, variant_field,
     variant_storage_type,
 };
+use wyrd_spec::vala::BifrostError;
 
 use crate::tables::fields::is_variant;
 

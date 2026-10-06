@@ -336,8 +336,8 @@ fn validate_variant_values(
             let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
             let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
             (start..end).try_for_each(|item| {
-                    validate_variant_values(element, label, list.values().as_ref(), item, row)
-                })
+                validate_variant_values(element, label, list.values().as_ref(), item, row)
+            })
         }
         _ => Ok(()),
     }

@@ -11,16 +11,23 @@
 //! Oracle under the tenant's SYSTEM Drift reader and audited there. A third
 //! journey proves every built-in typed payload — verification summaries, Eval
 //! items, gateway payloads, agent traces, and audit detail — reads back as the
-//! producer's native JSON.
+//! producer's native JSON. A fourth journey sends raw Arrow IPC with malformed
+//! Variant columns to built-ins and proves each is refused before any ACK.
 
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, FixedSizeBinaryArray, Float64Array, StringArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, Float64Array, ListArray,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema, TimeUnit};
+use arrow::compute::cast;
+use arrow::datatypes::{
+    DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef, TimeUnit,
+};
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike as _, Utc};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -36,8 +43,9 @@ use vala_sql::queries::audit_staging::append_audit;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
+use wyrd_client::bifrost::TableConfig;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, variant_cell_to_json, variant_storage_type,
+    EncodedVariant, VariantColumnBuilder, variant_cell_to_json, variant_field, variant_storage_type,
 };
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
@@ -49,20 +57,24 @@ use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{GatewayAccess, PrincipalId, PrincipalKindTag};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::{
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, VARIANT_MAX_DEPTH,
+    VARIANT_MAX_ENCODED_BYTES,
+};
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::AssertionResult;
 use wyrd_spec::vala::managed_columns::{
     CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
 };
-use wyrd_spec::vala::{AuditDetail, audit_detail_canonical_json};
+use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
-use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -1171,11 +1183,513 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     Ok(())
 }
 
+/// Raw Arrow IPC that bypasses every client-side Variant check reaches Scribe
+/// admission for a non-signal built-in and a nested signal Variant, and each
+/// malformed frame is refused with its exact catalogued error before any ACK.
+///
+/// `vala.dev.agent_traces` covers a missing and a foreign extension marker,
+/// invalid bytes, one container past the depth limit, and one byte past the
+/// size limit. Precedence is pinned twice: an oversized value that is also
+/// malformed reports its size, and a wrong marker on one field outranks
+/// invalid bytes in another. `vala.traces.spans` covers the Variant nested in
+/// `events`, named by its top-level column. A non-Variant type change stays a
+/// fingerprint mismatch. Afterward only the two valid sentinel frames are
+/// readable, so no refused frame persisted a row.
+///
+/// # Errors
+///
+/// Returns the first frame whose outcome or stored rows differ.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJourneyError> {
+    let admission = VariantAdmissionJourney::start().await?;
+    let refused = admission.session("refused");
+    let valid = || raw_variant(&EMPTY_METADATA, &[VARIANT_NULL]);
+    let invalid = || raw_variant(&[0xff], &[0xff]);
+    let storage_only =
+        |name: &str, nullable: bool| Field::new(name, variant_storage_type(), nullable);
+    let foreign = |name: &str| {
+        storage_only(name, false).with_metadata(HashMap::from([(
+            EXTENSION_NAME_KEY.to_owned(),
+            "arrow.json".to_owned(),
+        )]))
+    };
+    let messages = || variant_field("messages", false);
+    let tool_io = || variant_field("tool_io", true);
+    let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES)?;
+    let unsupported = |field: &str| BifrostError::UnsupportedType {
+        field: field.to_owned(),
+        data_type: variant_storage_type().to_string(),
+    };
+    let invalid_messages = BifrostError::VariantInvalidJson {
+        field: "messages".to_owned(),
+        row: 0,
+        path: String::new(),
+    };
+    let deepest = nested_lists(VARIANT_MAX_DEPTH)?;
+    EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
+        .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
+
+    let traces = [
+        (
+            "missing extension",
+            (storage_only("messages", false), valid()?),
+            unsupported("messages"),
+        ),
+        (
+            "foreign extension",
+            (foreign("messages"), valid()?),
+            unsupported("messages"),
+        ),
+        ("invalid bytes", (messages(), invalid()?), invalid_messages),
+        (
+            "one container past the depth limit",
+            (
+                messages(),
+                raw_variant(&EMPTY_METADATA, &nested_lists(VARIANT_MAX_DEPTH + 1)?)?,
+            ),
+            BifrostError::VariantTooDeep {
+                field: "messages".to_owned(),
+                row: 0,
+                path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
+                depth: VARIANT_MAX_DEPTH + 1,
+                limit: VARIANT_MAX_DEPTH,
+            },
+        ),
+        (
+            "an oversized malformed value reports its size",
+            (messages(), raw_variant(&[0xff], &vec![0xff; limit])?),
+            BifrostError::VariantTooLarge {
+                field: "messages".to_owned(),
+                row: 0,
+                bytes: VARIANT_MAX_ENCODED_BYTES + 1,
+                limit: VARIANT_MAX_ENCODED_BYTES,
+            },
+        ),
+    ];
+    for (what, messages, expected) in traces {
+        let frame = admission.trace_frame(&refused, messages, (tool_io(), valid()?))?;
+        admission
+            .refuse(what, AGENT_TRACES, &frame, &expected)
+            .await?;
+    }
+    let frame = admission.trace_frame(
+        &refused,
+        (messages(), invalid()?),
+        (storage_only("tool_io", true), valid()?),
+    )?;
+    admission
+        .refuse(
+            "a wrong marker outranks invalid bytes",
+            AGENT_TRACES,
+            &frame,
+            &unsupported("tool_io"),
+        )
+        .await?;
+    let frame = admission.trace_frame(&refused, (messages(), valid()?), (tool_io(), valid()?))?;
+    let mismatched = frame
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "model" => Arc::new(Field::new("model", DataType::LargeUtf8, false)),
+            _ => Arc::clone(field),
+        })
+        .collect::<Vec<_>>();
+    let mut columns = frame.columns().to_vec();
+    columns[frame.schema().index_of("model")?] = cast(
+        frame.column_by_name("model").ok_or("no model")?,
+        &DataType::LargeUtf8,
+    )?;
+    let mismatched = RecordBatch::try_new(Arc::new(Schema::new(mismatched)), columns)?;
+    let error = admission.refusal(AGENT_TRACES, &mismatched).await?;
+    expect_eq(
+        "a non-Variant type change",
+        &error.code(),
+        &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+    )?;
+
+    let refused_spans = admission.spans_frame(&refused);
+    let event_storage =
+        with_event_attributes(&refused_spans, storage_only("attributes", false), valid()?)?;
+    let events_type = event_storage
+        .schema()
+        .field_with_name("events")?
+        .data_type()
+        .to_string();
+    admission
+        .refuse(
+            "a nested marker",
+            SPANS,
+            &event_storage,
+            &BifrostError::UnsupportedType {
+                field: "events".to_owned(),
+                data_type: events_type,
+            },
+        )
+        .await?;
+    let event_bytes = with_event_attributes(
+        &refused_spans,
+        variant_field("attributes", false),
+        invalid()?,
+    )?;
+    admission
+        .refuse(
+            "nested invalid bytes",
+            SPANS,
+            &event_bytes,
+            &BifrostError::VariantInvalidJson {
+                field: "events".to_owned(),
+                row: 0,
+                path: String::new(),
+            },
+        )
+        .await?;
+
+    let accepted = admission.session("accepted");
+    let sentinel =
+        admission.trace_frame(&accepted, (messages(), valid()?), (tool_io(), valid()?))?;
+    admission.accept(AGENT_TRACES, &sentinel).await?;
+    admission
+        .accept(SPANS, &admission.spans_frame(&accepted))
+        .await?;
+    admission.journey.server.flush_bifrost().await?;
+
+    let suffix = &admission.run;
+    expect_eq(
+        "stored agent traces",
+        &admission
+            .journey
+            .rows(format!(
+                "SELECT dev_session_id, count(*) FROM {AGENT_TRACES} \
+                 WHERE dev_session_id LIKE '%{suffix}' GROUP BY dev_session_id"
+            ))
+            .await?,
+        &vec![vec![json!(accepted), json!(1)]],
+    )?;
+    expect_eq(
+        "stored spans",
+        &admission
+            .journey
+            .rows(format!(
+                "SELECT scope_name, count(*) FROM {SPANS} \
+                 WHERE scope_name LIKE '%{suffix}' GROUP BY scope_name"
+            ))
+            .await?,
+        &vec![vec![json!(accepted), json!(2)]],
+    )?;
+
+    admission.journey.server.shutdown().await?;
+    Ok(())
+}
+
+/// The non-signal built-in the Variant admission journey writes.
+const AGENT_TRACES: &str = "vala.dev.agent_traces";
+
+/// The signal built-in whose nested `events` Variant the journey writes.
+const SPANS: &str = "vala.traces.spans";
+
+/// Arrow field-metadata key naming a field's extension type.
+const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Variant metadata with an empty key dictionary.
+const EMPTY_METADATA: [u8; 3] = [0x01, 0x00, 0x00];
+
+/// The Variant null primitive value.
+const VARIANT_NULL: u8 = 0x00;
+
+/// Variant array header: four-byte offsets and a one-byte element count.
+const VARIANT_ARRAY_HEADER: u8 = 0x0f;
+
+/// One bound server and an admin ingest door that sends raw Arrow IPC frames.
+struct VariantAdmissionJourney {
+    /// Server, tenant, and published-row reader.
+    journey: TypedPayloadJourney,
+    /// Ingest transport that sends frames exactly as built.
+    ingest: RawIngest,
+    /// The described `vala.traces.spans` user schema.
+    spans: SchemaRef,
+    /// Suffix that scopes this run's sessions and span scopes.
+    run: String,
+}
+
+impl VariantAdmissionJourney {
+    /// Start the server, provision both built-ins, and connect an admin
+    /// ingest transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start, bootstrap, provisioning, client, or describe error.
+    async fn start() -> Result<Self, ServerJourneyError> {
+        let journey = TypedPayloadJourney::start().await?;
+        for (namespace, name) in [("dev", "agent_traces"), ("traces", "spans")] {
+            journey
+                .server
+                .ensure_builtin_table_for_test(journey.tenant, namespace, name)
+                .await?;
+        }
+        let Bootstrap::Machine { api_key, .. } = journey
+            .server
+            .bootstrap_service("variant_admission_writer", &["admin"])
+            .await?
+        else {
+            return Err("a service bootstrap returned a user".into());
+        };
+        let client = wyrd_client::bifrost::client_from_options(
+            journey.server.base_url(),
+            Some(api_key.expose_secret()),
+            journey.server.grpc_url().as_deref(),
+        )?;
+        let spans = Arc::clone(TableConfig::describe(&client, SPANS).await?.user_schema());
+        Ok(Self {
+            ingest: RawIngest::connect(&client).await?,
+            journey,
+            spans,
+            run: uuid::Uuid::now_v7().simple().to_string(),
+        })
+    }
+
+    /// Name one session or span scope of this run.
+    fn session(&self, outcome: &str) -> String {
+        format!("{outcome}-{}", self.run)
+    }
+
+    /// One agent trace under `session` with the given Variant columns.
+    ///
+    /// Every other column takes a fixed valid value, so a refusal can come
+    /// only from the two supplied fields or a deliberate schema change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the columns do not form a batch.
+    fn trace_frame(
+        &self,
+        session: &str,
+        messages: (Field, ArrayRef),
+        tool_io: (Field, ArrayRef),
+    ) -> Result<RecordBatch, ServerJourneyError> {
+        let now = Utc::now().timestamp_micros();
+        let at = || Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone("UTC"));
+        let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let mut fields = AgentTracesTable::arrow_fields();
+        let columns: Vec<ArrayRef> = vec![
+            text(session),
+            text("wyrd"),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            text("main"),
+            text("variant-admission"),
+            Arc::new(FixedSizeBinaryArray::new_null(16, 1)),
+            Arc::new(FixedSizeBinaryArray::new_null(8, 1)),
+            text("assistant"),
+            text("gpt-4o"),
+            text("openai"),
+            messages.1,
+            tool_io.1,
+            at(),
+            at(),
+        ];
+        for field in [messages.0, tool_io.0] {
+            let index = fields
+                .iter()
+                .position(|declared| declared.name() == field.name())
+                .ok_or("an agent trace field is undeclared")?;
+            fields[index] = field;
+        }
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    }
+
+    /// The canonical two-span fixture under span scope `scope`.
+    fn spans_frame(&self, scope: &str) -> RecordBatch {
+        canonical_signals::spans(
+            &self.spans,
+            scope,
+            Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        )
+    }
+
+    /// Send `batch` as one raw IPC frame and return the refusal it earns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error, or a description when the frame is acked.
+    async fn refusal(
+        &self,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<WyrdError, ServerJourneyError> {
+        match self
+            .ingest
+            .insert(table, uuid::Uuid::now_v7(), ipc(batch)?)
+            .await
+        {
+            Ok(request) => Err(format!("{table} acked malformed frame {request}").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    /// Require that `batch` is refused with exactly `expected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description naming `what` when the frame is acked or the
+    /// refusal is any other error.
+    async fn refuse(
+        &self,
+        what: &str,
+        table: &str,
+        batch: &RecordBatch,
+        expected: &BifrostError,
+    ) -> Result<(), ServerJourneyError> {
+        match self.refusal(table, batch).await? {
+            WyrdError::Vala { error } => expect_eq(what, &error, expected),
+            other => Err(format!("{what} was refused as {other:?}").into()),
+        }
+    }
+
+    /// Require that `batch` is acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding error or the server's refusal.
+    async fn accept(&self, table: &str, batch: &RecordBatch) -> Result<(), ServerJourneyError> {
+        self.ingest
+            .insert(table, uuid::Uuid::now_v7(), ipc(batch)?)
+            .await?;
+        Ok(())
+    }
+}
+
+/// One Variant storage cell holding exactly `metadata` and `value`.
+///
+/// The bytes are not validated, which is what lets a frame carry a Variant
+/// no client constructor would produce.
+///
+/// # Errors
+///
+/// Returns the Arrow error when the storage struct does not assemble.
+fn raw_variant(metadata: &[u8], value: &[u8]) -> Result<ArrayRef, ServerJourneyError> {
+    let DataType::Struct(children) = variant_storage_type() else {
+        return Err("Variant storage is not a struct".into());
+    };
+    Ok(Arc::new(StructArray::try_new(
+        children,
+        vec![
+            Arc::new(BinaryArray::from_vec(vec![metadata])),
+            Arc::new(BinaryArray::from_vec(vec![value])),
+        ],
+        None,
+    )?))
+}
+
+/// Variant value bytes for `depth` single-element lists around a null.
+///
+/// Each list uses four-byte offsets, so the encoding stays valid at any
+/// depth the journey needs.
+///
+/// # Errors
+///
+/// Returns an error when the encoding outgrows a four-byte offset.
+fn nested_lists(depth: u32) -> Result<Vec<u8>, ServerJourneyError> {
+    let mut value = vec![VARIANT_NULL];
+    for _ in 0..depth {
+        let mut list = vec![VARIANT_ARRAY_HEADER, 1];
+        list.extend(0_u32.to_le_bytes());
+        list.extend(u32::try_from(value.len())?.to_le_bytes());
+        list.extend(value);
+        value = list;
+    }
+    Ok(value)
+}
+
+/// Replace the `attributes` Variant of every `events` element in `spans`.
+///
+/// The supplied field and values stand in for the declared child, and the
+/// list and top-level field are rebuilt around them unchanged otherwise.
+///
+/// # Errors
+///
+/// Returns an error when `events` is not a list of structs with an
+/// `attributes` child, or the rebuilt arrays do not assemble.
+fn with_event_attributes(
+    spans: &RecordBatch,
+    attributes: Field,
+    values: ArrayRef,
+) -> Result<RecordBatch, ServerJourneyError> {
+    let schema = spans.schema();
+    let index = schema.index_of("events")?;
+    let events = spans
+        .column(index)
+        .as_list_opt::<i32>()
+        .ok_or("events is a list")?;
+    let DataType::List(element) = events.data_type() else {
+        return Err("events is a list".into());
+    };
+    let (children, mut columns, nulls) = events
+        .values()
+        .as_struct_opt()
+        .ok_or("an event is a struct")?
+        .clone()
+        .into_parts();
+    let (position, _) = children
+        .find("attributes")
+        .ok_or("an event has attributes")?;
+    let mut children = children.iter().cloned().collect::<Vec<_>>();
+    children[position] = Arc::new(attributes);
+    columns[position] = values;
+    let elements = StructArray::try_new(children.into(), columns, nulls)?;
+    let element = Arc::new(
+        element
+            .as_ref()
+            .clone()
+            .with_data_type(elements.data_type().clone()),
+    );
+    let events = ListArray::try_new(
+        element,
+        events.offsets().clone(),
+        Arc::new(elements),
+        events.nulls().cloned(),
+    )?;
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields[index] = Arc::new(
+        schema
+            .field(index)
+            .clone()
+            .with_data_type(events.data_type().clone()),
+    );
+    let mut columns = spans.columns().to_vec();
+    columns[index] = Arc::new(events);
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+/// Encode `batch` as one Arrow IPC stream.
+///
+/// # Errors
+///
+/// Returns the Arrow error when the stream does not encode.
+fn ipc(batch: &RecordBatch) -> Result<Vec<u8>, ServerJourneyError> {
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref())?;
+    writer.write(batch)?;
+    writer.finish()?;
+    drop(writer);
+    Ok(bytes)
+}
+
 /// Fail with `what` and both values unless `actual` equals `expected`.
 ///
 /// # Errors
 /// Returns a description naming `what` when the values differ.
-fn expect_eq<T: PartialEq + std::fmt::Debug>(
+fn expect_eq<T: PartialEq + Debug>(
     what: &str,
     actual: &T,
     expected: &T,

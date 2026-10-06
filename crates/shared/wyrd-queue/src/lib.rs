@@ -30,7 +30,9 @@ pub mod sealed_sender;
 pub mod sink;
 pub mod variant;
 
-pub use batch_builder::{PreparedRows, RowPreflight, is_reserved_column};
+pub use batch_builder::{
+    PreparedRows, RowPreflight, is_reserved_column, normalize_declared_variants,
+};
 pub use bounded_arrow::{
     ArrowIpcMaterialError, ArrowIpcMaterialFacts, ArrowIpcMaterialPlan,
     ArrowIpcMaterializedCapacity, BoundedArrowIpc,

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow::array::{Array, AsArray};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatch,
@@ -17,18 +18,19 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::compute::cast;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::BifrostTableDescription;
+use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec};
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
 use crate::sealed_sender::encode_ipc;
-use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
+use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant, variant_field};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -202,6 +204,89 @@ impl RowPreflight {
             .saturating_add(rows.len().saturating_mul(std::mem::size_of::<Row>()));
         Ok(PreparedRows { batch, charge })
     }
+}
+
+/// Normalize the columns `declared` as Variant to the canonical extension.
+///
+/// This is the Arrow-batch counterpart of [`RowPreflight::prepare`], driven by
+/// the destination's described user fields. A column the destination declares
+/// as Variant passes unchanged when it already carries the
+/// `arrow.parquet.variant` extension (the server validates its bytes), and is
+/// encoded from JSON text through [`EncodedVariant::from_json_text`] when it is
+/// `Utf8` or `LargeUtf8`; a null text is a null Variant. Text columns are
+/// encoded row by row in input order, then column by column, so the first
+/// refusal follows the locked check order. Every other column, including a
+/// text column the destination does not declare as Variant, is untouched.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::Contract`] with `BIFROST_UNSUPPORTED_TYPE` for a
+/// declared Variant column of any other type, the catalogued Variant error
+/// naming the field and row of the first unstorable text, and
+/// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
+/// columns.
+pub fn normalize_declared_variants(
+    declared: &[FieldSpec],
+    batch: &RecordBatch,
+) -> Result<RecordBatch, WyrdQueueError> {
+    let schema = batch.schema();
+    let mut texts = Vec::new();
+    for (index, field) in schema.fields().iter().enumerate() {
+        let is_declared_variant = declared
+            .iter()
+            .any(|spec| spec.name == *field.name() && spec.data_type == DataTypeSpec::Variant);
+        if !is_declared_variant || is_variant(field) {
+            continue;
+        }
+        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            return Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
+                field: field.name().clone(),
+                data_type: field.data_type().to_string(),
+            }));
+        }
+        let text = cast(batch.column(index), &DataType::Utf8View).map_err(arrow_failure)?;
+        texts.push((
+            index,
+            text,
+            VariantColumnBuilder::with_capacity(batch.num_rows()),
+        ));
+    }
+    if texts.is_empty() {
+        return Ok(batch.clone());
+    }
+    for row in 0..batch.num_rows() {
+        for (index, text, builder) in &mut texts {
+            let text = text.as_string_view();
+            if text.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let encoded = EncodedVariant::from_json_text(text.value(row)).map_err(|violation| {
+                WyrdQueueError::Contract(violation.into_error(
+                    schema.field(*index).name(),
+                    u64::try_from(row).unwrap_or(u64::MAX),
+                ))
+            })?;
+            builder.append(&encoded);
+        }
+    }
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    let mut columns = batch.columns().to_vec();
+    for (index, _, builder) in texts {
+        let field = &fields[index];
+        fields[index] = Arc::new(variant_field(field.name(), field.is_nullable()));
+        columns[index] = builder.finish();
+    }
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map_err(arrow_failure)
+}
+
+/// Report an Arrow failure while viewing or reassembling normalized columns.
+fn arrow_failure(error: ArrowError) -> WyrdQueueError {
+    WyrdQueueError::SchemaParse(format!("Variant normalization failed: {error}"))
 }
 
 /// One value of one input row on its way into a column.

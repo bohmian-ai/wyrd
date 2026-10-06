@@ -1,27 +1,30 @@
 //! Durable statements behind Oracle reader authority.
 //!
-//! Three owners share one rule: every mutation that changes what Forge may
-//! destroy first takes a `FOR UPDATE` lock on a single row, in one order, and
-//! commits in its caller's transaction. The order
-//! is always the `vala.cluster_nodes` Oracle role row, then
-//! `vala.oracle_reader_epochs`, then the table's
-//! `vala.bifrost_table_maintenance_authority` row; nothing here takes the
-//! reverse order.
+//! Two owners share one serialization row per tenant-qualified table,
+//! `vala.bifrost_table_maintenance_authority`. Oracle cut acquisition takes it
+//! `FOR SHARE` inside the one statement that also records the query's active
+//! table reads; destructive Forge work takes it `FOR NO KEY UPDATE` as an
+//! [`ExclusiveTableAuthority`] that exists only while no active read does and
+//! is held through the destructive effect's known outcome. That gives the
+//! read-versus-destroy race exactly one durable winner per table: either the
+//! reader commits first and no authority exists, or destruction finishes
+//! first and the waiting reader selects the later pointer.
 //!
-//! Every read fails closed. A missing row, an identity mismatch, an unknown
-//! encoding version, or a digest that does not reproduce is contradictory
-//! evidence, and none of those may degrade into "nothing is protected".
-// raw-query grep allowlist: the Oracle reader-authority tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
+//! Every read fails closed. A missing row, an identity mismatch, or a
+//! malformed result is contradictory evidence and never degrades into
+//! "nothing is being read".
+
+// raw-query grep allowlist: the Oracle reader-authority relations post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
-use crate::row_types::oracle_reader_authority::{
-    ANCESTRY_DIGEST_VERSION, FRONTIER_ENCODING_VERSION, OracleEpochRow, OracleEpochState,
-    OracleLeaseSample, ProtectionCas, ProtectionFrontier, ProtectionKey, ProtectionMember,
-    ProtectionRecord, TableAuthorityIdentity,
-};
-use crate::{OperatorPool, SqlError, TenantConn};
+use crate::row_types::file_list::HotFileRow;
+use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use crate::{SqlError, TenantConn};
 
 /// Exact catalog name every reader-protection row must carry.
 ///
@@ -50,23 +53,80 @@ fn table_uid(bytes: Vec<u8>) -> Result<[u8; 16], SqlError> {
         .map_err(|_| invariant("stored Bifrost table UID is not 16 bytes"))
 }
 
-/// Decodes one stored 32-byte digest.
+/// Live, exclusive maintenance authority over one tenant-qualified table.
 ///
-/// # Errors
+/// Obtained only from [`BifrostTableMaintenanceAuthority::exclusive`] after
+/// the table's authority row was locked and no active Oracle read remained.
+/// It mutably borrows the transaction holding that lock, so the lock cannot be
+/// released while this value exists, and every destructive Forge operation
+/// takes `&ExclusiveTableAuthority` as its proof. There is no state in which
+/// the reader check passed, the authority was surrendered, and destruction is
+/// still callable: ending the transaction first ends this borrow.
 ///
-/// Returns [`SqlError::InvariantViolation`] when the stored value is not
-/// exactly 32 bytes.
-pub(crate) fn digest32(bytes: Vec<u8>) -> Result<[u8; 32], SqlError> {
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| invariant("stored reader protection digest is not 32 bytes"))
+/// The owner holds no destructive SQL of its own. Forge's preparation and
+/// settlement transactions run on separate connections, so the caller drops
+/// this value and ends the borrowed transaction once the external effect's
+/// outcome is known and before settlement, which takes the row exclusively.
+pub struct ExclusiveTableAuthority<'conn, 'tx> {
+    /// Transaction holding the authority row `FOR NO KEY UPDATE`.
+    conn: &'conn mut TenantConn<'tx>,
+    /// Exact table the held row serializes.
+    identity: TableAuthorityIdentity,
+}
+
+impl ExclusiveTableAuthority<'_, '_> {
+    /// Returns the exact table identity the held authority covers.
+    #[must_use]
+    pub fn identity(&self) -> &TableAuthorityIdentity {
+        &self.identity
+    }
+
+    /// Returns the tenant the held authority transaction is bound to.
+    #[must_use]
+    pub fn tenant(&self) -> DataTenantId {
+        self.conn.data_tenant_id()
+    }
+
+    /// Fails closed unless this authority covers exactly `tenant` and the
+    /// table named by `table_uid`, `catalog_name`, `namespace_name`, and
+    /// `table_name`.
+    ///
+    /// Destructive preparation calls this with its request's identity, so a
+    /// capability taken for one table can never authorize work on another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when any component differs.
+    pub fn require_covers(
+        &self,
+        tenant: DataTenantId,
+        table_uid: &[u8; 16],
+        catalog_name: &str,
+        namespace_name: &str,
+        table_name: &str,
+    ) -> Result<(), SqlError> {
+        if self.tenant() == tenant
+            && self.identity.tenant == tenant
+            && &self.identity.table_uid == table_uid
+            && self.identity.catalog_name == catalog_name
+            && self.identity.namespace_name == namespace_name
+            && self.identity.table_name == table_name
+        {
+            return Ok(());
+        }
+        Err(SqlError::Conflict {
+            detail: "Forge maintenance names a table its exclusive authority does not cover"
+                .to_owned(),
+        })
+    }
 }
 
 /// The single SQL serialization boundary for one tenant-qualified table.
 ///
-/// Reader-protection expansion, narrowing, release, and snapshot-expiration
-/// preparation all lock this one row, which is what gives the
-/// admission-versus-destruction race exactly one durable winner per table
-/// without taking a global physical lock.
+/// Cut acquisition share-locks this one row and destructive Forge preparation
+/// locks it exclusively, which is what gives the admission-versus-destruction
+/// race exactly one durable winner per table without taking a global physical
+/// lock.
 pub struct BifrostTableMaintenanceAuthority<'conn, 'tx> {
     /// Tenant-bound connection every statement runs inside.
     conn: &'conn mut TenantConn<'tx>,
@@ -111,20 +171,81 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         Ok(())
     }
 
-    /// Takes the exact table's serialization row `FOR UPDATE`.
+    /// Reports, without taking any lock, whether an unabandoned Oracle read
+    /// still holds the table.
     ///
-    /// The lock is held for the remainder of the caller's transaction, so every
-    /// competing protection or expiration decision for this table waits here
-    /// rather than racing on the protection rows themselves.
+    /// This is a scheduling hint only and authorizes nothing: a reader may be
+    /// admitted or released the instant after it answers. Every destructive
+    /// effect instead requires [`Self::exclusive`]. Taking no lock is what
+    /// lets the hint run beside a held exclusive authority — including on the
+    /// same table, in another transaction — without waiting on it. Abandoned
+    /// reads (PostgreSQL time past `abandon_after`) are ignored here and
+    /// discarded only under the exclusive authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// and [`SqlError`] when the read fails.
+    pub async fn has_active_reads(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<bool, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        sqlx::query_scalar(
+            r"
+            SELECT EXISTS (
+                SELECT 1
+                  FROM vala.oracle_active_table_reads
+                 WHERE data_tenant_id = wyrd.current_tenant()
+                   AND table_uid = $1
+                   AND abandon_after > statement_timestamp()
+            )
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .fetch_one(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
+
+    /// Takes the table's exclusive maintenance authority and turns this owner
+    /// into the capability destructive Forge work requires.
+    ///
+    /// The row is locked `FOR NO KEY UPDATE`, the mode that conflicts with the
+    /// `FOR SHARE` Oracle cut acquisition takes but not with the `FOR KEY
+    /// SHARE` a claim row's foreign key takes, so a separate Forge preparation
+    /// transaction can still record claims while this one holds the row.
+    /// Abandoned reads are discarded under the rule
+    /// [`crate::queries::forge_operations::active_table_reads_exist`] owns; any
+    /// read that remains means no capability exists.
+    ///
+    /// The lock lives for the rest of the borrowed transaction, which the
+    /// returned capability keeps mutably borrowed: the caller cannot commit or
+    /// roll it back — and so cannot surrender the authority — while the
+    /// capability, and therefore any destructive call taking it, is alive.
+    /// `Ok(None)` still holds the lock until the caller ends the transaction.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the identity is malformed,
-    /// when no row exists for the exact catalog/namespace/table, or when the
-    /// stored table UID differs from the caller's — all of which are identity
-    /// failures that must fail closed rather than proceed unserialized.
-    pub async fn lock(&mut self, identity: &TableAuthorityIdentity) -> Result<(), SqlError> {
+    /// names a table with no authority row, names a different table UID, or
+    /// names a tenant other than the borrowed connection's; and [`SqlError`]
+    /// when the lock or either active-read statement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation leaves the lock with the borrowed transaction, which
+    /// releases it when it commits, rolls back, or is dropped.
+    pub async fn exclusive(
+        self,
+        identity: TableAuthorityIdentity,
+    ) -> Result<Option<ExclusiveTableAuthority<'conn, 'tx>>, SqlError> {
         identity.validate(BIFROST_CATALOG_NAME)?;
+        if identity.tenant != self.conn.data_tenant_id() {
+            return Err(invariant(
+                "exclusive table authority names a tenant other than its connection's",
+            ));
+        }
         let stored: Option<Vec<u8>> = sqlx::query_scalar(
             r"
             SELECT table_uid
@@ -133,7 +254,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
                AND catalog_name = $1
                AND namespace_name = $2
                AND table_name = $3
-               FOR UPDATE
+               FOR NO KEY UPDATE
             ",
         )
         .bind(&identity.catalog_name)
@@ -150,22 +271,32 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
                 "Bifrost table maintenance authority names a different registered table UID",
             ));
         }
-        Ok(())
+        if crate::queries::forge_operations::active_table_reads_exist(
+            self.conn.transaction(),
+            &identity,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(ExclusiveTableAuthority {
+            conn: self.conn,
+            identity,
+        }))
     }
 
     /// Returns every snapshot of this table an unresolved Forge expiration has
     /// already claimed, in ascending order.
     ///
-    /// This is the read side of the same serialization boundary [`Self::lock`]
-    /// owns: a caller that holds the table row and finds a requested snapshot
-    /// here lost the race to a prepared expiration and must re-resolve rather
-    /// than widen over a snapshot that is about to disappear. The owner never
-    /// mutates a claim; only the fenced Forge lifecycle does.
+    /// A snapshot another prepared expiration owns is removed from a new
+    /// selection rather than prepared twice; preparation re-checks the claim
+    /// index under [`Self::exclusive`]. The owner never mutates a claim; only the
+    /// fenced Forge lifecycle does.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
-    /// and [`SqlError`] when the admission-index read fails.
+    /// and [`SqlError`] when the claim-index read fails.
     pub async fn claimed_snapshots(
         &mut self,
         identity: &TableAuthorityIdentity,
@@ -185,1065 +316,362 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         .await
         .map_err(SqlError::from)
     }
-
-    /// Counts this table's unresolved expired-cleanup preparations.
-    ///
-    /// A prepared cleanup candidate may already have been handed to the object
-    /// store, so its object's existence is unknown until the owning attempt
-    /// settles it. This read shares [`Self::lock`]'s serialization boundary, so
-    /// a widening that observes zero here cannot be overtaken by a preparation
-    /// that commits afterwards.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
-    /// and [`SqlError`] when the task read fails.
-    pub async fn prepared_cleanup_candidates(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-    ) -> Result<i64, SqlError> {
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        sqlx::query_scalar(
-            r"
-            SELECT COUNT(*)
-              FROM vala.forge_tasks
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND catalog_name = $1
-               AND namespace_name = $2
-               AND table_name = $3
-               AND strategy = 'expired_cleanup'
-               AND state = 'prepared'
-               AND jsonb_typeof(evidence->'prepared_candidate_index') = 'number'
-            ",
-        )
-        .bind(&identity.catalog_name)
-        .bind(&identity.namespace_name)
-        .bind(&identity.table_name)
-        .fetch_one(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)
-    }
 }
 
-/// Durable owner of one process's bounded, renewable Oracle reader lease.
+/// One logical table a query asks to read, as the planner canonicalized it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveTableRef<'a> {
+    /// Canonical logical namespace, `vala.<segment>`.
+    pub namespace_name: &'a str,
+    /// Local table name inside that namespace.
+    pub table_name: &'a str,
+}
+
+/// The exact Oracle role fence that owns one query's active table reads.
 ///
-/// Every statement here locks the exact `vala.cluster_nodes` Oracle role row
-/// before touching the epoch, so registration of a replacement and renewal by
-/// the incumbent serialize on one row: an epoch whose fence has been superseded
-/// cannot renew even for one more round.
-pub struct OracleReaderEpochs<'conn, 'tx> {
-    /// System-owner-bound connection every statement runs inside.
+/// The fence identifies the node that recorded the reads. It carries no
+/// deadline: the query's remaining time shrinks between acquisitions, so each
+/// [`OracleActiveTableReads::acquire`] call binds the remaining duration its
+/// caller derived immediately before that statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveReadOwner {
+    /// Durable query identity Oracle already uses for the request.
+    pub query_id: Uuid,
+    /// Oracle node that admitted the query.
+    pub node_id: Uuid,
+    /// That node's current Oracle role fencing token.
+    pub fencing_token: i64,
+}
+
+/// One table of an acquired cut: its registered identity, the catalog pointer
+/// read under the table's authority lock, and its unresolved hot candidates.
+#[derive(Debug, Clone)]
+pub struct AcquiredTableCut {
+    /// Registered table identity the active read was recorded against.
+    pub identity: TableAuthorityIdentity,
+    /// Current Iceberg metadata document location for the table.
+    pub metadata_location: String,
+    /// Unresolved `file_list` rows in durable file-list order. These are
+    /// candidates; reconciliation against the selected snapshot happens after
+    /// the metadata document is read.
+    pub hot_files: Vec<HotFileRow>,
+}
+
+/// Owner of one tenant's active Oracle table reads.
+///
+/// Acquisition is one SQL statement that locks every requested table's
+/// maintenance authority, reads each catalog pointer and the unresolved hot
+/// candidates, and records one active read per query/table before returning
+/// any of it. The caller owns the transaction and must commit it before any
+/// metadata, manifest, or data-file IO.
+pub struct OracleActiveTableReads<'conn, 'tx> {
+    /// Tenant-bound connection whose RLS scopes every statement.
     conn: &'conn mut TenantConn<'tx>,
 }
 
-impl<'conn, 'tx> OracleReaderEpochs<'conn, 'tx> {
-    /// Binds the epoch owner to one `SYSTEM_OWNER` transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the connection is bound to
-    /// any tenant other than [`DataTenantId::SYSTEM_OWNER`]; an epoch is a
-    /// process fact and must never be written under a data tenant.
-    pub fn new(conn: &'conn mut TenantConn<'tx>) -> Result<Self, SqlError> {
-        if conn.data_tenant_id() != DataTenantId::SYSTEM_OWNER {
-            return Err(invariant(
-                "Oracle reader epochs are owned by the system tenant only",
-            ));
-        }
-        Ok(Self { conn })
-    }
-
-    /// Locks this node's Oracle role row and returns its current fence.
-    ///
-    /// This is the first statement of every epoch transaction. Taking it before
-    /// the epoch row is what fixes one global lock order and makes the
-    /// registration-versus-renewal race decidable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the node has no Oracle
-    /// role row or its stored fence is negative, and [`SqlError`] when the
-    /// statement fails.
-    async fn lock_role_fence(&mut self, node_id: uuid::Uuid) -> Result<i64, SqlError> {
-        let fence: Option<i64> = sqlx::query_scalar(
-            r"
-            SELECT fencing_token
-              FROM vala.cluster_nodes
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND role = 'oracle'
-               FOR UPDATE
-            ",
-        )
-        .bind(node_id)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let fence = fence.ok_or_else(|| invariant("node holds no Oracle cluster role row"))?;
-        if fence <= 0 {
-            return Err(invariant("Oracle cluster role fence is not positive"));
-        }
-        Ok(fence)
-    }
-
-    /// Locks the role row and proves it still carries the caller's exact fence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the role row is absent or
-    /// a replacement has already advanced the fence past the caller's.
-    async fn lock_exact_fence(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-    ) -> Result<(), SqlError> {
-        if self.lock_role_fence(node_id).await? != fencing_token {
-            return Err(invariant(
-                "Oracle cluster role fence was replaced; this epoch can no longer act",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Acquires one epoch at revision 1 under the node's current exact fence.
-    ///
-    /// The lease clock is Postgres: expiry is written as
-    /// `statement_timestamp() + lease`, and the same statement returns the
-    /// database time it used, so the caller converts a remaining duration onto
-    /// its monotonic clock rather than comparing two wall clocks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the role row is absent,
-    /// when its fence is not the caller's, or when a row already exists at this
-    /// exact new fence, which is an invariant failure rather than a retry.
-    /// Returns [`SqlError`] when a statement fails.
-    pub async fn acquire(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        lease: std::time::Duration,
-    ) -> Result<OracleLeaseSample, SqlError> {
-        self.lock_exact_fence(node_id, fencing_token).await?;
-        let lease_seconds = lease_seconds(lease)?;
-        let row: Option<(DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-            r"
-            INSERT INTO vala.oracle_reader_epochs
-                (epoch_owner_tenant_id, node_id, fencing_token, state, state_revision,
-                 acquired_at, activated_at, renewed_at, lease_expires_at, invalidated_at)
-            VALUES (wyrd.current_tenant(), $1, $2, 'acquired', 1,
-                    statement_timestamp(), NULL, statement_timestamp(),
-                    statement_timestamp() + make_interval(secs => $3), NULL)
-            ON CONFLICT DO NOTHING
-            RETURNING statement_timestamp(), lease_expires_at
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(lease_seconds)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let (database_now, lease_expires_at) = row.ok_or_else(|| {
-            invariant("an Oracle reader epoch already exists at this exact new fence")
-        })?;
-        Ok(OracleLeaseSample {
-            database_now,
-            lease_expires_at,
-            state_revision: 1,
-        })
-    }
-
-    /// Commits `acquired -> active` at exactly one next revision.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the fence was replaced or
-    /// no `acquired` row matches the expected revision, and [`SqlError`] when a
-    /// statement fails.
-    pub async fn activate(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        expected_revision: i64,
-    ) -> Result<OracleLeaseSample, SqlError> {
-        self.lock_exact_fence(node_id, fencing_token).await?;
-        let row: Option<(DateTime<Utc>, DateTime<Utc>, i64)> = sqlx::query_as(
-            r"
-            UPDATE vala.oracle_reader_epochs
-               SET state = 'active',
-                   state_revision = state_revision + 1,
-                   activated_at = statement_timestamp()
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-               AND state = 'acquired'
-               AND state_revision = $3
-               AND lease_expires_at > statement_timestamp()
-            RETURNING statement_timestamp(), lease_expires_at, state_revision
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(expected_revision)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let (database_now, lease_expires_at, state_revision) = row.ok_or_else(|| {
-            invariant("Oracle reader epoch could not activate at its confirmed revision")
-        })?;
-        Ok(OracleLeaseSample {
-            database_now,
-            lease_expires_at,
-            state_revision,
-        })
-    }
-
-    /// Extends the lease at the caller's confirmed revision.
-    ///
-    /// Renewal is bookkeeping, not an auditable transition: it changes only
-    /// `renewed_at`, `lease_expires_at`, and the revision. It cannot revive an
-    /// expired, draining, invalidated, or replacement-fenced epoch, which is
-    /// why the predicate names both the allowed states and unexpired database
-    /// time.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the exact fence was
-    /// replaced, and [`SqlError`] when a statement fails. A predicate that
-    /// matches no row returns `Ok(None)`: the caller must treat that as lease
-    /// loss, not as a retryable error.
-    pub async fn renew(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        expected_revision: i64,
-        lease: std::time::Duration,
-    ) -> Result<Option<OracleLeaseSample>, SqlError> {
-        self.lock_exact_fence(node_id, fencing_token).await?;
-        let lease_seconds = lease_seconds(lease)?;
-        let row: Option<(DateTime<Utc>, DateTime<Utc>, i64)> = sqlx::query_as(
-            r"
-            UPDATE vala.oracle_reader_epochs
-               SET renewed_at = statement_timestamp(),
-                   lease_expires_at = statement_timestamp() + make_interval(secs => $4),
-                   state_revision = state_revision + 1
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-               AND state_revision = $3
-               AND state IN ('acquired', 'active')
-               AND lease_expires_at > statement_timestamp()
-            RETURNING statement_timestamp(), lease_expires_at, state_revision
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(expected_revision)
-        .bind(lease_seconds)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        Ok(row.map(
-            |(database_now, lease_expires_at, state_revision)| OracleLeaseSample {
-                database_now,
-                lease_expires_at,
-                state_revision,
-            },
-        ))
-    }
-
-    /// Commits one audited lifecycle edge at exactly one next revision.
-    ///
-    /// `Draining` is reachable only from `active`; `Invalidated` is reachable
-    /// from `acquired`, `active`, or `draining`. An epoch that never admitted a
-    /// read goes straight to `invalidated` rather than inventing a draining
-    /// edge it never earned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] for a target state that is not
-    /// a legal edge, a replaced fence, or a predicate that matches no row, and
-    /// [`SqlError`] when a statement fails.
-    pub async fn transition(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        expected_revision: i64,
-        target: OracleEpochState,
-    ) -> Result<i64, SqlError> {
-        let sources: &[&str] = match target {
-            OracleEpochState::Draining => &["active"],
-            OracleEpochState::Invalidated => &["acquired", "active", "draining"],
-            OracleEpochState::Acquired | OracleEpochState::Active => {
-                return Err(invariant(
-                    "Oracle reader epoch acquisition and activation have their own statements",
-                ));
-            }
-        };
-        self.lock_exact_fence(node_id, fencing_token).await?;
-        let sources: Vec<String> = sources.iter().map(|state| (*state).to_owned()).collect();
-        let revision: Option<i64> = sqlx::query_scalar(
-            r"
-            UPDATE vala.oracle_reader_epochs
-               SET state = $4,
-                   state_revision = state_revision + 1,
-                   invalidated_at = CASE WHEN $4 = 'invalidated'
-                                         THEN statement_timestamp()
-                                         ELSE invalidated_at END
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-               AND state_revision = $3
-               AND state = ANY($5)
-            RETURNING state_revision
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(expected_revision)
-        .bind(target.as_str())
-        .bind(&sources)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        revision.ok_or_else(|| {
-            invariant("Oracle reader epoch transition found no row at its confirmed revision")
-        })
-    }
-
-    /// Invalidates a predecessor epoch Postgres proves is expired.
-    ///
-    /// Elapsed local time, a stale heartbeat, and replacement startup are never
-    /// predicates here: the only evidence accepted is
-    /// `lease_expires_at <= statement_timestamp()` evaluated by the database
-    /// itself. Recovery locks the role row first even though the fence it finds
-    /// may already belong to a replacement, so the shared lock order holds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the node has no Oracle
-    /// role row, and [`SqlError`] when a statement fails. `Ok(None)` means the
-    /// epoch is not provably expired and must be left alone.
-    pub async fn invalidate_expired(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-    ) -> Result<Option<i64>, SqlError> {
-        self.lock_role_fence(node_id).await?;
-        let revision: Option<i64> = sqlx::query_scalar(
-            r"
-            UPDATE vala.oracle_reader_epochs
-               SET state = 'invalidated',
-                   state_revision = state_revision + 1,
-                   invalidated_at = statement_timestamp()
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-               AND state IN ('acquired', 'active', 'draining')
-               AND lease_expires_at <= statement_timestamp()
-            RETURNING state_revision
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        Ok(revision)
-    }
-
-    /// Deletes one invalidated epoch at its exact last confirmed revision.
-    ///
-    /// The caller must already have proven that no protection header remains
-    /// for this epoch; retirement is the last statement of that sequence and
-    /// manufactures no further revision.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when a header still exists for
-    /// the epoch or no invalidated row matches the expected revision, and
-    /// [`SqlError`] when a statement fails.
-    pub async fn retire(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        expected_revision: i64,
-    ) -> Result<(), SqlError> {
-        // The count must span every tenant while this transaction is bound to
-        // the system owner, so it goes through the execute-only read-only
-        // function rather than a statement forced RLS would answer with zero.
-        let remaining: i64 =
-            sqlx::query_scalar(r"SELECT vala.oracle_epoch_protection_count($1, $2)")
-                .bind(node_id)
-                .bind(fencing_token)
-                .fetch_one(&mut **self.conn.transaction())
-                .await
-                .map_err(SqlError::from)?;
-        if remaining != 0 {
-            return Err(invariant(
-                "Oracle reader epoch still protects tables and cannot be retired",
-            ));
-        }
-        let deleted = sqlx::query(
-            r"
-            DELETE FROM vala.oracle_reader_epochs
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-               AND state = 'invalidated'
-               AND state_revision = $3
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(expected_revision)
-        .execute(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        if deleted.rows_affected() == 0 {
-            return Err(invariant(
-                "Oracle reader epoch retirement found no invalidated row at its revision",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Reads one epoch row exactly as Postgres holds it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] for an unknown stored state and
-    /// [`SqlError`] when the statement fails.
-    pub async fn read(
-        &mut self,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-    ) -> Result<Option<OracleEpochRow>, SqlError> {
-        let row: Option<EpochDbRow> = sqlx::query_as(
-            r"
-            SELECT node_id, fencing_token, state, state_revision, acquired_at,
-                   activated_at, renewed_at, lease_expires_at, invalidated_at
-              FROM vala.oracle_reader_epochs
-             WHERE epoch_owner_tenant_id = wyrd.current_tenant()
-               AND node_id = $1
-               AND fencing_token = $2
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        row.map(TryInto::try_into).transpose()
-    }
-}
-
-/// Converts a lease duration into the seconds Postgres builds an interval from.
-///
-/// # Errors
-///
-/// Returns [`SqlError::InvariantViolation`] for a zero or unrepresentable
-/// lease, both of which would write an already-expired row.
-fn lease_seconds(lease: std::time::Duration) -> Result<f64, SqlError> {
-    let seconds = lease.as_secs_f64();
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(invariant("Oracle reader lease duration is not positive"));
-    }
-    Ok(seconds)
-}
-
-/// Raw epoch projection decoded and validated before becoming authority.
-#[derive(sqlx::FromRow)]
-struct EpochDbRow {
-    /// Physical node holding the epoch.
-    node_id: uuid::Uuid,
-    /// Exact Oracle role fence.
-    fencing_token: i64,
-    /// Stored state discriminator awaiting fail-closed parsing.
-    state: String,
-    /// Monotonic revision.
-    state_revision: i64,
-    /// Database time at acquisition.
-    acquired_at: DateTime<Utc>,
-    /// Database time at activation, when activated.
-    activated_at: Option<DateTime<Utc>>,
-    /// Database time of the last renewal.
-    renewed_at: DateTime<Utc>,
-    /// Database time the lease expires.
-    lease_expires_at: DateTime<Utc>,
-    /// Database time at invalidation, when invalidated.
-    invalidated_at: Option<DateTime<Utc>>,
-}
-
-impl TryFrom<EpochDbRow> for OracleEpochRow {
-    type Error = SqlError;
-
-    /// Decodes one stored epoch row, failing closed on an unknown state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] for unknown stored state text
-    /// or a non-positive revision.
-    fn try_from(row: EpochDbRow) -> Result<Self, Self::Error> {
-        if row.state_revision < 1 {
-            return Err(invariant("stored Oracle reader epoch has no revision"));
-        }
-        Ok(Self {
-            node_id: row.node_id,
-            fencing_token: row.fencing_token,
-            state: OracleEpochState::parse(&row.state)?,
-            state_revision: row.state_revision,
-            acquired_at: row.acquired_at,
-            activated_at: row.activated_at,
-            renewed_at: row.renewed_at,
-            lease_expires_at: row.lease_expires_at,
-            invalidated_at: row.invalidated_at,
-        })
-    }
-}
-
-/// Durable owner of one epoch's per-table protection frontier.
-///
-/// Every mutation expects the caller to already hold the table's
-/// `bifrost_table_maintenance_authority` row, and every one of them is a
-/// compare-and-set on the table-local revision. A conflict returns the complete
-/// winning record so the coordinator can adopt it when it already covers the
-/// local cut instead of recomputing blindly.
-pub struct OracleTableProtections<'conn, 'tx> {
-    /// Tenant-bound transaction every statement runs inside.
-    ///
-    /// Owning the [`TenantConn`] itself, rather than a connection borrowed out
-    /// of one, is what makes every `&mut self` method below provably
-    /// tenant-scoped: there is no way to construct this owner from a connection
-    /// whose RLS binding was never established.
-    conn: &'conn mut TenantConn<'tx>,
-}
-
-impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
-    /// Binds the protection owner to one tenant transaction.
+impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
+    /// Binds the owner to one tenant transaction.
     pub fn new(conn: &'conn mut TenantConn<'tx>) -> Self {
         Self { conn }
     }
 
-    /// Reads and validates one epoch's complete header and members.
+    /// Acquires a complete cut and its active reads in one statement.
     ///
-    /// Header and members are read by one statement. Each statement takes its
-    /// own snapshot, so reading them separately would let a commit that lands
-    /// between the two hand this read one revision's digest over another
-    /// revision's members — a pair that cannot reproduce and is
-    /// indistinguishable from corruption. One statement sees one revision, and
-    /// it does so without locking the header against the reader pins that
-    /// commit it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the header or any member
-    /// fails validation, when the stored identity payload disagrees with the
-    /// caller's, or when a digest does not reproduce, and [`SqlError`] when a
-    /// statement fails.
-    pub async fn read(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-    ) -> Result<Option<ProtectionRecord>, SqlError> {
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        read_protection_record(self.conn.transaction(), identity, node_id, fencing_token).await
-    }
-
-    /// Commits one next revision of a table's frontier, or reports the winner.
-    ///
-    /// `expected_revision` is `None` for a first protection and the caller's
-    /// locally confirmed revision otherwise. An empty frontier is a release:
-    /// it removes the header and its members rather than storing a header that
-    /// protects nothing.
+    /// `tables` is the planner's ordered, canonical table set; a repeated table
+    /// keeps its first position and yields one result and one active read. The
+    /// result has exactly one entry per distinct table, in input order. A
+    /// replayed acquisition for the same query refreshes the existing rows to
+    /// the caller's fence and a new PostgreSQL abandonment time. Each row may be
+    /// discarded once PostgreSQL time passes this statement's
+    /// `statement_timestamp()` plus `remaining`. The caller derives `remaining`
+    /// from its query's one absolute deadline immediately before each call, so
+    /// a replayed acquisition never extends protection past that deadline.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::InvariantViolation`] when the identity or frontier
-    /// is malformed, and [`SqlError`] when a statement fails. A revision
-    /// mismatch is [`ProtectionCas::Conflict`], not an error, because the
-    /// caller must inspect the winner before deciding.
-    pub async fn commit(
+    /// Returns [`SqlError::NoRows`] when any table has no registration visible
+    /// to this tenant or no catalog pointer, and [`SqlError::Conflict`] when
+    /// any table has a snapshot expiration whose catalog outcome is still
+    /// unresolved; no active read commits in either case. Returns [`SqlError::InvariantViolation`] for an empty request, a
+    /// non-positive fence, a `remaining` duration shorter than one millisecond
+    /// or longer than `i64::MAX` milliseconds, or a result that does not contain exactly one
+    /// well-formed identity and pointer per requested table. Returns
+    /// [`SqlError`] when the statement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future leaves the statement's effects in the caller's
+    /// uncommitted transaction, which rolls back with it.
+    pub async fn acquire(
         &mut self,
-        identity: &TableAuthorityIdentity,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-        expected_revision: Option<i64>,
-        frontier: &ProtectionFrontier,
-    ) -> Result<ProtectionCas, SqlError> {
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        for member in &frontier.members {
-            member.validate(identity)?;
+        owner: ActiveReadOwner,
+        remaining: Duration,
+        tables: &[ActiveTableRef<'_>],
+    ) -> Result<Vec<AcquiredTableCut>, SqlError> {
+        let deadline_ms = i64::try_from(remaining.as_millis()).unwrap_or(0);
+        if tables.is_empty() || owner.fencing_token <= 0 || deadline_ms <= 0 {
+            return Err(invariant(
+                "active table read acquisition needs tables, a positive fence, and a deadline",
+            ));
         }
-        let current = self.read(identity, node_id, fencing_token).await?;
-        match (expected_revision, current.as_ref()) {
-            (None, None) => {}
-            (Some(expected), Some(record)) if record.revision == expected => {}
-            (_, record) => {
-                return Ok(ProtectionCas::Conflict(record.cloned().map(Box::new)));
-            }
-        }
-        let next_revision = expected_revision.unwrap_or(0) + 1;
-
-        if frontier.is_empty() {
-            sqlx::query(
-                r"
-                DELETE FROM vala.oracle_table_protections
-                 WHERE data_tenant_id = wyrd.current_tenant()
-                   AND table_uid = $1 AND node_id = $2 AND fencing_token = $3
-                ",
-            )
-            .bind(identity.table_uid.as_slice())
-            .bind(node_id)
-            .bind(fencing_token)
-            .execute(&mut **self.conn.transaction())
-            .await
-            .map_err(SqlError::from)?;
-            return Ok(ProtectionCas::Committed(Box::new(ProtectionRecord {
-                revision: next_revision,
-                frontier_encoding_version: FRONTIER_ENCODING_VERSION,
-                frontier_digest: frontier.digest(identity),
-                updated_at: chrono::Utc::now(),
-                frontier: ProtectionFrontier::default(),
-            })));
-        }
-
-        let updated_at: DateTime<Utc> = sqlx::query_scalar(
-            r"
-            INSERT INTO vala.oracle_table_protections
-                (data_tenant_id, table_uid, node_id, fencing_token, catalog_name,
-                 namespace_name, table_name, revision, frontier_encoding_version,
-                 frontier_digest, updated_at)
-            VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    statement_timestamp())
-            ON CONFLICT (data_tenant_id, table_uid, node_id, fencing_token)
-            DO UPDATE SET revision = EXCLUDED.revision,
-                          frontier_encoding_version = EXCLUDED.frontier_encoding_version,
-                          frontier_digest = EXCLUDED.frontier_digest,
-                          updated_at = EXCLUDED.updated_at
-            RETURNING updated_at
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(&identity.catalog_name)
-        .bind(&identity.namespace_name)
-        .bind(&identity.table_name)
-        .bind(next_revision)
-        .bind(FRONTIER_ENCODING_VERSION)
-        .bind(frontier.digest(identity).as_slice())
-        .fetch_one(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-
-        sqlx::query(
-            r"
-            DELETE FROM vala.oracle_table_protection_members
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND table_uid = $1 AND node_id = $2 AND fencing_token = $3
-               AND protected_snapshot_id <> ALL($4::bigint[])
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
-        .bind(node_id)
-        .bind(fencing_token)
-        .bind(
-            frontier
-                .members
+        let request = serde_json::Value::Array(
+            tables
                 .iter()
-                .map(|m| m.protected_snapshot_id)
-                .collect::<Vec<i64>>(),
+                .map(|table| {
+                    serde_json::json!({
+                        "namespace": table.namespace_name,
+                        "table": table.table_name,
+                    })
+                })
+                .collect(),
+        );
+        let rows: Vec<AcquiredCutDbRow> = sqlx::query_as(
+            "SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4, $5::jsonb)",
         )
-        .execute(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-
-        for member in &frontier.members {
-            sqlx::query(
-                r"
-                INSERT INTO vala.oracle_table_protection_members
-                    (data_tenant_id, table_uid, node_id, fencing_token,
-                     protected_snapshot_id, protected_snapshot_timestamp_ms,
-                     retained_head_snapshot_id, retained_head_timestamp_ms,
-                     ancestry_path, ancestry_digest_version, ancestry_digest)
-                VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (data_tenant_id, table_uid, node_id, fencing_token,
-                             protected_snapshot_id)
-                DO UPDATE SET
-                    protected_snapshot_timestamp_ms = EXCLUDED.protected_snapshot_timestamp_ms,
-                    retained_head_snapshot_id = EXCLUDED.retained_head_snapshot_id,
-                    retained_head_timestamp_ms = EXCLUDED.retained_head_timestamp_ms,
-                    ancestry_path = EXCLUDED.ancestry_path,
-                    ancestry_digest_version = EXCLUDED.ancestry_digest_version,
-                    ancestry_digest = EXCLUDED.ancestry_digest
-                ",
-            )
-            .bind(identity.table_uid.as_slice())
-            .bind(node_id)
-            .bind(fencing_token)
-            .bind(member.protected_snapshot_id)
-            .bind(member.protected_snapshot_timestamp_ms)
-            .bind(member.retained_head_snapshot_id)
-            .bind(member.retained_head_timestamp_ms)
-            .bind(&member.ancestry_path)
-            .bind(ANCESTRY_DIGEST_VERSION)
-            .bind(member.ancestry_digest.as_slice())
-            .execute(&mut **self.conn.transaction())
-            .await
-            .map_err(SqlError::from)?;
-        }
-
-        Ok(ProtectionCas::Committed(Box::new(ProtectionRecord {
-            revision: next_revision,
-            frontier_encoding_version: FRONTIER_ENCODING_VERSION,
-            frontier_digest: frontier.digest(identity),
-            updated_at,
-            frontier: frontier.clone(),
-        })))
-    }
-
-    /// Reads the stored identity and revision behind one protection key.
-    ///
-    /// Recovery discovers a dead epoch's protections by key alone, so it needs
-    /// the checked identity payload before it can lock that table's maintenance
-    /// authority row. This deliberately takes no lock: reading it first is what
-    /// keeps the canonical authority-row-then-protection order intact.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the stored identity
-    /// payload is not a valid Bifrost table identity, and [`SqlError`] when the
-    /// statement fails.
-    pub async fn read_key_identity(
-        &mut self,
-        key: &ProtectionKey,
-    ) -> Result<Option<(TableAuthorityIdentity, i64)>, SqlError> {
-        let row: Option<(String, String, String, i64)> = sqlx::query_as(
-            r"
-            SELECT catalog_name, namespace_name, table_name, revision
-              FROM vala.oracle_table_protections
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND table_uid = $1
-               AND node_id = $2
-               AND fencing_token = $3
-            ",
-        )
-        .bind(key.table_uid.as_slice())
-        .bind(key.node_id)
-        .bind(key.fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let Some((catalog_name, namespace_name, table_name, revision)) = row else {
-            return Ok(None);
-        };
-        let identity = TableAuthorityIdentity {
-            tenant: key.tenant,
-            table_uid: key.table_uid,
-            catalog_name,
-            namespace_name,
-            table_name,
-        };
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        Ok(Some((identity, revision)))
-    }
-
-    /// Lists every validated protection any epoch holds for one table.
-    ///
-    /// Forge consumes this as protection regardless of epoch state or heartbeat
-    /// freshness: a header that still exists protects, and only the audited
-    /// invalidation-and-release sequence removes one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when any stored header or
-    /// member fails validation, and [`SqlError`] when a statement fails.
-    pub async fn list_table_protection(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-    ) -> Result<Vec<ProtectionRecord>, SqlError> {
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        let epochs: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
-            r"
-            SELECT node_id, fencing_token
-              FROM vala.oracle_table_protections
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND table_uid = $1
-             ORDER BY node_id, fencing_token
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
+        .bind(owner.query_id)
+        .bind(owner.node_id)
+        .bind(owner.fencing_token)
+        .bind(deadline_ms)
+        .bind(request)
         .fetch_all(&mut **self.conn.transaction())
         .await
-        .map_err(SqlError::from)?;
-        let mut records = Vec::with_capacity(epochs.len());
-        for (node_id, fencing_token) in epochs {
-            let record = self
-                .read(identity, node_id, fencing_token)
-                .await?
-                .ok_or_else(|| {
-                    invariant("reader protection header disappeared inside one transaction")
-                })?;
-            records.push(record);
-        }
-        Ok(records)
+        .map_err(acquisition_error)?;
+        group_acquired_cut(self.conn.data_tenant_id(), tables, rows)
     }
-}
 
-/// Reads and validates one epoch's complete protection record in one statement.
-///
-/// Header and members live in two tables, and each statement takes its own
-/// snapshot, so reading them separately lets a reader pin that commits between
-/// the two hand the caller one revision's digest over another revision's
-/// members. That pair cannot reproduce, and Forge is required to treat a
-/// digest that does not reproduce as corruption and refuse to delete anything,
-/// so a torn read stalls maintenance over data that is perfectly intact. One
-/// joined statement sees one revision, and it does so without locking the
-/// header against the pins that write it.
-///
-/// Both protection readers — the Oracle owner's tenant connection and Forge's
-/// operator transaction under the table authority lock — call this, so there is
-/// one statement, one ordering, and one validation for the record.
-///
-/// # Errors
-///
-/// Returns [`SqlError::InvariantViolation`] when the stored identity payload
-/// disagrees with the caller's, when a member fails validation, or when the
-/// header digest does not reproduce over the stored members, and [`SqlError`]
-/// when the statement fails.
-pub(crate) async fn read_protection_record(
-    conn: &mut sqlx::PgConnection,
-    identity: &TableAuthorityIdentity,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-) -> Result<Option<ProtectionRecord>, SqlError> {
-    let rows: Vec<ProtectionJoinDbRow> = sqlx::query_as(
-        r"
-        SELECT h.catalog_name, h.namespace_name, h.table_name, h.revision,
-               h.frontier_encoding_version, h.frontier_digest, h.updated_at,
-               m.protected_snapshot_id, m.protected_snapshot_timestamp_ms,
-               m.retained_head_snapshot_id, m.retained_head_timestamp_ms,
-               m.ancestry_path, m.ancestry_digest_version, m.ancestry_digest
-          FROM vala.oracle_table_protections AS h
-          LEFT JOIN vala.oracle_table_protection_members AS m
-                 ON m.data_tenant_id = h.data_tenant_id
-                AND m.table_uid = h.table_uid
-                AND m.node_id = h.node_id
-                AND m.fencing_token = h.fencing_token
-         WHERE h.data_tenant_id = wyrd.current_tenant()
-           AND h.table_uid = $1
-           AND h.node_id = $2
-           AND h.fencing_token = $3
-         ORDER BY m.protected_snapshot_id
-        ",
-    )
-    .bind(identity.table_uid.as_slice())
-    .bind(node_id)
-    .bind(fencing_token)
-    .fetch_all(conn)
-    .await
-    .map_err(SqlError::from)?;
-    let Some(header) = rows.first() else {
-        return Ok(None);
-    };
-    if header.catalog_name != identity.catalog_name
-        || header.namespace_name != identity.namespace_name
-        || header.table_name != identity.table_name
-    {
-        return Err(invariant(
-            "stored reader protection names a different table than the caller",
-        ));
-    }
-    let mut members = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let Some(member) = row.member()? else {
-            continue;
-        };
-        member.validate(identity)?;
-        members.push(member);
-    }
-    let record = ProtectionRecord {
-        revision: header.revision,
-        frontier_encoding_version: header.frontier_encoding_version,
-        frontier_digest: digest32(header.frontier_digest.clone())?,
-        updated_at: header.updated_at,
-        frontier: ProtectionFrontier {
-            members: sorted_members(members),
-        },
-    };
-    record.validate(identity)?;
-    Ok(Some(record))
-}
-
-/// One joined protection row: the epoch's header beside at most one member.
-///
-/// The header columns repeat on every row of the join, and the member columns
-/// are null on the single row a header with no members produces. That header
-/// protects nothing, and the record's own digest check is what rejects it — the
-/// decode below simply reports no member.
-#[derive(sqlx::FromRow)]
-pub(crate) struct ProtectionJoinDbRow {
-    /// Persisted catalog payload, checked against the caller's identity.
-    pub(crate) catalog_name: String,
-    /// Persisted namespace payload, checked against the caller's identity.
-    pub(crate) namespace_name: String,
-    /// Persisted table-name payload, checked against the caller's identity.
-    pub(crate) table_name: String,
-    /// Monotonic table-local revision.
-    pub(crate) revision: i64,
-    /// Stored frontier encoding version.
-    pub(crate) frontier_encoding_version: i32,
-    /// Stored header digest bytes awaiting length validation.
-    pub(crate) frontier_digest: Vec<u8>,
-    /// Database time of the commit that wrote this revision.
-    pub(crate) updated_at: DateTime<Utc>,
-    /// Oldest active cut on this chain, absent when the header has no members.
-    pub(crate) protected_snapshot_id: Option<i64>,
-    /// Iceberg timestamp of the protected snapshot.
-    pub(crate) protected_snapshot_timestamp_ms: Option<i64>,
-    /// Newest active cut on this chain.
-    pub(crate) retained_head_snapshot_id: Option<i64>,
-    /// Iceberg timestamp of the retained head.
-    pub(crate) retained_head_timestamp_ms: Option<i64>,
-    /// Inclusive newest-to-oldest parent walk.
-    pub(crate) ancestry_path: Option<Vec<i64>>,
-    /// Stored ancestry digest version.
-    pub(crate) ancestry_digest_version: Option<i32>,
-    /// Stored ancestry digest bytes awaiting length validation.
-    pub(crate) ancestry_digest: Option<Vec<u8>>,
-}
-
-impl ProtectionJoinDbRow {
-    /// Decodes this row's member half, if the join matched one.
+    /// Deletes every active read this query holds and returns how many it
+    /// removed.
+    ///
+    /// Release is idempotent: a second call, or a call after Forge discarded
+    /// an abandoned row, removes nothing and succeeds.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::InvariantViolation`] for a malformed digest, and for
-    /// a row whose member columns are only partly present, which no join over
-    /// this schema can produce and would mean the projection changed.
-    fn member(&self) -> Result<Option<ProtectionMember>, SqlError> {
-        let (
-            Some(protected_snapshot_id),
-            Some(protected_snapshot_timestamp_ms),
-            Some(retained_head_snapshot_id),
-            Some(retained_head_timestamp_ms),
-            Some(ancestry_path),
-            Some(ancestry_digest_version),
-            Some(ancestry_digest),
-        ) = (
-            self.protected_snapshot_id,
-            self.protected_snapshot_timestamp_ms,
-            self.retained_head_snapshot_id,
-            self.retained_head_timestamp_ms,
-            self.ancestry_path.as_ref(),
-            self.ancestry_digest_version,
-            self.ancestry_digest.as_ref(),
-        )
-        else {
-            if self.protected_snapshot_id.is_none()
-                && self.ancestry_digest.is_none()
-                && self.ancestry_path.is_none()
-            {
-                return Ok(None);
-            }
-            return Err(invariant(
-                "reader protection member row is only partly present",
-            ));
-        };
-        Ok(Some(ProtectionMember {
-            protected_snapshot_id,
-            protected_snapshot_timestamp_ms,
-            retained_head_snapshot_id,
-            retained_head_timestamp_ms,
-            ancestry_path: ancestry_path.clone(),
-            ancestry_digest_version,
-            ancestry_digest: digest32(ancestry_digest.clone())?,
-        }))
+    /// Returns [`SqlError`] when the statement fails.
+    pub async fn release(&mut self, query_id: Uuid) -> Result<u64, SqlError> {
+        sqlx::query("DELETE FROM vala.oracle_active_table_reads WHERE query_id = $1")
+            .bind(query_id)
+            .execute(&mut **self.conn.transaction())
+            .await
+            .map(|done| done.rows_affected())
+            .map_err(SqlError::from)
     }
 }
 
-/// Orders decoded members by digest so a read reproduces the written order.
-pub(crate) fn sorted_members(mut members: Vec<ProtectionMember>) -> Vec<ProtectionMember> {
-    members.sort_by_key(|member| member.ancestry_digest);
-    members
+/// Maps the acquisition function's refusals onto typed errors.
+///
+/// The function raises `no_data_found` (SQLSTATE `P0002`) for a missing
+/// registration or catalog pointer so no partial claim set can commit; callers
+/// already treat [`SqlError::NoRows`] as the catalog's table-not-found. It
+/// raises `object_not_in_prerequisite_state` (`55000`) for a table whose
+/// snapshot expiration is unresolved, returned as [`SqlError::Conflict`],
+/// which this statement produces for no other reason.
+fn acquisition_error(error: sqlx::Error) -> SqlError {
+    match &error {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("P0002") => SqlError::NoRows,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("55000") => SqlError::Conflict {
+            detail: db.message().to_owned(),
+        },
+        _ => SqlError::from(error),
+    }
 }
 
-/// Enumerates the exact protection keys one dead epoch still holds.
+/// One flat result row of `vala.oracle_acquire_table_cut`.
 ///
-/// This is the only cross-tenant capability reader recovery has, and it is
-/// read-only by construction: it returns identity keys so recovery can open one
-/// actual-tenant transaction per key. It cannot mutate tenant state or append
-/// tenant audit.
+/// Every hot column comes from a left join, so each is nullable here; an
+/// all-null hot side means the table has no unresolved candidates.
+#[derive(sqlx::FromRow)]
+struct AcquiredCutDbRow {
+    /// First input position of the table this row belongs to.
+    ordinal: i32,
+    /// Registered table UID.
+    table_uid: Vec<u8>,
+    /// Registered logical namespace.
+    namespace_name: String,
+    /// Registered table name.
+    table_name: String,
+    /// Catalog pointer read under the authority lock.
+    metadata_location: String,
+    /// Hot row identity; `None` exactly when the hot side is empty.
+    id: Option<Uuid>,
+    /// Hot row tenant.
+    data_tenant_id: Option<Uuid>,
+    /// Hot object path.
+    file_path: Option<String>,
+    /// Hot object ordinal within its generation.
+    file_ordinal: Option<i16>,
+    /// Hot object checksum.
+    file_checksum: Option<String>,
+    /// Hot object size.
+    file_size: Option<i64>,
+    /// Hot object row count.
+    row_count: Option<i64>,
+    /// Hot object lower event-time bound.
+    min_event_time: Option<DateTime<Utc>>,
+    /// Hot object upper event-time bound.
+    max_event_time: Option<DateTime<Utc>>,
+    /// Hot object partition granularity.
+    partition_granularity: Option<String>,
+    /// Hot object partition start.
+    partition_start: Option<DateTime<Utc>>,
+    /// Whether Forge already published the hot object.
+    compacted: Option<bool>,
+    /// Snapshot that committed the hot object; always `None` for a candidate.
+    committed_snapshot_id: Option<i64>,
+    /// Forge operation that published the hot object.
+    forge_publication_operation_id: Option<Uuid>,
+    /// Producing Scribe node.
+    node_id: Option<Uuid>,
+    /// Producing writer epoch.
+    writer_epoch: Option<i64>,
+    /// Inclusive WAL lower bound.
+    wal_lsn_min: Option<i64>,
+    /// Inclusive WAL upper bound.
+    wal_lsn_max: Option<i64>,
+    /// Manifest insertion time.
+    created_at: Option<DateTime<Utc>>,
+}
+
+impl AcquiredCutDbRow {
+    /// Splits the hot side off one flat row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the hot side is partially
+    /// null, carries a negative size, or is not an unresolved candidate.
+    fn hot_file(&mut self) -> Result<Option<HotFileRow>, SqlError> {
+        let Some(id) = self.id else {
+            let empty = self.data_tenant_id.is_none()
+                && self.file_path.is_none()
+                && self.file_ordinal.is_none()
+                && self.file_checksum.is_none()
+                && self.file_size.is_none()
+                && self.row_count.is_none()
+                && self.min_event_time.is_none()
+                && self.max_event_time.is_none()
+                && self.partition_granularity.is_none()
+                && self.partition_start.is_none()
+                && self.compacted.is_none()
+                && self.committed_snapshot_id.is_none()
+                && self.forge_publication_operation_id.is_none()
+                && self.node_id.is_none()
+                && self.writer_epoch.is_none()
+                && self.wal_lsn_min.is_none()
+                && self.wal_lsn_max.is_none()
+                && self.created_at.is_none();
+            return if empty {
+                Ok(None)
+            } else {
+                Err(invariant("acquired cut returned a partially null hot row"))
+            };
+        };
+        let partial = || invariant("acquired cut returned a partially null hot row");
+        let row = HotFileRow {
+            id,
+            data_tenant_id: self.data_tenant_id.ok_or_else(partial)?,
+            namespace: self.namespace_name.clone(),
+            table_name: self.table_name.clone(),
+            file_path: self.file_path.take().ok_or_else(partial)?,
+            file_ordinal: self.file_ordinal.ok_or_else(partial)?,
+            file_checksum: self.file_checksum.take(),
+            file_size: self.file_size.ok_or_else(partial)?,
+            row_count: self.row_count.ok_or_else(partial)?,
+            min_event_time: self.min_event_time,
+            max_event_time: self.max_event_time,
+            partition_granularity: self.partition_granularity.take().ok_or_else(partial)?,
+            partition_start: self.partition_start.ok_or_else(partial)?,
+            compacted: self.compacted.ok_or_else(partial)?,
+            committed_snapshot_id: self.committed_snapshot_id,
+            forge_publication_operation_id: self.forge_publication_operation_id,
+            node_id: self.node_id.ok_or_else(partial)?,
+            writer_epoch: self.writer_epoch.ok_or_else(partial)?,
+            wal_lsn_min: self.wal_lsn_min.ok_or_else(partial)?,
+            wal_lsn_max: self.wal_lsn_max.ok_or_else(partial)?,
+            created_at: self.created_at.ok_or_else(partial)?,
+        };
+        if row.file_size < 0 || row.row_count < 0 || row.committed_snapshot_id.is_some() {
+            return Err(invariant(
+                "acquired cut returned a hot candidate with impossible metadata",
+            ));
+        }
+        Ok(Some(row))
+    }
+}
+
+/// Groups the flat acquisition result into one validated cut per table.
+///
+/// The grouping is complete or fails: every distinct requested table must
+/// appear exactly once with one stable identity and pointer, and no
+/// unrequested table may appear.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError::InvariantViolation`] for a malformed stored table UID,
-/// and [`SqlError`] when the statement fails.
-pub async fn enumerate_epoch_protection_keys_for_operator(
-    op: &OperatorPool,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-) -> Result<Vec<ProtectionKey>, SqlError> {
-    let rows: Vec<(uuid::Uuid, Vec<u8>)> = sqlx::query_as(
-        r"
-        SELECT data_tenant_id, table_uid
-          FROM vala.oracle_table_protections
-         WHERE node_id = $1 AND fencing_token = $2
-         ORDER BY data_tenant_id, table_uid
-        ",
-    )
-    .bind(node_id)
-    .bind(fencing_token)
-    .fetch_all(op.pool())
-    .await
-    .map_err(SqlError::from)?;
-    rows.into_iter()
-        .map(|(tenant, uid)| {
-            Ok(ProtectionKey {
-                tenant: DataTenantId::try_from(tenant)
-                    .map_err(|_| invariant("stored protection names an invalid tenant"))?,
-                table_uid: table_uid(uid)?,
-                node_id,
-                fencing_token,
-            })
-        })
-        .collect()
-}
-
-/// Lists every epoch Postgres itself proves is past its lease.
-///
-/// Expiry is evaluated by the database in the same statement that reads the
-/// row, so no caller ever compares its own clock against a stored timestamp.
-///
-/// # Errors
-///
-/// Returns [`SqlError::InvariantViolation`] for an unknown stored state, and
-/// [`SqlError`] when the statement fails.
-pub async fn list_expired_epochs_for_operator(
-    op: &OperatorPool,
-    limit: i64,
-) -> Result<Vec<OracleEpochRow>, SqlError> {
-    if limit <= 0 {
-        return Err(invariant(
-            "expired Oracle epoch scan bound must be positive",
+/// Returns [`SqlError::InvariantViolation`] for a missing, duplicate,
+/// conflicting, unrequested, or malformed table result or hot row.
+fn group_acquired_cut(
+    tenant: DataTenantId,
+    tables: &[ActiveTableRef<'_>],
+    rows: Vec<AcquiredCutDbRow>,
+) -> Result<Vec<AcquiredTableCut>, SqlError> {
+    let mut expected: Vec<(i32, ActiveTableRef<'_>)> = Vec::with_capacity(tables.len());
+    for (position, table) in tables.iter().enumerate() {
+        if !expected.iter().any(|(_, seen)| seen == table) {
+            let ordinal = i32::try_from(position + 1)
+                .map_err(|_| invariant("active table read request is too large"))?;
+            expected.push((ordinal, *table));
+        }
+    }
+    let mut cuts: Vec<(i32, AcquiredTableCut)> = Vec::with_capacity(expected.len());
+    for mut row in rows {
+        let hot = row.hot_file()?;
+        if let Some((ordinal, cut)) = cuts.last_mut()
+            && *ordinal == row.ordinal
+        {
+            if cut.identity.table_uid.as_slice() != row.table_uid.as_slice()
+                || cut.identity.namespace_name != row.namespace_name
+                || cut.identity.table_name != row.table_name
+                || cut.metadata_location != row.metadata_location
+            {
+                return Err(invariant(
+                    "acquired cut returned conflicting table identity",
+                ));
+            }
+            match hot {
+                Some(hot) if !cut.hot_files.is_empty() => cut.hot_files.push(hot),
+                _ => return Err(invariant("acquired cut mixed empty and hot rows")),
+            }
+            continue;
+        }
+        let Some((_, requested)) = expected.get(cuts.len()) else {
+            return Err(invariant("acquired cut returned an unrequested table"));
+        };
+        if expected[cuts.len()].0 != row.ordinal
+            || requested.namespace_name != row.namespace_name
+            || requested.table_name != row.table_name
+        {
+            return Err(invariant(
+                "acquired cut returned tables out of request order",
+            ));
+        }
+        let identity = TableAuthorityIdentity {
+            tenant,
+            table_uid: table_uid(std::mem::take(&mut row.table_uid))?,
+            catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+            namespace_name: row.namespace_name,
+            table_name: row.table_name,
+        };
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        cuts.push((
+            row.ordinal,
+            AcquiredTableCut {
+                identity,
+                metadata_location: row.metadata_location,
+                hot_files: hot.into_iter().collect(),
+            },
         ));
     }
-    let rows: Vec<EpochDbRow> = sqlx::query_as(
-        r"
-        SELECT node_id, fencing_token, state, state_revision, acquired_at,
-               activated_at, renewed_at, lease_expires_at, invalidated_at
-          FROM vala.oracle_reader_epochs
-         WHERE lease_expires_at <= statement_timestamp()
-         ORDER BY lease_expires_at, node_id, fencing_token
-         LIMIT $1
-        ",
-    )
-    .bind(limit)
-    .fetch_all(op.pool())
-    .await
-    .map_err(SqlError::from)?;
-    rows.into_iter().map(TryInto::try_into).collect()
+    if cuts.len() != expected.len() {
+        return Err(invariant("acquired cut is missing a requested table"));
+    }
+    Ok(cuts.into_iter().map(|(_, cut)| cut).collect())
 }

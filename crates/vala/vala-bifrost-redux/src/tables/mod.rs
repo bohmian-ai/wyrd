@@ -1,15 +1,16 @@
 //! Canonical Redux built-in table definitions and pure table-layer transforms.
 
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
+use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
-use wyrd_spec::vala::managed_columns::{
-    WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
-};
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub mod audit;
 pub mod drift;
@@ -59,21 +60,6 @@ pub enum CorrelationPolicy {
     Observation,
     /// Audit content has its own identity columns.
     None,
-}
-
-impl CorrelationPolicy {
-    /// Return the universal correlation columns appended by this policy.
-    #[must_use]
-    pub const fn appended_correlation_columns(self) -> &'static [&'static str] {
-        match self {
-            Self::Observation => &[
-                wyrd_spec::vala::RUN_ID,
-                wyrd_spec::vala::CARD_UID,
-                wyrd_spec::vala::PRINCIPAL_ID,
-            ],
-            Self::None => &[],
-        }
-    }
 }
 
 /// Payload handling classification for a built-in table.
@@ -222,11 +208,12 @@ pub trait DomainTable: Send + Sync + 'static {
 
     /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
-    /// Returning `Some` makes the table canonical: its physical schema, stable
-    /// field ids, sensitivity metadata, and canonical physical fingerprint are
-    /// all derived from the returned declaration rather than from a separately
-    /// maintained Arrow field list. Pre-declared tables return `None` and keep
-    /// their existing auto-assigned Iceberg ids and user-schema fingerprint.
+    /// Returning `Some` makes the table canonical: its physical schema,
+    /// sensitivity metadata, and canonical physical fingerprint are all derived
+    /// from the returned declaration rather than from a separately maintained
+    /// Arrow field list. Pre-declared tables return `None` and keep their
+    /// user-schema fingerprint. Field ids are never declared here: every table
+    /// takes them from its registered Iceberg schema.
     fn canonical_fields() -> Option<&'static [fields::CanonicalField]> {
         None
     }
@@ -244,7 +231,7 @@ pub trait DomainTable: Send + Sync + 'static {
     /// Full physical schema.
     ///
     /// A canonical table derives its whole physical schema, including the
-    /// Observation envelope's stable ids, from its ledger. Every other table
+    /// Observation envelope's sensitivity tags, from its ledger. Every other table
     /// keeps the existing managed-column append.
     fn schema() -> SchemaRef {
         match Self::canonical_fields() {
@@ -263,8 +250,8 @@ pub trait DomainTable: Send + Sync + 'static {
     /// This is a different identity from [`Self::schema_fingerprint`], which
     /// keeps its user-schema meaning for catalog rows. The canonical physical
     /// fingerprint covers the complete physical schema — envelope included —
-    /// with every stable id, nested child, nullability, sensitivity, and
-    /// metadata entry, and is what the Arrow validator, the Gate validation
+    /// with every ordered name, type, nested child, nullability, sensitivity,
+    /// and metadata entry other than a registered field id, and is what the Arrow validator, the Gate validation
     /// proof, the Parquet/Iceberg checks, and recovery compare.
     ///
     /// # Panics
@@ -293,32 +280,17 @@ pub trait DomainTable: Send + Sync + 'static {
     }
 }
 
-/// Validate user fields against all server-owned columns for a policy.
-pub fn reject_reserved_domain_fields(
-    user_fields: &[&str],
-    policy: CorrelationPolicy,
-) -> Result<(), TableError> {
-    let appended = policy.appended_correlation_columns();
-    for name in user_fields {
-        if is_reserved_managed_column(name)
-            || [WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID].contains(name)
-            || appended.contains(name)
-        {
-            return Err(TableError::Internal(format!("reserved column: {name}")));
-        }
-    }
-    Ok(())
-}
-
 /// Versioned recursive fingerprint over one complete canonical physical schema.
 ///
 /// This is a distinct identity from [`crate::schema::SchemaFingerprint`], which
 /// keeps its existing user-schema meaning for `BifrostTableEntry.fingerprint`
 /// and dynamic-table catalog rows. A canonical physical fingerprint commits to
-/// the *whole* physical schema — envelope fields included — plus every stable
-/// field id, nested child, nullability, sensitivity, and semantic metadata
-/// entry, so a canonical built-in cannot drift in any of those dimensions
-/// without the fingerprint changing.
+/// the *whole* physical schema — envelope fields included — plus every ordered
+/// name, physical type, nested child, nullability, sensitivity, and semantic
+/// metadata entry, so a canonical built-in cannot drift in any of those
+/// dimensions without the fingerprint changing. Numeric field ids are not part
+/// of the identity: the registered Iceberg table assigns them, so a schema
+/// stamped with those ids fingerprints the same as the bare declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CanonicalPhysicalFingerprint(pub [u8; 32]);
 
@@ -327,9 +299,9 @@ impl CanonicalPhysicalFingerprint {
     ///
     /// # Errors
     ///
-    /// Returns [`TableError::Internal`] when a field carries no parsable
-    /// `PARQUET:field_id`, no `wyrd:sensitive` marker, or an Arrow type outside
-    /// the closed canonical set.
+    /// Returns [`TableError::Internal`] when a field carries no
+    /// `wyrd:sensitive` marker or an Arrow type outside the closed canonical
+    /// set.
     pub fn from_physical_fields(fields: &Fields) -> Result<Self, TableError> {
         let mut hasher = Sha256::new();
         hasher.update(canonical_physical_fingerprint_bytes(fields)?);
@@ -373,9 +345,8 @@ impl ResolvedSchemaIdentity {
 
     /// Resolve the identity of a caller-registered dynamic table.
     ///
-    /// A dynamic table never has a canonical physical fingerprint: its Iceberg
-    /// ids are auto-assigned and its catalog fingerprint is the only identity
-    /// its registration contract commits to.
+    /// A dynamic table never has a canonical physical fingerprint: its catalog
+    /// fingerprint is the only identity its registration contract commits to.
     #[must_use]
     pub fn for_dynamic(user_fields: &[Field]) -> Self {
         Self {
@@ -389,11 +360,12 @@ impl ResolvedSchemaIdentity {
 
 /// Convert one physical Arrow schema into its Iceberg schema.
 ///
-/// A canonical signal table declares an immutable stable id on every field,
-/// including every nested child, so its Iceberg schema must adopt those ids
-/// rather than a positional assignment. A dynamic user table declares none and
-/// keeps the existing automatic assignment. The distinction is read from the
-/// schema itself, so no consumer needs to know which table it holds.
+/// No table declares field ids, so creating a physical table always lets
+/// Iceberg assign them. A schema Scribe stamped from a registered table
+/// already carries that table's ids on every field, nested children included,
+/// and adopts them unchanged, which is what keeps Scribe's footer evidence in
+/// the table's own numbering. The distinction is read from the schema itself,
+/// so no consumer needs to know which table it holds.
 ///
 /// # Errors
 ///
@@ -407,16 +379,134 @@ pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceb
     }
 }
 
-/// Report whether every top-level field carries a stable field id.
+/// Report whether every top-level field carries a registered field id.
 ///
-/// An empty schema declares none, which keeps the automatic assignment for the
-/// degenerate case rather than claiming canonical identity.
+/// An empty schema carries none, which keeps the automatic assignment for the
+/// degenerate case.
 fn declares_stable_field_ids(schema: &Schema) -> bool {
     !schema.fields().is_empty()
         && schema
             .fields()
             .iter()
             .all(|field| field.metadata().contains_key(fields::PARQUET_FIELD_ID))
+}
+
+/// Stamp a registered Iceberg table's field ids onto one stamped batch.
+///
+/// The registered table is the sole field-id authority. Every field of
+/// `batch` — user, correlation, and managed, at every nesting depth — takes
+/// the id of the registered field at the same path under `PARQUET:field_id`,
+/// matched by name for top-level and struct children and by position for a
+/// list element or map entry. The batch keeps its own types, names, and every
+/// other metadata entry, so the canonical physical identity is unchanged; a
+/// nested column is re-typed in place by [`restamp_field_identity`] and no
+/// buffer is copied.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when a batch field has no registered
+/// counterpart, a registered field's nesting differs from the batch's, or the
+/// re-typed batch fails Arrow validation.
+pub fn stamp_registered_field_ids(
+    batch: &RecordBatch,
+    registered: &spec::Schema,
+) -> Result<RecordBatch, TableError> {
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let nested = registered.field_by_name(field.name()).ok_or_else(|| {
+            TableError::Internal(format!(
+                "field {} has no registered Iceberg field",
+                field.name()
+            ))
+        })?;
+        let stamped = with_registered_id(field, nested)?;
+        columns.push(if stamped.data_type() == field.data_type() {
+            Arc::clone(column)
+        } else {
+            restamp_field_identity(column.as_ref(), stamped.data_type())
+                .map_err(|error| TableError::Internal(error.to_string()))?
+        });
+        fields.push(stamped);
+    }
+    let stamped_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new_with_options(
+        stamped_schema,
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|error| TableError::Internal(error.to_string()))
+}
+
+/// Return `field` carrying `registered`'s id, its children stamped recursively.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when a child has no registered counterpart
+/// or the registered nesting differs from the Arrow nesting.
+fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, TableError> {
+    let mismatch = || {
+        TableError::Internal(format!(
+            "field {} does not match its registered Iceberg nesting",
+            field.name()
+        ))
+    };
+    let data_type = match (field.data_type(), registered.field_type.as_ref()) {
+        (DataType::List(element), Type::List(list)) => {
+            DataType::List(Arc::new(with_registered_id(element, &list.element_field)?))
+        }
+        (DataType::LargeList(element), Type::List(list)) => {
+            DataType::LargeList(Arc::new(with_registered_id(element, &list.element_field)?))
+        }
+        (DataType::Struct(children), Type::Struct(registered_children)) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| {
+                    registered_children
+                        .field_by_name(child.name())
+                        .ok_or_else(mismatch)
+                        .and_then(|nested| with_registered_id(child, nested))
+                })
+                .collect::<Result<Fields, _>>()?,
+        ),
+        (DataType::Map(entries, sorted), Type::Map(map)) => {
+            let DataType::Struct(pair) = entries.data_type() else {
+                return Err(mismatch());
+            };
+            let [key, value] = pair.iter().collect::<Vec<_>>()[..] else {
+                return Err(mismatch());
+            };
+            let pair = Fields::from(vec![
+                with_registered_id(key, &map.key_field)?,
+                with_registered_id(value, &map.value_field)?,
+            ]);
+            DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Struct(pair)),
+                ),
+                *sorted,
+            )
+        }
+        (
+            DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(..),
+            _,
+        )
+        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_)) => return Err(mismatch()),
+        (scalar, _) => scalar.clone(),
+    };
+    let mut metadata = field.metadata().clone();
+    metadata.insert(
+        fields::PARQUET_FIELD_ID.to_owned(),
+        registered.id.to_string(),
+    );
+    Ok(field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata))
 }
 
 /// Re-stamp one column's declared type with the table's own field identity.
@@ -527,24 +617,26 @@ pub fn arrow_type_shape_matches(
 ///
 /// Any change to the encoding below must take the next unused version byte so
 /// an old and a new encoding can never collide.
-const CANONICAL_FINGERPRINT_VERSION: u8 = 1;
+const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
 
 /// Encode one canonical physical schema into its pre-hash fingerprint bytes.
 ///
 /// The encoding is a version byte, the top-level field count, and then each
-/// field in declared order as: stable id, length-prefixed name, type bytes,
-/// nullability, sensitivity, its metadata entries in ascending raw key-byte
-/// order, and finally its nested child count followed depth-first by the same
-/// record for each child. Every count and length is an unsigned big-endian
-/// `u32`; field ids and fixed-binary widths are signed big-endian `i32`.
+/// field in declared order as: length-prefixed name, type bytes, nullability,
+/// sensitivity, its metadata entries other than `PARQUET:field_id` in
+/// ascending raw key-byte order, and finally its nested child count followed
+/// depth-first by the same record for each child. Every count and length is an
+/// unsigned big-endian `u32`; fixed-binary widths are signed big-endian `i32`.
+/// Field ids are excluded because the registered Iceberg table, not the
+/// declaration, owns them.
 ///
 /// The bytes are exposed separately from the hash so a golden test can pin the
 /// exact encoding rather than only its digest.
 ///
 /// # Errors
 ///
-/// Returns [`TableError::Internal`] for a missing or unparsable stable id, a
-/// missing sensitivity marker, or an Arrow type with no pinned type tag.
+/// Returns [`TableError::Internal`] for a missing sensitivity marker or an
+/// Arrow type with no pinned type tag.
 pub fn canonical_physical_fingerprint_bytes(fields: &Fields) -> Result<Vec<u8>, TableError> {
     let mut bytes = vec![CANONICAL_FINGERPRINT_VERSION];
     encode_field_sequence(fields, &mut bytes)?;
@@ -568,18 +660,20 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 ///
 /// # Errors
 ///
-/// Returns [`TableError::Internal`] when the field lacks a parsable stable id
-/// or sensitivity marker, or when its type has no pinned tag.
+/// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
+/// or its type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
-    out.extend_from_slice(&stable_field_id(field)?.to_be_bytes());
     encode_len_prefixed(field.name().as_bytes(), out)?;
     encode_data_type(field.data_type(), out)?;
     out.push(u8::from(field.is_nullable()));
     out.push(u8::from(sensitivity(field)?));
 
-    let metadata = field.metadata();
-    out.extend_from_slice(&count_u32(metadata.len())?.to_be_bytes());
-    let mut entries: Vec<(&String, &String)> = metadata.iter().collect();
+    let mut entries: Vec<(&String, &String)> = field
+        .metadata()
+        .iter()
+        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID)
+        .collect();
+    out.extend_from_slice(&count_u32(entries.len())?.to_be_bytes());
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     for (key, value) in entries {
         encode_len_prefixed(key.as_bytes(), out)?;
@@ -654,28 +748,6 @@ fn child_fields(data_type: &DataType) -> Option<Fields> {
         DataType::Struct(children) => Some(children.clone()),
         _ => None,
     }
-}
-
-/// Read one field's table-local stable identity from its Arrow metadata.
-///
-/// # Errors
-///
-/// Returns [`TableError::Internal`] when the metadata entry is absent or is not
-/// a decimal `i32`.
-pub fn stable_field_id(field: &Field) -> Result<i32, TableError> {
-    field
-        .metadata()
-        .get(fields::PARQUET_FIELD_ID)
-        .ok_or_else(|| {
-            TableError::Internal(format!("field {} carries no stable id", field.name()))
-        })?
-        .parse::<i32>()
-        .map_err(|error| {
-            TableError::Internal(format!(
-                "field {} has an unparsable stable id: {error}",
-                field.name()
-            ))
-        })
 }
 
 /// Read one field's declared sensitivity from its Arrow metadata.
@@ -796,7 +868,7 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
-    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
+    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
     ///
@@ -1017,8 +1089,8 @@ mod tests {
     ///
     /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
     /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// publisher `principal_id`, and the required request, event-time,
-    /// ingestion-time, and batch identity columns. The tenant is a property of
+    /// publisher `principal_id`, and the required request, event-time, and
+    /// ingestion-time columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
@@ -1029,7 +1101,6 @@ mod tests {
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
             ts_us_utc(WYRD_EVENT_TIME, false),
             ts_us_utc(WYRD_INGESTED_AT, false),
-            Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
         ]
     }
 
@@ -1419,25 +1490,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn correlation_policies_are_explicit() {
-        assert!(
-            !CorrelationPolicy::None
-                .appended_correlation_columns()
-                .contains(&CARD_UID)
-        );
-        assert!(
-            CorrelationPolicy::Observation
-                .appended_correlation_columns()
-                .contains(&RUN_ID)
-        );
-        assert!(
-            CorrelationPolicy::Observation
-                .appended_correlation_columns()
-                .contains(&PRINCIPAL_ID)
-        );
-    }
-
     /// One attribute entry used by the round-trip fixtures.
     fn attribute(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -1555,13 +1607,13 @@ mod tests {
 
     /// Recursively assert two field sequences agree by declared identity.
     ///
-    /// Binding is by stable id and name, never by position, so a reordering
+    /// Binding is by name, never by position, so a reordering
     /// storage layer cannot silently pass.
     ///
     /// # Panics
     ///
-    /// Panics when a declared field is missing from `actual`, or when its type,
-    /// nullability, or stable id differs.
+    /// Panics when a declared field is missing from `actual`, or when its type
+    /// or nullability differs.
     fn assert_identity_matches(expected: &Fields, actual: &Fields, context: &str) {
         assert_eq!(
             expected.len(),
@@ -1584,15 +1636,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when the stable id, nullability, type shape, or any nested child
-    /// differs.
+    /// Panics when the nullability, type shape, or any nested child differs.
     fn assert_field_pair(expected: &Field, actual: &Field, context: &str) {
-        assert_eq!(
-            stable_field_id(expected).expect("declared stable id"),
-            stable_field_id(actual).expect("round-tripped stable id"),
-            "{context} keeps the stable id of {}",
-            expected.name()
-        );
         assert_eq!(
             expected.is_nullable(),
             actual.is_nullable(),
@@ -1706,8 +1751,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a stable id, name, nested type, nullability, or value is
-    /// lost by any leg of the round trip.
+    /// Panics when a name, nested type, nullability, or value is lost by any
+    /// leg of the round trip.
     #[test]
     fn canonical_signal_schemas_round_trip_arrow_parquet_and_iceberg() {
         let (spans, _) =
@@ -1749,12 +1794,16 @@ mod tests {
         }
     }
 
-    /// The canonical fingerprint encoding is byte-stable.
+    /// The canonical fingerprint encoding is byte-stable and ignores field ids.
+    ///
+    /// The fixture carries `PARQUET:field_id` entries, as a schema stamped
+    /// from a registered table does, to pin that the ids contribute nothing.
     ///
     /// # Panics
     ///
     /// Panics when the pre-hash encoding or its digest differs from the pinned
-    /// golden, which would silently change every canonical table's identity.
+    /// golden, which would silently change every canonical table's identity,
+    /// or when stripping the ids changes the encoding.
     #[test]
     fn canonical_physical_fingerprint_bytes_are_stable() {
         let child = Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([
@@ -1798,6 +1847,12 @@ mod tests {
 
         let schema = Fields::from(vec![nested, naive, zoned]);
         let bytes = canonical_physical_fingerprint_bytes(&schema).expect("the schema encodes");
+        assert_eq!(
+            canonical_physical_fingerprint_bytes(&without_field_ids(&schema))
+                .expect("the id-free schema encodes"),
+            bytes,
+            "field ids contribute nothing to the encoding"
+        );
         let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");
@@ -1805,14 +1860,92 @@ mod tests {
         });
         assert_eq!(
             hex,
-            "010000000300000001000000066e65737465640c01000000000200000010504152515545543a6669656c645f696400000001310000000e777972643a73656e7369746976650000000566616c736500000001000000050000000676616c7565730b00010000000200000010504152515545543a6669656c645f696400000001350000000e777972643a73656e73697469766500000004747275650000000100000003000000046974656d0701010000000200000010504152515545543a6669656c645f696400000001330000000e777972643a73656e73697469766500000004747275650000000000000002000000056e616976650a020000000000000200000010504152515545543a6669656c645f696400000001320000000e777972643a73656e7369746976650000000566616c73650000000000000004000000057a6f6e65640a02010000000001000000000200000010504152515545543a6669656c645f696400000001340000000e777972643a73656e7369746976650000000566616c736500000000"
+            "0200000003000000066e65737465640c0100000000010000000e777972643a73656e7369746976650000000566616c7365000000010000000676616c7565730b0001000000010000000e777972643a73656e736974697665000000047472756500000001000000046974656d070101000000010000000e777972643a73656e736974697665000000047472756500000000000000056e616976650a02000000000000010000000e777972643a73656e7369746976650000000566616c736500000000000000057a6f6e65640a0201000000000100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
         );
         assert_eq!(
             CanonicalPhysicalFingerprint::from_physical_fields(&schema)
                 .expect("the schema fingerprints")
                 .to_hex(),
-            "e33647f94358ef330ddd8a07e3533b5e15d485530191c73c450c7d3d36cba269"
+            "82ca36c7a0512f207912abdb53c086b17f98b0c5ab9dd0e191120557d927d9a9"
         );
+    }
+
+    /// Stamping adopts the registered table's ids without changing identity.
+    ///
+    /// The registry is Iceberg's own automatic assignment over each canonical
+    /// physical schema, as table creation produces it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a stamped schema does not convert back to exactly the
+    /// registered Iceberg struct, when stamping changes the canonical physical
+    /// fingerprint, or when a field the table lacks is stamped.
+    #[test]
+    fn stamped_batches_carry_the_registered_field_ids() {
+        for (namespace, name) in [
+            ("traces", "spans"),
+            ("logs", "records"),
+            ("metrics", "points"),
+        ] {
+            let definition = builtin_table(namespace, name).expect("canonical definition");
+            let physical = (definition.schema)();
+            let registered = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&physical)
+                .expect("the physical schema has an Iceberg projection");
+            let stamped = stamp_registered_field_ids(
+                &RecordBatch::new_empty(Arc::clone(&physical)),
+                &registered,
+            )
+            .expect("every physical field is registered");
+            let adopted = iceberg::arrow::arrow_schema_to_schema(&stamped.schema())
+                .expect("every stamped field carries an id");
+            assert_eq!(
+                adopted.as_struct(),
+                registered.as_struct(),
+                "{name} adopts the table ids"
+            );
+            assert_eq!(
+                CanonicalPhysicalFingerprint::from_physical_fields(stamped.schema().fields())
+                    .expect("the stamped schema fingerprints"),
+                (definition.canonical_physical_fingerprint)().expect("canonical fingerprint"),
+                "{name} keeps its canonical identity"
+            );
+
+            let mut extra: Vec<Field> = physical
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            extra.push(Field::new("unregistered", DataType::Utf8, true));
+            assert!(
+                stamp_registered_field_ids(
+                    &RecordBatch::new_empty(Arc::new(Schema::new(extra))),
+                    &registered
+                )
+                .is_err(),
+                "{name} refuses a field its table does not register"
+            );
+        }
+    }
+
+    /// Strip every `PARQUET:field_id` entry from `fields`, nested children included.
+    fn without_field_ids(fields: &Fields) -> Fields {
+        fields
+            .iter()
+            .map(|field| {
+                let data_type = match field.data_type() {
+                    DataType::List(child) => DataType::List(Arc::new(
+                        without_field_ids(&Fields::from(vec![child.as_ref().clone()]))[0]
+                            .as_ref()
+                            .clone(),
+                    )),
+                    DataType::Struct(children) => DataType::Struct(without_field_ids(children)),
+                    other => other.clone(),
+                };
+                let mut metadata = field.metadata().clone();
+                metadata.remove(fields::PARQUET_FIELD_ID);
+                Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
+            })
+            .collect()
     }
 
     /// The registry dispatches one canonical value validator per signal table.
@@ -1971,9 +2104,9 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a widened type, a changed timezone spelling, a lost nested
-    /// metadata entry, a changed field id, an unknown `wyrd_*` field, or a
-    /// duplicated reserved field leaves the canonical physical fingerprint
-    /// unchanged.
+    /// metadata entry, an unknown `wyrd_*` field, or a duplicated reserved
+    /// field leaves the canonical physical fingerprint unchanged, or when a
+    /// registered field id changes it.
     #[test]
     fn resolved_identity_rejects_normalized_physical_drift() {
         let definition = builtin_table("traces", "spans").expect("spans definition");
@@ -2017,26 +2150,26 @@ mod tests {
             "a nested child that loses its metadata drifts the canonical physical identity"
         );
 
-        let field_id_changed = mutate_first(|_| true, &|field| {
+        let field_id_stamped = mutate_first(|_| true, &|field| {
             let mut metadata = field.metadata().clone();
             metadata.insert(fields::PARQUET_FIELD_ID.to_owned(), "9999".to_owned());
             Field::new(field.name(), field.data_type().clone(), field.is_nullable())
                 .with_metadata(metadata)
         });
-        assert_ne!(
-            CanonicalPhysicalFingerprint::from_physical_fields(&field_id_changed)
-                .expect("a re-numbered field still fingerprints"),
+        assert_eq!(
+            CanonicalPhysicalFingerprint::from_physical_fields(&field_id_stamped)
+                .expect("a stamped field still fingerprints"),
             baseline,
-            "a changed stable field id drifts the canonical physical identity"
+            "a registered field id is not part of the canonical physical identity"
         );
 
         let mut unknown: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
         unknown.push(Arc::new(
             Field::new("wyrd_unknown", DataType::Utf8, true).with_metadata(
-                std::collections::HashMap::from([
-                    (fields::PARQUET_FIELD_ID.to_owned(), "9998".to_owned()),
-                    (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
-                ]),
+                std::collections::HashMap::from([(
+                    fields::WYRD_SENSITIVE.to_owned(),
+                    "false".to_owned(),
+                )]),
             ),
         ));
         assert_ne!(
@@ -2050,7 +2183,7 @@ mod tests {
         let reserved = physical
             .fields()
             .iter()
-            .find(|field| field.name() == WYRD_BATCH_ID)
+            .find(|field| field.name() == WYRD_INGESTED_AT)
             .expect("the physical schema carries the reserved envelope")
             .clone();
         duplicated.push(reserved);

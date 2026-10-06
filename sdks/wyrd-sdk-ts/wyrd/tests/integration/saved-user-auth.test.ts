@@ -32,6 +32,16 @@ function thrown(action: () => unknown): WyrdError {
   throw new Error("expected a WyrdError");
 }
 
+/** Connect `Cards` with `WYRD_TENANT` set to `tenant`, the only selector. */
+function cards(serverUrl: string, tenant?: string, credential?: string): Cards {
+  if (tenant === undefined) {
+    delete process.env.WYRD_TENANT;
+  } else {
+    process.env.WYRD_TENANT = tenant;
+  }
+  return Cards.connect({ serverUrl, credential });
+}
+
 /** The stable reason a saved login could not be used. */
 function reason(error: WyrdError): unknown {
   expect(error.code).toBe("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
@@ -74,36 +84,36 @@ describe("saved user login", () => {
 
       // Without a selector the newest login, alice's admin login, is used; a
       // selector must name a saved login.
-      await Cards.connect({ serverUrl }).registerFromPath(prompt);
-      expect(reason(thrown(() => Cards.connect({ serverUrl, tenant: "no-such-tenant" })))).toBe(
+      await cards(serverUrl).registerFromPath(prompt);
+      expect(reason(thrown(() => cards(serverUrl, "no-such-tenant")))).toBe(
         "tenant_mismatch",
       );
 
       // Bob is a reader: the read is allowed and the write denied.
-      const reader = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
+      const reader = cards(serverUrl, FIXTURE_TENANT);
       await reader.list({ kind: "Prompt" });
       expect((await rejection(reader.registerFromPath(prompt))).status).toBe(403);
-      await Cards.connect({ serverUrl, tenant: SECOND_TENANT }).list({ kind: "Prompt" });
+      await cards(serverUrl, SECOND_TENANT).list({ kind: "Prompt" });
 
       // A stale login renews through Wyrd and the renewal is saved.
       server.expireSavedLogin(config, FIXTURE_TENANT);
       expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(true);
-      await Cards.connect({ serverUrl, tenant: FIXTURE_TENANT }).list({ kind: "Prompt" });
+      await cards(serverUrl, FIXTURE_TENANT).list({ kind: "Prompt" });
       expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(false);
 
       // An explicit machine credential overrides the saved reader; it names
       // its own tenant, so a selector beside it is refused.
       const selected = thrown(() =>
-        Cards.connect({ serverUrl, credential: server.apiKey, tenant: FIXTURE_TENANT }),
+        cards(serverUrl, FIXTURE_TENANT, server.apiKey),
       );
       expect(selected.code).toBe("WYRD_CLIENT_400_CONFIG_INVALID");
       expect(selected.message).toContain("already names its tenant");
-      await Cards.connect({ serverUrl, credential: server.apiKey }).registerFromPath(prompt);
+      await cards(serverUrl, undefined, server.apiKey).registerFromPath(prompt);
 
       // Once the chain is revoked the login fails closed and asks for a new login.
       server.revokeSavedLogin(config, FIXTURE_TENANT);
       server.expireSavedLogin(config, FIXTURE_TENANT);
-      const revoked = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
+      const revoked = cards(serverUrl, FIXTURE_TENANT);
       expect(reason(await rejection(revoked.list({ kind: "Prompt" })))).toBe("refresh_refused");
     } finally {
       server.shutdown();

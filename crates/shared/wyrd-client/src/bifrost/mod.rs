@@ -62,6 +62,9 @@ pub use sink::{BifrostIngestSink, IngestTransport};
 pub use table::{Correlation, ResolvedTable, TableConfig, WriterTable};
 /// The bounded producer-queue configuration a Bifrost writer is connected with.
 pub use wyrd_queue::QueueConfig;
+/// The physical compaction type a [`TableConfig`] declares, re-exported so SDK
+/// users name it through this public Bifrost surface.
+pub use wyrd_spec::vala::api::CompactionTypeWire;
 /// One typed positional bind value for [`Bifrost::sql`] and its siblings.
 pub use wyrd_spec::vala::api::QueryParam;
 

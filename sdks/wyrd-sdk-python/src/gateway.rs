@@ -124,22 +124,17 @@ impl PyGateway {
 #[pymethods]
 impl PyGateway {
     /// Connects to a Wyrd server; omitted options resolve from the environment,
-    /// and `tenant` (a tenant route key) selects the saved user login.
+    /// and `WYRD_TENANT` selects the saved user login.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, or a transport error when the client cannot build.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    fn __new__(
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        tenant: Option<&str>,
-    ) -> WyrdPyResult<Self> {
-        let client =
-            wyrd_client::bifrost::client_from_options(server_url, credential, None, tenant)
-                .map_err(WyrdError::from)?;
+    #[pyo3(signature = (server_url=None, credential=None))]
+    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
+        let client = wyrd_client::bifrost::client_from_options(server_url, credential, None)
+            .map_err(WyrdError::from)?;
         Ok(Self {
             inner: wyrd_client::Gateway::new(client),
         })
@@ -204,8 +199,8 @@ impl PyGateway {
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` for an invalid name or the server's permission,
-    /// conflict, or availability error.
+    /// Raises `WyrdError` for an invalid name or the server's permission or
+    /// availability error.
     fn delete_deployment(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::deployment_name(name)?;
         Self::run(py, self.inner.delete_deployment(&name))
@@ -249,7 +244,8 @@ impl PyGateway {
     /// # Errors
     ///
     /// Raises `WyrdError` for an invalid body or the server's permission,
-    /// invalid-configuration, conflict, or availability error.
+    /// invalid-configuration, or availability error. A changed stored pricing
+    /// version is an invalid-configuration error.
     fn put_governance_policy(
         &self,
         py: Python<'_>,

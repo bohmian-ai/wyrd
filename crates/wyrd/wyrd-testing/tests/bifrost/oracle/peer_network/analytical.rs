@@ -26,7 +26,7 @@ const SCRIBE: usize = 3;
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn graph_lease_owns_exact_resources_for_complete_graph() {
-    prove_graph_lease_owns_exact_resources()
+    Box::pin(prove_graph_lease_owns_exact_resources())
         .await
         .expect("graph lease journey");
 }
@@ -311,7 +311,7 @@ const EXCHANGE_COUNTERS: [&str; 2] = [
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn baseline_executes_join_group_sort_and_interchangeable_topology() {
-    prove_physical_analytical_baseline()
+    Box::pin(prove_physical_analytical_baseline())
         .await
         .expect("physical analytical baseline journey");
 }
@@ -594,7 +594,7 @@ async fn peer_planes_are_reachable_from_both_coordinators(
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn stage_graph_executes_representative_query_styles() {
-    prove_representative_query_styles()
+    Box::pin(prove_representative_query_styles())
         .await
         .expect("representative query style journey");
 }

@@ -105,7 +105,7 @@ impl Agent {
                     input.to_owned(),
                     "before_agent",
                 )? {
-                    ChainResult::Abort(error) => {
+                    ChainResult::Abort(error, _) => {
                         return Ok(AgentRun {
                             output: String::new(),
                             final_response: None,
@@ -304,7 +304,7 @@ impl Agent {
                 request.clone(),
                 "before_model",
             )? {
-                ChainResult::Abort(error) => {
+                ChainResult::Abort(error, _) => {
                     self.append_model_journal_call_result(ModelJournalCallRecord {
                         iteration,
                         request: &request,
@@ -357,8 +357,19 @@ impl Agent {
                 response,
                 "after_model",
             )? {
-                ChainResult::Abort(_) => {
-                    unreachable!("after_model callbacks cannot skip a completed provider call")
+                ChainResult::Abort(error, _) => {
+                    return Ok(AgentRun {
+                        output: String::new(),
+                        final_response: None,
+                        iterations: iteration + 1,
+                        finish_reason: FinishReason::CallbackAborted,
+                        conversation,
+                        error: Some(error),
+                        errors: Vec::new(),
+                        structured_output: None,
+                        #[cfg(feature = "python")]
+                        parsed: None,
+                    });
                 }
                 ChainResult::Replaced(replacement) => replacement,
             };
@@ -404,9 +415,16 @@ impl Agent {
                     run,
                     "after_agent",
                 )? {
-                    ChainResult::Abort(_) => {
-                        unreachable!("after_agent callbacks cannot skip a completed agent run")
-                    }
+                    ChainResult::Abort(error, held) => Ok(AgentRun {
+                        output: String::new(),
+                        final_response: None,
+                        finish_reason: FinishReason::CallbackAborted,
+                        error: Some(error),
+                        structured_output: None,
+                        #[cfg(feature = "python")]
+                        parsed: None,
+                        ..held
+                    }),
                     ChainResult::Replaced(replacement) => Ok(replacement),
                 };
             }
@@ -461,7 +479,7 @@ impl Agent {
                             call.args,
                             "before_tool",
                         )? {
-                            ChainResult::Abort(error) => {
+                            ChainResult::Abort(error, _) => {
                                 let content = serde_json::json!({ "skipped": true });
                                 journal
                                     .append(JournalEvent::ToolResult {
@@ -487,24 +505,26 @@ impl Agent {
                             ChainResult::Replaced(replacement) => replacement,
                         };
                         let result = tool.invoke(args).await;
-                        let result = match apply_chain_with_panic_catch_tool_result(
+                        let (ok, content) = match apply_chain_with_panic_catch_tool_result(
                             &after_tool,
                             &ctx,
                             tool.as_ref(),
                             result,
                             "after_tool",
                         )? {
-                            ChainResult::Abort(_) => {
-                                unreachable!(
-                                    "after_tool callbacks cannot skip a completed tool call"
+                            ChainResult::Replaced(Ok(value)) => (true, value),
+                            ChainResult::Replaced(Err(error)) => {
+                                record_error(&tool_span, &error.code());
+                                (
+                                    false,
+                                    serde_json::json!({
+                                        "code": error.code(),
+                                        "error": error.to_string(),
+                                    }),
                                 )
                             }
-                            ChainResult::Replaced(replacement) => replacement,
-                        };
-                        let (ok, content) = match result {
-                            Ok(value) => (true, value),
-                            Err(error) => {
-                                record_error(&tool_span, &error.code());
+                            ChainResult::Abort(error, _) => {
+                                record_error(&tool_span, error.code());
                                 (
                                     false,
                                     serde_json::json!({

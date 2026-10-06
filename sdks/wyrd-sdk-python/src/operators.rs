@@ -58,20 +58,16 @@ pub struct OperatorConnections {
 #[pymethods]
 impl OperatorConnections {
     /// Build a handle; omitted arguments fall through the client configuration,
-    /// and `tenant` (a tenant route key) selects the saved user login.
+    /// and `WYRD_TENANT` selects the saved user login.
     ///
     /// No network call happens here.
     ///
     /// # Errors
     /// Raises `WyrdError` when the server URL or credential cannot be resolved.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    fn __new__(
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        tenant: Option<&str>,
-    ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, None, tenant)
+    #[pyo3(signature = (server_url=None, credential=None))]
+    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
+        let client = client_from_options(server_url, credential, None)
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         Ok(Self {
             inner: NativeOperatorConnections::with_client(client),
@@ -104,7 +100,7 @@ impl OperatorConnections {
     /// Read one connection's redacted view.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `connection_id` is not a UUID, the caller
+    /// Raises `WyrdError` when `connection_id` is not a `UUIDv7`, the caller
     /// lacks `operators:read`, the connection is unknown in the caller's
     /// tenant, or the request fails.
     fn get(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {
@@ -136,7 +132,7 @@ impl OperatorConnections {
     /// Disable one connection; Operators naming it fail closed until re-enabled.
     ///
     /// # Errors
-    /// Raises `WyrdError` when `connection_id` is not a UUID, the caller
+    /// Raises `WyrdError` when `connection_id` is not a `UUIDv7`, the caller
     /// lacks `operators:write`, the connection is unknown, or the request
     /// fails.
     fn disable(&self, py: Python<'_>, connection_id: &str) -> WyrdPyResult<Py<PyAny>> {

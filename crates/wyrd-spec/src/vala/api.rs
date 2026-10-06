@@ -140,6 +140,34 @@ pub struct BifrostTableDescription {
     /// the deployment default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_target_file_size_bytes: Option<u64>,
+    /// The table's explicit Forge compaction type.
+    ///
+    /// Present only when the table stores its own `wyrd.forge.compaction.type`;
+    /// omitted means Forge compacts it `small-files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_type: Option<CompactionTypeWire>,
+}
+
+/// Physical compaction strategy a table asks Forge to apply.
+///
+/// The public wire spelling is hyphenated (`auto`, `full`, `small-files`,
+/// `files-with-delete`), matching the table's stored
+/// `wyrd.forge.compaction.type` Iceberg property; underscore spellings are
+/// rejected. A table that names no type compacts `small-files`, and a
+/// copy-on-write table always compacts `full` whatever it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactionTypeWire {
+    /// Choose a delete-heavy or small-file plan from table-wide thresholds.
+    Auto,
+    /// Rewrite every live data file.
+    Full,
+    /// Rewrite only data files below the small-file threshold; the default
+    /// when none is declared.
+    SmallFiles,
+    /// Rewrite only data files with associated delete files.
+    FilesWithDelete,
 }
 
 // ── Arrow-free schema / field wire types ────────────────────────────────────
@@ -382,6 +410,15 @@ pub struct RegisterTableRequest {
     /// is `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_target_file_size_bytes: Option<u64>,
+    /// Optional physical compaction strategy Forge applies to this table.
+    ///
+    /// Omitted, the table stores no explicit type and Forge compacts it
+    /// `small-files`. Supplied, it is stored as the table's
+    /// `wyrd.forge.compaction.type` Iceberg property. A re-register may omit
+    /// it or repeat the stored value; a different value is
+    /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_type: Option<CompactionTypeWire>,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -2007,76 +2044,10 @@ impl ScribeProviderCut {
     }
 }
 
-/// The exact protected snapshot cut one follower is authorized to read.
-///
-/// A follower never borrows the leader's reader epoch: it must establish its
-/// own durable protection before it opens anything the snapshot names. This is
-/// the signed statement of *which* cut that protection has to cover, so a
-/// follower can prove the snapshot it is about to protect is the one the leader
-/// planned rather than one it inferred from its own catalog.
-///
-/// The ancestry path and its digest travel with the cut because coverage is an
-/// ancestry question, not a numeric one: a follower that only knew the snapshot
-/// identifier could not tell a descendant of the leader's cut from an unrelated
-/// lineage that happens to sort later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct FollowerReaderCut {
-    /// Durable registered identity of the table this cut belongs to.
-    pub table_uid: uuid::Uuid,
-    /// Exact Iceberg snapshot this follower is authorized to read.
-    pub snapshot_id: i64,
-    /// That snapshot's own recorded commit timestamp in milliseconds.
-    pub snapshot_timestamp_ms: i64,
-    /// Newest snapshot on the chain proving this cut's ancestry.
-    pub retained_head_snapshot_id: i64,
-    /// Ancestry from the retained head down to `snapshot_id`, newest first.
-    pub ancestry_path: Vec<i64>,
-    /// Version of the ancestry digest encoding this cut was signed under.
-    pub ancestry_digest_version: u32,
-    /// Lowercase 64-hex SHA-256 digest binding the path to its table.
-    pub ancestry_digest_hex: String,
-    /// Oracle role fence of the epoch this cut was planned under.
-    pub target_epoch_fence: u64,
-}
-
-impl FollowerReaderCut {
-    /// Builds the cut for a source that reads no Iceberg snapshot.
-    ///
-    /// A live Scribe tail assignment reads memory the writer still owns, so
-    /// there is no snapshot for the follower to protect. The cut is still
-    /// required and still signed: making it explicit means a follower can tell
-    /// "this source needs no protection" apart from "the cut was omitted",
-    /// which is the distinction an optional field would erase.
-    ///
-    /// `snapshot_id` zero is the sentinel; Iceberg never assigns it.
-    #[must_use]
-    pub fn no_snapshot(table_uid: uuid::Uuid, target_epoch_fence: u64) -> Self {
-        Self {
-            table_uid,
-            snapshot_id: 0,
-            snapshot_timestamp_ms: 0,
-            retained_head_snapshot_id: 0,
-            ancestry_path: vec![0],
-            ancestry_digest_version: 1,
-            ancestry_digest_hex: "00".repeat(32),
-            target_epoch_fence,
-        }
-    }
-
-    /// Reports whether this cut names an Iceberg snapshot to protect.
-    #[must_use]
-    pub fn protects_a_snapshot(&self) -> bool {
-        self.snapshot_id != 0
-    }
-}
-
 /// One scan-keyed role-local follower assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct FollowerScanAssignment {
-    /// Exact protected snapshot cut this follower must cover before any read.
-    pub reader_cut: FollowerReaderCut,
     /// Stable identifier encoded in the physical extension node.
     pub scan_id: String,
     /// Authenticated tenant/table binding for this scan.
@@ -2156,8 +2127,14 @@ pub struct WorkerScanStats {
     pub row_groups_scanned: u64,
     /// Row groups the follower excluded by closed-predicate statistics
     /// pruning, reported alongside `row_groups_scanned` so an operator can see
-    /// how much a pushed-down predicate actually saved.
+    /// how much a pushed-down predicate actually saved. Counts every excluded
+    /// row group, whether statistics or a Bloom filter excluded it.
     pub row_groups_pruned: u64,
+    /// Subset of `row_groups_pruned` that a Bloom filter excluded after
+    /// min/max statistics retained the row group.
+    pub row_groups_pruned_bloom: u64,
+    /// Rows inside retained row groups that page-index row selection skipped.
+    pub rows_pruned_page_index: u64,
 }
 
 /// Verified worker footer for one completed attempt.
@@ -2647,7 +2624,7 @@ mod bifrost_wire_tests {
     use std::collections::BTreeMap;
 
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec,
+        BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
         INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY, NullOrderWire, PARQUET_FIELD_ID_KEY,
         PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
         SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
@@ -2759,6 +2736,79 @@ mod bifrost_wire_tests {
         bifrost_wire_round_trip(&req);
     }
 
+    /// The register request carries the compaction type in its hyphenated
+    /// public spelling and rejects the underscore spelling, so one table has
+    /// exactly one way to name its type on the wire.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the hyphenated or omitted request fails to deserialize or
+    /// round-trip, carries the wrong compaction type, or the underscore
+    /// spelling is accepted.
+    #[test]
+    fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
+        let req: RegisterTableRequest = serde_json::from_str(
+            r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                "compaction_type":"small-files"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
+        bifrost_wire_round_trip(&req);
+        let omitted: RegisterTableRequest =
+            serde_json::from_str(r#"{"namespace":"vala.datasets","name":"events","fields":[]}"#)
+                .expect("deserialize");
+        assert_eq!(omitted.compaction_type, None);
+        assert!(
+            serde_json::from_str::<RegisterTableRequest>(
+                r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                    "compaction_type":"small_files"}"#,
+            )
+            .is_err()
+        );
+    }
+
+    /// Every compaction type serializes to exactly its approved hyphenated
+    /// value, the underscore spellings are refused, and the generated request
+    /// and description schemas publish the same set and the `small-files`
+    /// omitted default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compaction type serializes or parses to a spelling other
+    /// than its hyphenated value, an underscore spelling parses, or a generated
+    /// schema omits the approved values or the `small-files` default.
+    #[test]
+    fn bifrost_wire_compaction_type_values_and_schemas_are_hyphenated() {
+        for (kind, spelling) in [
+            (CompactionTypeWire::Auto, "auto"),
+            (CompactionTypeWire::Full, "full"),
+            (CompactionTypeWire::SmallFiles, "small-files"),
+            (CompactionTypeWire::FilesWithDelete, "files-with-delete"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize"),
+                serde_json::Value::String(spelling.to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<CompactionTypeWire>(spelling.into()).expect("parse"),
+                kind
+            );
+        }
+        for refused in ["small_files", "files_with_delete"] {
+            assert!(serde_json::from_value::<CompactionTypeWire>(refused.into()).is_err());
+        }
+        for schema in [
+            serde_json::to_string(&schema_for!(RegisterTableRequest)).expect("schema"),
+            serde_json::to_string(&schema_for!(BifrostTableDescription)).expect("schema"),
+        ] {
+            assert!(schema.contains(r#""small-files""#), "{schema}");
+            assert!(schema.contains(r#""files-with-delete""#), "{schema}");
+            assert!(!schema.contains("small_files"), "{schema}");
+            assert!(!schema.contains("files_with_delete"), "{schema}");
+            assert!(schema.contains("compacts it `small-files`"), "{schema}");
+        }
+    }
+
     /// No wire field names a partition column any more, so a declaration that
     /// carries one is rejected rather than silently ignored.
     #[test]
@@ -2813,6 +2863,14 @@ mod bifrost_wire_tests {
         bifrost_wire_round_trip(&spec);
     }
 
+    /// A table entry and its full description survive a JSON round trip,
+    /// including correlation fields, field-id metadata, managed candidates,
+    /// physical layout, and the compaction target and type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either value does not serialize and deserialize back to an
+    /// equal value.
     #[test]
     fn bifrost_wire_table_entry_and_description_round_trip() {
         let entry = BifrostTableEntry {
@@ -2872,6 +2930,7 @@ mod bifrost_wire_tests {
                 bloom_columns: vec!["run_id".to_string()],
             },
             compaction_target_file_size_bytes: Some(1_073_741_824),
+            compaction_type: Some(CompactionTypeWire::SmallFiles),
         };
         bifrost_wire_round_trip(&entry);
         bifrost_wire_round_trip(&desc);

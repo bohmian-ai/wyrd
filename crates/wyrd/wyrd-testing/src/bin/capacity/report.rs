@@ -12,7 +12,7 @@
 //!   one-replica sustained step (AC-040);
 //! - ingest drain: every tenant's client queue drained within
 //!   [`INGEST_DRAIN`] with no `QUEUE_FULL` (AC-041, counted as an error);
-//! - backlogs: run queue, Scribe, audit outbox, and Forge demand empty
+//! - backlogs: run queue, Scribe, audit outbox, and Forge tasks empty
 //!   within [`DRAIN_LIMIT`] of load stopping.
 //!
 //! Client latency, replica CPU and memory, the judge kind's engine overhead,
@@ -475,7 +475,7 @@ impl Report {
         }
         let _ = writeln!(
             text,
-            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, wrong judgment, failed run; QUEUE_FULL counts); direct overhead p95 < 10 ms for PSI, SPC, Custom and assertion Eval, from ≥ 1,000 samples each in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge demand) drained within 60 s of load stopping. Latency, CPU/memory, judge engine overhead, and judge provider wait are reported, not judged. Overhead figures are bucket upper bounds. Each step row (operation `all`) is followed by its operation rows; `n/a` marks a column that does not apply.\n"
+            "\nL is verification executions per second over four identical tenants; each step offers direct and queued verification at L/2 each, Scribe ingest at 2.5·L Drift observations of 100 features, and Oracle queries at L/2. SLOs: traffic ≥ 95% of offered per operation; 0 errors (refused, lost, wrong judgment, failed run; QUEUE_FULL counts); direct overhead p95 < 10 ms for PSI, SPC, Custom and assertion Eval, from ≥ 1,000 samples each in the 1-replica sustained step; client queue drain ≤ 1 s; every backlog (run queue, Scribe, audit outbox, Forge tasks) drained within 60 s of load stopping. Latency, CPU/memory, judge engine overhead, and judge provider wait are reported, not judged. Overhead figures are bucket upper bounds. Each step row (operation `all`) is followed by its operation rows; `n/a` marks a column that does not apply.\n"
         );
         let _ = writeln!(text, "{HEADER}");
         for record in &self.records {

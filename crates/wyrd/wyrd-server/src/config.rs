@@ -239,30 +239,10 @@ pub struct ForgeRuntimeConfig {
     /// set. Default 1.
     #[serde(default)]
     pub per_tenant_active_cap: Option<usize>,
-    /// Age (seconds) after which old Iceberg snapshots become eligible for
-    /// expiry. Must be positive when set. Default 432000 (120 hours).
-    #[serde(default)]
-    pub snapshot_retention_secs: Option<u64>,
-    /// Number of snapshots retained along each current/ref ancestry. Must be
-    /// positive and must not exceed the internal retained-snapshot traversal
-    /// cap. Default 1.
-    #[serde(default)]
-    pub retain_last: Option<usize>,
     /// Age (seconds) after which an unreferenced object may be deleted by
     /// orphan GC. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
     pub orphan_gc_ttl_secs: Option<u64>,
-    /// Count of accumulated commits past `retain_last` that makes snapshot
-    /// expiry due on its own, independent of compaction backlog. Must be at
-    /// least 1 when set. Default 32.
-    #[serde(default)]
-    pub maintenance_trigger_snapshot_count: Option<usize>,
-    /// Oldest-retained-snapshot age (seconds) past which snapshot expiry
-    /// becomes due when at least one commit exists past `retain_last`. Paired
-    /// with `maintenance_trigger_snapshot_count` as a count-OR-interval
-    /// trigger. Must be positive when set. Default 3600 (1 hour).
-    #[serde(default)]
-    pub maintenance_trigger_interval_secs: Option<u64>,
     /// Maximum object-store listing pages one orphan-GC candidate scan walks
     /// before yielding cleanly to a successor run. Must be at least 1 when set.
     /// Default 1024.
@@ -272,8 +252,9 @@ pub struct ForgeRuntimeConfig {
     /// Partial. Must be positive when set. Default 120 (2 minutes).
     #[serde(default)]
     pub orphan_gc_run_budget_secs: Option<u64>,
-    /// Interval (seconds) between Forge maintenance scheduler ticks. Must be
-    /// positive when set. Default 60.
+    /// Interval (seconds) between the Forge leader's manifest-rewrite,
+    /// snapshot-expiry and cleanup passes. Must be positive when set.
+    /// Default 3600 (1 hour).
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
     /// Soft rewrite file target for every table that declares no
@@ -526,6 +507,18 @@ fn default_oracle_max_workers_per_query() -> usize {
 }
 fn default_oracle_max_frame_bytes() -> usize {
     8 * 1024 * 1024
+}
+
+impl OracleRuntimeConfig {
+    /// Returns the total deadline a query without `deadline_ms` runs under.
+    ///
+    /// Boot resolves it once from this configuration for both the local Oracle
+    /// engine and the public forwarder, so neither path can fall back to the
+    /// built-in default while the other honors the configured value.
+    #[must_use]
+    pub const fn default_query_deadline(&self) -> Duration {
+        Duration::from_millis(self.default_query_deadline_ms)
+    }
 }
 
 impl Default for OracleRuntimeConfig {
@@ -1103,7 +1096,9 @@ impl BifrostRuntimeConfig {
 /// Oracle, and Forge in-process and opens no private socket. Peer mode is
 /// enabled by supplying both `address` and `tls_dir`, even for the first of
 /// several replicas; each replica publishes its own address through the
-/// existing fenced `vala.cluster_nodes` membership.
+/// existing fenced `vala.cluster_nodes` membership. A dedicated `forge-worker`
+/// opens no listener, so it takes `tls_dir` alone: its credentials only dial
+/// the elected Forge leader's peer route.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
@@ -1173,13 +1168,35 @@ impl BifrostPeerConfig {
         }))
     }
 
-    /// Validates the explicit peer-mode inputs.
+    /// Validates the explicit peer-mode inputs for a process that does, or
+    /// does not, serve a peer listener.
+    ///
+    /// A listening target needs both `address` and `tls_dir` or neither. A
+    /// dial-only target (`listens == false`, the dedicated Forge worker) may
+    /// name `tls_dir` alone and never an `address`, because it publishes no
+    /// endpoint for anyone to dial.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when only one of `address` and
-    /// `tls_dir` is supplied, or when `address` is not a bare `host:port`.
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] when a listening target supplies only
+    /// one of `address` and `tls_dir`, a dial-only target supplies an
+    /// `address`, `tls_dir` is empty, or `address` is not a bare `host:port`.
+    fn validate(&self, listens: bool) -> Result<(), ConfigError> {
+        if !listens {
+            if self.address.is_some() {
+                return Err(ConfigError::Invalid {
+                    message: "the forge-worker target serves no peer listener; \
+                              unset WYRD_PEER_ADDRESS and keep only WYRD_PEER_TLS_DIR"
+                        .to_owned(),
+                });
+            }
+            return match &self.tls_dir {
+                Some(tls_dir) if tls_dir.as_os_str().is_empty() => Err(ConfigError::Invalid {
+                    message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
+                }),
+                _ => Ok(()),
+            };
+        }
         let (address, tls_dir) = match (&self.address, &self.tls_dir) {
             (None, None) => return Ok(()),
             (Some(address), Some(tls_dir)) => (address, tls_dir),
@@ -3301,21 +3318,15 @@ impl WyrdServerConfig {
             self.workflow.validate()?;
         }
 
-        // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
-        // target cannot reach its counterpart in-process and needs it; a Forge
-        // worker keeps its durable assignment path and never opens the socket.
-        self.bifrost.peer.validate()?;
+        // Peer mode is explicit and all-or-nothing for a listening target. A
+        // split Scribe or Oracle target cannot reach its counterpart
+        // in-process and needs it; a Forge worker never opens the socket and
+        // takes only the credentials it dials the Forge leader with.
+        self.bifrost.peer.validate(serves_api)?;
         if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
                 message: "split oracle and scribe targets require peer mode \
                           (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
-                    .to_owned(),
-            });
-        }
-        if !serves_api && self.bifrost.peer.is_enabled() {
-            return Err(ConfigError::Invalid {
-                message: "the forge-worker target serves no peer listener; \
-                          unset WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR"
                     .to_owned(),
             });
         }
@@ -4010,11 +4021,7 @@ mod tests {
         let config = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, None);
-        assert_eq!(forge.snapshot_retention_secs, None);
-        assert_eq!(forge.retain_last, None);
         assert_eq!(forge.orphan_gc_ttl_secs, None);
-        assert_eq!(forge.maintenance_trigger_snapshot_count, None);
-        assert_eq!(forge.maintenance_trigger_interval_secs, None);
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
         assert_eq!(forge.maintenance_interval_secs, None);
@@ -4027,11 +4034,7 @@ mod tests {
         let toml = r"
 [forge]
 per_tenant_active_cap = 2
-snapshot_retention_secs = 7200
-retain_last = 3
 orphan_gc_ttl_secs = 3600
-maintenance_trigger_snapshot_count = 8
-maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
 maintenance_interval_secs = 45
@@ -4039,11 +4042,7 @@ maintenance_interval_secs = 45
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, Some(2));
-        assert_eq!(forge.snapshot_retention_secs, Some(7200));
-        assert_eq!(forge.retain_last, Some(3));
         assert_eq!(forge.orphan_gc_ttl_secs, Some(3600));
-        assert_eq!(forge.maintenance_trigger_snapshot_count, Some(8));
-        assert_eq!(forge.maintenance_trigger_interval_secs, Some(900));
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
         assert_eq!(forge.maintenance_interval_secs, Some(45));
@@ -4709,6 +4708,54 @@ minimum_slots = 2
         assert!(
             config.validate().is_err(),
             "a Forge worker opens no peer socket"
+        );
+    }
+
+    /// A dedicated Forge worker takes peer credentials without an address and
+    /// reads them to dial the leader; a listening target may not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a dial-only worker is refused or reads no bundle, or when a
+    /// listening target accepts credentials without an address.
+    #[test]
+    fn forge_worker_takes_dial_only_peer_credentials() {
+        let dir = tempfile::tempdir().expect("peer TLS directory");
+        for (name, contents) in [("ca.crt", "ca"), ("tls.crt", "leaf"), ("tls.key", "key")] {
+            std::fs::write(dir.path().join(name), contents).expect("peer TLS file");
+        }
+        let dial_only = BifrostPeerConfig {
+            tls_dir: Some(dir.path().to_path_buf()),
+            ..BifrostPeerConfig::default()
+        };
+        let mut config = WyrdServerConfig {
+            role: BifrostTarget::ForgeWorker,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.peer = dial_only.clone();
+        config
+            .validate()
+            .expect("a Forge worker dials the leader with credentials alone");
+        assert_eq!(config.bifrost.peer.advertised_uri(), None);
+        let bundle = config
+            .bifrost
+            .peer
+            .read_bundle()
+            .expect("the dial-only bundle reads")
+            .expect("dial-only credentials are peer mode");
+        assert_eq!(bundle.certificate_chain, b"leaf");
+
+        config.bifrost.peer.tls_dir = Some(PathBuf::new());
+        assert!(
+            config.validate().is_err(),
+            "an empty dial-only directory is refused"
+        );
+
+        config.role = BifrostTarget::Server;
+        config.bifrost.peer = dial_only;
+        assert!(
+            config.validate().is_err(),
+            "a listening target needs an address with its credentials"
         );
     }
 

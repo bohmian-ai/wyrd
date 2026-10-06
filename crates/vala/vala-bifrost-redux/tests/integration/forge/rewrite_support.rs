@@ -249,6 +249,16 @@ impl PromotedRewriteFixture {
     /// path receives. Execution stops at the first plan that fails, and the
     /// attempt handle is returned either way so a scenario can read the
     /// attempt-global possible-output set after a drain or a failure.
+    ///
+    /// It plans `Full`, as the fixture table declares: the fixture seals one
+    /// object per day, so every object is its own group, and the scenarios
+    /// here are about what happens to a plan rather than which files a type
+    /// selects.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the managed-rewrite attempt context cannot be built for the
+    /// fixture binding.
     pub(crate) async fn run_attempt(
         &self,
         forge: &Arc<Forge>,
@@ -263,7 +273,10 @@ impl PromotedRewriteFixture {
                 &cancel,
             )
             .expect("the attempt context builds");
-        let planned = match rewrite.plan().await {
+        let planned = match rewrite
+            .plan(vala_bifrost_redux::forge::ForgeCompactionType::Full)
+            .await
+        {
             Ok(planned) => planned,
             Err(failure) => {
                 return AttemptRun {

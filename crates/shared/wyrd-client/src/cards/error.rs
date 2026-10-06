@@ -89,7 +89,6 @@ mod tests {
                 environment.clone(),
                 server_url,
                 credential.map(SecretString::from),
-                None,
             )
             .map(Cards::with_client)
             .map_err(WyrdError::from)

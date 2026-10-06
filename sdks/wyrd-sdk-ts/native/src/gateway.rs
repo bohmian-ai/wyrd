@@ -46,17 +46,14 @@ pub struct NativeGateway {
 pub fn connect_gateway(
     server_url: Option<String>,
     credential: Option<String>,
-    tenant: Option<String>,
 ) -> napi::Result<NativeGateway> {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         None,
-        tenant.as_deref(),
     );
     drop(server_url);
     drop(credential);
-    drop(tenant);
     let client = client.map_err(napi_error)?;
     Ok(NativeGateway {
         gateway: Gateway::new(client),

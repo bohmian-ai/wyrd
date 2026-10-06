@@ -17,4 +17,3 @@ Current owners and evidence:
 - [Bifrost design](../../../architecture/bifrost-design.md).
 - [Data-root owner](../../../crates/wyrd/wyrd-server/src/boot/data_root.rs), [server boot](../../../crates/wyrd/wyrd-server/src/boot/mod.rs), and [server configuration](../../../crates/wyrd/wyrd-server/src/config.rs).
 - [Bifrost server and Scribe journeys](../../../crates/wyrd/wyrd-testing/tests/bifrost).
-

@@ -185,7 +185,6 @@ fn connect(server: &WyrdTestServer, credential: &str) -> WyrdClient {
         Some(server.base_url().expect("bound server has a URL")),
         Some(credential),
         server.grpc_url().as_deref(),
-        None,
     )
     .expect("client builds")
 }
@@ -1028,6 +1027,11 @@ fn answered_observation(
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
 /// the first mismatch.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourneyError> {

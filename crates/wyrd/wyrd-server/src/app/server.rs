@@ -17,7 +17,7 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
     TaskExit, TaskId, classify_first_exit_with_shutdown, drain_with_shutdown_hooks, fallible_task,
-    worker_task,
+    restarting_worker, worker_task,
 };
 use crate::boot::{
     ServerBootError, check_card_recovery_pool, spawn_maintenance_scheduler, spawn_storage_sweeper,
@@ -45,14 +45,24 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
 /// only on the clean path so a lifecycle failure can never be mistaken for a
 /// completed drain. A supervisor terminal message and a Bifrost lifecycle error
 /// both remain terminal, with the Bifrost error taking precedence because it
-/// describes the state the process is actually leaving behind.
+/// describes the state the process is actually leaving behind. When both are
+/// present the supervisor message is appended to the Bifrost error, so the
+/// exit reason still names the failure that triggered the shutdown.
+///
+/// # Errors
+///
+/// Returns [`BootExit::Other`] when either a supervisor terminal message or a
+/// Bifrost lifecycle error is present.
 fn server_shutdown_result(
     terminal: Option<String>,
     bifrost_error: Option<wyrd_spec::vala::error::BifrostError>,
     report: BifrostShutdownReport,
 ) -> Result<BifrostShutdownReport, BootExit> {
     match (terminal, bifrost_error) {
-        (_, Some(error)) => Err(BootExit::Other(Box::new(error))),
+        (Some(message), Some(error)) => Err(BootExit::Other(
+            format!("{error}; shutdown was triggered by: {message}").into(),
+        )),
+        (None, Some(error)) => Err(BootExit::Other(Box::new(error))),
         (Some(message), None) => Err(BootExit::Other(
             Box::<dyn std::error::Error + Send + Sync>::from(message),
         )),
@@ -495,8 +505,8 @@ impl BoundServer {
     /// install.
     ///
     /// # Panics
-    ///
-    /// Panics if a bound peer listener lacks its peer router, which binding rules out.
+    /// Panics if a bound peer listener has no peer router. Binding sets both
+    /// together, so this is an invariant violation, not a runtime condition.
     pub async fn run(mut self) -> Result<BifrostShutdownReport, BootExit> {
         // A production deployment without the Wyrd operator pool cannot run the
         // Card recovery sweep, so stale precommits would leak indefinitely.
@@ -617,24 +627,41 @@ impl BoundServer {
                 }
             }));
         }
-        // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
-        // live-set rebuild, and orphan GC for this process.
-        if let Some(scheduler) = spawn_maintenance_scheduler(&self.state, shutdown.clone())
-            .map_err(|e| BootExit::Other(Box::new(e)))?
-        {
-            set.spawn(fallible_task(
-                TaskId::Worker("maintenance_scheduler"),
-                scheduler,
-            ));
+        // One supervised Redux Forge scheduler owns compaction, expiry,
+        // reconciliation, live-set rebuild, and orphan GC for this process. A
+        // Forge failure costs only maintenance on this pod, so the scheduler and
+        // the embedded worker restart in place instead of stopping the API.
+        if self.state.forge_handle().is_some() {
+            let state = self.state.clone();
+            let scheduler = restarting_worker(
+                "maintenance_scheduler",
+                shutdown.clone(),
+                move |token| {
+                    spawn_maintenance_scheduler(&state, token)?.ok_or_else(|| {
+                        ServerBootError::ForgeSchedulerRequired {
+                            detail: "Forge maintenance owner is no longer composed".to_owned(),
+                        }
+                    })
+                },
+                vala_bifrost_redux::forge::ForgeTelemetry::record_scheduler_restart,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(scheduler);
         }
         // `All` owns one bounded Forge worker in addition to the scheduler;
         // `Server` intentionally schedules maintenance without executing it.
         // The dedicated `ForgeWorker` process is composed by
         // `run_forge_worker_process` and never reaches this serving owner.
         if self.config.role == BifrostTarget::All {
-            let worker = crate::boot::spawn_forge_worker(&self.state, shutdown.clone())
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
-            set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+            let state = self.state.clone();
+            let worker = restarting_worker(
+                "forge_worker",
+                shutdown.clone(),
+                move |token| crate::boot::spawn_forge_worker(&state, token),
+                vala_bifrost_redux::forge::ForgeTelemetry::record_worker_restart,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(worker);
         }
 
         if let Some(operator) = self.state.postgres.operator_pool() {
@@ -1051,7 +1078,8 @@ mod pg_tests {
         drop(server2);
     }
 
-    /// Preserves an observable Bifrost lifecycle failure after the required abort.
+    /// Preserves an observable Bifrost lifecycle failure after the required
+    /// abort, together with the supervisor failure that triggered it.
     #[tokio::test]
     async fn bound_server_run_preserves_bifrost_shutdown_failure_after_abort() {
         let result = server_shutdown_result(
@@ -1065,6 +1093,9 @@ mod pg_tests {
         else {
             panic!("Bifrost lifecycle failure must use the runtime error channel");
         };
-        assert_eq!(error.to_string(), "Scribe role unavailable");
+        assert_eq!(
+            error.to_string(),
+            "Scribe role unavailable; shutdown was triggered by: worker exited"
+        );
     }
 }

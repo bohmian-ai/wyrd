@@ -8,6 +8,7 @@ mod pg_audit_outbox;
 mod pg_audit_staging;
 mod pg_file_list_cluster_nodes;
 mod pg_forge_file_list;
+mod pg_forge_leader;
 mod pg_forge_operations;
 mod pg_forge_tasks;
 mod pg_maintenance_leases;

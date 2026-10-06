@@ -6,7 +6,7 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
+use vala_bifrost_redux::catalog::{BifrostCatalogError, CompactionRegistration, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -68,8 +68,10 @@ fn assert_registered_layout_matches(
 /// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
 /// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
 /// A supplied `compaction_target_file_size_bytes` must match an existing
-/// table's explicit target (`WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`);
-/// omitting it on an existing table leaves the stored target unchanged.
+/// table's explicit target (`WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`),
+/// and a supplied `compaction_type` its explicit type
+/// (`WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`); omitting either on an
+/// existing table leaves the stored property unchanged.
 ///
 /// Exactly one canonical audit row records the verdict. It is staged on the
 /// process audit outbox as soon as the permission is decided, before
@@ -137,6 +139,13 @@ pub async fn register_table(
                     wyrd_spec::vala::BifrostError::CompactionTargetMismatch { table: fqn }.into(),
                 );
             }
+            if let Some(kind) = body.compaction_type
+                && existing.compaction_type != Some(kind)
+            {
+                return Err(
+                    wyrd_spec::vala::BifrostError::CompactionTypeMismatch { table: fqn }.into(),
+                );
+            }
             Ok(RegisterTableResponse {
                 outcome: RegisterOutcome::AlreadyExists,
                 table_uid: existing.entry.table_uid,
@@ -150,7 +159,10 @@ pub async fn register_table(
                     table,
                     user_fields,
                     body.physical_layout.clone(),
-                    body.compaction_target_file_size_bytes,
+                    CompactionRegistration {
+                        target_file_size_bytes: body.compaction_target_file_size_bytes,
+                        compaction_type: body.compaction_type.map(Into::into),
+                    },
                 )
                 .await
                 .map_err(map_engine_error)?;
@@ -246,7 +258,7 @@ mod pg_tests {
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeGranularityWire};
+    use wyrd_spec::vala::api::{CompactionTypeWire, DataTypeSpec, FieldSpec, TimeGranularityWire};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     async fn test_state() -> AppState {
@@ -359,6 +371,9 @@ mod pg_tests {
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
 
+    /// Builds a `vala.datasets` registration request for `name` with the given
+    /// fields and every optional layout and compaction setting left unset, so
+    /// each test exercises the server defaults.
     fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
         RegisterTableRequest {
             namespace: "vala.datasets".to_owned(),
@@ -366,6 +381,7 @@ mod pg_tests {
             fields,
             physical_layout: None,
             compaction_target_file_size_bytes: None,
+            compaction_type: None,
         }
     }
 
@@ -483,6 +499,82 @@ mod pg_tests {
             assert_eq!(
                 default.compaction_target_file_size_bytes, None,
                 "an omitted target stores no property and follows the deployment default"
+            );
+        });
+    }
+
+    /// An explicit compaction type is stored on create, described back,
+    /// accepted when repeated or omitted, and refused with its own stable code
+    /// when it differs — without changing the stored type. An omitted type
+    /// stores nothing, so the table compacts with Forge's `small-files` default.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start or any registration or describe
+    /// outcome differs from the documented contract.
+    #[test]
+    fn bifrost_tables_register_compaction_type_is_stored_and_fenced() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([
+                Permission::bifrost_table_write(),
+                Permission::bifrost_table_read(),
+            ]);
+            let name = unique_name();
+            let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+            req.compaction_type = Some(CompactionTypeWire::SmallFiles);
+            let created = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("an explicit type registers");
+            assert_eq!(created.outcome, RegisterOutcome::Created);
+            let described = |name: String| {
+                let state = &state;
+                let caller = caller.clone();
+                async move {
+                    describe_table(state, caller, "vala.datasets".to_owned(), name)
+                        .await
+                        .expect("registered table describes")
+                        .compaction_type
+                }
+            };
+            assert_eq!(
+                described(name.clone()).await,
+                Some(CompactionTypeWire::SmallFiles)
+            );
+
+            let repeated = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("the same type is idempotent");
+            assert_eq!(repeated.outcome, RegisterOutcome::AlreadyExists);
+            req.compaction_type = None;
+            register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("omission on an existing table is accepted");
+            req.compaction_type = Some(CompactionTypeWire::Full);
+            let conflict = register_table(&state, caller.clone(), req)
+                .await
+                .expect_err("a different type conflicts");
+            assert_eq!(
+                conflict.code(),
+                "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH"
+            );
+            assert_eq!(
+                described(name).await,
+                Some(CompactionTypeWire::SmallFiles),
+                "the stored type is unchanged"
+            );
+
+            let default_name = unique_name();
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&default_name, vec![field("id", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect("an omitted type registers");
+            assert_eq!(
+                described(default_name).await,
+                None,
+                "an omitted type stores no property and compacts full"
             );
         });
     }

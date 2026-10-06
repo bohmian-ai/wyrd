@@ -50,7 +50,7 @@ use clap::Parser;
 use secrecy::ExposeSecret as _;
 use tokio::time::{Instant, Interval};
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::release_server::{CPUS, LocalServer, MEMORY_BYTES, STOP_GRACE};
+use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES, STOP_GRACE};
 
 use evidence::Queue;
 use fixture::Tenant;
@@ -499,6 +499,7 @@ impl Benchmark {
             &self.cli.database_admin_url,
             &TENANTS,
             &self.env(0),
+            Envelope::POD,
         )
         .await?;
         let mut tenants = Vec::new();
@@ -742,7 +743,7 @@ mod tests {
     use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::{Benchmark, Cli, Lifetime, LocalServer};
+    use super::{Benchmark, Cli, Envelope, Lifetime, LocalServer};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -953,7 +954,7 @@ esac
         let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
-        let replica = LocalServer::start(&server, "postgres://unused", &[], &[])
+        let replica = LocalServer::start(&server, "postgres://unused", &[], &[], Envelope::POD)
             .await
             .expect("the stand-in serves");
         benchmark.deployment = Some(super::Deployment {

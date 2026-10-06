@@ -155,5 +155,12 @@ name = "capacity"
 path = "src/bin/capacity/main.rs"
 bench = false
 
+# The opt-in Forge capacity benchmark. Run only through
+# `mise run bench:bifrost:forge-capacity`; only its unit tests run in a lane.
+[[bin]]
+name = "bifrost_forge_capacity"
+path = "src/bin/bifrost_forge_capacity/main.rs"
+bench = false
+
 [lints]
 workspace = true

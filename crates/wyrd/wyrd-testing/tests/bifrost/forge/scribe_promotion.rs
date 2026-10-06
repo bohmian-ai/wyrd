@@ -383,10 +383,22 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
 /// still unsettled in SQL. The production `pin_sealed_table` cut is taken at
 /// that instant, and before and after it, and each cut must partition the
 /// sealed set exactly.
+///
+/// # Panics
+///
+/// Panics when the fixture seals nothing, the held promotion does not reach
+/// or leave the catalog boundary in time, or any cut double-counts or misses
+/// a sealed row.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     /// Asserts one production cut sees every sealed path exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cut cannot be acquired, materialized, or released, when
+    /// a path is visible from both hot and promoted sources, or when the cut
+    /// does not cover the sealed set exactly.
     async fn assert_exact_cut(
         catalog: &vala_bifrost_redux::catalog::BifrostCatalog,
         table: &vala_bifrost_redux::catalog::TableRef,
@@ -394,15 +406,31 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let permit = vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-        let prepared = catalog
-            .prepare_reader_identity(table, tenant)
+        let query_id = uuid::Uuid::now_v7();
+        let acquired = catalog
+            .acquire_active_cut(
+                tenant,
+                vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
+                    query_id,
+                    node_id: uuid::Uuid::now_v7(),
+                    fencing_token: 1,
+                },
+                std::time::Instant::now() + std::time::Duration::from_hours(1),
+                std::slice::from_ref(table),
+            )
             .await
-            .expect("the registered table prepares its reader identity");
+            .expect("the registered table acquires its active cut")
+            .expect("an hour remains before the deadline")
+            .pop()
+            .expect("one acquired table");
         let pinned = catalog
-            .materialize_reader_cut(prepared, &permit)
+            .materialize_acquired_cut(tenant, table, acquired)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
+        catalog
+            .release_active_reads(tenant, query_id)
+            .await
+            .expect("the inspection cut releases its active read");
         let hot = pinned
             .hot_files
             .iter()
@@ -419,6 +447,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
             "{label}: the cut does not cover the sealed set exactly"
         );
     }
+
     let server = start_engine_fixture_server().await;
     let fixture = seed_forge_group(&server, "promotion_window").await;
     let catalog_owner = server.bifrost_catalog();
@@ -647,6 +676,12 @@ async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
 /// already be spent, so the definite conflict closes the operation instead of
 /// buying a second catalog call. One delegated update — against two in the
 /// retry scenario — is what proves the barrier held.
+///
+/// # Panics
+///
+/// Panics when the manual Forge clock cannot advance past the retry budget,
+/// the catalog sees more than one update attempt, the operation does not
+/// close as `reset`, or any sealed row is settled.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_deadline_expires_before_conflict_retry() {
@@ -697,10 +732,15 @@ async fn scribe_promotion_deadline_expires_before_conflict_retry() {
 
 /// Cancellation drains a parked promotion without settling anything.
 ///
-/// The worker is cancelled while its commit is parked before delegation, so
-/// acceptance is unknown by construction. Draining must therefore release the
+/// The coordinator is cancelled while its inline promotion commit is parked
+/// before delegation, so acceptance is unknown by construction. Draining must therefore release the
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have.
+///
+/// # Panics
+///
+/// Panics when the drained operation leaves `prepared`, any sealed row is
+/// settled, or the drained attempt still holds its lease.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_cancellation_drains_without_settlement() {
@@ -715,11 +755,11 @@ async fn scribe_promotion_cancellation_drains_without_settlement() {
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&fixture.object_store),
     );
-    let worker_stop = forge.worker_stop();
+    let coordinator_stop = forge.coordinator_stop();
     let forge = forge
         .run_one_failure_while(async {
             catalog.wait_for_before_commit().await;
-            worker_stop.cancel();
+            coordinator_stop.cancel();
             catalog.wait_for_before_commit_drop().await;
         })
         .await;

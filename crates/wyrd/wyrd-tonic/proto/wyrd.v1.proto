@@ -88,6 +88,15 @@ service ScribeTailService {
 service ScribeCapturePeerService {
   rpc IngestCapture(IngestCaptureRequest) returns (IngestCaptureResponse);
 }
+// The elected Forge leader's private surface on a coordinator's peer listener.
+// A caller resolves the live term from the election row and names its fencing
+// token, so a replaced or expired leader refuses rather than counting a commit.
+service ForgeLeaderPeerService {
+  rpc NotifyPromotion(NotifyForgePromotionRequest) returns (NotifyForgePromotionResponse);
+  // A compactor's capacity pull; the response is its acknowledgement.
+  rpc PullCompaction(PullForgeCompactionRequest) returns (PullForgeCompactionResponse);
+  rpc ReportCompaction(ReportForgeCompactionRequest) returns (ReportForgeCompactionResponse);
+}
 service OraclePeerService {
   // Held graph grant. The first message admits or refuses; an admitted grant
   // lives exactly as long as the leader keeps this stream open.
@@ -125,6 +134,30 @@ message VerifierResultAttribution {
   string run_id = 1; string verifier_ref = 2; string verifier_uid = 3; string principal_id = 4;
 }
 message IngestCaptureResponse {}
+// One successful Scribe promotion Iceberg commit. properties carries only the
+// table's wyrd.forge.* scheduling settings, read where the table was loaded.
+message NotifyForgePromotionRequest {
+  sint64 fencing_token = 1; string tenant_id = 2; string namespace = 3; string table = 4;
+  sint64 snapshot_id = 5; map<string, string> properties = 6;
+}
+message NotifyForgePromotionResponse {}
+// At most limit table-level tasks; the leader never names files.
+message PullForgeCompactionRequest { sint64 fencing_token = 1; uint32 limit = 2; }
+message ForgeCompactionTask {
+  string task_id = 1; string tenant_id = 2; string namespace = 3; string table = 4;
+  string branch = 5; string compaction_type = 6;
+}
+message PullForgeCompactionResponse { repeated ForgeCompactionTask tasks = 1; }
+// NOT_STARTED returns an undelivered task to Idle with its commits intact.
+enum ForgeCompactionOutcome {
+  FORGE_COMPACTION_OUTCOME_UNSPECIFIED = 0; FORGE_COMPACTION_OUTCOME_SUCCEEDED = 1;
+  FORGE_COMPACTION_OUTCOME_FAILED = 2; FORGE_COMPACTION_OUTCOME_NOT_STARTED = 3;
+}
+message ReportForgeCompactionRequest {
+  sint64 fencing_token = 1; string task_id = 2; string tenant_id = 3; string namespace = 4;
+  string table = 5; ForgeCompactionOutcome outcome = 6;
+}
+message ReportForgeCompactionResponse { bool matched = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
 message OracleRoleFence { string node_id = 1; ClusterRole role = 2; uint64 fencing_token = 3; }
@@ -193,27 +226,17 @@ message ScanLiteral {
   oneof value {
     bool bool_value = 1; int64 i64_value = 2; uint64 u64_value = 3;
     uint64 f64_bits_value = 4; string utf8_value = 5; int64 timestamp_micros_value = 6;
+    bytes bytes_value = 7;
   }
 }
 message ScanPredicate { ScanPredicateOp op = 1; string column = 2; ScanLiteral literal = 3; }
-// Exact protected snapshot cut one follower is authorized to read. Required:
-// a follower establishes its own reader protection over this cut before it
-// opens anything, and never borrows the leader's epoch.
-message FollowerReaderCut {
-  bytes table_uid = 1;              // exactly 16 bytes; registered table identity
-  int64 snapshot_id = 2; int64 snapshot_timestamp_ms = 3;
-  int64 retained_head_snapshot_id = 4;
-  repeated int64 ancestry_path = 5; // newest first, head .. snapshot_id
-  uint32 ancestry_digest_version = 6;
-  bytes ancestry_digest = 7;        // exactly 32 bytes
-  uint64 target_epoch_fence = 8;
-}
 message FollowerScanAssignment {
   string scan_id = 1; TenantTableBinding binding = 2;
   PersistedFileAssignment persisted = 3; ScribeProviderCut scribe_provider_cut = 4;
   string schema_fingerprint = 5;
   repeated string required_columns = 6; repeated ScanPredicate predicates = 7;
-  FollowerReaderCut reader_cut = 8;
+  reserved 8;
+  reserved "reader_cut";
 }
 message ExecuteFragmentRequest {
   PeerContext context = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
@@ -233,10 +256,13 @@ message WorkerScanStats {
   // the same as zero, so the leader must not substitute one for the other.
   optional uint64 bytes_scanned = 1;
   uint64 files_scanned = 2; uint64 partitions_scanned = 3;
-  // Row groups retained and excluded by closed-predicate statistics pruning
-  // on the follower. The leader's own plan carries only a remote placeholder,
+  // Row groups retained and excluded by closed-predicate pruning on the
+  // follower; row_groups_pruned_bloom is the Bloom-attributed subset of
+  // row_groups_pruned, and rows_pruned_page_index counts rows page-index
+  // selection skipped inside retained row groups. The leader's own plan carries only a remote placeholder,
   // so these can only be observed where the physical read happened.
   uint64 row_groups_scanned = 4; uint64 row_groups_pruned = 5;
+  uint64 row_groups_pruned_bloom = 6; uint64 rows_pruned_page_index = 7;
 }
 
 message InsertBatchRequest {

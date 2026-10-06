@@ -13,24 +13,38 @@
 //! object Scribe published and break the exactness the route exists to
 //! preserve.
 
+use bytes::Bytes;
+use iceberg::spec::DataFile;
 use std::collections::BTreeSet;
 
+use iceberg::table::Table;
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
 use vala_sql::queries::file_list::HotFileCatalog;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_operations::{
+    ForgeOperationFamily, ForgeOperationPhase, ForgeOperationTransition,
+};
 use wyrd_spec::vala::api::{
     AuditDetail, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
     StoragePath,
 };
 
-use super::Forge;
+use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask};
+use wyrd_spec::DataTenantId;
+
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
+use super::identity::task_table_binding;
+use super::leader::{ForgeCommitNotice, ForgeTableKey};
 use super::lease::ForgeLease;
+use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_table};
+use super::settings::ForgeTableSettings;
+use super::worker::ATTEMPT_BOUND;
+use super::{Forge, ForgeWorker};
 use crate::catalog::TenantTableBinding;
 use crate::scribe::promotion::ScribePublishedHotFileV1;
 
@@ -341,9 +355,9 @@ fn event_time_bound_micros(
 /// event-time bounds fall outside the partition the record claims.
 fn validate_promoted_object(
     record: &ScribePublishedHotFileV1,
-    bytes: &bytes::Bytes,
+    bytes: &Bytes,
     file_size: u64,
-    table: &iceberg::table::Table,
+    table: &Table,
 ) -> Result<(), ForgeError> {
     let metadata = table.metadata();
     if record.partition_spec_id != metadata.default_partition_spec_id() {
@@ -529,9 +543,9 @@ pub(super) async fn read_promotion_demand(
 /// two `Uuid` arguments.
 pub(super) struct ForgePromotionCommit<'a> {
     /// Table state the append is built against.
-    pub(super) table: &'a iceberg::table::Table,
+    pub(super) table: &'a Table,
     /// Writer-owned `DataFile` values appended unchanged.
-    pub(super) data_files: Vec<iceberg::spec::DataFile>,
+    pub(super) data_files: Vec<DataFile>,
     /// Durable task that owns this promotion.
     pub(super) task_id: Uuid,
     /// Attempt used only to label the commit span.
@@ -580,6 +594,162 @@ pub(super) enum PromotionPlanStatus {
 }
 
 impl Forge {
+    /// Builds the attempt request for the promotion one table owes now, if any.
+    ///
+    /// The request is derived entirely from durable Scribe evidence bound to
+    /// the table's current snapshot, so the same eligible rows always produce
+    /// the same inputs, parameters and promoted-file-set digest. Promotion
+    /// never opens the objects it publishes; the byte total is carried only as
+    /// the attempt's estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant-scoped demand read fails,
+    /// [`ForgeError::Catalog`] when the table cannot be loaded, and
+    /// [`ForgeError::Invariant`] when promotion evidence is absent or
+    /// contradictory.
+    pub(super) async fn promotion_task(
+        &self,
+        binding: &TenantTableBinding,
+        table_ref: &ForgeTaskTableIdentity,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let demand = read_promotion_demand(&mut conn, binding, PROMOTION_BRANCH, None).await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let Some(ScribePromotionDemand {
+            plan, total_bytes, ..
+        }) = demand
+        else {
+            return Ok(None);
+        };
+        let table = self.load_table(&binding.table_ident()).await?;
+        let mut inputs = plan
+            .files()
+            .iter()
+            .map(|file| file.path().as_str().to_owned())
+            .collect::<Vec<_>>();
+        inputs.sort_unstable();
+        let candidate = ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::ScribePromotion,
+            input_bytes: vec![1; inputs.len()],
+            inputs,
+            bytes: total_bytes.max(1),
+            parameters: plan.to_parameters(),
+        };
+        let planned = plan_table(&ForgeTableSnapshot {
+            snapshot_id: table.metadata().current_snapshot_id().unwrap_or(0),
+            candidates: vec![candidate],
+        })?;
+        Ok(planned.into_iter().next().map(|task| NewForgeTask {
+            data_tenant_id: binding.tenant,
+            table_ref: table_ref.clone(),
+            strategy: task.strategy,
+            base_snapshot_id: task.base_snapshot_id,
+            plan: task.plan,
+            plan_hash: task.plan_hash,
+            estimates: task.estimates,
+            ready_at: None,
+        }))
+    }
+
+    /// Promotes what one table owes through `executor`, the coordinator's own
+    /// attempt executor.
+    ///
+    /// Returns whether the table owes a promotion. An owed promotion that
+    /// already has an active or queued attempt is left to that attempt and
+    /// still returns `true`, so the pass plans no rewrite over the table's
+    /// unsettled publication; the leader's promotion-debt sweep retries it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::promotion_task`] and
+    /// [`ForgeWorker::execute_accepted`].
+    pub(super) async fn promote_table(
+        &self,
+        executor: &ForgeWorker,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+        stop: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let binding = task_table_binding(tenant, tenant, table_ref)?;
+        let Some(task) = self.promotion_task(&binding, table_ref).await? else {
+            return Ok(false);
+        };
+        // Boxed: the full attempt future is deep, and inlining it into every
+        // supervisor future that promotes overflows the compiler's layout depth.
+        if !Box::pin(executor.execute_accepted(Uuid::now_v7(), &task, stop)).await? {
+            // ponytail: retried only by the next planning pass's sweep, so a
+            // busy table waits up to one maintenance interval; re-sweep on the
+            // active attempt's settlement if that delay ever matters.
+            tracing::debug!(table = %table_ref.table, "Forge promotion deferred behind the table's active attempt");
+        }
+        Ok(true)
+    }
+
+    /// Returns the exact promotion task one table owes, without running it.
+    ///
+    /// Production hands this task straight to the coordinator's executor.
+    /// Scenarios about the worker claim path enqueue the same task instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the binding, demand-read, catalog and planning failures
+    /// [`Self::promote_table`] would return.
+    #[cfg(feature = "test-support")]
+    pub async fn promotion_task_for_test(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let binding = task_table_binding(tenant, tenant, table_ref)?;
+        self.promotion_task(&binding, table_ref).await
+    }
+
+    /// Reports one committed promotion to the live leader.
+    ///
+    /// Runs only after the Iceberg fast append returned, so a hot publication
+    /// alone never counts. The table's settings are read from the metadata
+    /// this commit returned, so the leader does no catalog IO. Delivery is
+    /// best-effort, as `RisingWave`'s post-commit notification is: a lost notice
+    /// costs one pending count, never data.
+    pub(super) async fn notify_promotion_commit(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+        table: &Table,
+    ) {
+        let Some(snapshot_id) = table.metadata().current_snapshot_id() else {
+            return;
+        };
+        let settings = match ForgeTableSettings::from_properties(table.metadata().properties()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(table = %table_ref.table, error = %error, "Forge table settings are invalid; table is not scheduled");
+                return;
+            }
+        };
+        let notice = ForgeCommitNotice {
+            key: ForgeTableKey {
+                tenant,
+                table: table_ref.clone(),
+            },
+            snapshot_id,
+            settings,
+        };
+        let delivered = match self.core.clock.now() {
+            Ok(now) => self.leadership.notify(notice, now).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = delivered {
+            tracing::warn!(table = %table_ref.table, error = %error, "Forge promotion notice was not delivered");
+        }
+    }
+
     /// Classifies one claimed promotion plan against its own durable rows.
     ///
     /// This runs before the Prepared transition, because Prepared is a promise
@@ -609,7 +779,7 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         plan: &ScribePromotionPlan,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) -> Result<PromotionPlanStatus, ForgeError> {
         let planned = plan.file_ids();
         let mut conn = self
@@ -677,7 +847,7 @@ impl Forge {
     async fn live_data_object_keys(
         &self,
         binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) -> Result<BTreeSet<String>, ForgeError> {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(BTreeSet::new());
@@ -744,8 +914,8 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         plan: &ScribePromotionPlan,
-        table: &iceberg::table::Table,
-    ) -> Result<Vec<iceberg::spec::DataFile>, ForgeError> {
+        table: &Table,
+    ) -> Result<Vec<DataFile>, ForgeError> {
         let mut conn = self
             .core
             .vala
@@ -831,7 +1001,7 @@ impl Forge {
         lease: &mut ForgeLease,
         commit: ForgePromotionCommit<'_>,
         stop: &CancellationToken,
-    ) -> Result<iceberg::table::Table, ForgeError> {
+    ) -> Result<Table, ForgeError> {
         let ForgePromotionCommit {
             table,
             data_files,
@@ -874,7 +1044,7 @@ impl Forge {
         let timeout = self.core.config.iceberg_total_retry_timeout;
         let catalog = self.core.catalog.as_ref();
         let outcome = async move {
-            let commit = transaction.commit(catalog);
+            let commit = transaction.commit_once(catalog);
             tokio::pin!(commit);
             tokio::select! {
                 response = tokio::time::timeout(timeout, &mut commit) => match response {
@@ -902,6 +1072,63 @@ impl Forge {
             },
         );
         outcome
+    }
+
+    /// Resolves the operation identity one promotion task's next transition uses.
+    ///
+    /// A promotion task is retried in place, so its operation identity must be
+    /// recoverable from durable state alone: a successor that finds a Prepared
+    /// operation resumes it, and one that finds a committed snapshot settles it
+    /// under the identity that snapshot carries. Generation zero is the task
+    /// identity itself. A generation that closed as `Reset` proved certain
+    /// non-acceptance and can never be reopened, so the task's next attempt
+    /// moves to the next generation, whose identity
+    /// [`promotion_generation_operation_id`] derives from the task and the
+    /// generation number. The first generation that is not `Reset` — absent,
+    /// Prepared, Committed, or Recovered — is the task's current operation, so
+    /// every transition of one attempt, and every successor attempt, resolves
+    /// the same identity.
+    ///
+    /// The walk is bounded: each reset ends an attempt, and a task is
+    /// terminalized after [`ATTEMPT_BOUND`] attempts, so no task can reset more
+    /// generations than that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant read fails or a stored
+    /// operation row is malformed, and [`ForgeError::Invariant`] when every
+    /// generation an attempt-bounded task could have used is already reset.
+    pub(super) async fn promotion_operation_id(
+        &self,
+        binding: &TenantTableBinding,
+        task_id: Uuid,
+    ) -> Result<Uuid, ForgeError> {
+        let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
+            .map_err(ForgeError::Sql)?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        for generation in 0..=ATTEMPT_BOUND {
+            let operation_id = promotion_generation_operation_id(task_id, generation);
+            let reset = operations
+                .operation(&mut conn, operation_id)
+                .await
+                .map_err(ForgeError::Sql)?
+                .is_some_and(|row| row.phase == ForgeOperationPhase::Reset);
+            if !reset {
+                conn.commit().await.map_err(ForgeError::Sql)?;
+                return Ok(operation_id);
+            }
+        }
+        Err(ForgeError::Invariant {
+            detail: format!(
+                "promotion task {task_id} reset more operation generations than it can attempt"
+            ),
+        })
     }
 
     /// Settles one promotion's audit transition and hot-row publication together.
@@ -1007,9 +1234,65 @@ const fn phase_suffix(phase: ForgeScribePromotionPhase) -> &'static str {
     }
 }
 
+/// Derives the operation identity of one promotion task's `generation`.
+///
+/// Generation zero is the task identity, so a task that never resets keeps the
+/// one identity its snapshot properties and `file_list` settlement already
+/// carry. Every later generation is a domain-separated SHA-256 of the task
+/// identity and the generation number, encoded as a custom (version 8) UUID:
+/// deterministic, so every attempt and successor derives the same value from
+/// durable state, and distinct from the task identity and from every other
+/// generation of the same task.
+fn promotion_generation_operation_id(task_id: Uuid, generation: u32) -> Uuid {
+    if generation == 0 {
+        return task_id;
+    }
+    let digest = Sha256::new()
+        .chain_update(b"wyrd.forge.scribe_promotion.operation_generation")
+        .chain_update(task_id.as_bytes())
+        .chain_update(generation.to_be_bytes())
+        .finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generation zero is the task identity; later generations are stable and distinct.
+    ///
+    /// Recovery re-derives the identity from durable state, so the derivation
+    /// must be deterministic, and a reset generation can never be reopened, so
+    /// no two generations of one task may collide.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a generation is not deterministic or collides with another.
+    #[test]
+    fn promotion_generations_are_deterministic_and_distinct() {
+        let task = Uuid::from_u128(7);
+        assert_eq!(promotion_generation_operation_id(task, 0), task);
+        let generations = (0..=ATTEMPT_BOUND)
+            .map(|generation| promotion_generation_operation_id(task, generation))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generations.len(),
+            usize::try_from(ATTEMPT_BOUND).expect("small bound") + 1,
+            "every generation of one task is a distinct operation"
+        );
+        assert_eq!(
+            promotion_generation_operation_id(task, 1),
+            promotion_generation_operation_id(task, 1),
+            "a generation re-derives the same identity"
+        );
+        assert_ne!(
+            promotion_generation_operation_id(task, 1),
+            promotion_generation_operation_id(Uuid::from_u128(8), 1),
+            "generations of different tasks do not collide"
+        );
+    }
 
     /// Builds one deterministic promoted file for parameter round-trip proofs.
     fn file(seed: u128, name: &str) -> ForgePromotedFile {

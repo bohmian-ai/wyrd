@@ -13,6 +13,7 @@ pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
 mod capture_peer;
+mod forge_peer;
 mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -390,8 +391,8 @@ where
 /// plan decode or storage IO.
 ///
 /// Returns `Ok(None)` when this target selects no private service, which is the
-/// Forge-worker case: it keeps using its durable assignment path and opens no
-/// peer socket.
+/// Forge-worker case: it only dials the elected Forge leader's peer route and
+/// opens no peer socket.
 ///
 /// # Errors
 /// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.
@@ -455,6 +456,13 @@ pub fn build_peer_grpc(
                 transport.clone(),
             ))
         }
+        None => router,
+    };
+    let router = match state.forge_handle() {
+        Some(forge) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            forge_peer::ForgeLeaderPeerGrpc::new(Arc::clone(forge)).into_server(),
+            transport.clone(),
+        )),
         None => router,
     };
     let router = match state.bifrost_query() {

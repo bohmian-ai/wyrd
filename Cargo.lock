@@ -4093,6 +4093,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcp_auth"
+version = "0.12.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26d27dbcc645b60b8e7f6e2868a9d7102ece97d1bb49c1288b5321fcc67f7260"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "http 1.4.2",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4586,7 +4613,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4645,7 +4672,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4658,9 +4685,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-rest"
+version = "0.10.0"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "gcp_auth",
+ "http 1.4.2",
+ "iceberg",
+ "itertools 0.13.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "typed-builder",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4671,7 +4719,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=170bf8e1164be84f8e27be70d088459097871f21#170bf8e1164be84f8e27be70d088459097871f21"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=35f037e5413a3dfbffb996fbb8c882da79644804#35f037e5413a3dfbffb996fbb8c882da79644804"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4682,6 +4730,7 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
+ "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -4700,7 +4749,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4716,7 +4765,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8027,6 +8076,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -9965,6 +10015,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-futures"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
+dependencies = [
+ "pin-project",
+ "tracing",
+]
+
+[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11070,6 +11130,7 @@ dependencies = [
  "rsa",
  "rustix",
  "rustls",
+ "rustls-webpki",
  "secrecy",
  "security-framework-sys",
  "semver",

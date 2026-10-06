@@ -8,9 +8,9 @@
 //! claim owns is proportional to the number of runs rather than to the object
 //! it produces.
 //!
-//! Ordering is the layout's sort keys followed by `wyrd_batch_id`, then claim
-//! run order, then position within a run. That makes the merge total: rows
-//! that tie on every layout key and batch still have exactly one order, because
+//! Ordering is the layout's sort keys, then claim run order, then position
+//! within a run. That makes the merge total: rows that tie on every layout key
+//! still have exactly one order, because
 //! a claim's members, and therefore its runs, are in durable claim order and
 //! each run is immutable. Re-running an interrupted claim over the same members
 //! reproduces the same objects rather than a permutation of them.
@@ -27,15 +27,6 @@ use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchR
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::schema::SchemaFingerprint;
-
-/// Stable tie-breaker appended after every layout sort key.
-///
-/// A managed column, so it is present in every physical schema the staged
-/// writer produces; a run missing it is a corrupted member rather than a
-/// supported shape, and the merge refuses it. Rows still tied after it keep
-/// claim run order and in-run position, which [`StagedRunMerge::next_cursor`]
-/// preserves.
-const STABLE_TIE_BREAKER: &str = "wyrd_batch_id";
 
 /// One staged run positioned on the row it currently offers to the merge.
 ///
@@ -109,7 +100,7 @@ impl StagedRunMerge {
                 detail: "staged run merge requires a positive batch size".to_owned(),
             });
         }
-        let mut key_columns = Vec::with_capacity(layout.sort_keys().len() + 1);
+        let mut key_columns = Vec::with_capacity(layout.sort_keys().len());
         let mut fields = Vec::with_capacity(key_columns.capacity());
         for key in layout.sort_keys() {
             let index = column_index(&schema, key.column())?;
@@ -122,9 +113,6 @@ impl StagedRunMerge {
                 },
             ));
         }
-        let index = column_index(&schema, STABLE_TIE_BREAKER)?;
-        key_columns.push(index);
-        fields.push(SortField::new(schema.field(index).data_type().clone()));
         let converter = RowConverter::new(fields).map_err(|error| ScribeError::Internal {
             detail: format!("build the staged merge row encoder: {error}"),
         })?;
@@ -197,8 +185,8 @@ impl StagedRunMerge {
     /// Returns the cursor offering the smallest remaining row.
     ///
     /// An exact tie keeps the earliest cursor in claim order, and a cursor
-    /// offers its run's rows in position order, so rows equal on every key and
-    /// on `wyrd_batch_id` leave in claim run order, then run position. That is
+    /// offers its run's rows in position order, so rows equal on every key
+    /// leave in claim run order, then run position. That is
     /// the last level of the merge's total order.
     ///
     /// The scan is linear in the number of runs because a claim merges the
@@ -426,7 +414,7 @@ fn field_names(schema: &arrow::datatypes::Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeBinaryArray, Int32Array, TimestampMicrosecondArray};
+    use arrow::array::{Int32Array, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     /// Builds the physical schema every merge fixture run is written under.
@@ -440,7 +428,6 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
             Field::new("value", DataType::Int32, false),
         ]))
     }
@@ -460,20 +447,21 @@ mod tests {
 
     /// Writes one already sorted run and returns its path.
     ///
-    /// Rows are given as `(event_time, batch_id_byte, value)` so a test can
-    /// place an exact tie on `wyrd_event_time`, with or without a tie on batch
-    /// identity, and name each row in the merged output by its `value`.
-    fn write_run(directory: &Path, name: &str, rows: &[(i64, u8, i32)]) -> PathBuf {
+    /// Rows are given as `(event_time, value)` so a test can place an exact
+    /// tie on `wyrd_event_time` and name each row in the merged output by its
+    /// `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rows cannot form a batch under the merge schema or when the
+    /// Parquet file cannot be created, written, or closed.
+    fn write_run(directory: &Path, name: &str, rows: &[(i64, i32)]) -> PathBuf {
         let schema = merge_schema();
         let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.0));
-        let batch_ids = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| [row.1; 16]))
-            .expect("fixture batch identity");
-        let values = Int32Array::from_iter_values(rows.iter().map(|row| row.2));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(times), Arc::new(batch_ids), Arc::new(values)],
-        )
-        .expect("fixture run batch");
+        let values = Int32Array::from_iter_values(rows.iter().map(|row| row.1));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times), Arc::new(values)])
+                .expect("fixture run batch");
         let path = directory.join(name);
         let file = std::fs::File::create(&path).expect("fixture run file");
         let mut writer =
@@ -483,8 +471,13 @@ mod tests {
         path
     }
 
-    /// Drains a merge into the exact `(event_time, batch_id_byte, value)` order it emitted.
-    fn drain(merge: &mut StagedRunMerge) -> Vec<(i64, u8, i32)> {
+    /// Drains a merge into the exact `(event_time, value)` order it emitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the merge fails to produce a batch or when a merged batch's
+    /// columns are not the expected timestamp and `Int32` arrays.
+    fn drain(merge: &mut StagedRunMerge) -> Vec<(i64, i32)> {
         let mut merged = Vec::new();
         while let Some(batch) = merge.next_batch().expect("merged batch") {
             let times = batch
@@ -492,40 +485,41 @@ mod tests {
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .expect("merged event time");
-            let batch_ids = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .expect("merged batch identity");
             let values = batch
-                .column(2)
+                .column(1)
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .expect("merged value");
             for row in 0..batch.num_rows() {
-                merged.push((times.value(row), batch_ids.value(row)[0], values.value(row)));
+                merged.push((times.value(row), values.value(row)));
             }
         }
         merged
     }
 
     /// The merge is total and deterministic: rows leave in layout order, an
-    /// exact layout tie is ordered by `wyrd_batch_id`, a tie on batch identity
-    /// too keeps claim run order and then run position, no row is dropped or
+    /// exact layout tie keeps claim run order and then run position, no row is
+    /// dropped or
     /// duplicated, and re-running the same claim over the same runs reproduces
     /// the identical sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture run cannot be written, when the merge cannot open,
+    /// when the merged order differs from layout order with run-then-position tie
+    /// breaking, or when a different batch size changes the sequence.
     #[test]
     fn merged_runs_leave_in_one_total_deterministic_order() {
         let directory = tempfile::tempdir().expect("merge fixture root");
         let first = write_run(
             directory.path(),
             "run-0.parquet",
-            &[(10, 1, 0), (20, 1, 1), (25, 3, 10), (25, 3, 11), (40, 1, 3)],
+            &[(10, 0), (20, 1), (25, 10), (25, 11), (40, 3)],
         );
         let second = write_run(
             directory.path(),
             "run-1.parquet",
-            &[(15, 2, 0), (20, 2, 1), (25, 3, 20), (50, 2, 2)],
+            &[(15, 100), (20, 101), (25, 20), (50, 102)],
         );
         let schema = merge_schema();
         let layout = merge_layout(schema.as_ref());
@@ -537,18 +531,17 @@ mod tests {
         assert_eq!(
             merged,
             vec![
-                (10, 1, 0),
-                (15, 2, 0),
-                (20, 1, 1),
-                (20, 2, 1),
-                (25, 3, 20),
-                (25, 3, 10),
-                (25, 3, 11),
-                (40, 1, 3),
-                (50, 2, 2),
+                (10, 0),
+                (15, 100),
+                (20, 101),
+                (20, 1),
+                (25, 20),
+                (25, 10),
+                (25, 11),
+                (40, 3),
+                (50, 102),
             ],
-            "the tie at 20 is broken by batch identity, not by claim order; the \
-             full tie at 25 keeps claim run order, then position within a run"
+            "a layout tie keeps claim run order, then position within a run"
         );
 
         let mut replay =
@@ -563,10 +556,16 @@ mod tests {
     /// A run encoded under a different physical schema is refused at open:
     /// merging it would put rows into an object whose footer claims the claim's
     /// schema fingerprint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture run cannot be written, when the merge opens under
+    /// the foreign schema, or when the refusal does not name the physical schema
+    /// disagreement.
     #[test]
     fn a_run_under_another_schema_is_refused() {
         let directory = tempfile::tempdir().expect("merge fixture root");
-        let run = write_run(directory.path(), "run-0.parquet", &[(10, 1, 0)]);
+        let run = write_run(directory.path(), "run-0.parquet", &[(10, 0)]);
         let schema = merge_schema();
         let layout = merge_layout(schema.as_ref());
         let mut foreign_fields = merge_schema().fields().to_vec();

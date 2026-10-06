@@ -460,6 +460,13 @@ mod tests {
     /// A staged member survives without its WAL: the runs it names are fsynced
     /// in the member directory, decode, and recover as a claimable ready member
     /// whose bytes and rows equal what was actually written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture directory, binding, encode, publication, or recovery
+    /// step fails, when the encoded member does not name its one fsynced run, or
+    /// when the recovered member is not the single ready record whose identity,
+    /// rows, encoded bytes, WAL range, and run paths match what was written.
     #[tokio::test]
     async fn staged_member_recovers_ready_with_the_runs_it_named() {
         let root = tempfile::tempdir().expect("staged root");
@@ -484,9 +491,8 @@ mod tests {
         assert_eq!(member.member(), StagedMemberId::new(5, 9));
         assert_eq!(member.runs().len(), 1);
 
-        let recovered_before = stage.recover().await.expect("scan before publication");
         assert!(
-            recovered_before.is_empty(),
+            stage.member(member.key(), member.member()).await.is_err(),
             "runs without a record are never a query authority"
         );
 

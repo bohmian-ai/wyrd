@@ -150,12 +150,10 @@ pub struct Cards {
 
 impl Cards {
     /// Construct a registry handle from global client configuration with
-    /// optional explicit server URL, credential, and tenant selector
-    /// overrides.
+    /// optional explicit server URL and credential overrides.
     ///
-    /// `tenant` (a tenant route key) replaces the configured
-    /// `WYRD_TENANT` selector of the saved user login. No network or token
-    /// exchange occurs during construction.
+    /// The saved user login is selected by the configured `WYRD_TENANT`. No
+    /// network or token exchange occurs during construction.
     ///
     /// # Errors
     /// Returns a Wyrd error when the local configuration, credential override,
@@ -163,10 +161,9 @@ impl Cards {
     pub fn new(
         server_url: Option<&str>,
         credential: Option<SecretString>,
-        tenant: Option<&str>,
     ) -> Result<Self, WyrdError> {
-        let client = config::load(Environment::Process, server_url, credential, tenant)
-            .map_err(WyrdError::from)?;
+        let client =
+            config::load(Environment::Process, server_url, credential).map_err(WyrdError::from)?;
         Ok(Self {
             engine: RegistryEngine::new(client),
         })
@@ -646,7 +643,6 @@ mod tests {
         let cards = Cards::new(
             Some(&server.uri()),
             Some(SecretString::from("test-api-key")),
-            None,
         )
         .expect("test cards handle is configured");
 
@@ -823,7 +819,6 @@ mod tests {
         let cards = Cards::new(
             Some(&server.uri()),
             Some(SecretString::from("test-api-key")),
-            None,
         )
         .expect("test cards handle is configured");
 

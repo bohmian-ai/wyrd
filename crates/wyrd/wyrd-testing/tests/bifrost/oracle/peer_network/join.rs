@@ -46,7 +46,7 @@ const GROUPS: i64 = 8;
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn peer_join_and_remote_query() {
-    prove_peer_join_and_remote_query()
+    Box::pin(prove_peer_join_and_remote_query())
         .await
         .expect("peer join journey");
 }

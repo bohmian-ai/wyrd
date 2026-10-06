@@ -106,7 +106,7 @@ async fn workflow_forwarded_query_settles_before_the_run_ends() {
         TerminalCause::ShorterDeadline,
         TerminalCause::PodKill,
     ] {
-        prove_forwarded_query_settles(cause)
+        Box::pin(prove_forwarded_query_settles(cause))
             .await
             .unwrap_or_else(|error| panic!("{cause:?}: {error}"));
     }

@@ -1,20 +1,31 @@
 //! Redux-owned tenant-qualified Bifrost catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
-use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
+use iceberg::spec::{
+    self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties, Transform,
+};
+use iceberg::table::Table;
+use iceberg::{Catalog as _, Error as IcebergError, TableCreation, TableIdent};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 use vala_sql::ValaPostgres;
-use vala_sql::queries::file_list::HotFileCatalog;
+use vala_sql::queries::file_list::HotFileCut;
+use vala_sql::queries::oracle_reader_authority::{
+    AcquiredTableCut, ActiveReadOwner, ActiveTableRef, OracleActiveTableReads,
+};
+use vala_sql::row_types::file_list::HotFileRow;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
-use wyrd_spec::vala::api::{BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire};
+use wyrd_spec::vala::api::{
+    BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
+};
 
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
@@ -29,8 +40,9 @@ use crate::catalog::wire::{
     reject_reserved_field_names,
 };
 use crate::catalog::{TableRef, TenantTableBinding};
+use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType};
 use crate::namespaces::BifrostNamespace;
-use crate::schema::{SchemaFingerprint, with_managed_columns};
+use crate::schema::SchemaFingerprint;
 use crate::storage::BifrostStorage;
 use crate::tables::{BuiltinTableDefinition, builtin_table};
 use iceberg_datafusion::IcebergStaticTableProvider;
@@ -50,8 +62,12 @@ fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
 pub struct TableUid([u8; 16]);
 
 impl TableUid {
+    /// Mints a fresh time-ordered identity for a table being registered.
+    ///
+    /// A version-7 UUID keeps newly registered table ids roughly insertion-ordered in
+    /// `vala.bifrost_tables`; the identity is opaque to every other reader.
     fn new_v7() -> Self {
-        Self(*uuid::Uuid::now_v7().as_bytes())
+        Self(*Uuid::now_v7().as_bytes())
     }
 
     fn from_row(bytes: &[u8], table: &str) -> Result<Self, BifrostCatalogError> {
@@ -105,7 +121,7 @@ pub struct PinnedSealedTable {
     /// reconstruct one.
     pub table_uid: TableUid,
     /// Iceberg table metadata loaded once for this cut.
-    pub iceberg_table: iceberg::table::Table,
+    pub iceberg_table: Table,
     /// Exact current snapshot identity selected from the immutable table metadata.
     pub snapshot_id: Option<i64>,
     /// Stable digest of the selected snapshot identity and live data-file set.
@@ -115,7 +131,7 @@ pub struct PinnedSealedTable {
     /// Ordered immutable data-file work from the pinned Iceberg snapshot.
     pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
-    pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
+    pub hot_files: Vec<HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
@@ -214,7 +230,7 @@ struct PinnedIcebergState {
     /// Current snapshot identity, when the table has committed data.
     snapshot_id: Option<i64>,
     /// Validated Forge publication operation recorded by the current snapshot.
-    forge_publication_operation_id: Option<uuid::Uuid>,
+    forge_publication_operation_id: Option<Uuid>,
     /// Canonical paths used to exclude hot-manifest overlap.
     file_paths: BTreeSet<String>,
     /// Exact immutable metadata keyed by canonical path.
@@ -223,83 +239,18 @@ struct PinnedIcebergState {
     estimated_bytes: u64,
 }
 
-/// Everything one reader needs to protect a cut before it opens anything.
-///
-/// Produced by [`BifrostCatalog::prepare_reader_identity`] and consumed by
-/// [`BifrostCatalog::materialize_reader_cut`]. It is deliberately inert: it
-/// names a snapshot and carries the immutable metadata that names it, and holds
-/// no `FileIO`, provider, or open object of its own.
-#[derive(Debug, Clone)]
-pub struct PreparedReaderIdentity {
-    /// Authenticated tenant the cut belongs to.
-    pub tenant: DataTenantId,
-    /// Resolved tenant/table binding for the physical table.
-    pub binding: TenantTableBinding,
-    /// Durable registered identity protection is keyed by.
-    pub table_uid: TableUid,
-    /// Physical Iceberg identifier the table was loaded under.
-    pub identifier: iceberg::TableIdent,
-    /// Immutable metadata document naming this cut.
-    pub metadata: iceberg::spec::TableMetadataRef,
-    /// Immutable location the metadata document was read from.
-    ///
-    /// Every catalog commit writes a new `<version>-<uuid>.metadata.json` and
-    /// swaps the pointer to it, so this location names exactly one document.
-    pub metadata_location: String,
-    /// Current snapshot, or `None` for a table that has never committed.
-    pub snapshot_id: Option<i64>,
-    /// That snapshot's own recorded commit timestamp in milliseconds.
-    pub snapshot_timestamp_ms: Option<i64>,
-    /// Ancestry from the current snapshot to the oldest reachable parent.
-    pub ancestry_path: Vec<i64>,
-}
-
-/// Walks one snapshot's parent ancestry from the immutable metadata document.
-///
-/// Bounded by the retained snapshot count: an ancestry longer than the
-/// metadata's own snapshot list is a cycle, not deep history, and following it
-/// would not terminate.
-///
-/// # Errors
-/// Returns [`BifrostCatalogError::MetadataMismatch`] when the ancestry does not
-/// terminate.
-fn ancestry_path(
-    metadata: &iceberg::spec::TableMetadataRef,
-    snapshot: &iceberg::spec::Snapshot,
-) -> Result<Vec<i64>, BifrostCatalogError> {
-    let mut path = vec![snapshot.snapshot_id()];
-    let mut cursor = snapshot.parent_snapshot_id();
-    let bound = metadata.snapshots().count().saturating_add(1);
-    while let Some(parent) = cursor {
-        if path.len() > bound || path.contains(&parent) {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "pinned snapshot ancestry does not terminate".to_owned(),
-            ));
-        }
-        path.push(parent);
-        cursor = metadata
-            .snapshot_by_id(parent)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
-    }
-    Ok(path)
-}
-
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
 #[derive(Clone)]
 pub struct BifrostCatalog {
-    /// The one Iceberg SQL catalog, held concretely so a reader can recheck
-    /// its authoritative metadata pointer without reloading the document.
+    /// The one Iceberg SQL catalog every registration and load goes through.
     catalog: Arc<SqlCatalog>,
     postgres: ValaPostgres,
     warehouse: String,
     file_io: FileIO,
-    /// The node's storage owner, retained so a query can build its own
-    /// epoch-gated `FileIO` instead of borrowing this catalog's ungated one.
+    /// The node's storage owner, retained for the hot-footer path.
     storage: Arc<BifrostStorage>,
-    /// Backend properties every built `FileIO` must share with the catalog.
-    storage_properties: std::collections::HashMap<String, String>,
     /// Node-wide decoded manifest and manifest-list cache shared by every
-    /// permit-scoped read table, so the snapshot pin and `plan_files` decode
+    /// read table, so the snapshot pin and `plan_files` decode
     /// each immutable manifest once per node instead of once per consumer per
     /// query. Seeded lazily because iceberg only builds a cache with a table.
     manifest_cache: Arc<std::sync::OnceLock<Arc<ObjectCache>>>,
@@ -310,8 +261,20 @@ pub struct BifrostCatalog {
     /// it. Only found rows are cached, so a table registered later is still
     /// seen on its first lookup. Grows with registered tables, never with
     /// queries.
-    table_uids: Arc<std::sync::RwLock<HashMap<(DataTenantId, String), TableUid>>>,
+    table_uids: Arc<RwLock<HashMap<(DataTenantId, String), TableUid>>>,
+    /// Registered Iceberg schemas this node has already loaded, by tenant and
+    /// table name.
+    ///
+    /// The schema is the field-id authority Scribe stamps into every Parquet
+    /// object. A registered table's schema never evolves and its registration
+    /// is never dropped, so a loaded schema stays authoritative for the life
+    /// of the node. Grows with registered tables, never with writes.
+    registered_schemas: Arc<RwLock<RegisteredSchemas>>,
 }
+
+/// Registered Iceberg schemas a node has loaded, keyed by tenant and table
+/// name; the field-id authority behind [`BifrostCatalog`]'s schema cache.
+type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<spec::Schema>>;
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
 ///
@@ -320,8 +283,7 @@ pub struct BifrostCatalog {
 /// iceberg's estimated entry weight. This is not a hard memory ceiling: a
 /// query still holding an evicted `Arc`, or loads in flight, can briefly
 /// exceed it. It sits outside the Oracle memory root because decoded
-/// manifests are small and shared across every query. A cache hit performs no
-/// storage IO and therefore consults no reader IO permit.
+/// manifests are small and shared across every query.
 const MANIFEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Catalog pins observed by production code paths during serialized tests.
@@ -346,136 +308,167 @@ pub fn sealed_pin_count_for_test() -> usize {
     TEST_SEALED_PIN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Reader identities prepared by production code paths in serialized tests.
+/// Active-cut acquisition statements observed in serialized tests.
 ///
-/// A restart after catalog promotion has to re-prepare every table, not only
-/// the one that drifted, so the count is what distinguishes a complete restart
-/// from a partial one.
+/// A successful query acquires its whole cut in one statement and a metadata
+/// `NotFound` race in exactly two, so the count is the observable that proves
+/// neither per-table nor unbounded acquisition.
 #[cfg(any(test, feature = "test-support"))]
-static TEST_PREPARED_IDENTITY_COUNT: std::sync::atomic::AtomicUsize =
+static TEST_ACTIVE_CUT_ACQUISITIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Authoritative metadata-pointer reads observed by one catalog test.
-#[cfg(test)]
-static TEST_METADATA_POINTER_READS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Reader-identity metadata documents read by one catalog test.
-#[cfg(test)]
-static TEST_METADATA_DOCUMENT_READS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Revalidations still to be failed before the next one is allowed to succeed.
+/// Metadata reads still to be failed as object-store `NotFound`.
 #[cfg(any(test, feature = "test-support"))]
-static TEST_REVALIDATION_FAULTS: std::sync::atomic::AtomicUsize =
+static TEST_METADATA_NOT_FOUND_FAULTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Resets and returns the observed prepared-identity count for one test.
+/// Resets and returns the observed active-cut acquisition count.
 #[cfg(any(test, feature = "test-support"))]
-pub fn reset_prepared_identity_count_for_test() -> usize {
-    TEST_PREPARED_IDENTITY_COUNT.swap(0, std::sync::atomic::Ordering::SeqCst)
+pub fn reset_active_cut_acquisitions_for_test() -> usize {
+    TEST_ACTIVE_CUT_ACQUISITIONS.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Returns prepared reader identities observed since the last reset.
-#[must_use]
-#[cfg(any(test, feature = "test-support"))]
-pub fn prepared_identity_count_for_test() -> usize {
-    TEST_PREPARED_IDENTITY_COUNT.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Makes the next `count` revalidations report authoritative metadata drift.
+/// Makes the next `count` acquired metadata reads report object-store
+/// `NotFound`.
 ///
-/// A real promotion between preparation and materialization is what this
-/// stands in for. Committing one at that exact point from outside the call is
-/// not reachable, because preparation, protection, revalidation, and
-/// materialization are one operation by construction.
+/// Stands in for a catalog move whose superseded document was deleted between
+/// acquisition and the metadata read, which a test cannot place at that exact
+/// point from outside the query.
 #[cfg(any(test, feature = "test-support"))]
-pub fn inject_revalidation_faults_for_test(count: usize) {
-    TEST_REVALIDATION_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Returns how many injected revalidation faults remain unconsumed.
-#[must_use]
-#[cfg(any(test, feature = "test-support"))]
-pub fn pending_revalidation_faults_for_test() -> usize {
-    TEST_REVALIDATION_FAULTS.load(std::sync::atomic::Ordering::SeqCst)
+pub fn inject_metadata_not_found_for_test(count: usize) {
+    TEST_METADATA_NOT_FOUND_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
 }
 
 impl BifrostCatalog {
-    /// Resolves only the identity of the cut a reader is about to protect.
+    /// Acquires one query's complete active cut in one tenant statement.
     ///
-    /// This is deliberately the whole of what may happen before protection: a
-    /// registration lookup (served from [`BifrostCatalog::table_uid`]'s cache
-    /// after the node's first write or query of the table), one authoritative
-    /// metadata-pointer read, one read of
-    /// the immutable metadata document it names, and the facts derived from
-    /// that document. Reading that document is the allowed
-    /// identity step because there is no other way to name the snapshot that
-    /// protection has to cover. Nothing here loads a manifest list, enumerates
-    /// data files, queries the hot manifest, builds a provider, or opens any
-    /// object the snapshot names — all of that is snapshot-dependent IO, and it
-    /// belongs after [`BifrostCatalog::materialize_reader_cut`] takes a permit.
+    /// Runs [`OracleActiveTableReads::acquire`] on one tenant transaction and
+    /// commits it before returning, so every returned pointer is already
+    /// protected by a durable active read when the caller opens its metadata.
+    /// A replayed acquisition for the same query refreshes the same rows.
+    ///
+    /// `deadline` is the query's one immutable absolute deadline. The
+    /// remaining duration bound into the statement is derived from it after
+    /// the tenant connection is obtained, so every acquisition, the one
+    /// permitted reacquisition included, expires its rows at that same
+    /// deadline in `PostgreSQL` time. `Ok(None)` means under one millisecond
+    /// remained and nothing was acquired; the caller reports its timeout.
     ///
     /// # Errors
-    /// Returns [`BifrostCatalogError::TableNotFound`] when the table is not
-    /// registered for this tenant or has no catalog pointer, an invalid-binding
-    /// error when the tenant and table cannot be bound, and a catalog error when
-    /// the pointer or the Iceberg metadata document cannot be read.
-    pub async fn prepare_reader_identity(
+    /// Returns [`BifrostCatalogError::InvalidBinding`] when a table cannot be
+    /// bound to `tenant`, [`BifrostCatalogError::TableNotFound`] when any table
+    /// has no registration or catalog pointer visible to the tenant,
+    /// [`BifrostCatalogError::UnresolvedExpiry`] when any table's snapshot
+    /// expiration has an unknown catalog outcome (nothing commits in either
+    /// case), and a SQL error when the statement or commit fails.
+    ///
+    /// # Cancellation
+    /// Dropping the future before commit rolls the acquisition back. Dropping
+    /// it after commit leaves the rows for PostgreSQL-time abandonment.
+    pub async fn acquire_active_cut(
         &self,
-        table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
+        owner: ActiveReadOwner,
+        deadline: Instant,
+        tables: &[TableRef],
+    ) -> Result<Option<Vec<AcquiredTableCut>>, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
-        TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let table_uid = self.table_uid(table, tenant).await?;
-        let binding = TenantTableBinding::resolve((tenant, table.clone()))
-            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let identifier = binding.table_ident();
-        let metadata_location = self.metadata_pointer(&identifier).await?;
-        #[cfg(test)]
-        TEST_METADATA_DOCUMENT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &metadata_location).await?);
-        let snapshot = metadata.current_snapshot();
-        Ok(PreparedReaderIdentity {
-            tenant,
-            binding,
-            table_uid,
-            identifier,
-            metadata_location,
-            snapshot_id: snapshot.map(|snapshot| snapshot.snapshot_id()),
-            snapshot_timestamp_ms: snapshot.map(|snapshot| snapshot.timestamp_ms()),
-            ancestry_path: snapshot
-                .map(|snapshot| ancestry_path(&metadata, snapshot))
-                .transpose()?
-                .unwrap_or_default(),
-            metadata,
-        })
+        TEST_ACTIVE_CUT_ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let bindings = tables
+            .iter()
+            .map(|table| {
+                TenantTableBinding::resolve((tenant, table.clone()))
+                    .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs = bindings
+            .iter()
+            .map(|binding| ActiveTableRef {
+                namespace_name: &binding.logical_namespace,
+                table_name: &binding.table_name,
+            })
+            .collect::<Vec<_>>();
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        // Derived only now, after the pool wait, so the row PostgreSQL stamps
+        // expires at the caller's original deadline however long the wait or
+        // however many times the cut is reacquired.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < std::time::Duration::from_millis(1) {
+            return Ok(None);
+        }
+        let acquired = match OracleActiveTableReads::new(&mut conn)
+            .acquire(owner, remaining, &refs)
+            .await
+        {
+            Err(vala_sql::SqlError::NoRows) => {
+                let names = tables.iter().map(TableRef::fqn).collect::<Vec<_>>();
+                return Err(BifrostCatalogError::TableNotFound(names.join(", ")));
+            }
+            Err(vala_sql::SqlError::Conflict { detail }) => {
+                return Err(BifrostCatalogError::UnresolvedExpiry(detail));
+            }
+            other => other?,
+        };
+        conn.commit().await?;
+        Ok(Some(acquired))
     }
 
-    /// Proves the authoritative catalog still holds the prepared identity.
-    ///
-    /// Protection is taken against the metadata document preparation read, and
-    /// that document is then reused for the whole cut, so nothing downstream
-    /// can notice that the table was promoted in between. This is the one place
-    /// that asks the catalog again: one authoritative pointer read per prepared
-    /// identifier. The pointer alone is sufficient because the Iceberg SQL
-    /// catalog, the only publication path Wyrd uses, commits by writing a new
-    /// `<version>-<uuid>.metadata.json` and compare-and-swapping the pointer to
-    /// it; no supported writer changes a document in place. An unchanged
-    /// pointer therefore names the same immutable document preparation read.
+    /// Deletes every active table read one query holds, idempotently.
     ///
     /// # Errors
-    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the authoritative
-    /// pointer differs from the prepared one,
-    /// [`BifrostCatalogError::TableNotFound`] when the table's pointer is gone,
-    /// and a catalog error when the pointer cannot be read.
-    pub async fn revalidate_reader_identity(
+    /// Returns a SQL error when the tenant transaction, delete, or commit fails;
+    /// the rows then stay for PostgreSQL-time abandonment.
+    pub async fn release_active_reads(
         &self,
-        prepared: &PreparedReaderIdentity,
-    ) -> Result<(), BifrostCatalogError> {
+        tenant: DataTenantId,
+        query_id: Uuid,
+    ) -> Result<u64, BifrostCatalogError> {
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let released = OracleActiveTableReads::new(&mut conn)
+            .release(query_id)
+            .await?;
+        conn.commit().await?;
+        Ok(released)
+    }
+
+    /// Materializes one table of a committed active cut.
+    ///
+    /// Reads the exact metadata document the acquisition returned directly —
+    /// no cache, no pointer reread — pins its current snapshot's manifests,
+    /// and reconciles the acquisition's unresolved hot candidates against that
+    /// snapshot with the shared exact hot/Iceberg rule. The returned cut is
+    /// then validated row by row against the tenant/table binding.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::InvalidBinding`] when the table cannot be
+    /// bound, [`BifrostCatalogError::MetadataMismatch`] when the acquisition
+    /// identity disagrees with the requested table or a manifest or hot row
+    /// violates the binding, [`BifrostCatalogError::AmbiguousPublication`] when
+    /// a candidate cannot be placed, and [`BifrostCatalogError::Iceberg`] when
+    /// the metadata document or a manifest cannot be read; a missing document
+    /// reports [`BifrostCatalogError::is_missing_object`].
+    pub async fn materialize_acquired_cut(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        acquired: AcquiredTableCut,
+    ) -> Result<PinnedSealedTable, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
-        if TEST_REVALIDATION_FAULTS
+        TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        if acquired.identity.tenant != tenant
+            || acquired.identity.namespace_name != binding.logical_namespace
+            || acquired.identity.table_name != binding.table_name
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "active cut identity disagrees with the requested table".to_owned(),
+            ));
+        }
+        let table_uid = TableUid::from_bytes(acquired.identity.table_uid);
+        let identifier = binding.table_ident();
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_METADATA_NOT_FOUND_FAULTS
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
@@ -483,131 +476,40 @@ impl BifrostCatalog {
             )
             .is_ok()
         {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "injected authoritative reader-identity drift".to_owned(),
+            return Err(BifrostCatalogError::Iceberg(
+                IcebergError::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    "injected missing metadata document",
+                )
+                .with_source(crate::storage::BifrostStorageError::NotFound {
+                    detail: "injected missing metadata document".to_owned(),
+                }),
             ));
         }
-        if self.metadata_pointer(&prepared.identifier).await? != prepared.metadata_location {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "the authoritative table metadata pointer moved under the prepared identity"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Reads one table's authoritative metadata pointer and nothing else.
-    ///
-    /// The read runs through the Iceberg SQL catalog's own primary connection
-    /// and catalog-owner credential, with the exact catalog, namespace, and
-    /// table predicates. The request role is deliberately denied the catalog
-    /// schema, so this is never issued from a tenant connection.
-    ///
-    /// # Errors
-    /// Returns [`BifrostCatalogError::TableNotFound`] when the catalog has no
-    /// row for the identifier, and a catalog error when the read fails.
-    async fn metadata_pointer(
-        &self,
-        identifier: &iceberg::TableIdent,
-    ) -> Result<String, BifrostCatalogError> {
-        #[cfg(test)]
-        TEST_METADATA_POINTER_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.catalog
-            .load_metadata_location(identifier)
-            .await?
-            .ok_or_else(|| BifrostCatalogError::TableNotFound(identifier.to_string()))
-    }
-
-    /// Materializes the pinned cut through storage gated by one reader permit.
-    ///
-    /// The table is rebuilt here rather than reused from
-    /// [`BifrostCatalog::prepare_reader_identity`] for one reason: the catalog's
-    /// table carries the catalog's own ungated `FileIO`, and every manifest,
-    /// data, and delete object this cut opens must go through the permit
-    /// instead. Reusing the loaded table would leave an ungated route to
-    /// exactly the objects the protection was taken for.
-    ///
-    /// Drift between preparation and this call is not detectable here: this
-    /// method builds its table from the prepared metadata, so comparing the
-    /// result against that same document proves nothing. The authoritative
-    /// check is [`BifrostCatalog::revalidate_reader_identity`], which the
-    /// caller runs for every prepared table before materializing any.
-    ///
-    /// # Errors
-    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the table moved
-    /// under the prepared identity, [`BifrostCatalogError::AmbiguousPublication`]
-    /// or [`BifrostCatalogError::UnstableCut`] from the underlying cut, a
-    /// catalog or SQL error when the manifest or hot cut cannot be read, and
-    /// [`BifrostCatalogError::Iceberg`] when the permit no longer authorizes
-    /// exposing the cut.
-    pub async fn materialize_reader_cut(
-        &self,
-        prepared: PreparedReaderIdentity,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<PinnedSealedTable, BifrostCatalogError> {
-        #[cfg(any(test, feature = "test-support"))]
-        TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let tenant = prepared.tenant;
-        let binding = prepared.binding;
-        let table_uid = prepared.table_uid;
-        let gated = self.permit_scoped_table(
-            &prepared.identifier,
-            prepared.metadata.clone(),
-            Some(prepared.metadata_location.clone()),
-            permit,
-        )?;
-        let (iceberg_table, pinned, cut) = self
-            .acquire_stable_cut_from(gated, &binding, tenant)
-            .await?;
-        // A cut served wholly from the node-wide manifest cache opened nothing
-        // through the gated `FileIO`, so the permit is checked once more before
-        // the cut is exposed: an epoch that lost authority returns no cut.
-        permit
-            .expose_result()
-            .map_err(|error| crate::catalog::iceberg_storage::permit_error(&error))?;
+        let metadata =
+            Arc::new(TableMetadata::read_from(&self.file_io, &acquired.metadata_location).await?);
+        let iceberg_table =
+            self.cached_table(&identifier, metadata, Some(acquired.metadata_location))?;
+        let pinned = self.pin_iceberg_snapshot(&iceberg_table, &binding).await?;
+        let cut = HotFileCut::reconcile(
+            acquired.hot_files,
+            &pinned.file_paths,
+            pinned.forge_publication_operation_id,
+        );
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
-        let mut estimated_bytes = pinned.estimated_bytes;
         if cut.ambiguous_publication {
             return Err(BifrostCatalogError::AmbiguousPublication);
         }
         let hot_files = cut.hot_files;
-        for row in &hot_files {
-            let valid_identity = row.data_tenant_id == tenant.as_uuid()
-                && row.namespace == binding.logical_namespace
-                && row.table_name == binding.table_name
-                && row.file_size > 0
-                && row.row_count >= 0
-                && row.writer_epoch >= 0
-                && row.wal_lsn_min >= 0
-                && row.wal_lsn_max >= row.wal_lsn_min
-                && binding.validate_object_path(&row.file_path).is_some();
-            if !valid_identity {
-                return Err(BifrostCatalogError::MetadataMismatch(
-                    "sealed manifest row violates its tenant/table binding".to_owned(),
-                ));
-            }
-        }
+        let estimated_bytes = hot_cut_bytes(&binding, &hot_files, pinned.estimated_bytes)?;
         metrics::counter!(
             "bifrost_oracle_files_pruned_total",
             "source" => "hot_sealed",
             "reason" => "snapshot_overlap"
         )
         .increment(cut.represented as u64);
-        for row in &hot_files {
-            estimated_bytes = estimated_bytes
-                .checked_add(u64::try_from(row.file_size).map_err(|_| {
-                    BifrostCatalogError::MetadataMismatch(
-                        "hot manifest file size is invalid".to_owned(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    BifrostCatalogError::MetadataMismatch(
-                        "sealed byte estimate overflow".to_owned(),
-                    )
-                })?;
-        }
         let snapshot_digest = digest_strings(
             snapshot_id
                 .map(|id| id.to_string())
@@ -634,52 +536,25 @@ impl BifrostCatalog {
         })
     }
 
-    /// Builds a `FileIO` whose every read is gated by one reader permit.
+    /// Builds one immutable read table over this catalog's storage and the
+    /// node-wide manifest cache.
     ///
-    /// This is the only place Oracle constructs read storage for a protected
-    /// cut. Writes and deletes are refused by the storage itself rather than by
-    /// convention, so a query path cannot mutate warehouse objects even if it
-    /// reaches an Iceberg API that would.
-    #[must_use]
-    pub fn gated_file_io(
-        &self,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> iceberg::io::FileIO {
-        let factory = Arc::new(
-            crate::catalog::iceberg_storage::EpochGatedIcebergStorageFactory::new(
-                Arc::clone(&self.storage),
-                &self.warehouse,
-                permit.clone(),
-            ),
-        ) as Arc<dyn StorageFactory>;
-        FileIOBuilder::new(factory)
-            .with_props(self.storage_properties.clone())
-            .build()
-    }
-
-    /// Rebuilds one immutable table over storage gated by a reader permit.
-    ///
-    /// Uses the prepared metadata document rather than reloading it, so this
-    /// step opens nothing: the table it returns is the same immutable metadata
-    /// with a `FileIO` that refuses every object read the permit no longer
-    /// authorizes. The table shares the node-wide manifest cache; a cache miss
-    /// still reads through this table's gated `FileIO`, and a hit can only be a
-    /// manifest under this tenant's own table prefix because cache keys are
-    /// full object paths.
+    /// Uses the supplied metadata rather than reloading it, so building the
+    /// table opens nothing. Cache keys are full manifest paths, so a hit can
+    /// only be a manifest under this tenant's own table prefix.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::Iceberg`] when the table cannot be built
-    /// from the prepared identity and metadata.
-    fn permit_scoped_table(
+    /// from the identity and metadata.
+    fn cached_table(
         &self,
-        identifier: &iceberg::TableIdent,
-        metadata: iceberg::spec::TableMetadataRef,
+        identifier: &TableIdent,
+        metadata: TableMetadataRef,
         metadata_location: Option<String>,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<iceberg::table::Table, BifrostCatalogError> {
+    ) -> Result<Table, BifrostCatalogError> {
         let manifest_cache = self.manifest_cache(identifier, &metadata)?;
-        let mut builder = iceberg::table::Table::builder()
-            .file_io(self.gated_file_io(permit))
+        let mut builder = Table::builder()
+            .file_io(self.file_io.clone())
             .metadata(metadata)
             .identifier(identifier.clone())
             .runtime(iceberg::Runtime::current())
@@ -693,11 +568,9 @@ impl BifrostCatalog {
     /// Returns the node-wide manifest cache, seeding it on first use.
     ///
     /// iceberg only constructs an `ObjectCache` as part of a table, so the
-    /// first caller builds a throwaway table over the catalog's ungated
-    /// `FileIO` with [`MANIFEST_CACHE_BYTES`] and keeps its cache. The seed's
-    /// `FileIO` is never used for reads: every consumer attaches the entries
-    /// with `Table::with_object_cache`, which rebinds misses to that table's
-    /// own gated `FileIO`. A racing first caller builds a redundant seed and
+    /// first caller builds a throwaway table over the catalog's `FileIO` with
+    /// [`MANIFEST_CACHE_BYTES`] and keeps its cache. Every consumer attaches
+    /// the entries with `Table::with_object_cache`. A racing first caller builds a redundant seed and
     /// discards it.
     ///
     /// # Errors
@@ -705,13 +578,13 @@ impl BifrostCatalog {
     /// built from the supplied identity and metadata.
     fn manifest_cache(
         &self,
-        identifier: &iceberg::TableIdent,
-        metadata: &iceberg::spec::TableMetadataRef,
+        identifier: &TableIdent,
+        metadata: &TableMetadataRef,
     ) -> Result<Arc<ObjectCache>, BifrostCatalogError> {
         if let Some(cache) = self.manifest_cache.get() {
             return Ok(Arc::clone(cache));
         }
-        let seed = iceberg::table::Table::builder()
+        let seed = Table::builder()
             .file_io(self.file_io.clone())
             .metadata(Arc::clone(metadata))
             .identifier(identifier.clone())
@@ -723,49 +596,6 @@ impl BifrostCatalog {
         ))
     }
 
-    /// Acquires one stable Iceberg/SQL/Iceberg cut for a tenant table.
-    ///
-    /// Every reload uses the same permit-scoped table the caller supplied, so
-    /// the stability retry can never fall back to the catalog's ungated
-    /// storage part-way through.
-    ///
-    /// # Errors
-    ///
-    /// Returns a catalog or SQL error for one failed read, or `UnstableCut`
-    /// after three complete snapshot identity mismatches. Cancellation drops
-    /// the in-flight attempt without exposing partial state.
-    async fn acquire_stable_cut_from(
-        &self,
-        gated: iceberg::table::Table,
-        binding: &TenantTableBinding,
-        tenant: DataTenantId,
-    ) -> Result<
-        (
-            iceberg::table::Table,
-            PinnedIcebergState,
-            vala_sql::queries::file_list::HotFileCut,
-        ),
-        BifrostCatalogError,
-    > {
-        let pinned = self.pin_iceberg_snapshot(&gated, binding).await?;
-        let cut = async {
-            let hot_file_catalog =
-                HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let cut = hot_file_catalog
-                .unresolved_for_cut(
-                    &mut conn,
-                    &pinned.file_paths,
-                    pinned.forge_publication_operation_id,
-                )
-                .await?;
-            conn.commit().await?;
-            Ok::<_, BifrostCatalogError>(cut)
-        }
-        .await;
-        Ok((gated, pinned, cut?))
-    }
-
     /// Collects and validates the immutable files of one current Iceberg snapshot.
     ///
     /// # Errors
@@ -774,7 +604,7 @@ impl BifrostCatalog {
     /// tenant binding, file metadata conflicts, or byte accounting overflows.
     async fn pin_iceberg_snapshot(
         &self,
-        iceberg_table: &iceberg::table::Table,
+        iceberg_table: &Table,
         binding: &TenantTableBinding,
     ) -> Result<PinnedIcebergState, BifrostCatalogError> {
         let snapshot_id = iceberg_table.metadata().current_snapshot_id();
@@ -795,7 +625,7 @@ impl BifrostCatalog {
             .additional_properties
             .get("forge.operation_id")
             .map(|value| {
-                uuid::Uuid::parse_str(value).map_err(|_| {
+                Uuid::parse_str(value).map_err(|_| {
                     BifrostCatalogError::MetadataMismatch(
                         "current snapshot has malformed forge.operation_id".to_owned(),
                     )
@@ -919,9 +749,9 @@ impl BifrostCatalog {
             warehouse,
             file_io,
             storage,
-            storage_properties,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             table_uids: Arc::default(),
+            registered_schemas: Arc::default(),
         })
     }
 
@@ -974,26 +804,28 @@ impl BifrostCatalog {
                 "built-in tables must be provisioned with ensure_builtin".to_owned(),
             ));
         }
-        self.create_table_locked(request, None, None).await
+        self.create_table_locked(request, None, CompactionRegistration::default())
+            .await
     }
 
     /// Register a caller-owned dataset in the tenant-qualified dataset namespace.
     ///
-    /// `compaction_target_file_size_bytes`, when supplied, becomes the new
-    /// table's explicit `write.target-file-size-bytes` property; omitted, the
-    /// table follows Forge's deployment default. On an existing table it must
-    /// match the stored explicit target or be omitted.
+    /// Each option `compaction` declares becomes the new table's explicit
+    /// Iceberg property — the file target as `write.target-file-size-bytes`,
+    /// the type as `wyrd.forge.compaction.type`; an omitted option stores
+    /// nothing and the table follows Forge's default. On an existing table each
+    /// declared option must match the stored explicit value or be omitted.
     ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// compaction target, or control row is invalid.
+    /// compaction target or type, or control row is invalid.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
         table: TableRef,
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
-        compaction_target_file_size_bytes: Option<u64>,
+        compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
             return Err(BifrostCatalogError::MetadataMismatch(
@@ -1008,7 +840,7 @@ impl BifrostCatalog {
                 physical_layout,
             },
             None,
-            compaction_target_file_size_bytes,
+            compaction,
         )
         .await
     }
@@ -1046,7 +878,7 @@ impl BifrostCatalog {
                 physical_layout: Some((definition.physical_layout)()),
             },
             Some((definition.schema)()),
-            None,
+            CompactionRegistration::default(),
         )
         .await
     }
@@ -1068,23 +900,23 @@ impl BifrostCatalog {
     /// fields. It selects no resolver: every declaration, built-in or caller,
     /// resolves through the one [`PhysicalLayout::resolve`] entry point.
     ///
-    /// `compaction_target_file_size_bytes` is checked for intrinsic shape
-    /// before the transaction, compared under the advisory lock against an
-    /// existing physical table's explicit target, and otherwise written as the
-    /// new table's `write.target-file-size-bytes` in its create transaction.
+    /// `compaction` is checked for intrinsic shape before the transaction,
+    /// compared under the advisory lock against an existing physical table's
+    /// explicit target and type, and otherwise written as the new table's
+    /// properties in its create transaction.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::ReservedColumn`] when a declaration
     /// names a server-owned column,
     /// [`BifrostCatalogError::Registration`] for an invalid or
-    /// conflicting layout or compaction target,
+    /// conflicting layout, compaction target, or compaction type,
     /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict, and
-    /// metadata, Iceberg, SQL, or audit errors otherwise.
+    /// metadata, Iceberg, or SQL errors otherwise.
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
-        canonical_schema: Option<arrow::datatypes::SchemaRef>,
-        compaction_target_file_size_bytes: Option<u64>,
+        canonical_schema: Option<SchemaRef>,
+        compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
@@ -1098,13 +930,7 @@ impl BifrostCatalog {
             request.physical_layout.as_ref(),
             canonical_schema.as_deref(),
         )?;
-        if let Some(bytes) = compaction_target_file_size_bytes
-            && !crate::forge::managed::policy::registrable_target_file_size_bytes(bytes)
-        {
-            return Err(BifrostCatalogError::Registration(
-                wyrd_spec::vala::BifrostError::InvalidCompactionTarget { table: fqn, bytes },
-            ));
-        }
+        compaction.validate(&fqn)?;
         let layout_wire = layout.to_wire();
         let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
             BifrostCatalogError::MetadataMismatch(format!(
@@ -1134,7 +960,7 @@ impl BifrostCatalog {
             }
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
-            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
+            compaction.assert_matches(physical.metadata(), &fqn)?;
             conn.commit().await?;
             return TableUid::from_row(&row.table_uid, &row.fqn);
         }
@@ -1143,15 +969,10 @@ impl BifrostCatalog {
         if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
-            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
+            compaction.assert_matches(physical.metadata(), &fqn)?;
         } else {
-            self.create_physical_table(
-                &binding,
-                &arrow_schema,
-                &layout,
-                compaction_target_file_size_bytes,
-            )
-            .await?;
+            self.create_physical_table(&binding, &arrow_schema, &layout, compaction)
+                .await?;
         }
 
         let table_uid = TableUid::new_v7();
@@ -1175,10 +996,10 @@ impl BifrostCatalog {
     /// derived from `layout` and `binding`, so the canonical layout stays the
     /// single authority for the table's shape. The Forge data path is written
     /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root. A supplied
-    /// `compaction_target_file_size_bytes` is written as the table's explicit
-    /// `write.target-file-size-bytes`; omitted, no target property is written
-    /// so Forge resolves its deployment default at planning time.
+    /// the recipe segment instead of the default data root. Each option
+    /// `compaction` declares is written as the table's explicit property;
+    /// an omitted option writes nothing, so Forge resolves its default at
+    /// planning time.
     ///
     /// # Errors
     ///
@@ -1190,7 +1011,7 @@ impl BifrostCatalog {
         binding: &TenantTableBinding,
         arrow_schema: &Schema,
         layout: &PhysicalLayout,
-        compaction_target_file_size_bytes: Option<u64>,
+        compaction: CompactionRegistration,
     ) -> Result<(), BifrostCatalogError> {
         let iceberg_schema = crate::tables::iceberg_schema_for(arrow_schema)?;
         let partition_spec = layout
@@ -1215,9 +1036,7 @@ impl BifrostCatalog {
                 forge_data_location,
             ),
         ]);
-        if let Some(bytes) = compaction_target_file_size_bytes {
-            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
-        }
+        compaction.write_properties(&mut properties);
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
@@ -1248,7 +1067,7 @@ impl BifrostCatalog {
     /// converted for shape validation.
     fn validate_physical_table(
         &self,
-        table: &iceberg::table::Table,
+        table: &Table,
         binding: &TenantTableBinding,
         expected_schema: &Schema,
         layout: &PhysicalLayout,
@@ -1399,6 +1218,48 @@ impl BifrostCatalog {
         Ok(table_uid)
     }
 
+    /// Return the registered Iceberg schema of one tenant/logical table.
+    ///
+    /// The registered table, not any declaration, assigns every physical field
+    /// id, nested and managed fields included; Scribe stamps exactly these ids
+    /// into the objects it writes so Forge and Oracle resolve its columns by
+    /// the table's own numbering. Answers from the node's cache when this
+    /// table was loaded before, and otherwise loads the tenant-bound Iceberg
+    /// table once and caches its current schema.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
+    /// binding cannot be resolved, and the Iceberg error when the physical
+    /// table cannot be loaded.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding the cache lock.
+    pub async fn registered_schema(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<Arc<spec::Schema>, BifrostCatalogError> {
+        let key = (tenant, table.fqn());
+        let cached = self
+            .registered_schemas
+            .read()
+            .expect("the registered schema cache lock is never poisoned")
+            .get(&key)
+            .map(Arc::clone);
+        if let Some(schema) = cached {
+            return Ok(schema);
+        }
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let loaded = self.catalog.load_table(&binding.table_ident()).await?;
+        let schema = Arc::clone(loaded.metadata().current_schema());
+        self.registered_schemas
+            .write()
+            .expect("the registered schema cache lock is never poisoned")
+            .insert(key, Arc::clone(&schema));
+        Ok(schema)
+    }
+
     /// Return the registered user-schema fingerprint for one tenant/logical table.
     ///
     /// # Errors
@@ -1437,10 +1298,9 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<arrow::datatypes::SchemaRef, BifrostCatalogError> {
+    ) -> Result<SchemaRef, BifrostCatalogError> {
         // Schema only: the provider is built from the loaded metadata document
-        // and dropped here, so this path opens no snapshot object and needs no
-        // reader permit to gate one.
+        // and dropped here, so this path opens no snapshot object.
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -1492,11 +1352,11 @@ impl BifrostCatalog {
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
         // A canonical built-in is described from its own declaration, not from
-        // the Iceberg round trip. The catalog assigns its own sequential field
-        // ids at table creation, so the stored schema's ids diverge from the
-        // ledger's after the first nested column — and it is the ledger's ids
-        // that Scribe enforces on every stamped canonical batch. Describing the
-        // stored ids would hand a writer a schema its own batches fail against.
+        // the Iceberg round trip: the stored schema drops the ledger's
+        // sensitivity markers and renames nested list elements, and it is the
+        // ledger's shape that Scribe enforces on every canonical batch. The
+        // registered field ids are the table's and Scribe stamps them itself,
+        // so the description carries none.
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
@@ -1520,6 +1380,8 @@ impl BifrostCatalog {
             compaction_target_file_size_bytes: explicit_compaction_target(
                 iceberg_table.metadata(),
             )?,
+            compaction_type: explicit_compaction_type(iceberg_table.metadata())?
+                .map(CompactionTypeWire::from),
         })
     }
 
@@ -1539,7 +1401,6 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1549,11 +1410,10 @@ impl BifrostCatalog {
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
         let loaded = self.catalog.load_table(&identifier).await?;
-        let iceberg_table = self.permit_scoped_table(
+        let iceberg_table = self.cached_table(
             &identifier,
             loaded.metadata_ref(),
             loaded.metadata_location().map(ToOwned::to_owned),
-            permit,
         )?;
         IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
@@ -1579,7 +1439,6 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
         snapshot_id: i64,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1589,11 +1448,10 @@ impl BifrostCatalog {
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
         let loaded = self.catalog.load_table(&identifier).await?;
-        let iceberg_table = self.permit_scoped_table(
+        let iceberg_table = self.cached_table(
             &identifier,
             loaded.metadata_ref(),
             loaded.metadata_location().map(ToOwned::to_owned),
-            permit,
         )?;
         IcebergStaticTableProvider::try_new_from_table_snapshot(iceberg_table, snapshot_id)
             .await
@@ -1676,7 +1534,12 @@ fn resolve_registration_layout(
     canonical_schema: Option<&Schema>,
 ) -> Result<(Schema, PhysicalLayout), BifrostCatalogError> {
     let arrow_schema = canonical_schema.map_or_else(
-        || Schema::new(with_managed_columns(user_fields.to_vec())),
+        || {
+            Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+                user_fields.to_vec(),
+                crate::tables::CorrelationPolicy::Observation,
+            ))
+        },
         Clone::clone,
     );
     let schema_refusal = |detail: String| {
@@ -1743,30 +1606,123 @@ fn explicit_compaction_target(
         .transpose()
 }
 
-/// Checks a re-registration's compaction target against the stored one.
+/// Reads the explicit compaction type a physical table stores.
 ///
-/// Omission always matches and leaves the stored property untouched; a
-/// supplied value must equal the table's explicit target.
+/// `None` means the table declares none and Forge plans its `small-files` default.
 ///
 /// # Errors
-/// Returns [`BifrostCatalogError::Registration`] carrying
-/// `CompactionTargetMismatch` when a supplied target differs from the stored
-/// explicit target (including when none is stored), and a metadata mismatch
-/// when the stored property is malformed.
-fn assert_compaction_target(
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
+/// is not a known compaction type spelling.
+fn explicit_compaction_type(
     metadata: &TableMetadata,
-    supplied: Option<u64>,
-    fqn: &str,
-) -> Result<(), BifrostCatalogError> {
-    match supplied {
-        Some(bytes) if explicit_compaction_target(metadata)? != Some(bytes) => {
-            Err(BifrostCatalogError::Registration(
+) -> Result<Option<ForgeCompactionType>, BifrostCatalogError> {
+    metadata
+        .properties()
+        .get(COMPACTION_TYPE_PROPERTY)
+        .map(|raw| {
+            ForgeCompactionType::parse(raw).map_err(|error| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "stored {COMPACTION_TYPE_PROPERTY}={raw:?} is invalid: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// The Forge compaction options one dataset registration declares.
+///
+/// Every option is optional and independent: a declared option becomes the
+/// new table's explicit Iceberg property in its create transaction, and on a
+/// re-registration must equal the stored explicit value. An omitted option
+/// stores nothing and never conflicts, so the table follows Forge's default
+/// (the deployment file target, the `small-files` type). [`Default`] declares
+/// nothing, which is how built-ins register.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionRegistration {
+    /// Soft file target Forge compacts toward, stored as
+    /// `write.target-file-size-bytes`.
+    pub target_file_size_bytes: Option<u64>,
+    /// Physical compaction type a worker plans with, stored as
+    /// `wyrd.forge.compaction.type`.
+    pub compaction_type: Option<ForgeCompactionType>,
+}
+
+impl CompactionRegistration {
+    /// Rejects a declaration Forge could never honor, before any durable write.
+    ///
+    /// Only the file target has intrinsic shape: it must be registrable under
+    /// Forge's file-size policy. Every compaction type is valid on its own.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Registration`] carrying
+    /// `InvalidCompactionTarget` when the declared target is not registrable.
+    fn validate(&self, fqn: &str) -> Result<(), BifrostCatalogError> {
+        match self.target_file_size_bytes {
+            Some(bytes)
+                if !crate::forge::managed::policy::registrable_target_file_size_bytes(bytes) =>
+            {
+                Err(BifrostCatalogError::Registration(
+                    wyrd_spec::vala::BifrostError::InvalidCompactionTarget {
+                        table: fqn.to_owned(),
+                        bytes,
+                    },
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks a re-registration's declared options against the stored table.
+    ///
+    /// Omission always matches and leaves the stored property untouched; a
+    /// declared option must equal the table's explicit value, so declaring
+    /// one for a table that stores none is a conflict. The target is checked
+    /// before the type.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Registration`] carrying
+    /// `CompactionTargetMismatch` or `CompactionTypeMismatch` for a differing
+    /// declaration, and a metadata mismatch when a stored property is
+    /// malformed.
+    fn assert_matches(
+        &self,
+        metadata: &TableMetadata,
+        fqn: &str,
+    ) -> Result<(), BifrostCatalogError> {
+        if let Some(bytes) = self.target_file_size_bytes
+            && explicit_compaction_target(metadata)? != Some(bytes)
+        {
+            return Err(BifrostCatalogError::Registration(
                 wyrd_spec::vala::BifrostError::CompactionTargetMismatch {
                     table: fqn.to_owned(),
                 },
-            ))
+            ));
         }
-        _ => Ok(()),
+        if let Some(kind) = self.compaction_type
+            && explicit_compaction_type(metadata)? != Some(kind)
+        {
+            return Err(BifrostCatalogError::Registration(
+                wyrd_spec::vala::BifrostError::CompactionTypeMismatch {
+                    table: fqn.to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Adds each declared option to a new table's creation properties.
+    ///
+    /// Writes nothing for an omitted option.
+    fn write_properties(&self, properties: &mut HashMap<String, String>) {
+        if let Some(bytes) = self.target_file_size_bytes {
+            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
+        }
+        if let Some(kind) = self.compaction_type {
+            properties.insert(
+                COMPACTION_TYPE_PROPERTY.to_owned(),
+                kind.as_str().to_owned(),
+            );
+        }
     }
 }
 
@@ -1840,14 +1796,111 @@ mod schema_shape_tests {
     }
 }
 
+/// Validates every reconciled hot row against its binding and adds its bytes.
+///
+/// A hot row is only readable when it names this tenant and table, carries a
+/// coherent size, row count, epoch, and WAL range, and resolves inside the
+/// binding's object prefix. The returned estimate is `base` plus every row's
+/// file size.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when a row violates its
+/// binding or the byte estimate cannot be represented.
+fn hot_cut_bytes(
+    binding: &TenantTableBinding,
+    hot_files: &[HotFileRow],
+    base: u64,
+) -> Result<u64, BifrostCatalogError> {
+    hot_files.iter().try_fold(base, |total, row| {
+        let valid_identity = row.data_tenant_id == binding.tenant.as_uuid()
+            && row.namespace == binding.logical_namespace
+            && row.table_name == binding.table_name
+            && row.file_size > 0
+            && row.row_count >= 0
+            && row.writer_epoch >= 0
+            && row.wal_lsn_min >= 0
+            && row.wal_lsn_max >= row.wal_lsn_min
+            && binding.validate_object_path(&row.file_path).is_some();
+        if !valid_identity {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "sealed manifest row violates its tenant/table binding".to_owned(),
+            ));
+        }
+        total
+            .checked_add(u64::try_from(row.file_size).map_err(|_| {
+                BifrostCatalogError::MetadataMismatch(
+                    "hot manifest file size is invalid".to_owned(),
+                )
+            })?)
+            .ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch("sealed byte estimate overflow".to_owned())
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use arrow::datatypes::{DataType, Field};
 
-    use super::{MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile, resolve_registration_layout};
+    use super::{
+        CompactionRegistration, MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile,
+        resolve_registration_layout,
+    };
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
+    use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType, ForgeTableSettings};
+    use wyrd_spec::vala::api::CompactionTypeWire;
+
+    /// A declared compaction type is written under Forge's own property in
+    /// the hyphenated spelling Forge parses back to the same type, every wire
+    /// value round-trips through the Forge type, and an empty declaration
+    /// writes nothing so Forge keeps its `small-files` default.
+    ///
+    /// # Panics
+    /// Panics when a written property is missing, misspelled, or does not
+    /// parse back into the declared type.
+    #[test]
+    fn compaction_registration_writes_the_forge_type_property() {
+        for wire in [
+            CompactionTypeWire::Auto,
+            CompactionTypeWire::Full,
+            CompactionTypeWire::SmallFiles,
+            CompactionTypeWire::FilesWithDelete,
+        ] {
+            let kind = ForgeCompactionType::from(wire);
+            assert_eq!(CompactionTypeWire::from(kind), wire);
+            let mut properties = HashMap::new();
+            CompactionRegistration {
+                target_file_size_bytes: None,
+                compaction_type: Some(kind),
+            }
+            .write_properties(&mut properties);
+            assert_eq!(properties.len(), 1);
+            let settings =
+                ForgeTableSettings::from_properties(&properties).expect("settings parse");
+            assert_eq!(settings.compaction_type, kind);
+        }
+        let mut properties = HashMap::new();
+        CompactionRegistration {
+            target_file_size_bytes: None,
+            compaction_type: Some(ForgeCompactionType::SmallFiles),
+        }
+        .write_properties(&mut properties);
+        assert_eq!(
+            properties.get(COMPACTION_TYPE_PROPERTY).map(String::as_str),
+            Some("small-files")
+        );
+        let mut empty = HashMap::new();
+        CompactionRegistration::default().write_properties(&mut empty);
+        assert!(empty.is_empty());
+        assert_eq!(
+            ForgeTableSettings::from_properties(&empty)
+                .expect("defaults parse")
+                .compaction_type,
+            ForgeCompactionType::SmallFiles
+        );
+    }
 
     /// Builds one Forge-style rewrite output's manifest `DataFile` with typed
     /// `wyrd_event_time` bounds under the given field id.
@@ -2029,13 +2082,14 @@ mod production_pin_tests {
 
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use secrecy::ExposeSecret as _;
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::WYRD_EVENT_TIME;
 
     use crate::storage::BifrostStorage;
 
     use std::sync::Arc;
 
-    use super::BifrostCatalog;
+    use super::{BifrostCatalog, CompactionRegistration, PinnedSealedTable};
     use crate::catalog::TableRef;
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
     use crate::namespaces::BifrostNamespace;
@@ -2172,81 +2226,6 @@ mod production_pin_tests {
         data_files.collect()
     }
 
-    /// One stable protected cut reads the immutable metadata document once.
-    ///
-    /// Preparation reads the authoritative pointer and the document it names;
-    /// the post-protection recheck reads only the pointer again; and
-    /// materialization reuses the prepared document. The pointer is read
-    /// through the catalog-owner credential, while the request role's tenant
-    /// connection is still refused the catalog schema outright.
-    ///
-    /// # Panics
-    /// Panics when the fixture, registration, or cut fails, when the cut reads
-    /// the document or the pointer a different number of times, or when the
-    /// request role can read the catalog table.
-    #[test]
-    fn protected_cut_reuses_immutable_metadata() {
-        use std::sync::atomic::Ordering::SeqCst;
-        wyrd_runtime::runtime().block_on(async {
-            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-                .await
-                .expect("postgres fixture starts");
-            let warehouse = tempfile::tempdir().expect("warehouse directory");
-            let catalog = BifrostCatalog::new(
-                fixture.catalog_dsn().expose_secret(),
-                local_storage_owner(warehouse.path()),
-                fixture.vala_postgres().clone(),
-            )
-            .await
-            .expect("redux catalog builds over the fixture");
-            let tenant = fixture.data_tenant_id();
-            let table = TableRef::new(BifrostNamespace::Datasets, "immutable_metadata");
-            catalog
-                .register_dataset(
-                    tenant,
-                    table.clone(),
-                    vec![arrow::datatypes::Field::new(
-                        "value",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    )],
-                    None,
-                    None,
-                )
-                .await
-                .expect("dataset registers");
-
-            super::TEST_METADATA_POINTER_READS.store(0, SeqCst);
-            super::TEST_METADATA_DOCUMENT_READS.store(0, SeqCst);
-            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-            let prepared = catalog
-                .prepare_reader_identity(&table, tenant)
-                .await
-                .expect("the registered table prepares");
-            catalog
-                .revalidate_reader_identity(&prepared)
-                .await
-                .expect("an unchanged pointer revalidates");
-            catalog
-                .materialize_reader_cut(prepared, &permit)
-                .await
-                .expect("the cut materializes");
-            assert_eq!(super::TEST_METADATA_POINTER_READS.load(SeqCst), 2);
-            assert_eq!(super::TEST_METADATA_DOCUMENT_READS.load(SeqCst), 1);
-
-            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-            let denied =
-                sqlx::query("SELECT metadata_location FROM iceberg_catalog.iceberg_tables")
-                    .execute(&mut **conn.transaction())
-                    .await
-                    .expect_err("the request role cannot read the catalog pointer");
-            assert!(
-                denied.to_string().contains("permission denied"),
-                "the request role is refused by privilege, not by absence: {denied}"
-            );
-        });
-    }
-
     /// The registration cache keeps found UIDs and never remembers a miss.
     ///
     /// A table looked up before it exists must still be found on the first
@@ -2286,7 +2265,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                 )
                 .await
                 .expect("dataset registers");
@@ -2372,15 +2351,49 @@ mod production_pin_tests {
         assert!(deleted > 0, "the append wrote manifests");
     }
 
-    /// Plans the current snapshot through a fresh permit-scoped table and
-    /// returns how many file tasks it produced.
+    /// Acquires and materializes one table's current cut the way Oracle does.
+    ///
+    /// The fixture owner is a fresh query on an arbitrary positive fence;
+    /// acquisition records an active read but checks no Oracle liveness.
+    ///
+    /// # Panics
+    /// Panics when acquisition or materialization fails.
+    async fn pin_current(
+        catalog: &BifrostCatalog,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> PinnedSealedTable {
+        let owner = vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
+            query_id: uuid::Uuid::now_v7(),
+            node_id: uuid::Uuid::now_v7(),
+            fencing_token: 1,
+        };
+        let acquired = catalog
+            .acquire_active_cut(
+                tenant,
+                owner,
+                std::time::Instant::now() + std::time::Duration::from_hours(1),
+                std::slice::from_ref(table),
+            )
+            .await
+            .expect("the registered table acquires")
+            .expect("an hour remains before the deadline")
+            .pop()
+            .expect("one acquired table");
+        catalog
+            .materialize_acquired_cut(tenant, table, acquired)
+            .await
+            .expect("the committed snapshot pins")
+    }
+
+    /// Plans the current snapshot through a fresh cached table and returns how
+    /// many file tasks it produced.
     ///
     /// # Panics
     /// Panics when the table cannot be reloaded, built, or planned.
     async fn planned_file_count(
         catalog: &BifrostCatalog,
         identifier: &iceberg::TableIdent,
-        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> usize {
         use futures_util::TryStreamExt as _;
         let loaded = catalog
@@ -2389,11 +2402,10 @@ mod production_pin_tests {
             .await
             .expect("physical table reloads");
         let tasks: Vec<_> = catalog
-            .permit_scoped_table(
+            .cached_table(
                 identifier,
                 loaded.metadata_ref(),
                 loaded.metadata_location().map(ToOwned::to_owned),
-                permit,
             )
             .expect("the scoped table builds")
             .scan()
@@ -2420,7 +2432,7 @@ mod production_pin_tests {
     ///
     /// It also proves the pin and the scan share one decode: after the pin,
     /// every Avro manifest object is deleted from the warehouse, and a fresh
-    /// permit-scoped table must still plan the committed file, which it can
+    /// cached table must still plan the committed file, which it can
     /// only do from the node-wide manifest cache the pin populated.
     ///
     /// # Panics
@@ -2454,7 +2466,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                 )
                 .await
                 .expect("dataset registers");
@@ -2499,31 +2511,23 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
-            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-            let prepared = catalog
-                .prepare_reader_identity(&table, tenant)
-                .await
-                .expect("the registered table prepares");
-            let pinned = catalog
-                .materialize_reader_cut(prepared, &permit)
-                .await
-                .expect("the committed snapshot pins");
+            let pinned = pin_current(&catalog, tenant, &table).await;
             let snapshot_id = pinned
                 .snapshot_id
                 .expect("a committed table has a snapshot");
             delete_manifest_objects(warehouse.path());
             assert_eq!(
-                planned_file_count(&catalog, &binding.table_ident(), &permit).await,
+                planned_file_count(&catalog, &binding.table_ident()).await,
                 1,
                 "the pin's decoded manifests plan the file"
             );
             catalog
-                .pinned_provider(&table, tenant, snapshot_id, &permit)
+                .pinned_provider(&table, tenant, snapshot_id)
                 .await
                 .expect("the published snapshot resolves");
             assert!(
                 catalog
-                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1), &permit)
+                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1))
                     .await
                     .is_err(),
                 "an unpublished snapshot must fail to resolve rather than serve the current one"
@@ -2577,7 +2581,7 @@ mod production_pin_tests {
                         true,
                     )],
                     None,
-                    None,
+                    CompactionRegistration::default(),
                 )
                 .await
                 .expect("dataset registers");
@@ -2610,15 +2614,7 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
-            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-            let prepared = catalog
-                .prepare_reader_identity(&table, tenant)
-                .await
-                .expect("the registered table prepares");
-            let pinned = catalog
-                .materialize_reader_cut(prepared, &permit)
-                .await
-                .expect("the committed snapshot pins");
+            let pinned = pin_current(&catalog, tenant, &table).await;
             assert_eq!(
                 pinned.iceberg_files.len(),
                 cases.len(),

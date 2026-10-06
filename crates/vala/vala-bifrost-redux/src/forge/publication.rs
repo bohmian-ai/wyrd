@@ -1123,7 +1123,7 @@ pub(super) enum RewriteSubmission {
     Committed(Box<Table>),
     /// No `update_table` call was started, so nothing landed.
     NotSubmitted(ForgeError),
-    /// The catalog answered with a definite, non-retryable refusal.
+    /// The catalog answered with a definite refusal: a failed requirement or a non-retryable error.
     DefiniteConflict(ForgeError),
     /// A call was submitted and its acceptance is unknown.
     AcceptanceUnknown(ForgeError),
@@ -1313,9 +1313,11 @@ impl Forge {
     /// the caller may close the operation as definitely uncommitted rather than
     /// stranding it for a successor to reconcile a commit that never happened.
     ///
-    /// The wait itself is derived from the publication's one absolute deadline
-    /// immediately before the call, so the initial commit and its single
-    /// permitted retry share one budget and neither can outlive it.
+    /// The call is one catalog update (`commit_once`): the transaction layer's
+    /// own retry would re-apply a commit whose response was lost and report
+    /// the landed effect as a definite duplicate-file refusal. Its wait is
+    /// derived from the publication's one absolute deadline immediately before
+    /// the call, so it cannot outlive that budget.
     ///
     /// # Errors
     ///
@@ -1375,14 +1377,20 @@ impl Forge {
         };
         let catalog = self.core.catalog.as_ref();
         let outcome = async move {
-            let commit = transaction.commit(catalog);
+            let commit = transaction.commit_once(catalog);
             tokio::pin!(commit);
             tokio::select! {
                 response = tokio::time::timeout(remaining, &mut commit) => match response {
                     Ok(Ok(committed)) => Ok(committed),
-                    // A retryable catalog answer invites another call rather
-                    // than closing this one, so it is not proof of rejection:
-                    // it reconciles rather than resets.
+                    // A failed requirement or compare-and-swap is the catalog
+                    // refusing this exact update, so it is definite even though
+                    // it invites a retry; Forge revalidates and retries it.
+                    Ok(Err(error)) if error.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
+                        Err(RewriteSubmission::DefiniteConflict(ForgeError::Catalog(error)))
+                    }
+                    // Any other retryable catalog answer invites another call
+                    // rather than closing this one, so it is not proof of
+                    // rejection: it reconciles rather than resets.
                     Ok(Err(error)) if error.retryable() => {
                         Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Catalog(error)))
                     }

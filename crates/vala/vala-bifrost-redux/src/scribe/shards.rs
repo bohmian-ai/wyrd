@@ -4,11 +4,14 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, watch};
+use vala_sql::ValaPostgres;
+use vala_sql::queries::scribe_batch_commits::ScribeBatchCommit;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
@@ -803,7 +806,7 @@ struct ShardOwner {
     /// Optional immutable-generation persistence runtime.
     persistence: Option<Arc<PersistenceRuntime>>,
     /// Vala SQL pool retained only by the production batch-control fence.
-    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    control_postgres: Option<Arc<ValaPostgres>>,
     /// Completion sender routed back to this owner's command mailbox.
     completion_tx: mpsc::Sender<ShardCommand>,
     /// Typed WAL stream identity for generations and replay.
@@ -889,7 +892,7 @@ pub(crate) struct ScribeShardStartConfig {
     /// Optional immutable-generation persistence runtime.
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     /// Tenant-scoped SQL owner used to fence durable public batch ACKs.
-    pub(crate) control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    pub(crate) control_postgres: Option<Arc<ValaPostgres>>,
     /// Typed pod stream identity.
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
@@ -3621,7 +3624,14 @@ impl ShardOwner {
                 })?,
                 request_id: first.request_id,
             };
-            if self.commit_batch_control_fence(&postgres, &commit).await? {
+            let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "Scribe admission instant exceeds the PostgreSQL range".to_owned(),
+                })?;
+            if self
+                .commit_batch_control_fence(&postgres, &commit, ingested_at)
+                .await?
+            {
                 tracing::debug!(
                     tenant = %append.tenant,
                     table = %append.table.fqn(),
@@ -3636,6 +3646,9 @@ impl ShardOwner {
 
     /// Commits or durably reconciles one exact WAL batch-control fence.
     ///
+    /// `ingested_at` is the batch's admission instant, the value stamped on
+    /// its rows as `wyrd_ingested_at`; the fence stores it unchanged.
+    ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
     /// tenant transaction and compares every durable identity field. An exact
     /// row completes once; an absent row retries the identical insert. An unavailable or contradictory lookup poisons the shared
@@ -3649,13 +3662,15 @@ impl ShardOwner {
     /// failures poison admission and retain the group until restart.
     async fn commit_batch_control_fence(
         &self,
-        postgres: &vala_sql::ValaPostgres,
-        commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
+        postgres: &ValaPostgres,
+        commit: &ScribeBatchCommit,
+        ingested_at: DateTime<Utc>,
     ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;
             let recorded =
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit).await?;
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, ingested_at)
+                    .await?;
             if conn.commit().await.is_ok() {
                 return Ok(matches!(
                     recorded,
@@ -6439,6 +6454,7 @@ mod tests {
             crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
+                ingested_at_micros: 0,
                 rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
                 measured_wire_bytes: initial_bytes,
                 reservation,
@@ -7046,8 +7062,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, batch_id, \
              slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, wal_shard_id, \
-             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id) \
-             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6)",
+             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
+             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6, statement_timestamp())",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())

@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! SQL integration tests for `vala.forge_operation_state`.
     //!
@@ -32,7 +35,7 @@ mod pg_tests {
             ForgeExpirationSettlementRequest, ForgeOperationFamily, ForgeOperationTransition,
         };
         use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
-        use vala_sql::{SqlError, TenantConn};
+        use vala_sql::{OperatorPool, SqlError, TenantConn};
 
         // -----------------------------------------------------------------------
         // Fixture and helpers
@@ -670,7 +673,6 @@ mod pg_tests {
                     .expect("valid path"),
                 current_snapshot_id: Some(42),
                 retained_ref_heads: vec![42, 43],
-                cutoff_ms: 1_700_000_000_000i64,
                 selected_snapshot_ids: vec![1, 2, 3],
             };
             let prepared_event = event("forge.snapshot_expire.prepared", resource(), Some(detail));
@@ -691,7 +693,6 @@ mod pg_tests {
                     base_metadata_location,
                     current_snapshot_id,
                     retained_ref_heads,
-                    cutoff_ms,
                     selected_snapshot_ids,
                     ..
                 } => AuditDetail::ForgeSnapshotExpire {
@@ -701,7 +702,6 @@ mod pg_tests {
                     base_metadata_location: base_metadata_location.clone(),
                     current_snapshot_id: *current_snapshot_id,
                     retained_ref_heads: retained_ref_heads.clone(),
-                    cutoff_ms: *cutoff_ms,
                     selected_snapshot_ids: selected_snapshot_ids.clone(),
                 },
                 _ => panic!("expected snapshot-expiry detail"),
@@ -873,7 +873,6 @@ mod pg_tests {
                         .expect("valid path"),
                         current_snapshot_id: Some(42),
                         retained_ref_heads: vec![42],
-                        cutoff_ms: 1_700_000_000_000,
                         selected_snapshot_ids: vec![1],
                     },
                     "Reset transition is not valid for family snapshot_expire",
@@ -1278,6 +1277,7 @@ mod pg_tests {
                 .await;
                 operation_id
             }
+
             let TestFixtures { fixture, .. } = setup().await;
             let pool = fixture.app_pool();
             let tenant = fixture.data_tenant_id();
@@ -1414,7 +1414,6 @@ mod pg_tests {
                 .expect("valid path"),
                 current_snapshot_id: Some(77),
                 retained_ref_heads: vec![77],
-                cutoff_ms: 1_700_000_000_000,
                 selected_snapshot_ids: vec![11, 12],
             }
         }
@@ -1676,6 +1675,46 @@ mod pg_tests {
         // Serialized snapshot expiration claims
         // -------------------------------------------------------------------
 
+        /// Prepares one expiration the way Forge does: under the table's live
+        /// exclusive maintenance authority, surrendered afterwards.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SqlError::Conflict`] when an Oracle read still holds the
+        /// table, so no authority exists, and otherwise the preparation's own
+        /// result.
+        async fn prepare_expiration_exclusively(
+            app: &PgPool,
+            ops: &ForgeOperations<'_>,
+            operator: &OperatorPool,
+            tenant: DataTenantId,
+            request: &ForgeExpirationPreparation<'_>,
+        ) -> Result<ForgeOperationTransition, SqlError> {
+            let mut conn = vala_sql::TenantConn::acquire(app, tenant).await?;
+            let identity = vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity {
+                tenant,
+                table_uid: request.table.table_uid,
+                catalog_name: request.table.catalog_name.clone(),
+                namespace_name: request.table.namespace_name.clone(),
+                table_name: request.table.table_name.clone(),
+            };
+            let exclusive =
+                vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority::new(
+                    &mut conn,
+                )
+                .exclusive(identity)
+                .await?
+                .ok_or_else(|| SqlError::Conflict {
+                    detail: "an Oracle query is still reading this table".to_owned(),
+                })?;
+            let prepared = ops
+                .prepare_snapshot_expiration(operator, tenant, &exclusive, request)
+                .await;
+            drop(exclusive);
+            conn.commit().await?;
+            prepared
+        }
+
         /// Fixed table identity every expiration test claims against.
         fn claim_table(table_uuid: Uuid) -> ForgeClaimTable {
             ForgeClaimTable {
@@ -1795,8 +1834,7 @@ mod pg_tests {
         /// Captured as one tuple so a corruption case can compare the complete
         /// state before and after the refusal instead of asserting each fact
         /// separately: total claim rows, the operation phase, the task state,
-        /// the tenant's highest planning-demand generation, and the audit
-        /// chain length.
+        /// and the audit chain length.
         ///
         /// # Panics
         ///
@@ -1806,7 +1844,7 @@ mod pg_tests {
             tenant: DataTenantId,
             operation_id: Uuid,
             task_id: Uuid,
-        ) -> (i64, Option<String>, String, i64, i64) {
+        ) -> (i64, Option<String>, String, i64) {
             let claims: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM vala.forge_snapshot_expiration_claims")
                     .fetch_one(superuser)
@@ -1819,18 +1857,10 @@ mod pg_tests {
             .fetch_optional(superuser)
             .await
             .expect("operation phase");
-            let demand: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(max(generation),-1) FROM vala.forge_planning_demands WHERE data_tenant_id=$1",
-            )
-            .bind(tenant.as_uuid())
-            .fetch_one(superuser)
-            .await
-            .expect("planning demand generation");
             (
                 claims,
                 phase,
                 task_state_of(superuser, task_id).await,
-                demand,
                 count_audit(superuser, tenant).await,
             )
         }
@@ -1947,10 +1977,15 @@ mod pg_tests {
                 detail: &detail,
             };
 
-            let applied = ops
-                .prepare_snapshot_expiration(operator, tenant, &preparation)
-                .await
-                .expect("preparation applies");
+            let applied = prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
+                operator,
+                tenant,
+                &preparation,
+            )
+            .await
+            .expect("preparation applies");
             assert!(
                 matches!(applied, ForgeOperationTransition::Applied),
                 "first preparation applies: {applied:?}"
@@ -1972,10 +2007,15 @@ mod pg_tests {
             );
 
             // Replaying the identical preparation writes nothing.
-            let replay = ops
-                .prepare_snapshot_expiration(operator, tenant, &preparation)
-                .await
-                .expect("preparation replay");
+            let replay = prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
+                operator,
+                tenant,
+                &preparation,
+            )
+            .await
+            .expect("preparation replay");
             assert!(
                 matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "identical preparation replay is idempotent: {replay:?}"
@@ -1998,7 +2038,7 @@ mod pg_tests {
                 detail: &rival_detail,
             };
             assert!(
-                ops.prepare_snapshot_expiration(operator, tenant, &rival)
+                prepare_expiration_exclusively(fixture.app_pool(), &ops, operator, tenant, &rival)
                     .await
                     .is_err(),
                 "a rival operation cannot claim an already-claimed snapshot"
@@ -2016,13 +2056,14 @@ mod pg_tests {
                 detail: &detail,
             };
             let reset = ops
-                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
                 .await
                 .expect("reset applies");
-            let ForgeExpirationResetOutcome::Applied { demand_generation } = reset else {
-                panic!("first reset applies: {reset:?}");
-            };
-            assert!(demand_generation > 0, "reset advanced planning demand");
+            assert_eq!(
+                reset,
+                ForgeExpirationResetOutcome::Applied,
+                "first reset applies"
+            );
             assert_eq!(
                 count_claims(&superuser, operation_id).await,
                 0,
@@ -2046,7 +2087,7 @@ mod pg_tests {
             );
 
             let reset_replay = ops
-                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .reset_snapshot_expiration(operator, tenant, None, &reset_request)
                 .await
                 .expect("reset replay");
             assert_eq!(
@@ -2093,7 +2134,9 @@ mod pg_tests {
                 ForgeSnapshotExpirePhase::Prepared,
                 resource(),
             );
-            ops.prepare_snapshot_expiration(
+            prepare_expiration_exclusively(
+                fixture.app_pool(),
+                &ops,
                 operator,
                 tenant,
                 &ForgeExpirationPreparation {
@@ -2126,7 +2169,7 @@ mod pg_tests {
             // current execution authority, never preparation identity, so any
             // divergence must refuse reconciliation input, reset, and
             // settlement without touching claims, operation state, the task,
-            // planning demand, or the audit chain.
+            // or the audit chain.
             let settle_reset_request = ForgeExpirationResetRequest {
                 authority: &settle_authority,
                 table: &table,
@@ -2323,13 +2366,13 @@ mod pg_tests {
                     "reconciliation input must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.reset_snapshot_expiration(operator, tenant, &settle_reset_request)
+                    ops.reset_snapshot_expiration(operator, tenant, None, &settle_reset_request)
                         .await
                         .is_err(),
                     "reset must refuse a corrupted {label}"
                 );
                 assert!(
-                    ops.settle_snapshot_expiration(operator, tenant, &settlement)
+                    ops.settle_snapshot_expiration(operator, tenant, None, &settlement)
                         .await
                         .is_err(),
                     "settlement must refuse a corrupted {label}"
@@ -2344,7 +2387,7 @@ mod pg_tests {
                     )
                     .await,
                     before,
-                    "a refused {label} leaves claims, operation, task, demand, and audit unchanged"
+                    "a refused {label} leaves claims, operation, task, and audit unchanged"
                 );
 
                 sqlx::query(AssertSqlSafe(restore.as_str()))
@@ -2384,7 +2427,7 @@ mod pg_tests {
             .expect("restore historical authority");
 
             let settled = ops
-                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .settle_snapshot_expiration(operator, tenant, None, &settlement)
                 .await
                 .expect("settlement applies");
             assert!(
@@ -2403,7 +2446,7 @@ mod pg_tests {
             );
 
             let settle_replay = ops
-                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .settle_snapshot_expiration(operator, tenant, None, &settlement)
                 .await
                 .expect("settlement replay");
             assert!(

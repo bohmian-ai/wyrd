@@ -19,7 +19,7 @@ use uuid::Uuid;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
@@ -186,6 +186,11 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 /// tenant, the Gate-owned allow/success audit event, the projected `value`-only
 /// source fingerprint (`wyrd_event_time` is server-managed and never part of
 /// schema identity), and the measured wire size.
+///
+/// # Panics
+///
+/// Panics if the composed server exposes no Bifrost catalog or Scribe, if
+/// dataset registration fails, or if Scribe does not admit both rows.
 async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
     let rows = non_empty_tail_batch();
     let principal = test_principal(tenant);
@@ -198,7 +203,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             table.clone(),
             vec![Field::new("value", DataType::Int64, false)],
             None,
-            None,
+            CompactionRegistration::default(),
         )
         .await
         .expect("tail fixture dataset registers for the authenticated tenant");
@@ -597,7 +602,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
             vec![Field::new("value", DataType::Int64, false)],
             None,
-            None,
+            CompactionRegistration::default(),
         )
         .await
         .expect("logical dataset registers for the authenticated tenant");

@@ -82,12 +82,12 @@ impl Agent {
     ///     id (str | None): Optional stable runtime id.
     ///     tools (list | None): Optional runtime-local decorated tools.
     ///     run_config (RunConfig | None): Optional run configuration.
-    ///     before_agent_callback (Callable | None): Optional callback fired before the run starts. Return None to continue, return replacement input text, or raise to abort.
-    ///     after_agent_callback (Callable | None): Optional callback fired after the run completes. Return None to continue, return a replacement AgentRun, or raise to abort.
-    ///     before_model_callback (Callable | None): Optional callback fired before each model invocation. Return None to continue, return a ProviderRequest replacement, or raise to abort.
-    ///     after_model_callback (Callable | None): Optional callback fired after each model invocation. Return None to continue, return a ProviderResponse replacement, or raise to abort.
-    ///     before_tool_callback (Callable | None): Optional callback fired before each tool invocation. Return None to continue, return replacement tool arguments, or raise to abort.
-    ///     after_tool_callback (Callable | None): Optional callback fired after each tool invocation. Return None to continue, return replacement tool output, or raise to abort.
+    ///     before_agent_callback (Callable | None): Optional callback fired before the run starts. Return None to continue, return replacement input text, or raise to end the run CallbackAborted.
+    ///     after_agent_callback (Callable | None): Optional callback fired after the run completes. Return None to continue, return a mapping in the serialized AgentRun shape to replace the result, or raise to end the run CallbackAborted.
+    ///     before_model_callback (Callable | None): Optional callback fired before each model invocation. Return None to continue, return a ProviderRequest replacement, or raise to end the run CallbackAborted.
+    ///     after_model_callback (Callable | None): Optional callback fired after each model invocation. Return None to continue, return a ProviderResponse replacement, or raise to discard the response and end the run CallbackAborted.
+    ///     before_tool_callback (Callable | None): Optional callback fired before each tool invocation. Return None to continue, return replacement tool arguments, or raise to skip that call and report it to the model as failed.
+    ///     after_tool_callback (Callable | None): Optional callback fired after each tool invocation. Return None to continue, return replacement tool output, or raise to report that call to the model as failed.
     ///     session (SessionMemory | None): Optional session memory object with recent and append methods.
     ///     labels (dict[str, str] | None): Optional envelope labels.
     ///     annotations (dict[str, str] | None): Optional envelope annotations.

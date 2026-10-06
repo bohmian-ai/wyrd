@@ -28,8 +28,8 @@ scope. Token mint and refresh resolve the bounded scope to authoritative Card
 UIDs; ingest uses that verified in-memory mapping without a Card-registry
 Postgres or cache lookup. The server derives tenant, publisher, and request
 identity from verified authority and stamps physical storage columns such as
-`data_tenant_id`, `card_uid`, `principal_id`, `wyrd_batch_id`, and
-`wyrd_ingested_at`. Missing Card correlation leaves
+`card_uid`, `principal_id`, `wyrd_request_id`, and `wyrd_ingested_at`; the
+tenant is bound to the physical table rather than stored as a column. Missing Card correlation leaves
 `card_uid` null; it never erases the server-stamped publisher identity.
 
 OTLP table projection recognizes the exact record-level attributes

@@ -29,7 +29,7 @@ Keep a small private helper beside its caller. Create another module only when
 it has a coherent responsibility. [`Cards`](../../../crates/shared/wyrd-client/src/cards/handle.rs)
 is the canonical Wyrd handle shape (`AGENTS.md` §5).
 
-## Structs and methods: own shared state once
+## Structs and methods: own retained state once
 
 Bad: operations that use a writer's state live outside the writer.
 
@@ -49,9 +49,8 @@ fn take_ready_batch(writer: &mut BatchWriter) -> Option<Vec<Observation>> {
 }
 ```
 
-Good: the concrete owner holds its dependencies and callers discover the
-workflow through methods. Extract a pure free function only when it has no
-natural owner.
+Good: the concrete owner holds state and dependencies that survive across
+operations, and callers discover that durable capability through methods.
 
 ```rust
 /// Buffers observations until a batch can be sent.
@@ -79,6 +78,11 @@ impl BatchWriter {
 The owning type must have meaningful state or invariants. Do not add a
 zero-sized utility struct, a single-implementation trait, or a god object to
 make code look object-oriented.
+
+A free function may coordinate multiple steps, dependencies, or awaits when
+everything it uses remains caller-owned for that invocation. Move it onto a
+struct only when the struct retains meaningful state, resources, identity, or
+invariants across calls, or when the type prevents an invalid lifecycle.
 
 ## Function shape: show the main path
 

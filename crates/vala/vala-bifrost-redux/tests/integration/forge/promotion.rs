@@ -153,6 +153,79 @@ async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
     );
 }
 
+/// A promotion whose operation was reset is retried under a fresh operation.
+///
+/// Two definite conflicts exhaust the single revalidated retry, so the attempt
+/// closes its operation as `Reset` and the task waits as `retryable`. A Reset
+/// operation can never be reopened, so the task's next attempt must prepare
+/// and commit the next operation generation. Reusing the reset identity would
+/// instead fail every remaining attempt on the reopen refusal while the
+/// retryable task holds the table's promotion behind it. The production retry
+/// backoff is brought forward rather than slept through.
+///
+/// # Panics
+///
+/// Panics when the surviving conflict does not reset the operation, a later
+/// attempt fails on the reopen refusal, or the retry does not commit a
+/// second operation generation beside the closed reset one.
+#[tokio::test]
+async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operation() {
+    let fixture = PromotionIntegrationFixture::start("promotion_reset_retry").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    catalog.reject_next_commits(2);
+
+    let forge = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    let mut forge = forge.run_one_failure_while(async {}).await;
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned()],
+        "a conflict that survives the retry resets the operation"
+    );
+
+    fixture.clear_task_backoff().await;
+    forge.restart_worker();
+    forge.run_one_success().await;
+    let errors = forge.returned_errors();
+    forge.shutdown().await;
+
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("cannot be reopened")),
+        "no attempt tried to reopen the reset operation: {errors:?}"
+    );
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned(), "committed".to_owned()],
+        "the retry commits a second operation generation and leaves the reset one closed"
+    );
+    let settled = fixture.file_rows().await;
+    assert!(
+        settled
+            .iter()
+            .all(|row| row.compacted && row.committed_snapshot_id.is_some()),
+        "the fresh operation promoted every row: {settled:?}"
+    );
+    let tasks = fixture.forge_tasks().await;
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| (task.state.as_str(), task.attempt_count))
+            .collect::<Vec<_>>(),
+        vec![("succeeded", 1)],
+        "the one task succeeded on its first retry: {tasks:?}"
+    );
+}
+
 /// The operation deadline bounds the conflict retry to zero second attempts.
 ///
 /// The commit is parked at the real catalog seam, the Forge clock is moved past
@@ -213,11 +286,16 @@ async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
 
 /// Cancellation drains a parked promotion without settling anything.
 ///
-/// The worker is cancelled while its commit is parked before delegation, so
+/// The coordinator is cancelled while its inline promotion commit is parked, so
 /// acceptance is unknown by construction. Draining must therefore release the
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have, and holding the
 /// lease would leak the owner past its own shutdown.
+///
+/// # Panics
+///
+/// Panics when the drained operation is not left `prepared`, the drained
+/// attempt keeps its lease, or any settlement is recorded.
 #[tokio::test]
 async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
     let fixture = PromotionIntegrationFixture::start("promotion_drain").await;
@@ -234,11 +312,11 @@ async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),
     );
-    let worker_stop = forge.worker_stop();
+    let coordinator_stop = forge.coordinator_stop();
     let forge = forge
         .run_one_failure_while(async {
             catalog.wait_for_parked_commit().await;
-            worker_stop.cancel();
+            coordinator_stop.cancel();
             catalog.wait_for_parked_commit_drop().await;
         })
         .await;
@@ -529,4 +607,310 @@ async fn scribe_promotion_integration_rejects_corrupted_object_before_catalog_io
         .write(&object_key, intact.to_vec())
         .await
         .expect("fixture object restoration");
+}
+
+/// Forge operation family and phase vocabulary shared by the barrier proof.
+mod promotion_barrier {
+    use uuid::Uuid;
+    use vala_sql::SqlError;
+    use vala_sql::queries::forge_operations::ForgeOperations;
+    use vala_sql::row_types::forge_operations::{
+        ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation, ForgeOperationFamily,
+    };
+    use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
+    use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+    use wyrd_spec::vala::api::{
+        AuditDetail, ForgeIcebergRewritePhase, ForgePromotedFile, ForgePromotedFileSetDigest,
+        ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, StoragePath, TimeGranularityWire,
+        TimePartitionWire,
+    };
+
+    use super::super::support::PromotionIntegrationFixture;
+
+    /// Canonical Forge resource every operation family uses for one table.
+    fn resource_for(identity: &TableAuthorityIdentity) -> String {
+        format!(
+            "bifrost://{}/{}/{}",
+            identity.tenant, identity.namespace_name, identity.table_name
+        )
+    }
+
+    /// Builds one Scribe promotion transition detail for the fixture table.
+    ///
+    /// # Panics
+    /// Panics when the fixed object identity is invalid.
+    fn promotion_detail(
+        resource: &str,
+        operation_id: Uuid,
+        phase: ForgeScribePromotionPhase,
+        committed_snapshot_id: Option<i64>,
+    ) -> AuditDetail {
+        let path = StoragePath::new("table/hot-a.parquet").expect("valid path");
+        let promoted = [
+            ForgePromotedFile::new(Uuid::from_u128(5), path.clone(), "checksum")
+                .expect("promoted file"),
+        ];
+        AuditDetail::ForgeScribePromotion {
+            operation_id,
+            phase,
+            group: resource.to_owned(),
+            base_snapshot_id: 200,
+            committed_snapshot_id,
+            input_file_ids: vec![Uuid::from_u128(5)],
+            input_paths: vec![path],
+            promoted_file_set_digest: ForgePromotedFileSetDigest::compute(&promoted),
+        }
+    }
+
+    /// Appends one Scribe promotion transition through the operation owner.
+    ///
+    /// # Panics
+    /// Panics when the transition or its commit fails.
+    async fn append_promotion(
+        fixture: &PromotionIntegrationFixture,
+        resource: &str,
+        detail: &AuditDetail,
+        operation: &str,
+    ) {
+        let operations = ForgeOperations::new(resource, ForgeOperationFamily::ScribePromotion)
+            .expect("valid Forge resource");
+        let mut conn = fixture
+            .vala
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("tenant connection");
+        if operation.ends_with(".prepared") {
+            operations
+                .append_prepared(&mut conn, operation, detail)
+                .await
+        } else {
+            operations
+                .append_terminal(&mut conn, operation, detail)
+                .await
+        }
+        .expect("the promotion transition appends");
+        conn.commit()
+            .await
+            .expect("the promotion transition commits");
+    }
+
+    /// Prepares one new rewrite operation through the operation owner.
+    ///
+    /// # Errors
+    /// Returns the owner's refusal, including an unsettled promotion, and
+    /// [`SqlError::Conflict`] when an active read leaves no exclusive authority.
+    ///
+    /// # Panics
+    /// Panics when the fixed detail is invalid or the commit fails.
+    async fn prepare_rewrite(
+        fixture: &PromotionIntegrationFixture,
+        resource: &str,
+    ) -> Result<(), SqlError> {
+        let detail = AuditDetail::ForgeIcebergRewrite {
+            operation_id: Uuid::now_v7(),
+            phase: ForgeIcebergRewritePhase::Prepared,
+            group: resource.to_owned(),
+            base_snapshot_id: 100,
+            committed_snapshot_id: None,
+            partition_spec_id: 3,
+            time_partition: TimePartitionWire::new(
+                TimeGranularityWire::Day,
+                chrono::DateTime::from_timestamp(1_756_684_800, 0).expect("fixture instant"),
+            )
+            .expect("fixture instant is an exact day boundary"),
+            target_file_size_bytes: 1024,
+            input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid path")],
+            output_paths: vec![StoragePath::new("table/live-b.parquet").expect("valid path")],
+        };
+        let mut conn = fixture
+            .vala
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("tenant connection");
+        ForgeOperations::new(resource, ForgeOperationFamily::IcebergRewrite)
+            .expect("valid Forge resource")
+            .append_prepared(&mut conn, "forge.iceberg_rewrite.prepared", &detail)
+            .await?;
+        conn.commit()
+            .await
+            .expect("the rewrite preparation commits");
+        Ok(())
+    }
+
+    /// Seeds one live Forge lease and one running snapshot-expiry task.
+    ///
+    /// # Panics
+    /// Panics when either seeding statement fails.
+    async fn seed_running_expiry_task(
+        fixture: &PromotionIntegrationFixture,
+        identity: &TableAuthorityIdentity,
+    ) -> ForgeExpirationAuthority {
+        let authority = ForgeExpirationAuthority {
+            task_id: Uuid::now_v7(),
+            attempt_id: Uuid::now_v7(),
+            worker_id: Uuid::now_v7(),
+            lease_key: format!("forge:{}:barrier", identity.table_name),
+            lease_fencing_token: 20,
+        };
+        let pool = fixture.database.operator_pool().pool();
+        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
+            .bind(&authority.lease_key)
+            .bind(authority.worker_id)
+            .bind(authority.lease_fencing_token)
+            .execute(pool)
+            .await
+            .expect("lease seeds");
+        sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',20,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',20,1,now())")
+            .bind(authority.task_id)
+            .bind(identity.tenant.as_uuid())
+            .bind(&identity.catalog_name)
+            .bind(&identity.namespace_name)
+            .bind(&identity.table_name)
+            .bind(authority.attempt_id)
+            .bind(authority.worker_id)
+            .execute(pool)
+            .await
+            .expect("running task seeds");
+        authority
+    }
+
+    /// Prepares one snapshot expiration for snapshot 30 through the SQL owner.
+    ///
+    /// # Errors
+    /// Returns the owner's refusal, including an unsettled promotion, and
+    /// [`SqlError::Conflict`] when an active read leaves no exclusive authority.
+    ///
+    /// # Panics
+    /// Panics when the fixed resource or path is invalid.
+    async fn prepare_expiration(
+        fixture: &PromotionIntegrationFixture,
+        identity: &TableAuthorityIdentity,
+        authority: &ForgeExpirationAuthority,
+    ) -> Result<(), SqlError> {
+        let resource = resource_for(identity);
+        let detail = AuditDetail::ForgeSnapshotExpire {
+            operation_id: Uuid::now_v7(),
+            phase: ForgeSnapshotExpirePhase::Prepared,
+            group: resource.clone(),
+            base_metadata_location: StoragePath::new("table/iceberg/metadata/00001-base.json")
+                .expect("valid path"),
+            current_snapshot_id: Some(90),
+            retained_ref_heads: vec![90],
+            selected_snapshot_ids: vec![30],
+        };
+        let table = ForgeClaimTable {
+            table_uid: identity.table_uid,
+            catalog_name: identity.catalog_name.clone(),
+            namespace_name: identity.namespace_name.clone(),
+            table_name: identity.table_name.clone(),
+            table_uuid: Uuid::now_v7(),
+        };
+        let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
+            version: 1,
+            committed_snapshot_id: None,
+            committed_metadata_location: None,
+            committed_metadata_digest: None,
+            cleanup_candidates: Vec::new(),
+            deleted_candidate_count: 0,
+        };
+        // Preparation runs the way Forge runs it: under the table's live
+        // exclusive maintenance authority, surrendered afterwards.
+        let mut conn =
+            vala_sql::TenantConn::acquire(fixture.database.app_pool(), identity.tenant).await?;
+        let exclusive =
+            vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority::new(
+                &mut conn,
+            )
+            .exclusive(identity.clone())
+            .await?
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            })?;
+        let prepared = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .expect("valid Forge resource")
+            .prepare_snapshot_expiration(
+                fixture.database.operator_pool(),
+                identity.tenant,
+                &exclusive,
+                &ForgeExpirationPreparation {
+                    authority,
+                    table: &table,
+                    evidence: &evidence,
+                    operation: "forge.snapshot_expire.prepared",
+                    detail: &detail,
+                },
+            )
+            .await
+            .map(|_| ());
+        drop(exclusive);
+        conn.commit().await?;
+        prepared
+    }
+
+    /// Proves a Prepared promotion blocks rewrite and expiration until settled.
+    ///
+    /// The promotion's Prepared row is the state a promotion holds between its
+    /// catalog append and its `file_list` settlement. While it stands, a new
+    /// rewrite preparation and a snapshot-expiration preparation on the same
+    /// table both refuse through the operation owner. Once the promotion's
+    /// Committed transition lands, both proceed through the same owner.
+    ///
+    /// # Panics
+    /// Panics when either operation is admitted while the promotion is open
+    /// or refused after it settles.
+    #[tokio::test]
+    async fn unsettled_promotion_blocks_rewrite_and_expiration() {
+        let fixture = PromotionIntegrationFixture::start("promotion_barrier").await;
+        let identity = fixture.table_identity().await;
+        let resource = resource_for(&identity);
+        let promotion = Uuid::now_v7();
+        append_promotion(
+            &fixture,
+            &resource,
+            &promotion_detail(
+                &resource,
+                promotion,
+                ForgeScribePromotionPhase::Prepared,
+                None,
+            ),
+            "forge.scribe_promotion.prepared",
+        )
+        .await;
+        let expiring = seed_running_expiry_task(&fixture, &identity).await;
+
+        assert!(
+            matches!(
+                prepare_rewrite(&fixture, &resource).await,
+                Err(SqlError::Conflict { .. })
+            ),
+            "an unsettled promotion refuses a new rewrite"
+        );
+        assert!(
+            matches!(
+                prepare_expiration(&fixture, &identity, &expiring).await,
+                Err(SqlError::Conflict { .. })
+            ),
+            "an unsettled promotion refuses snapshot expiration"
+        );
+
+        append_promotion(
+            &fixture,
+            &resource,
+            &promotion_detail(
+                &resource,
+                promotion,
+                ForgeScribePromotionPhase::Committed,
+                Some(201),
+            ),
+            "forge.scribe_promotion.committed",
+        )
+        .await;
+        prepare_rewrite(&fixture, &resource)
+            .await
+            .expect("a settled promotion admits the rewrite");
+        prepare_expiration(&fixture, &identity, &expiring)
+            .await
+            .expect("a settled promotion admits snapshot expiration");
+    }
 }

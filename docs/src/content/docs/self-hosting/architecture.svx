@@ -77,6 +77,8 @@ All transports and workers run in one `JoinSet` under a single supervisor. The s
 
 A `SIGINT` or `SIGTERM` is the normal path: the signal watcher exits first, the shutdown token is cancelled, and every transport stops accepting new work while in-flight requests finish within `shutdown.drain_ms`. If a task fails first instead (a listener dies, a worker panics), the same drain runs, but the process exits non-zero. Anything still running when the drain deadline passes is aborted.
 
+The Forge worker and the Forge maintenance scheduler are the exception. Losing one stops only compaction and maintenance on that pod, so its failure never ends the process. The failure is logged, Forge readiness drops on that pod, and the loop is rebuilt after a backoff that doubles from one second to a thirty-second cap. The new instance takes over durable claimed and Prepared work through the same startup recovery a process restart runs. API listeners keep serving the whole time.
+
 ## Extension seams
 
 The server is built to be wrapped by a downstream crate (for example an enterprise distribution) without forking core boot. Three seams matter:

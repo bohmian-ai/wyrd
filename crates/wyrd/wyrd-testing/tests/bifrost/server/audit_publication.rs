@@ -1167,7 +1167,6 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
             Some(&base_url),
             Some(credential),
             grpc_url.as_deref(),
-            None,
         )
     };
     let admin_bootstrap = server

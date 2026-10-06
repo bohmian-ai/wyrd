@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! SQL integration tests for audit staging.
     //!
@@ -511,6 +514,60 @@ mod pg_tests {
             assert_eq!(staged, 0, "no grace tail survives an idle tenant");
         }
 
+        /// Only active tenants with unpublished rows are listed as owing.
+        ///
+        /// This is the publisher's one cross-tenant read per turn: a settled
+        /// tenant and a suspended one must not be offered a cycle, and a tenant
+        /// with staged rows must be.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the owed list differs from the one tenant that owes.
+        #[tokio::test]
+        async fn only_active_tenants_with_unpublished_rows_owe_publication() {
+            let (fixture, superuser, owing) = setup().await;
+            let settled = DataTenantId::new_v7();
+            let suspended = DataTenantId::new_v7();
+            for tenant in [settled, suspended] {
+                fixture
+                    .seed_additional_tenant_with_uuid(
+                        tenant,
+                        &format!("test-{}", tenant.as_uuid().simple()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            append(fixture.app_pool(), owing, "owing.1").await;
+            append(fixture.app_pool(), settled, "settled.1").await;
+            append(fixture.app_pool(), suspended, "suspended.1").await;
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), settled)
+                .await
+                .unwrap();
+            vala_sql::queries::audit_staging::settle_publication(&mut conn, 1)
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+            sqlx::query(
+                "UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1",
+            )
+            .bind(suspended.as_uuid())
+            .execute(&superuser)
+            .await
+            .unwrap();
+
+            let owed = vala_sql::queries::audit_staging::list_tenants_owing_publication(
+                fixture.operator_pool(),
+            )
+            .await
+            .unwrap();
+            assert!(owed.contains(&owing), "a tenant with staged rows owes");
+            assert!(!owed.contains(&settled), "a settled tenant owes nothing");
+            assert!(
+                !owed.contains(&suspended),
+                "a suspended tenant is not served"
+            );
+        }
+
         /// Settlement never reaches another tenant's rows.
         #[tokio::test]
         async fn settlement_is_tenant_scoped() {
@@ -592,6 +649,13 @@ mod pg_tests {
         }
 
         /// Two-epoch replay suppresses an exact retry and fails a contradiction without mutation.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture or a tenant connection cannot start, the first
+        /// observation does not commit or store the admission instant, an exact or
+        /// re-sent retry does not resolve as committed, a contradictory replay is
+        /// accepted, or the replay appends audit or publication rows.
         #[tokio::test]
         async fn replay_two_epoch_batch_fence_suppresses_exact_and_rejects_contradiction() {
             let (fixture, superuser, tenant) = setup().await;
@@ -615,14 +679,28 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
+            let ingested_at = vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn)
+                .await
+                .expect("admission instant");
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, ingested_at)
                     .await
                     .expect("canonical fence"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
                 "a first observation of a batch identity commits it"
             );
             conn.commit().await.expect("commit canonical fence");
+            let stored: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT ingested_at FROM vala.scribe_batch_commits WHERE batch_id = $1",
+            )
+            .bind(batch_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("stored ingestion instant");
+            assert_eq!(
+                stored, ingested_at,
+                "the fence stores the admission instant Scribe stamps on the rows"
+            );
 
             let retry = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
                 wal_writer_epoch: 2,
@@ -648,7 +726,7 @@ mod pg_tests {
                 ..retry.clone()
             };
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend, chrono::Utc::now())
                     .await
                     .expect("re-sent identical batch resolves"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,

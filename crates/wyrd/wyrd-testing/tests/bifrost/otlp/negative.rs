@@ -659,7 +659,7 @@ mod pg_tests {
         journey.publish().await;
         let stored: usize = journey
             .try_query(&format!(
-                "SELECT wyrd_batch_id FROM {SPANS_TABLE} WHERE scope_name = '{FAN_OUT_TRACE_SCOPE}'"
+                "SELECT wyrd_request_id FROM {SPANS_TABLE} WHERE scope_name = '{FAN_OUT_TRACE_SCOPE}'"
             ))
             .await
             .expect("the accepted export is queryable")
@@ -682,7 +682,7 @@ mod pg_tests {
     /// Panics when a row is queryable or the query fails for any reason other
     /// than the table never having been created.
     async fn assert_no_rows(journey: &OtlpJourney, table: &str, scope: &str) {
-        let sql = format!("SELECT wyrd_batch_id FROM {table} WHERE scope_name = '{scope}'");
+        let sql = format!("SELECT wyrd_request_id FROM {table} WHERE scope_name = '{scope}'");
         match journey.try_query(&sql).await {
             Ok(batches) => {
                 let stored: usize = batches.iter().map(RecordBatch::num_rows).sum();

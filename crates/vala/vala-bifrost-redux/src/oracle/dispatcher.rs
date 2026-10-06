@@ -2065,10 +2065,6 @@ mod tests {
                 schema_fingerprint: "0".repeat(64),
                 required_columns: vec!["value".to_owned()],
                 predicates: Vec::new(),
-                reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
-                    uuid::Uuid::nil(),
-                    1,
-                ),
             }],
             binding,
             target_role: ClusterRole::Oracle,

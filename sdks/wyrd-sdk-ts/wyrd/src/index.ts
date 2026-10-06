@@ -126,7 +126,8 @@ export interface PhysicalLayout {
  * A writer declares `user_fields`, supplies `correlation_fields`, and may
  * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
  * for a canonical signal table; `compaction_target_file_size_bytes` only when
- * the table declared an explicit Forge compaction file target.
+ * the table declared an explicit Forge compaction file target, and
+ * `compaction_type` only when it declared an explicit compaction type.
  */
 export interface TableDescription {
   readonly entry: TableEntry;
@@ -136,7 +137,15 @@ export interface TableDescription {
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
   readonly compaction_target_file_size_bytes?: number;
+  readonly compaction_type?: CompactionType;
 }
+
+/**
+ * The physical compaction strategy a table asks Forge to apply, in its wire
+ * spelling. Omitted, Forge compacts the table `small-files`; a copy-on-write table
+ * compacts `full` whatever it declares.
+ */
+export type CompactionType = "auto" | "full" | "small-files" | "files-with-delete";
 
 export interface RunningQueryProgress {
   readonly completedParticipants: number;
@@ -522,6 +531,8 @@ export interface TableConfigOptions {
   readonly layout?: TableLayout;
   /** Explicit Forge compaction file target in bytes. */
   readonly compactionTargetFileSizeBytes?: number;
+  /** Forge compaction type; omitted, Forge compacts the table `small-files`. */
+  readonly compactionType?: CompactionType;
 }
 
 /**
@@ -576,10 +587,15 @@ export class TableConfig {
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *
+   * `options.compactionType` chooses the table's Forge compaction type;
+   * omitted, Forge compacts it `small-files`. Like the target, it is recorded
+   * once and a later registration naming a different type is refused with
+   * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+   *
    * @throws {@link WyrdError} when the resulting document does not map to an
-   * Arrow schema, declares a column the write path already owns, or the
-   * compaction target is not a non-negative integer
-   * (`WYRD_SPEC_400_VALIDATION`).
+   * Arrow schema, declares a column the write path already owns, the
+   * compaction target is not a non-negative integer, or the compaction type
+   * is not a known spelling (`WYRD_SPEC_400_VALIDATION`).
    */
   static fromJsonSchema(
     table: string,
@@ -595,6 +611,7 @@ export class TableConfig {
       JSON.stringify(document),
       layoutJson(options.layout),
       options.compactionTargetFileSizeBytes,
+      options.compactionType,
     );
     return new TableConfig(nativeHandle(declared.config, declared.error));
   }
@@ -611,7 +628,6 @@ export class TableConfig {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
-      readonly tenant?: string;
     } = {},
   ): Promise<TableConfig> {
     const described = await describeTableConfig(
@@ -619,7 +635,6 @@ export class TableConfig {
       transport.serverUrl,
       transport.credential,
       transport.grpcUrl,
-      transport.tenant,
     );
     return new TableConfig(nativeHandle(described.config, described.error));
   }
@@ -646,6 +661,17 @@ export class TableConfig {
       compaction_target_file_size_bytes?: number;
     };
     return wire.compaction_target_file_size_bytes;
+  }
+
+  /**
+   * The explicit Forge compaction type, declared or described, or undefined
+   * when the table compacts with the `small-files` default.
+   */
+  get compactionType(): CompactionType | undefined {
+    const wire = JSON.parse(this.#native.configJson) as {
+      compaction_type?: CompactionType;
+    };
+    return wire.compaction_type;
   }
 
   /** The server-assigned identity, or undefined while unregistered. */
@@ -764,7 +790,7 @@ export class Bifrost {
    * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
    * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
    * `WYRD_API_KEY` → the saved `wyrd auth login` for this server and
-   * `tenant` (a tenant route key) → `~/.config/wyrd/credentials.toml`.
+   * `WYRD_TENANT` → `~/.config/wyrd/credentials.toml`.
    *
    * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
    * authentication and transport. It cannot be combined with `serverUrl`,
@@ -781,7 +807,6 @@ export class Bifrost {
           readonly serverUrl?: string;
           readonly credential?: string;
           readonly grpcUrl?: string;
-          readonly tenant?: string;
           readonly client?: never;
           readonly clientByteLimitBytes?: number;
         }
@@ -791,7 +816,6 @@ export class Bifrost {
           readonly serverUrl?: never;
           readonly credential?: never;
           readonly grpcUrl?: never;
-          readonly tenant?: never;
           readonly clientByteLimitBytes?: number;
         } = {},
   ): Promise<Bifrost> {
@@ -802,7 +826,6 @@ export class Bifrost {
             options.serverUrl,
             options.credential,
             options.grpcUrl,
-            options.tenant,
             options.clientByteLimitBytes,
           )
         : await wyrdClientNative(options.client).connectBifrost(
@@ -810,7 +833,6 @@ export class Bifrost {
             options.serverUrl,
             options.credential,
             options.grpcUrl,
-            options.tenant,
             options.clientByteLimitBytes,
           );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
@@ -1125,9 +1147,9 @@ export class WyrdClient {
    * Build a client without performing IO.
    *
    * Omitted options resolve from the environment, then the saved
-   * `wyrd auth login` for this server (the one for `tenant`, a tenant route
-   * key, when given, otherwise the newest), then
-   * `~/.config/wyrd/credentials.toml`. A `tenant` that matches none of this
+   * `wyrd auth login` for this server (the one for `WYRD_TENANT` when set,
+   * otherwise the newest), then
+   * `~/.config/wyrd/credentials.toml`. A `WYRD_TENANT` that matches none of this
    * server's saved logins, or a saved login that cannot be used, raises
    * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */
@@ -1136,14 +1158,12 @@ export class WyrdClient {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
-      readonly tenant?: string;
     } = {},
   ): WyrdClient {
     const result = connectWyrdClient(
       options.serverUrl,
       options.credential,
       options.grpcUrl,
-      options.tenant,
     );
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
@@ -1215,13 +1235,11 @@ export class Cards {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): Cards {
     const connection = connectCards(
       options.serverUrl,
       options.credential,
-      options.tenant,
     );
     return new Cards(nativeHandle(connection.cards, connection.error));
   }
@@ -1617,13 +1635,11 @@ export class OperatorConnections {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): OperatorConnections {
     const connection = connectOperatorConnections(
       options.serverUrl,
       options.credential,
-      options.tenant,
     );
     return new OperatorConnections(
       nativeHandle(connection.connections, connection.error),
@@ -2073,7 +2089,6 @@ export class WyrdState {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
-      readonly tenant?: string;
       readonly clientByteLimitBytes?: number;
     } = {},
   ): Promise<void> {
@@ -2083,7 +2098,6 @@ export class WyrdState {
         options.serverUrl,
         options.credential,
         options.grpcUrl,
-        options.tenant,
         options.clientByteLimitBytes,
       ),
     );
@@ -2324,10 +2338,9 @@ export class Gateway {
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
-      readonly tenant?: string;
     } = {},
   ): Gateway {
-    return new Gateway(connectGateway(options.serverUrl, options.credential, options.tenant));
+    return new Gateway(connectGateway(options.serverUrl, options.credential));
   }
 
   /** Read one redacted provider credential. */

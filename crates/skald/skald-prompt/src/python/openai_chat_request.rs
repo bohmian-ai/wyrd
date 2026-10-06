@@ -33,6 +33,7 @@ use crate::prompt::wrong_variant;
 // OpenAI Chat — request side
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read-only view of an `OpenAI` Chat Completions request.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiChatRequest")]
 pub struct PyOpenAiChatRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -52,10 +53,12 @@ impl PyOpenAiChatRequest {
 
 #[pymethods]
 impl PyOpenAiChatRequest {
+    /// The `model` field.
     #[getter]
     fn model(&self) -> &str {
         &self.req().model
     }
+    /// The `messages` list, in order.
     #[getter]
     fn messages(&self) -> Vec<PyOpenAiChatMessage> {
         (0..self.req().messages.len())
@@ -76,6 +79,7 @@ impl PyOpenAiChatRequest {
                 inner: Arc::clone(&self.inner),
             })
     }
+    /// The `stream` flag, or `None` when unset.
     #[getter]
     fn stream(&self) -> Option<bool> {
         self.req().stream
@@ -108,6 +112,7 @@ impl PyOpenAiChatRequest {
                 inner: Arc::clone(&self.inner),
             })
     }
+    /// The `parallel_tool_calls` flag, or `None` when unset.
     #[getter]
     fn parallel_tool_calls(&self) -> Option<bool> {
         self.req().parallel_tool_calls

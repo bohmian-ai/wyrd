@@ -138,8 +138,27 @@ impl SupervisedForge {
     ///
     /// Panics when the scheduler does not return within the deterministic bound.
     pub(crate) async fn schedule_once(&self) {
+        let expected = self.request_pass();
+        self.await_pass(expected).await;
+    }
+
+    /// Requests one production pass without awaiting it.
+    ///
+    /// The leader promotes inline on its pass, so a scenario that observes or
+    /// holds that promotion must act while the pass is still running. Returns
+    /// the completed-pass count that marks the requested pass done.
+    fn request_pass(&self) -> usize {
         let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
         self.scheduler_trigger.request_pass();
+        expected
+    }
+
+    /// Awaits the pass whose completion count [`Self::request_pass`] returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler does not return within the deterministic bound.
+    async fn await_pass(&self, expected: usize) {
         tokio::time::timeout(
             Duration::from_secs(30),
             self.scheduler_trigger.wait_for_passes_at_least(expected),
@@ -160,7 +179,7 @@ impl SupervisedForge {
         let expected_attempt = self.worker_observer.attempts().saturating_add(1);
         let expected_errors = self.worker_observer.returned_errors().len();
         self.worker_observer.hold_after_next_attempt_for_test();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         if tokio::time::timeout(
             Duration::from_secs(30),
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -180,13 +199,6 @@ impl SupervisedForge {
                     .fetch_all(self.operator_pool.pool())
                     .await
                     .expect("Forge table diagnostics");
-            let demands: Vec<(String, String, i64)> = sqlx::query_as(
-                "SELECT table_name, last_source, generation FROM vala.forge_planning_demands \
-                 ORDER BY table_name",
-            )
-            .fetch_all(self.operator_pool.pool())
-            .await
-            .expect("Forge demand diagnostics");
             let files: Vec<(String, i64, bool)> = sqlx::query_as(
                 "SELECT file_path, file_size, compacted FROM vala.file_list ORDER BY file_path",
             )
@@ -194,7 +206,7 @@ impl SupervisedForge {
             .await
             .expect("Forge file diagnostics");
             panic!(
-                "production Forge worker completion bound: completed={}, attempts={}, errors={:?}, tasks={tasks:?}, tables={tables:?}, demands={demands:?}, files={files:?}",
+                "production Forge worker completion bound: completed={}, attempts={}, errors={:?}, tasks={tasks:?}, tables={tables:?}, files={files:?}",
                 self.worker_observer.completed(),
                 self.worker_observer.attempts(),
                 self.worker_observer.returned_errors(),
@@ -208,6 +220,7 @@ impl SupervisedForge {
             self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
@@ -229,7 +242,7 @@ impl SupervisedForge {
             .len()
             .saturating_add(1);
         self.worker_observer.hold_after_next_attempt_for_test();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             Duration::from_secs(30),
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -237,6 +250,7 @@ impl SupervisedForge {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             expected_errors,
@@ -267,7 +281,7 @@ impl SupervisedForge {
             .len()
             .saturating_add(1);
         self.worker_observer.hold_after_next_attempt_for_test();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(Duration::from_secs(30), during)
             .await
             .expect("paused production commit seam bound");
@@ -278,6 +292,7 @@ impl SupervisedForge {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             expected_errors,
@@ -287,12 +302,12 @@ impl SupervisedForge {
         self
     }
 
-    /// Borrows the token production worker execution observes as shutdown.
+    /// Borrows the token the coordinator, and its inline promotions, observe as shutdown.
     ///
-    /// A drain proof has to cancel *while* an attempt is parked at a real seam
+    /// A drain proof has to cancel *while* a promotion is parked at a real seam
     /// and then keep observing it, which joining the supervisor would prevent.
-    pub(crate) fn worker_stop(&self) -> CancellationToken {
-        self.worker_stop.clone()
+    pub(crate) fn coordinator_stop(&self) -> CancellationToken {
+        self.scheduler_stop.clone()
     }
 
     /// Cancel and join the worker before it can retry a returned attempt.

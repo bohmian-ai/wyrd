@@ -140,16 +140,23 @@ class Observe:
     ) -> None:
         """Emit one Drift observation as one row per feature.
 
-        ``features`` is a flat mapping, dataclass instance, or Pydantic model
-        instance of string, integer, float, or boolean values. It is converted
-        here, before admission.
+        Args:
+            features: a non-empty flat mapping with ``str`` feature-name keys,
+                a dataclass instance, or a Pydantic model instance whose
+                values are strings, integers no larger in magnitude than
+                ``2**53``, finite floats, or booleans. It is converted here,
+                before admission.
+            session_id: a UUID naming the observed interaction's session.
+                Omitted, the rows carry no session.
 
         Raises:
-            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
-                ``WYRD_SDK_409_BIFROST_CLOSED``,
-                ``WYRD_SDK_400_INVALID_OBSERVATION`` for an input that is not a
-                flat object of supported scalars, ``WYRD_SPEC_400_VALIDATION``
-                for a malformed ``session_id``, or
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an input of another
+                shape, a non-``str`` key, a non-finite float, or a
+                ``session_id`` that is not a UUID;
+                ``WYRD_SDK_400_INVALID_OBSERVATION`` for an empty input, an
+                invalid feature name, or a ``None``, nested, or out-of-range
+                value; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``.
         """
         ...
@@ -165,14 +172,23 @@ class Observe:
     ) -> None:
         """Emit one Eval observation carrying its context and identity.
 
-        ``trace_id`` and ``span_id`` are lower-case hex. When both are omitted
-        the active OpenTelemetry span supplies them; a ``span_id`` without its
-        ``trace_id`` is refused.
+        Args:
+            context: the observed interaction the Eval judges score, as a
+                mapping with ``str`` keys, a dataclass instance, or a Pydantic
+                model instance; nested JSON values are allowed.
+            session_id: as for ``drift()``.
+            media: a ``list`` of ``wyrd.eval.MediaRef`` descriptors for the
+                judge Prompt's ``${media:id}`` slots. Omitted, none.
+            trace_id: the 32-hex-character OpenTelemetry trace id.
+            span_id: the 16-hex-character span id within ``trace_id``. When
+                both ids are omitted, Python's active OpenTelemetry span
+                supplies them if there is one.
 
         Raises:
-            WyrdError: As :meth:`drift`, plus ``WYRD_SPEC_400_VALIDATION`` for a
-                malformed media descriptor, trace identifier, or a ``span_id``
-                supplied without ``trace_id``.
+            WyrdError: As ``drift()``, plus ``WYRD_SPEC_400_VALIDATION`` for a
+                ``media`` value that is not a list of valid descriptors, a
+                malformed or all-zero trace or span id, or a ``span_id``
+                without ``trace_id``.
         """
         ...
 
@@ -204,12 +220,18 @@ class Observe:
     def record(self, table: str, row: Mapping[str, Any] | Any) -> None:
         """Emit one row into a registered ``vala.datasets.<name>`` table.
 
-        The first call for a table describes it; later calls reuse the cached
-        schema and producer, so only the first blocks on a lookup.
+        The first call for a table blocks to describe it; later calls reuse
+        the cached schema and producer. Row values are checked against that
+        schema when the queue seals a batch, not here.
+
+        Args:
+            table: the registered ``"vala.datasets.<name>"`` table.
+            row: the row, in any shape ``drift()`` accepts for ``features``,
+                with any JSON values.
 
         Raises:
-            WyrdError: As :meth:`drift`, plus
-                ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
+            WyrdError: As ``drift()`` for the row's shape, lifecycle, and
+                queue, plus ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
                 ``vala.datasets``, and the server's error for a table that is
                 unknown, unauthorized, or unavailable.
         """
@@ -225,9 +247,23 @@ def record(
     """Record one telemetry observation, fire-and-forget.
 
     Telemetry names its own ``table`` and ``schema`` per call rather than using
-    the client's active binding. ``schema`` is JSON-Schema text; ``correlation``
-    optionally carries ``card_ref`` (``space/Kind/name@version``) and ``run_id``.
-    Queue-full is swallowed and counted on ``bifrost.dropped``, never raised.
+    the client's active binding, so an instrumented process writes its signals
+    alongside whatever the application writes. If the producer refuses the row,
+    for example because its queue is full, the row is dropped and counted on
+    ``bifrost.dropped`` instead of raising.
+
+    Args:
+        bifrost: the ``Bifrost`` client whose producers carry the row.
+        table: the destination table name.
+        schema: the table's JSON Schema text, mapped to the Arrow schema of
+            the row.
+        row: the row as JSON object text.
+        correlation: optional ``card_ref`` (``space/Kind/name@version``) and
+            ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
+
+    Raises:
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for malformed or unsupported
+            ``schema`` text or an invalid ``card_ref``.
     """
     ...
 

@@ -19,4 +19,3 @@ Current owners and evidence:
 - [Release authority](../../../architecture/operations/deployment-and-release.md) and [testing map](../../../TESTING.md).
 - [CI selector](../../../.github/scripts/select-ci.py), [selector checks](../../../.github/scripts/tests/test-detect-changes.sh), and [pull-request workflow](../../../.github/workflows/lints-test.yml).
 - [Release workflow](../../../.github/workflows/release.yml) and [artifact verifier](../../../.github/scripts/verify-release-artifacts.sh).
-

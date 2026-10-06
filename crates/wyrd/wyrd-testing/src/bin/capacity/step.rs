@@ -3,7 +3,7 @@
 //! exporter, database, resource, and optional profile evidence.
 //!
 //! The drain watches every server-owned backlog — the run queue, Scribe,
-//! the audit outbox, and Forge demand — from the moment the arrivals stop,
+//! the audit outbox, and Forge tasks — from the moment the arrivals stop,
 //! and gives up at [`DRAIN_LIMIT`], the REQ-171 saturation SLO, so a step
 //! that cannot drain fails instead of stretching the run. A backlog first
 //! seen empty after the limit is a miss, not a late pass.

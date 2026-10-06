@@ -25,6 +25,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, SealedBatch, SinkError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::request_id::RequestId;
 
 /// The client write door, wired for tests.
 ///
@@ -182,7 +183,11 @@ impl RawIngest {
         })
     }
 
-    /// Submit one Arrow IPC frame under `batch_id`.
+    /// Submit one Arrow IPC frame under `batch_id` and return its request id.
+    ///
+    /// The request id is minted here and sent on every retry of the frame, so
+    /// it is the `wyrd_request_id` the server stamps on the frame's rows; a
+    /// journey reads rows back by it.
     ///
     /// The frame is sealed exactly as a producer seals one, so it inherits the
     /// transport's frame validation, auth metadata, and bounded retry of
@@ -207,22 +212,23 @@ impl RawIngest {
         table: &str,
         batch_id: Uuid,
         arrow_ipc: Vec<u8>,
-    ) -> Result<(), WyrdError> {
+    ) -> Result<RequestId, WyrdError> {
         let guard = self
             .budget
             .reserve_sealed(arrow_ipc.len())
             .expect("harness frame fits the client byte budget");
+        let request_id = RequestId::now_v7();
         let batch = SealedBatch {
             table: table.to_owned(),
             batch_id: batch_id.into_bytes(),
             frame: OwnedIpcBytes::new(arrow_ipc, guard),
             rows: 0,
-            request_id: None,
+            request_id: Some(request_id.clone()),
         };
         self.transport
             .insert_batch(&batch)
             .await
-            .map(|_ack| ())
+            .map(|_ack| request_id)
             .map_err(|error| match error {
                 SinkError::Retryable(error) | SinkError::Terminal(error) => error,
             })

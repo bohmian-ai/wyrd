@@ -46,7 +46,5 @@ pub use audit_detail::{
 pub use correlation::CorrelationColumns;
 pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 pub use managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RESERVED_CORRELATION_COLUMNS, RESERVED_MANAGED_COLUMNS,
-    RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
-    is_reserved_correlation_column, is_reserved_managed_column,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };

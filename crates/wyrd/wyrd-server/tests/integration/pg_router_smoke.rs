@@ -9,8 +9,6 @@
 //! caller cannot distinguish a real `/v1` route from a missing one.
 
 use std::sync::Arc;
-#[cfg(feature = "test-support")]
-use std::time::Duration;
 
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
@@ -633,543 +631,6 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Polls the Oracle readiness input until it reports `expected`.
-///
-/// `/readyz` reads this value through its published snapshot; the snapshot is
-/// republished by a background loop that a composed-in-process server does not
-/// run, so the readiness contract is observed at the same input the probe
-/// reads rather than through a snapshot that never ticks.
-///
-/// # Panics
-///
-/// Panics when Oracle readiness does not reach `expected` within the budget.
-#[cfg(feature = "test-support")]
-async fn await_oracle_ready(server: &WyrdTestServer, expected: bool) {
-    let oracle = server
-        .state()
-        .bifrost_query()
-        .expect("Oracle role")
-        .engine();
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        while oracle.is_ready() != expected {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let ready = oracle.is_ready();
-        server.state().shutdown_token.cancel();
-        panic!("Oracle readiness never reached {expected}; last ready={ready}");
-    }
-}
-
-/// Reads this node's durable Oracle reader-epoch state, if the row survives.
-///
-/// An epoch lifecycle transition evaluates no principal permission, so the
-/// epoch row is its own lineage authority: the state column names how far the
-/// lifecycle has advanced, and retirement removes the row entirely.
-///
-/// # Panics
-///
-/// Panics when the epoch row cannot be read.
-#[cfg(feature = "test-support")]
-async fn epoch_state(
-    pool: &sqlx::PgPool,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-) -> Option<String> {
-    sqlx::query_scalar(
-        "SELECT state FROM vala.oracle_reader_epochs \
-          WHERE node_id = $1 AND fencing_token = $2",
-    )
-    .bind(node_id)
-    .bind(fencing_token)
-    .fetch_optional(pool)
-    .await
-    .expect("epoch state read")
-}
-
-/// Reports whether this node's durable Oracle role row still advertises ready.
-///
-/// # Panics
-///
-/// Panics when the role row cannot be read.
-#[cfg(feature = "test-support")]
-async fn role_advertises_ready(pool: &sqlx::PgPool, node_id: uuid::Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT ready FROM vala.cluster_nodes WHERE node_id = $1 AND role = 'oracle'",
-    )
-    .bind(node_id)
-    .fetch_one(pool)
-    .await
-    .expect("oracle role row read")
-}
-
-/// Proves epoch loss closes readiness before it settles, and that retirement
-/// joins whichever owner selected that loss.
-///
-/// Two properties are inseparable here and are therefore proved together.
-/// Reaching the admission cutoff must remove readiness — the authority's own
-/// admission, the engine, `/readyz`, and the durable role advertisement — at
-/// the instant loss is selected, which is strictly before the durable loss
-/// edge commits, while liveness stays true because the process is healthy and
-/// merely no longer authorized. And retirement must resolve who owns that
-/// loss before it releases anything: whether the lease supervisor selected it
-/// first or retirement did, the epoch ends with exactly one durable loss edge
-/// and no surviving row. A renewal already stalled inside Postgres is the
-/// third case, because it is the one state in which the supervisor has no
-/// local reason to look at the clock at all.
-///
-/// # Panics
-///
-/// Panics when readiness, liveness, durable advertisement, epoch state, or
-/// the retired epoch row differs from that contract.
-#[cfg(feature = "test-support")]
-#[tokio::test]
-async fn oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner() {
-    supervisor_first_loss_closes_readiness_and_retires().await;
-    blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement().await;
-    retirement_first_loss_commits_its_own_edge().await;
-}
-
-/// Drives the race in which the lease supervisor selects loss first.
-///
-/// # Panics
-///
-/// Panics when readiness, liveness, advertisement, or the retired epoch row
-/// differs from the contract.
-#[cfg(feature = "test-support")]
-async fn supervisor_first_loss_closes_readiness_and_retires() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let authority = std::sync::Arc::clone(
-        server
-            .state()
-            .bifrost_query()
-            .expect("this server hosts an Oracle role")
-            .engine()
-            .reader_authority(),
-    );
-    let node_id = uuid::Uuid::from(server.node_id());
-    let fencing_token = authority.fencing_token();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-
-    await_oracle_ready(&server, true).await;
-    assert!(role_advertises_ready(&pool, node_id).await);
-
-    // Reach the cutoff through the production supervisor. A renewal that lands
-    // first re-derives the deadlines from its fresh lease, so the collapse is
-    // reapplied until admission actually closes.
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        while authority.admits() {
-            authority.collapse_lease_for_test();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "epoch cutoff timed out; admits={}, Oracle ready={}",
-            authority.admits(),
-            server
-                .state()
-                .bifrost_query()
-                .expect("Oracle role")
-                .engine()
-                .is_ready()
-        );
-    }
-
-    // Loss is selected. Readiness must already be gone everywhere it is
-    // published; the blocked-settlement ordering is proved by the stalled
-    // renewal case, which is the only one that can hold the edge open.
-    assert!(
-        !server
-            .state()
-            .bifrost_query()
-            .expect("the Oracle runtime is retained")
-            .engine()
-            .is_ready(),
-        "an epoch past its admission cutoff is not a ready Oracle"
-    );
-    let liveness = server
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(axum::body::Body::empty())
-                .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(
-        liveness.status(),
-        StatusCode::OK,
-        "a fenced epoch is unready, not unhealthy"
-    );
-    let mut advertised = true;
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        loop {
-            advertised = role_advertises_ready(&pool, node_id).await;
-            if !advertised {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "Oracle advertisement did not close; last ready={advertised}, admits={}",
-            authority.admits()
-        );
-    }
-    // Drive the production Oracle drain in place: `shutdown` consumes the
-    // harness, and with it the Postgres fixture whose rows this asserts on.
-    server
-        .state()
-        .bifrost_query()
-        .expect("the Oracle runtime is retained")
-        .engine()
-        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
-        .await;
-
-    await_epoch_retirement(&server, &pool, node_id, fencing_token).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
-        )
-        .bind(node_id)
-        .fetch_one(&pool)
-        .await
-        .expect("epoch rows counted"),
-        0,
-        "a retired epoch leaves no row"
-    );
-
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// Waits until the supervisor has committed the epoch's retirement.
-///
-/// Retirement removes the epoch row, so its absence is the durable settlement
-/// this waits on.
-///
-/// # Panics
-/// Panics after fifteen seconds with the last state and authority readiness.
-#[cfg(feature = "test-support")]
-async fn await_epoch_retirement(
-    server: &WyrdTestServer,
-    pool: &sqlx::PgPool,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-) {
-    let mut observed = None;
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        loop {
-            observed = epoch_state(pool, node_id, fencing_token).await;
-            if observed.is_none() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "retirement did not join the loss owner; state={observed:?}, admits={}",
-            server
-                .state()
-                .bifrost_query()
-                .expect("Oracle role")
-                .engine()
-                .reader_authority()
-                .admits()
-        );
-    }
-}
-
-/// Reports how many backends are queued behind an Oracle epoch row lock.
-///
-/// A writer that has to wait for a row first takes a `tuple` lock on the
-/// relation and only then blocks on the holder's transaction, so the presence
-/// of that lock is the evidence — visible without any elevated statistics
-/// privilege — that a statement reached Postgres and cannot return. Renewal is
-/// the only statement a live epoch issues against this table.
-///
-/// # Panics
-///
-/// Panics when `pg_locks` cannot be read.
-#[cfg(feature = "test-support")]
-async fn epoch_row_lock_waiters(pool: &sqlx::PgPool) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM pg_locks \
-          WHERE locktype = 'tuple' \
-            AND relation = 'vala.oracle_reader_epochs'::regclass",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("epoch row lock waiters counted")
-}
-
-/// Proves a renewal stuck in Postgres cannot hold admission open past cutoff.
-///
-/// The supervisor used to await its renewal without any competing deadline, so
-/// a renewal that reached SQL and never returned kept admission, readiness, and
-/// the durable role advertisement open for as long as Postgres stalled it —
-/// well past the instant the confirmed lease stopped authorizing source IO.
-/// Holding the epoch row reproduces exactly that stall, and the absolute
-/// cutoff derived from the last confirmed lease must still close this Oracle.
-///
-/// Nothing here holds a query guard: this server carries the production
-/// aborting terminator, so a descendant that outlived the cutoff would end the
-/// test process rather than fail it. Retained protection under an exhausted
-/// deadline is proved in `vala-bifrost-redux`'s Tier 2 authority target, which
-/// injects a recording terminator.
-///
-/// # Panics
-///
-/// Panics when the blocked renewal suppresses the cutoff, when readiness or
-/// the durable advertisement survives it, when the loss edge is audited while
-/// settlement is still blocked, or when the released epoch does not retire
-/// through its exact audit sequence.
-#[cfg(feature = "test-support")]
-async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let authority = std::sync::Arc::clone(
-        server
-            .state()
-            .bifrost_query()
-            .expect("this server hosts an Oracle role")
-            .engine()
-            .reader_authority(),
-    );
-    let node_id = uuid::Uuid::from(server.node_id());
-    let fencing_token = authority.fencing_token();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-
-    await_oracle_ready(&server, true).await;
-    assert!(role_advertises_ready(&pool, node_id).await);
-
-    // Hold the epoch row itself. Renewal is the only statement the live epoch
-    // issues against it, so this stalls the renewal inside Postgres without
-    // touching the deadlines the supervisor already derived. No renewal can
-    // confirm past this hold, so the lease Postgres reports now fixes the
-    // cutoff the supervisor must enforce: `EXPECTED_CUTOFF_LEAD` before expiry.
-    let mut gate = pool.begin().await.expect("epoch gate transaction begins");
-    let lease_remaining: f64 = sqlx::query_scalar(
-        "SELECT EXTRACT(EPOCH FROM lease_expires_at - clock_timestamp())::float8 \
-           FROM vala.oracle_reader_epochs \
-          WHERE node_id = $1 AND fencing_token = $2 FOR UPDATE",
-    )
-    .bind(node_id)
-    .bind(fencing_token)
-    .fetch_one(&mut *gate)
-    .await
-    .expect("the epoch row is held");
-    let cutoff_bound = tokio::time::Instant::now()
-        + std::time::Duration::from_secs_f64(lease_remaining.max(0.0))
-            .saturating_sub(EXPECTED_CUTOFF_LEAD)
-        + CUTOFF_SCHEDULING_SLACK;
-
-    // The renewal cadence is short relative to the lease, so the stall is
-    // observable long before the cutoff the test is waiting for.
-    let mut waiters = 0;
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        loop {
-            waiters = epoch_row_lock_waiters(&pool).await;
-            if waiters > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "renewal never reached held row; waiters={waiters}, admits={}",
-            authority.admits()
-        );
-    }
-    // The supervisor captured its confirmed cutoff before this renewal began,
-    // and the stalled renewal holds the lifecycle, so nothing can move that
-    // cutoff now: it must close admission on its own before the lease expires.
-    if tokio::time::timeout_at(cutoff_bound, async {
-        while authority.admits() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "blocked renewal suppressed cutoff; admits={}, waiters={waiters}",
-            authority.admits()
-        );
-    }
-
-    // Settlement is still blocked behind the same held row, and everything the
-    // process publishes about its authority must already be closed.
-    assert!(
-        !server
-            .state()
-            .bifrost_query()
-            .expect("the Oracle runtime is retained")
-            .engine()
-            .is_ready(),
-        "an epoch past its admission cutoff is not a ready Oracle"
-    );
-    assert_eq!(
-        epoch_state(&pool, node_id, fencing_token).await.as_deref(),
-        Some("active"),
-        "the loss edge does not settle while its transaction is still blocked"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.oracle_table_protections WHERE node_id = $1"
-        )
-        .bind(node_id)
-        .fetch_one(&pool)
-        .await
-        .expect("protection rows counted"),
-        0,
-        "nothing is released while settlement is blocked"
-    );
-
-    // Release before the bounded settlement window expires, so the audited
-    // loss edge is the one the supervisor already selected.
-    gate.rollback().await.expect("the epoch gate releases");
-
-    let liveness = server
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(axum::body::Body::empty())
-                .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
-    assert_eq!(
-        liveness.status(),
-        StatusCode::OK,
-        "a fenced epoch is unready, not unhealthy"
-    );
-
-    let mut advertised = true;
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        loop {
-            advertised = role_advertises_ready(&pool, node_id).await;
-            if !advertised {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "Oracle advertisement did not close; last ready={advertised}, admits={}",
-            authority.admits()
-        );
-    }
-
-    // Drive the production Oracle drain in place: `shutdown` consumes the
-    // harness, and with it the Postgres fixture whose rows this asserts on.
-    server
-        .state()
-        .bifrost_query()
-        .expect("the Oracle runtime is retained")
-        .engine()
-        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
-        .await;
-
-    await_epoch_retirement(&server, &pool, node_id, fencing_token).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
-        )
-        .bind(node_id)
-        .fetch_one(&pool)
-        .await
-        .expect("epoch rows counted"),
-        0,
-        "a retired epoch leaves no row"
-    );
-
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// Drives the race in which retirement selects loss first.
-///
-/// # Panics
-///
-/// Panics when the audit sequence or the retired epoch row differs from the
-/// contract.
-#[cfg(feature = "test-support")]
-async fn retirement_first_loss_commits_its_own_edge() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let node_id = uuid::Uuid::from(server.node_id());
-    let fencing_token = server
-        .state()
-        .bifrost_query()
-        .expect("this server hosts an Oracle role")
-        .engine()
-        .reader_authority()
-        .fencing_token();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-
-    await_oracle_ready(&server, true).await;
-    // Drive the production Oracle drain in place: `shutdown` consumes the
-    // harness, and with it the Postgres fixture whose rows this asserts on.
-    server
-        .state()
-        .bifrost_query()
-        .expect("the Oracle runtime is retained")
-        .engine()
-        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
-        .await;
-
-    await_epoch_retirement(&server, &pool, node_id, fencing_token).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
-        )
-        .bind(node_id)
-        .fetch_one(&pool)
-        .await
-        .expect("epoch rows counted"),
-        0,
-        "a retired epoch leaves no row"
-    );
-
-    server.shutdown().await.expect("server shuts down");
-}
-
 /// Plan payload whose parameters no strategy contract accepts.
 ///
 /// The worker's pre-effect gate terminalizes a claim carrying it before any
@@ -1186,25 +647,6 @@ const MALFORMED_PLAN: &str = r#"{"version":1,"inputs":["a.parquet"],"parameters"
 #[cfg(feature = "test-support")]
 const LIVE_REWRITE_PLAN: &str =
     r#"{"version":1,"inputs":["a.parquet"],"parameters":{"kind":"live_rewrite"}}"#;
-
-/// How far before database lease expiry the Oracle must close admission.
-///
-/// Mirrors `EPOCH_DATABASE_TIME_ALLOWANCE` (2s) plus `EPOCH_READINESS_MARGIN`
-/// (8s) in `vala-bifrost-redux/src/oracle/reader_pins.rs`, which are
-/// crate-private. The stalled-renewal wait is bounded by expiry minus this
-/// lead, so a cutoff that slips toward the expiry fails the test; update it
-/// together with those constants.
-#[cfg(feature = "test-support")]
-const EXPECTED_CUTOFF_LEAD: Duration = Duration::from_secs(10);
-
-/// Scheduling allowance past the expected admission cutoff for a stalled
-/// renewal.
-///
-/// It only absorbs a loaded test runner waking the waiter late; it stays well
-/// inside `EXPECTED_CUTOFF_LEAD`, so a cutoff that slips toward the lease
-/// expiry still fails.
-#[cfg(feature = "test-support")]
-const CUTOFF_SCHEDULING_SLACK: Duration = Duration::from_secs(2);
 
 /// Diagnostic ceiling for one Forge role transition.
 ///
@@ -1235,8 +677,48 @@ const SNAPSHOT_PUBLICATION_CEILING: std::time::Duration = std::time::Duration::f
 /// is wedged rather than merely unready.
 #[cfg(feature = "test-support")]
 async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
+    drive_forge_pass(
+        server,
+        label,
+        WyrdTestServer::request_forge_scheduler_pass_for_test,
+    )
+    .await;
+}
+
+/// Requests one leader maintenance pass and waits until the timer loop returns.
+///
+/// Maintenance runs manifest rewrite, expiry, and cleanup apart from the
+/// heartbeat, so it publishes no readiness of its own; the caller drives a
+/// heartbeat pass afterwards to observe the coordinator bit.
+///
+/// # Panics
+///
+/// Panics when the requested pass does not complete within
+/// [`FORGE_READINESS_CEILING`].
+#[cfg(feature = "test-support")]
+async fn drive_maintenance_pass(server: &WyrdTestServer, label: &str) {
+    drive_forge_pass(
+        server,
+        label,
+        WyrdTestServer::request_forge_maintenance_pass_for_test,
+    )
+    .await;
+}
+
+/// Issues one test-trigger request and waits for the pass counter to advance.
+///
+/// Both the heartbeat and maintenance loops count a returned pass on the same
+/// trigger, so one bounded wait serves either request.
+///
+/// # Panics
+///
+/// Panics when the requested pass does not complete within
+/// [`FORGE_READINESS_CEILING`], which means the loop is not running or is
+/// wedged rather than merely unready.
+#[cfg(feature = "test-support")]
+async fn drive_forge_pass(server: &WyrdTestServer, label: &str, request: fn(&WyrdTestServer)) {
     let before = server.completed_forge_scheduler_passes_for_test();
-    server.request_forge_scheduler_pass_for_test();
+    request(server);
     tokio::time::timeout(
         FORGE_READINESS_CEILING,
         server.wait_for_forge_scheduler_passes_for_test(before + 1),
@@ -1250,12 +732,12 @@ async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
     });
 }
 
-/// Waits for the planning pass the coordinator runs as soon as it starts.
+/// Waits for the maintenance pass the coordinator runs as soon as it starts.
 ///
-/// The scheduler's first tick is immediate, so a test that drives its own
-/// passes must observe the boot pass first; otherwise the next pass it drives
-/// is the boot pass still in flight, and its assertions describe a pass that
-/// ran before the test finished arranging the world.
+/// The leader maintenance timer's first tick is immediate, so a test that
+/// drives its own passes must observe the boot pass first; otherwise the next
+/// pass it drives is the boot pass still in flight, and its assertions describe
+/// a pass that ran before the test finished arranging the world.
 ///
 /// # Panics
 ///
@@ -1526,6 +1008,11 @@ async fn forge_worker_readiness_gates_on_recovery() {
 
 /// The coordinator publishes ready only once a full fenced pass completes, and
 /// its guard removes the bit when the supervised loop stops.
+///
+/// # Panics
+///
+/// Panics if the server or scheduler fails to start or stop, or if readiness
+/// is reported before the first completed pass or after the loop stops.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_coordinator_readiness_follows_a_completed_pass() {
@@ -1548,6 +1035,9 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
         .expect("the default target selects a coordinator");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
 
+    // The boot maintenance pass counts on the same trigger, so settle it
+    // first; the driven pass is then the first heartbeat pass.
+    await_boot_scheduler_pass(&server, "boot maintenance pass").await;
     drive_scheduler_pass(&server, "first coordinator pass").await;
     assert!(
         forge.is_ready(),
@@ -1631,96 +1121,6 @@ async fn coordinator_standby_pass_is_ready() {
     assert!(
         readiness.is_ready(),
         "the first pass to reclaim the fence completed and is ready"
-    );
-
-    stop.cancel();
-    join_forge_loop(&server, handle)
-        .await
-        .expect("pass loop ok");
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// An overflowed partial planning pass leaves the coordinator unready until the
-/// next pass drains the remaining demand.
-///
-/// The per-wake hint budget bounds one pass, not the queue. A replica that
-/// stopped at its budget has left demand unacknowledged, so it has not yet
-/// proved it can plan what it was asked to plan.
-///
-/// # Panics
-///
-/// Panics when a partial or completed pass publishes the wrong bit.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_partial_pass_is_not_ready() {
-    let server = WyrdTestServer::builder()
-        .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
-            max_hints_per_wake: 1,
-            ..vala_bifrost_redux::forge::ForgeConfig::default()
-        })
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .coordinator_readiness();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-
-    for table in ["partial_one", "partial_two"] {
-        register_forge_table(&server, table).await;
-    }
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-
-    let stop = server.state().shutdown_token.child_token();
-    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
-        .expect("the scheduler composes")
-        .expect("the default target selects a coordinator");
-    let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
-
-    await_boot_scheduler_pass(&server, "overflowed partial pass").await;
-    assert!(
-        !readiness.is_ready(),
-        "a pass that stopped at its hint budget left demand unplanned"
-    );
-
-    let first = (
-        table_task_count(&pool, tenant, "partial_one").await,
-        table_task_count(&pool, tenant, "partial_two").await,
-        outstanding_demands(&pool, tenant, "partial_one").await,
-        outstanding_demands(&pool, tenant, "partial_two").await,
-    );
-    assert!(
-        matches!(first, (1, 0, 0, 1) | (0, 1, 1, 0)),
-        "first pass must plan one real table and retain only its sibling demand: {first:?}"
-    );
-    eprintln!(
-        "partial pass: tasks/demands={first:?}, ready={}",
-        readiness.is_ready()
-    );
-    drive_scheduler_pass(&server, "pass draining the remaining real demand").await;
-    let second = (
-        table_task_count(&pool, tenant, "partial_one").await,
-        table_task_count(&pool, tenant, "partial_two").await,
-        outstanding_demands(&pool, tenant, "partial_one").await,
-        outstanding_demands(&pool, tenant, "partial_two").await,
-    );
-    assert_eq!(
-        second,
-        (1, 1, 0, 0),
-        "second pass must acknowledge the remaining table"
-    );
-    assert!(
-        readiness.is_ready(),
-        "the complete second pass restores readiness"
-    );
-    eprintln!(
-        "complete pass: tasks/demands={second:?}, ready={}",
-        readiness.is_ready()
     );
 
     stop.cancel();
@@ -1864,95 +1264,11 @@ async fn await_forge_role_while_running(server: &WyrdTestServer, label: &str) {
         .expect("worker loop ok");
 }
 
-/// Installs the shared planning-failure function and one trigger that raises on
-/// the named durable step.
-///
-/// The function is the same one the SQL-tier planning tests use, so a router
-/// test fails exactly the step a real coordinator commits rather than a stub.
-///
-/// # Panics
-///
-/// Panics when the fault DDL cannot be installed.
-#[cfg(feature = "test-support")]
-async fn install_planning_failure(pool: &sqlx::PgPool, create_trigger: &'static str) {
-    sqlx::query(
-        "CREATE FUNCTION vala.fail_forge_planning_step() RETURNS trigger LANGUAGE plpgsql \
-         AS $$ BEGIN RAISE EXCEPTION 'injected Forge planning failure'; END $$",
-    )
-    .execute(pool)
-    .await
-    .expect("the planning failure function installs");
-    sqlx::query(create_trigger)
-        .execute(pool)
-        .await
-        .expect("the planning failure trigger installs");
-}
-
-/// Removes the planning-failure trigger from `table` and its shared function.
-///
-/// # Panics
-///
-/// Panics when the fault DDL cannot be removed, which would leak into the next
-/// boundary this test drives.
-#[cfg(feature = "test-support")]
-async fn remove_planning_failure(pool: &sqlx::PgPool, table: &str) {
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER forge_fail_step ON vala.{table}"
-    )))
-    .execute(pool)
-    .await
-    .expect("the planning failure trigger is removable");
-    sqlx::query("DROP FUNCTION vala.fail_forge_planning_step()")
-        .execute(pool)
-        .await
-        .expect("the planning failure function is removable");
-}
-
-/// Counts one registered table's outstanding planning demand.
-///
-/// The count is table-scoped because roster repair re-upserts periodic demand
-/// for every registered table on every pass, so a tenant-wide count cannot tell
-/// a retained rollback apart from an unrelated table's fresh demand.
-///
-/// # Panics
-///
-/// Panics when the demand table cannot be read.
-#[cfg(feature = "test-support")]
-async fn outstanding_demands(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_planning_demands \
-         WHERE data_tenant_id=$1 AND table_name=$2",
-    )
-    .bind(tenant)
-    .bind(table)
-    .fetch_one(pool)
-    .await
-    .expect("outstanding planning demand is readable")
-}
-
-/// Counts the Forge tasks one registered table currently owns.
-///
-/// # Panics
-///
-/// Panics when the task table cannot be read.
-#[cfg(feature = "test-support")]
-async fn table_task_count(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2",
-    )
-    .bind(tenant)
-    .bind(table)
-    .fetch_one(pool)
-    .await
-    .expect("the Forge task table is readable")
-}
-
 /// Registers one real Bifrost table through the retained production catalog.
 ///
-/// Planning discovers a table's snapshot before it reaches any durable write,
-/// so a demand naming a table the catalog does not hold fails in discovery and
-/// never exercises the enqueue transaction. Every coordinator fault this matrix
-/// injects therefore has to be raised against a table that really exists.
+/// Forge loads a table's snapshot before it reaches any durable write, so a
+/// fault this matrix injects has to be raised against a table that really
+/// exists rather than a name the catalog does not hold.
 ///
 /// # Panics
 ///
@@ -2024,97 +1340,6 @@ async fn join_forge_loop(
     outcome
         .expect("bounded Forge join")
         .expect("Forge task joins")
-}
-
-/// A coordinator whose durable task insert fails advances its pass counter,
-/// clears readiness, keeps the demand, and recovers on the next complete pass.
-///
-/// The insert commits inside the planning transaction, so a failure must roll
-/// the whole pass back rather than acknowledge demand it never planned.
-/// Readiness is the externally visible consequence: a replica whose planning
-/// writes are failing must not be routed maintenance.
-///
-/// The faulted table is registered only after the unfaulted pass, so the failing
-/// pass is the first one to plan it. A table already carrying its planned task
-/// would insert nothing on a replan and never reach the fault.
-///
-/// # Panics
-///
-/// Panics when a failed pass publishes ready, silently drops demand, or the
-/// healthy pass that follows does not restore readiness.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_task_insert_failure_clears_readiness() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .coordinator_readiness();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-
-    let stop = server.state().shutdown_token.child_token();
-    let handle = spawn_coordinator(&server, &stop);
-    drive_scheduler_pass(&server, "healthy pass before fault injection").await;
-    assert!(
-        readiness.is_ready(),
-        "the unfaulted pass this case builds on did not complete"
-    );
-
-    // An idle registered table still projects one orphan-cleanup task, so a
-    // real table is all the demand needed to reach the durable insert.
-    register_forge_table(&server, "coordinator_sql").await;
-    install_planning_failure(
-        &pool,
-        "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.forge_tasks \
-         FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-    )
-    .await;
-
-    drive_scheduler_pass(&server, "faulted planning pass").await;
-    assert!(
-        !readiness.is_ready(),
-        "a coordinator whose forge_tasks write failed advertised ready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_sql").await,
-        0,
-        "a rolled-back pass left a task behind"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_sql").await,
-        1,
-        "a rolled-back pass acknowledged demand it never planned"
-    );
-
-    remove_planning_failure(&pool, "forge_tasks").await;
-    drive_scheduler_pass(&server, "restoration pass").await;
-    assert!(
-        readiness.is_ready(),
-        "the pass after the forge_tasks fault was removed stayed unready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_sql").await,
-        1,
-        "the recovered pass did not enqueue the task the failed pass rolled back"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_sql").await,
-        0,
-        "the recovered pass left demand unacknowledged"
-    );
-
-    stop.cancel();
-    join_forge_loop(&server, handle)
-        .await
-        .expect("pass loop ok");
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// Publication evidence naming a snapshot the table never retained.
@@ -2555,25 +1780,23 @@ fn forge_table_ident(server: &WyrdTestServer, table: &str) -> iceberg::TableIden
     .table_ident()
 }
 
-/// A planning pass whose object store cannot serve the current snapshot's
-/// manifest list leaves demand unacknowledged, inserts no task, and clears
-/// coordinator readiness until the object returns.
+/// A maintenance pass whose object store cannot serve one table's manifest
+/// list completes and keeps coordinator readiness.
 ///
-/// Planning discovers a snapshot before it writes anything durable, so an
-/// unreadable manifest list must fail the whole pass rather than produce a
-/// partially-planned table. The coordinator answers whether this replica can
-/// plan; while it cannot read the table it must not advertise that it can.
+/// The leader's maintenance timer isolates per-table failures: an unreadable
+/// table is logged and skipped while the pass continues, exactly as the
+/// RisingWave Iceberg GC loop treats one table's error. Coordinator readiness
+/// answers whether this replica holds or can contest leadership and read
+/// promotion debt, so one table's missing object must not drain the replica.
 ///
 /// # Panics
 ///
-/// Panics when the faulted pass acknowledges demand, inserts a task, or keeps
-/// readiness, or when restoring the exact bytes does not restore planning.
+/// Panics when the faulted pass does not complete or clears readiness, or when
+/// the pass after restoring the exact bytes is not ready.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_object_store_failure_clears_readiness() {
-    let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
+async fn coordinator_object_store_failure_keeps_readiness() {
     let server = WyrdTestServer::builder()
-        .with_forge_completion_observer_for_test(observer.clone())
         .start_bound()
         .await
         .expect("test server starts");
@@ -2584,16 +1807,9 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .coordinator_readiness();
     // The coordinator's first tick is immediate, so the boot pass must be
     // observed before this test arranges anything. Otherwise the pass this
-    // test drives below can be that boot pass still in flight — one that
-    // planned the table before it held any rows — and the worker barrier
-    // armed for the promoting attempt closes on that empty attempt instead.
-    // The worker then never attempts again and no snapshot ever appears.
+    // test drives below can be that boot pass still in flight — one that ran
+    // before the table held any rows — and the promotion loop would count it.
     await_boot_scheduler_pass(&server, "boot pass before object-store fault").await;
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
     let table = "coordinator_object_store";
 
     register_forge_table(&server, table).await;
@@ -2607,12 +1823,9 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .flush_bifrost()
         .await
         .expect("the seeded rows publish as hot files");
-    // Snapshot visibility precedes terminal settlement. Park the worker after
-    // its full attempt so the coordinator's fault proof has a stable demand generation.
-    // The hold targets this table: the server's audit publisher also drives
-    // Forge work for the system and tenant audit logs, and an audit-log attempt
-    // must not consume the barrier and park the worker before this table promotes.
-    observer.hold_after_next_table_attempt_for_test(server.data_tenant_id(), table);
+    // The coordinator promotes inline, so a driven pass returns only after the
+    // promoting attempt settled: a visible snapshot already proves ownership
+    // finished.
     let catalog = server.bifrost_catalog();
     let ident = forge_table_ident(&server, table);
     let mut completed = server.completed_forge_scheduler_passes_for_test();
@@ -2632,34 +1845,13 @@ async fn coordinator_object_store_failure_clears_readiness() {
     .await
     .unwrap_or_else(|_| {
         server.state().shutdown_token.cancel();
-        observer.release_held_attempt_for_test();
         panic!(
             "promotion timed out without a snapshot; ready={}, completed passes={completed}",
             readiness.is_ready()
         );
     });
-    if tokio::time::timeout(
-        FORGE_READINESS_CEILING,
-        observer.wait_for_held_attempt_for_test(),
-    )
-    .await
-    .is_err()
-    {
-        server.state().shutdown_token.cancel();
-        observer.release_held_attempt_for_test();
-        panic!(
-            "promotion did not finish ownership; ready={}, passes={completed}, attempts={}",
-            readiness.is_ready(),
-            observer.attempts()
-        );
-    }
     drive_scheduler_pass(&server, "healthy pass after promotion ownership completes").await;
     assert!(readiness.is_ready(), "the healthy pass did not complete");
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        0,
-        "the healthy pass left demand unacknowledged"
-    );
 
     // Retain the exact manifest-list bytes, then remove that exact object. The
     // table is otherwise untouched, so restoring the bytes restores the table.
@@ -2675,21 +1867,11 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .await
         .expect("the manifest list is removable");
 
-    let tasks_before = table_task_count(&pool, tenant, table).await;
-    drive_scheduler_pass(&server, "object-store faulted pass").await;
+    drive_maintenance_pass(&server, "object-store faulted maintenance pass").await;
+    drive_scheduler_pass(&server, "heartbeat after the faulted maintenance").await;
     assert!(
-        !readiness.is_ready(),
-        "a coordinator that cannot read its table advertised ready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, table).await,
-        tasks_before,
-        "a pass that could not discover a snapshot still inserted a task"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        1,
-        "the failed pass acknowledged demand it never planned"
+        readiness.is_ready(),
+        "one table's unreadable manifest list drained the coordinator"
     );
 
     file_io
@@ -2701,16 +1883,10 @@ async fn coordinator_object_store_failure_clears_readiness() {
     drive_scheduler_pass(&server, "restoration pass").await;
     assert!(
         readiness.is_ready(),
-        "restoring the manifest list did not restore planning"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, table).await,
-        0,
-        "the restored pass left demand unacknowledged"
+        "the pass after restoring the manifest list was not ready"
     );
 
     server.state().shutdown_token.cancel();
-    observer.release_held_attempt_for_test();
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -3050,16 +2226,21 @@ async fn release_failure_clears_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Preseeded demand cannot authorize readiness when the independent roster read
-/// is unavailable. Restoring discovery permits a fresh complete cycle.
+/// An unavailable promotion-debt read clears coordinator readiness until the
+/// read returns.
+///
+/// Scribe's `file_list` is the one durable read the leader makes on every
+/// heartbeat, so a leader that cannot read it cannot recover stranded
+/// promotions and must not advertise that it coordinates. Restoring the read
+/// lets the next pass restore readiness.
 ///
 /// # Panics
-/// Panics if demand alone raises readiness or discovery restoration cannot recover.
+/// Panics if the pass without the debt read reports ready or the restored pass
+/// does not.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_preseeded_demand_requires_roster_discovery() {
+async fn coordinator_promotion_debt_read_failure_clears_readiness() {
     let server = WyrdTestServer::start_in_process().await.expect("server");
-    register_forge_table(&server, "roster_required").await;
     let readiness = server
         .state()
         .forge()
@@ -3069,50 +2250,26 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
         .pg_fixture()
         .superuser_pool()
         .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-    sqlx::query("INSERT INTO vala.forge_planning_demands(data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,'wyrd-redux','vala.bifrost','roster_required','periodic') ON CONFLICT DO NOTHING")
-        .bind(tenant).execute(&pool).await.expect("preseed real demand");
-    sqlx::query("ALTER TABLE vala.bifrost_tables RENAME TO unavailable_forge_roster")
+    sqlx::query("ALTER TABLE vala.file_list RENAME TO unavailable_promotion_debt")
         .execute(&pool)
         .await
-        .expect("fail roster read");
+        .expect("fail promotion-debt read");
     let stop = server.state().shutdown_token.child_token();
     let handle = spawn_coordinator(&server, &stop);
-    await_boot_scheduler_pass(&server, "boot pass with unavailable roster").await;
-    drive_scheduler_pass(&server, "preseeded demand with unavailable roster").await;
+    await_boot_scheduler_pass(&server, "boot pass with unavailable debt read").await;
+    drive_scheduler_pass(&server, "pass with unavailable debt read").await;
     assert!(
         !readiness.is_ready(),
-        "demand does not prove complete discovery"
+        "a leader that cannot read promotion debt advertised ready"
     );
-    assert_eq!(
-        table_task_count(&pool, tenant, "roster_required").await,
-        1,
-        "the demand planned successfully despite the unavailable independent roster"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "roster_required").await,
-        0
-    );
-    sqlx::query("ALTER TABLE vala.unavailable_forge_roster RENAME TO bifrost_tables")
+    sqlx::query("ALTER TABLE vala.unavailable_promotion_debt RENAME TO file_list")
         .execute(&pool)
         .await
-        .expect("restore roster read");
-    drive_scheduler_pass(&server, "restored authoritative roster").await;
+        .expect("restore promotion-debt read");
+    drive_scheduler_pass(&server, "restored promotion-debt read").await;
     assert!(
         readiness.is_ready(),
-        "complete fresh cycle restores readiness"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "roster_required").await,
-        0
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "roster_required").await,
-        1,
-        "the new cycle's fresh orphan cutoff coalesces onto the still-pending orphan task"
-    );
-    eprintln!(
-        "roster unavailable: task=1/demand=0/ready=false; restored: tasks=1/demand=0/ready=true"
+        "the pass after restoring the debt read stayed unready"
     );
     stop.cancel();
     join_forge_loop(&server, handle)

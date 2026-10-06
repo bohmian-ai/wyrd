@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
+use wyrd_storage::StorageError;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
@@ -28,9 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{
-    BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding,
-};
+use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
@@ -45,9 +44,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::StorageInspection;
-use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
-use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use vala_bifrost_redux::storage::{BifrostStorage, StorageInspection};
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -82,7 +79,7 @@ use wyrd_server::state::{
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{FencingToken, NodeId};
+use wyrd_spec::vala::api::NodeId;
 use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
 
@@ -100,7 +97,7 @@ use wyrd_sql::queries::auth::{
     revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
-use wyrd_storage::{BackendConfig, StorageSettings};
+use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 use crate::time::ClockHandle;
 use crate::verification::{VerificationFixture, VerificationFixtureError};
@@ -185,7 +182,7 @@ pub struct WyrdTestServer {
     /// Peer identity this server presents and verifies on the private plane.
     peer_tls: Option<TestBifrostPeerTls>,
     /// Retains generated peer PEM files for as long as this server exists.
-    _peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    _peer_tls_root: Option<Arc<TempDir>>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Test-only readiness failure requested by the builder.
@@ -219,13 +216,18 @@ pub struct WyrdTestServer {
 /// the Bifrost shutdown that follows it. Expiry falls through to an abort.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
+/// Resources one running test server owns until it shuts down.
+///
+/// Holding the guards here ties every temporary directory, data root, and
+/// fixture handle to the server's lifetime, so nothing is removed while a
+/// background task may still read it.
 struct WyrdTestServerInner {
     /// Lifetime guard of the generated Operator key directory, when used.
     operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
-    storage_root: Option<Arc<tempfile::TempDir>>,
+    storage_root: Option<Arc<TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
-    _bifrost_data_dir: Arc<tempfile::TempDir>,
+    _bifrost_data_dir: Arc<TempDir>,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
     /// Lifetime guard for the mounted managed-secret key files this server
@@ -465,8 +467,6 @@ pub struct PublishedHotFileInspection {
 /// Durable pre-snapshot Forge workflow state for one tenant table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeWorkflowInspection {
-    /// Whether a coalesced planning demand remains.
-    pub has_demand: bool,
     /// Durable strategy/state pairs in creation order.
     pub tasks: Vec<(String, String)>,
     /// Tasks retaining active claims.
@@ -506,7 +506,9 @@ enum Mode {
 )]
 pub struct WyrdTestServerBuilder {
     storage_settings: Option<StorageSettings>,
-    storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
+    /// Prebuilt storage handle to share instead of constructing one from
+    /// `storage_settings`.
+    storage_handle: Option<Arc<StorageHandle>>,
     access_ttl: Option<ChronoDuration>,
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
@@ -536,11 +538,11 @@ pub struct WyrdTestServerBuilder {
     /// Closed role set constructed for this server instance.
     bifrost_roles: BTreeSet<BifrostRuntimeRole>,
     /// Cluster-retained Bifrost data directory reused across restarts.
-    bifrost_data_dir: Option<Arc<tempfile::TempDir>>,
+    bifrost_data_dir: Option<Arc<TempDir>>,
     /// Caller-owned durable Bifrost data root that outlives this process.
     ///
     /// A multi-process harness needs a root a restarted child re-mounts, which
-    /// a process-local [`tempfile::TempDir`] cannot be.
+    /// a process-local [`TempDir`] cannot be.
     bifrost_data_path: Option<std::path::PathBuf>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
@@ -563,7 +565,7 @@ pub struct WyrdTestServerBuilder {
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
     /// Temporary root retaining generated peer PEM files for this server's life.
-    peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    peer_tls_root: Option<Arc<TempDir>>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
@@ -1733,6 +1735,15 @@ impl WyrdTestServer {
         self.inner.forge_scheduler_trigger.request_pass();
     }
 
+    /// Wake the already-running leader maintenance timer for one test pass.
+    ///
+    /// The pass runs manifest rewrite, snapshot expiry, and expired and orphan
+    /// cleanup exactly as one production timer tick does, and counts as one
+    /// completed scheduler pass. A replica without the leader term skips it.
+    pub fn request_forge_maintenance_pass_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_maintenance();
+    }
+
     /// Return completed production scheduler passes observed by the test trigger.
     #[must_use]
     pub fn completed_forge_scheduler_passes_for_test(&self) -> usize {
@@ -2690,7 +2701,7 @@ impl WyrdTestServer {
         self.inner.forge_publisher.clone()
     }
 
-    /// Inspect durable Forge demand and task state without requiring an Iceberg snapshot.
+    /// Inspect durable Forge task state without requiring an Iceberg snapshot.
     ///
     /// # Errors
     ///
@@ -2707,7 +2718,7 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Inspect durable Forge demand and task state for one namespace-qualified
+    /// Inspect durable Forge task state for one namespace-qualified
     /// table without requiring an Iceberg snapshot.
     ///
     /// This is the authoritative body; the `&str` form above is the
@@ -2724,15 +2735,6 @@ impl WyrdTestServer {
         let namespace = table.namespace.as_str();
         let table = table.name.as_str();
         let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
-        let has_demand = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
-        )
-        .bind(tenant.as_uuid())
-        .bind(namespace)
-        .bind(table)
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)?;
         let tasks = sqlx::query_as::<_, (String, String)>(
             "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 ORDER BY created_at,task_id",
         )
@@ -2761,7 +2763,6 @@ impl WyrdTestServer {
         .await
         .map_err(sql)?;
         Ok(ForgeWorkflowInspection {
-            has_demand,
             tasks,
             active_claims: u64::try_from(active_claims).map_err(|_| {
                 WyrdTestServerError::Start("negative Forge active claim count".to_owned())
@@ -3624,45 +3625,34 @@ impl WyrdTestServer {
             .map_err(sql)
     }
 
-    /// Reads one accepted Oracle epoch's validated durable table protection.
+    /// Counts the active Oracle table reads one table currently holds.
     ///
-    /// Resolves the registered table UID under tenant RLS and ends the read
-    /// transaction before returning, so inspection holds no maintenance lock.
+    /// Reads `vala.oracle_active_table_reads` under tenant RLS by the
+    /// registered table UID and ends the read transaction before returning, so
+    /// inspection holds no maintenance lock and never discards an abandoned
+    /// row.
     ///
     /// # Errors
-    /// Returns a harness SQL error for missing or invalid identity, a malformed
-    /// frontier, an unrepresentable fence, or a failed read transaction.
-    pub async fn oracle_table_protection_for_test(
+    /// Returns a harness SQL error when the table is unregistered or the read
+    /// transaction fails.
+    pub async fn oracle_active_table_reads_for_test(
         &self,
         binding: &TenantTableBinding,
-        node: NodeId,
-        fence: FencingToken,
-    ) -> Result<Option<ProtectionRecord>, WyrdTestServerError> {
+    ) -> Result<i64, WyrdTestServerError> {
         let mut conn = self.tenant_conn_for(binding.tenant).await?;
-        let stored: Vec<u8> =
-            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1")
-                .bind(binding.table_ref.fqn())
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .map_err(sql)?;
-        let identity = TableAuthorityIdentity {
-            tenant: binding.tenant,
-            table_uid: <[u8; 16]>::try_from(stored.as_slice()).map_err(sql)?,
-            catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-            namespace_name: binding.table_ref.namespace.as_str().to_owned(),
-            table_name: binding.table_ref.name.clone(),
-        };
-        let record = OracleTableProtections::new(&mut conn)
-            .read(
-                &identity,
-                node.as_uuid(),
-                i64::try_from(fence).map_err(sql)?,
-            )
-            .await
-            .map_err(sql)?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.oracle_active_table_reads r \
+             JOIN vala.bifrost_tables t ON t.table_uid = r.table_uid \
+             WHERE t.fqn = $1",
+        )
+        .bind(binding.table_ref.fqn())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
-        Ok(record)
+        Ok(count)
     }
+
     /// Return the durable Scribe WAL root this fixture composed the server with.
     ///
     /// Durability assertions replay the WAL directly rather than trusting an
@@ -4248,7 +4238,7 @@ impl WyrdTestServerBuilder {
     /// server skips the boot health probe. Takes precedence over
     /// [`Self::with_storage_settings`].
     #[must_use]
-    pub fn with_storage_handle(mut self, handle: Arc<wyrd_storage::StorageHandle>) -> Self {
+    pub fn with_storage_handle(mut self, handle: Arc<StorageHandle>) -> Self {
         self.storage_handle = Some(handle);
         self
     }
@@ -4430,10 +4420,7 @@ impl WyrdTestServerBuilder {
 
     /// Reuse a cluster-owned local Bifrost data directory for this node.
     #[must_use]
-    pub(crate) fn with_bifrost_data_dir(
-        mut self,
-        data_dir: Option<Arc<tempfile::TempDir>>,
-    ) -> Self {
+    pub(crate) fn with_bifrost_data_dir(mut self, data_dir: Option<Arc<TempDir>>) -> Self {
         self.bifrost_data_dir = data_dir;
         self
     }
@@ -4585,11 +4572,15 @@ impl WyrdTestServerBuilder {
     /// or fixture resources, authentication state, Forge, Scribe, or the
     /// application router cannot be constructed. Cancellation may leave
     /// fixture-owned database setup committed, but no server task is retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the static test signing key id is rejected as invalid.
     pub(crate) async fn start_with_resources(
         mut self,
         fixture: Arc<PgFixture>,
-        storage: Arc<wyrd_storage::StorageHandle>,
-        storage_root: Option<Arc<tempfile::TempDir>>,
+        storage: Arc<StorageHandle>,
+        storage_root: Option<Arc<TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         wyrd_tls::install_crypto_provider()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -4731,7 +4722,7 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         // Same boot order as production: resources, then the one storage owner,
         // then the catalog that runs its Iceberg I/O through it.
-        let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+        let bifrost_storage = Arc::new(BifrostStorage::new(
             Arc::clone(&storage),
             vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
                 self.bifrost_storage_io.to_storage_config(),
@@ -5336,11 +5327,11 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
 ///
 /// # Errors
 ///
-/// Returns the [`wyrd_storage::StorageError`] from building the operator or
+/// Returns the [`StorageError`] from building the operator or
 /// opening the handle.
 pub(crate) async fn fixture_storage_handle(
     settings: StorageSettings,
-) -> Result<Arc<wyrd_storage::StorageHandle>, wyrd_storage::StorageError> {
+) -> Result<Arc<StorageHandle>, StorageError> {
     if matches!(settings.backend, BackendConfig::Local { .. }) {
         let operator = wyrd_storage::factory::build_operator(&settings.backend)?.layer(
             opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
@@ -5348,9 +5339,9 @@ pub(crate) async fn fixture_storage_handle(
                 capability
             }),
         );
-        wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator).await
+        StorageHandle::from_settings_with_operator(settings, operator).await
     } else {
-        wyrd_storage::StorageHandle::from_settings(settings).await
+        StorageHandle::from_settings(settings).await
     }
 }
 
@@ -5643,7 +5634,7 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
 /// to its SQL catalog or construct its storage-backed Iceberg catalog.
 pub(crate) async fn test_catalog(
     fixture: &PgFixture,
-    storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
+    storage: Arc<BifrostStorage>,
 ) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
     let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
@@ -5665,18 +5656,17 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// Builds a control-plane storage owner over one already-built backend handle.
 ///
 /// Used by cluster and Forge harnesses that need a catalog handle before any
-/// node has composed its resources. It allocates no metadata cache, because a
-/// control-plane catalog reads no hot Parquet footer; each simulated node still
-/// constructs its own Oracle-funded owner when it starts.
+/// node has composed its resources, and by the Forge capacity benchmark,
+/// which commits table properties as an operator. It allocates no metadata
+/// cache, because a control-plane catalog reads no hot Parquet footer; each
+/// simulated node still constructs its own Oracle-funded owner when it starts.
 ///
 /// # Panics
 /// Panics when the default storage policy does not resolve, which would mean
 /// the shipped defaults are themselves invalid.
 #[must_use]
-pub(crate) fn test_storage_owner(
-    storage: &Arc<wyrd_storage::StorageHandle>,
-) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
-    Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+pub fn test_storage_owner(storage: &Arc<StorageHandle>) -> Arc<BifrostStorage> {
+    Arc::new(BifrostStorage::new(
         Arc::clone(storage),
         vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
             vala_bifrost_redux::storage::BifrostStorageConfig::default(),

@@ -300,7 +300,6 @@ mod pg_tests {
             server.base_url(),
             Some(key.as_str()),
             server.grpc_url().as_deref(),
-            None,
         )?;
         let state = WyrdState::from_path(&bundle)?;
         state

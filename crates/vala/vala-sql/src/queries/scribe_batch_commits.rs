@@ -3,8 +3,13 @@
 //! The owner records the fsynced v4 WAL identity in the caller-owned
 //! [`TenantConn`] transaction. A batch commit evaluates no principal
 //! permission, so it is lineage only and appends no audit event.
-// raw-query grep allowlist: both statements are fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
+//!
+//! The fence also records when Wyrd ingested the batch. [`ingest_instant`]
+//! reads that instant once per batch at admission; Scribe stamps it on every
+//! row as `wyrd_ingested_at` and [`record`] stores the same value here.
+// raw-query grep allowlist: every statement is fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
 
+use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;
 
 use crate::{SqlError, TenantConn};
@@ -236,6 +241,23 @@ pub async fn resolve(
     }
 }
 
+/// Reads the one ingestion instant Scribe admits a batch under.
+///
+/// PostgreSQL is the clock of record for `wyrd_ingested_at`: the value is
+/// `statement_timestamp()` from the tenant transaction, so every replica
+/// stamps from the same source. The caller commits or drops `conn`; the read
+/// writes nothing.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the read.
+pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, SqlError> {
+    sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
+}
+
 /// Records a Scribe commit, or classifies the conflict.
 ///
 /// The caller commits the supplied tenant transaction. A first observation
@@ -246,6 +268,10 @@ pub async fn resolve(
 /// make them visible again, and different rows under the same batch identity
 /// are a contradiction. `Absent` is never returned.
 ///
+/// `ingested_at` is the batch's admission instant from [`ingest_instant`],
+/// the same value stamped on its rows. It is not part of the identity: a
+/// retry carries a fresh instant and still resolves against the first row.
+///
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant does not match `conn`, the insert
@@ -253,6 +279,7 @@ pub async fn resolve(
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
+    ingested_at: DateTime<Utc>,
 ) -> Result<ScribeBatchCommitResolution, SqlError> {
     if conn.data_tenant_id() != commit.tenant {
         return Err(invariant(
@@ -263,8 +290,8 @@ pub async fn record(
         "INSERT INTO vala.scribe_batch_commits \
          (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
           wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, \
-          wal_lsn_min, wal_lsn_max, request_id) \
-         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+          wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
+         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (data_tenant_id, logical_table_fqn, batch_id) DO NOTHING \
          RETURNING true",
     )
@@ -279,6 +306,7 @@ pub async fn record(
     .bind(commit.wal_lsn_min)
     .bind(commit.wal_lsn_max)
     .bind(commit.request_id)
+    .bind(ingested_at)
     .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;

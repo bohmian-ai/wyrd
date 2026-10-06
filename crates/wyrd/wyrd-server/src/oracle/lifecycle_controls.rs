@@ -152,8 +152,9 @@ impl RunningQueryControls {
             .filter(|deadline_ms| *deadline_ms != 0)
             .map_or(DEFAULT_QUERY_DEADLINE, std::time::Duration::from_millis);
         let deadline = Instant::now() + duration;
+        // Boxed so every caller's future carries a pointer, not the open.
         cancel_while_opening(
-            open,
+            Box::pin(open),
             self.cancel(tenant_id, request_id.clone()),
             cancel,
             deadline,

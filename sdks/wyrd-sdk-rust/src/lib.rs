@@ -47,6 +47,8 @@ pub use wyrd_spec::error::WyrdError;
 /// SDK root re-export shape.
 #[cfg(test)]
 mod tests {
+    use super::bifrost::{CompactionTypeWire, TableConfig};
+
     /// The SDK root names every composed client capability from `wyrd-client`
     /// and the error they return.
     #[test]
@@ -65,5 +67,35 @@ mod tests {
         let _ = super::PublicWyrdGatewayCaller::new;
         let _ = super::cards::Cards::workflow;
         let _ = super::WyrdError::code;
+    }
+
+    /// A Rust SDK user names every compaction type and declares it on a
+    /// table config through `wyrd_sdk::bifrost` alone, with no direct
+    /// `wyrd-spec` dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the one-column JSON schema is rejected or a config does not
+    /// report the compaction type it was given.
+    #[test]
+    fn sdk_bifrost_names_the_compaction_type() {
+        for kind in [
+            CompactionTypeWire::Auto,
+            CompactionTypeWire::Full,
+            CompactionTypeWire::SmallFiles,
+            CompactionTypeWire::FilesWithDelete,
+        ] {
+            let config = TableConfig::from_json_schema(
+                "vala.datasets.events",
+                &serde_json::json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                }),
+            )
+            .expect("a one-column JSON schema is a valid table config")
+            .with_compaction_type(kind);
+            assert_eq!(config.compaction_type(), Some(kind));
+        }
     }
 }

@@ -22,13 +22,12 @@ pub mod tenant_table;
 mod wire;
 
 pub use bifrost_catalog::{
-    BifrostCatalog, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile,
-    PinnedSealedTable, PreparedReaderIdentity, TableUid,
+    BifrostCatalog, CompactionRegistration, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS,
+    PinnedIcebergFile, PinnedSealedTable, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
-    inject_revalidation_faults_for_test, pending_revalidation_faults_for_test,
-    prepared_identity_count_for_test, reset_prepared_identity_count_for_test,
+    inject_metadata_not_found_for_test, reset_active_cut_acquisitions_for_test,
     reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
 };
 pub use error::BifrostCatalogError;

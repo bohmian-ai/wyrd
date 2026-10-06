@@ -78,15 +78,6 @@ pub enum PrivateConversionError {
     },
 }
 
-/// Maximum ancestry entries one signed reader cut may carry.
-///
-/// A protected chain spans only the snapshots a live query still needs, so a
-/// path this long is a malformed or hostile peer rather than deep history.
-const MAXIMUM_ANCESTRY_PATH: usize = 4096;
-
-/// Only ancestry digest encoding this build can reproduce and compare.
-const SUPPORTED_ANCESTRY_DIGEST_VERSION: u32 = 1;
-
 impl TryFrom<proto::TimePartition> for domain::TimePartitionWire {
     type Error = PrivateConversionError;
 
@@ -532,6 +523,7 @@ impl TryFrom<proto::ScanLiteral> for assignment_authority::ScanLiteral {
             Value::F64BitsValue(inner) => Ok(Self::F64Bits(inner)),
             Value::Utf8Value(inner) => Ok(Self::Utf8(inner)),
             Value::TimestampMicrosValue(inner) => Ok(Self::TimestampMicros(inner)),
+            Value::BytesValue(inner) => Ok(Self::Bytes(inner)),
         }
     }
 }
@@ -549,6 +541,7 @@ impl From<assignment_authority::ScanLiteral> for proto::ScanLiteral {
             assignment_authority::ScanLiteral::TimestampMicros(inner) => {
                 Value::TimestampMicrosValue(inner)
             }
+            assignment_authority::ScanLiteral::Bytes(inner) => Value::BytesValue(inner),
         };
         Self { value: Some(value) }
     }
@@ -636,112 +629,6 @@ impl From<assignment_authority::ScanPredicate> for proto::ScanPredicate {
     }
 }
 
-impl TryFrom<proto::FollowerReaderCut> for domain::FollowerReaderCut {
-    type Error = PrivateConversionError;
-
-    /// Decodes the exact protected snapshot cut one follower may read.
-    ///
-    /// Every shape rule is enforced here rather than at the point of use. A cut
-    /// that survives this decode is one the follower can protect without
-    /// consulting its own catalog, so a malformed one must never reach the
-    /// resolver: an ancestry that does not begin at the retained head and end
-    /// at the read snapshot cannot be checked for coverage at all, and a
-    /// wrong-width digest cannot be compared to a recomputed one.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError::InvalidUuid`] when the table identity
-    /// is not 16 bytes, [`PrivateConversionError::TooLarge`] when the ancestry
-    /// exceeds its protocol bound, and [`PrivateConversionError::Invalid`] when
-    /// the ancestry is empty, does not span head to snapshot, repeats a
-    /// snapshot, carries an unsupported digest version, or the digest is not
-    /// 32 bytes.
-    fn try_from(value: proto::FollowerReaderCut) -> Result<Self, Self::Error> {
-        let table_uid: [u8; 16] = value
-            .table_uid
-            .as_slice()
-            .try_into()
-            .map_err(|_| PrivateConversionError::InvalidUuid("table_uid"))?;
-        if value.ancestry_path.is_empty() {
-            return Err(PrivateConversionError::Invalid {
-                field: "ancestry_path",
-            });
-        }
-        if value.ancestry_path.len() > MAXIMUM_ANCESTRY_PATH {
-            return Err(PrivateConversionError::TooLarge {
-                field: "ancestry_path",
-            });
-        }
-        let first = value.ancestry_path[0];
-        let last = value.ancestry_path[value.ancestry_path.len() - 1];
-        if first != value.retained_head_snapshot_id || last != value.snapshot_id {
-            return Err(PrivateConversionError::Invalid {
-                field: "ancestry_path",
-            });
-        }
-        let mut seen = value.ancestry_path.clone();
-        seen.sort_unstable();
-        seen.dedup();
-        if seen.len() != value.ancestry_path.len() {
-            return Err(PrivateConversionError::Invalid {
-                field: "ancestry_path",
-            });
-        }
-        if value.ancestry_digest_version != SUPPORTED_ANCESTRY_DIGEST_VERSION {
-            return Err(PrivateConversionError::Invalid {
-                field: "ancestry_digest_version",
-            });
-        }
-        if value.ancestry_digest.len() != 32 {
-            return Err(PrivateConversionError::Invalid {
-                field: "ancestry_digest",
-            });
-        }
-        let mut ancestry_digest_hex = String::with_capacity(64);
-        for byte in &value.ancestry_digest {
-            use std::fmt::Write as _;
-            let _ = write!(ancestry_digest_hex, "{byte:02x}");
-        }
-        Ok(Self {
-            table_uid: uuid::Uuid::from_bytes(table_uid),
-            snapshot_id: value.snapshot_id,
-            snapshot_timestamp_ms: value.snapshot_timestamp_ms,
-            retained_head_snapshot_id: value.retained_head_snapshot_id,
-            ancestry_path: value.ancestry_path,
-            ancestry_digest_version: value.ancestry_digest_version,
-            ancestry_digest_hex,
-            target_epoch_fence: value.target_epoch_fence,
-        })
-    }
-}
-
-impl From<domain::FollowerReaderCut> for proto::FollowerReaderCut {
-    /// Encodes one validated protected snapshot cut.
-    ///
-    /// The domain digest is canonical lowercase hex by construction, so a byte
-    /// that fails to parse can only mean the value was built outside the
-    /// decoder; encoding zero for it would silently sign a different cut, so
-    /// the parse is saturated to a value that cannot match a real digest and
-    /// the receiver rejects it.
-    fn from(value: domain::FollowerReaderCut) -> Self {
-        let ancestry_digest = (0..value.ancestry_digest_hex.len() / 2)
-            .map(|index| {
-                u8::from_str_radix(&value.ancestry_digest_hex[index * 2..index * 2 + 2], 16)
-                    .unwrap_or(u8::MAX)
-            })
-            .collect();
-        Self {
-            table_uid: value.table_uid.as_bytes().to_vec(),
-            snapshot_id: value.snapshot_id,
-            snapshot_timestamp_ms: value.snapshot_timestamp_ms,
-            retained_head_snapshot_id: value.retained_head_snapshot_id,
-            ancestry_path: value.ancestry_path,
-            ancestry_digest_version: value.ancestry_digest_version,
-            ancestry_digest,
-            target_epoch_fence: value.target_epoch_fence,
-        }
-    }
-}
-
 impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
     type Error = PrivateConversionError;
 
@@ -790,10 +677,6 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
             predicates,
-            reader_cut: value
-                .reader_cut
-                .ok_or(PrivateConversionError::Missing("reader_cut"))?
-                .try_into()?,
         })
     }
 }
@@ -811,7 +694,6 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
             predicates: value.predicates.into_iter().map(Into::into).collect(),
-            reader_cut: Some(value.reader_cut.into()),
         }
     }
 }
@@ -1060,6 +942,8 @@ impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
             row_groups_pruned: value.row_groups_pruned,
+            row_groups_pruned_bloom: value.row_groups_pruned_bloom,
+            rows_pruned_page_index: value.rows_pruned_page_index,
         }
     }
 }
@@ -1073,6 +957,8 @@ impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
             row_groups_pruned: value.row_groups_pruned,
+            row_groups_pruned_bloom: value.row_groups_pruned_bloom,
+            rows_pruned_page_index: value.rows_pruned_page_index,
         }
     }
 }
@@ -1683,6 +1569,11 @@ mod tests {
     }
 
     /// A completed worker footer round-trips as the terminal frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture digest is invalid, the footer fails to convert
+    /// back from the wire, or the round-tripped frame differs.
     #[test]
     fn worker_footer_round_trips() {
         let expected = domain::WorkerAttemptFrame::Footer(domain::WorkerFooter {
@@ -1700,6 +1591,8 @@ mod tests {
                 partitions_scanned: 2,
                 row_groups_scanned: 5,
                 row_groups_pruned: 7,
+                row_groups_pruned_bloom: 3,
+                rows_pruned_page_index: 11,
             },
         });
         let actual =
@@ -1711,6 +1604,11 @@ mod tests {
     /// Every closed scalar/op round-trips through the v2 wire, and malformed
     /// closed-shape input (unspecified op, literal on a null-check, missing
     /// literal on a comparison) is rejected before it reaches the domain type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a valid scalar or operator fails to round-trip through the
+    /// v2 wire, or a malformed closed-shape predicate is accepted.
     #[test]
     fn follower_assignment_v2_contract() {
         let predicates = vec![
@@ -1738,6 +1636,10 @@ mod tests {
                 "active".into(),
                 assignment_authority::ScanLiteral::Bool(true),
             ),
+            assignment_authority::ScanPredicate::Eq(
+                "trace_id".into(),
+                assignment_authority::ScanLiteral::Bytes(vec![0xff, 0x00, 0x7f]),
+            ),
             assignment_authority::ScanPredicate::IsNull("optional_field".into()),
             assignment_authority::ScanPredicate::IsNotNull("required_field".into()),
         ];
@@ -1760,7 +1662,6 @@ mod tests {
                 "data_tenant_id".into(),
             ],
             predicates,
-            reader_cut: test_reader_cut(),
         };
 
         let actual = domain::FollowerScanAssignment::try_from(proto::FollowerScanAssignment::from(
@@ -1846,7 +1747,6 @@ mod tests {
             schema_fingerprint: "0".repeat(64),
             required_columns: vec!["data_tenant_id".into()],
             predicates: Vec::new(),
-            reader_cut: test_reader_cut(),
         };
         let mut v1_shaped = proto::FollowerScanAssignment::from(expected);
         v1_shaped.required_columns = Vec::new();
@@ -1854,130 +1754,5 @@ mod tests {
             domain::FollowerScanAssignment::try_from(v1_shaped),
             Err(PrivateConversionError::Missing("required_columns"))
         ));
-    }
-
-    /// Builds one canonical domain reader cut for round-trip fixtures.
-    fn test_reader_cut() -> domain::FollowerReaderCut {
-        domain::FollowerReaderCut {
-            table_uid: uuid::Uuid::parse_str("0a0b0c0d-0e0f-1011-1213-141516171819")
-                .expect("fixture table identity parses"),
-            snapshot_id: 8_675_309,
-            snapshot_timestamp_ms: 1_787_497_200_000,
-            retained_head_snapshot_id: 8_675_311,
-            ancestry_path: vec![8_675_311, 8_675_310, 8_675_309],
-            ancestry_digest_version: 1,
-            ancestry_digest_hex: "22".repeat(32),
-            target_epoch_fence: 9,
-        }
-    }
-
-    /// The reader cut survives the wire exactly and every malformed shape is
-    /// refused before a follower could act on it.
-    ///
-    /// The cut is the follower's whole authority over which snapshot it reads,
-    /// and it protects that snapshot from its own epoch before opening
-    /// anything. So the decode has to be total: a cut that arrives with an
-    /// ancestry that does not span head to snapshot, a repeated snapshot, an
-    /// unsupported digest version, a wrong-width digest or table identity, or
-    /// no cut at all, cannot be checked for coverage later and must be rejected
-    /// here rather than resolved and read.
-    #[test]
-    fn follower_reader_cut_round_trips_and_rejects_tampering() {
-        let domain_cut = test_reader_cut();
-        let wire = proto::FollowerReaderCut::from(domain_cut.clone());
-        assert_eq!(wire.table_uid.len(), 16);
-        assert_eq!(wire.ancestry_digest, vec![0x22; 32]);
-        assert_eq!(
-            domain::FollowerReaderCut::try_from(wire.clone()).expect("canonical cut round-trips"),
-            domain_cut
-        );
-
-        // A cut is required on every assignment: an absent one is a peer that
-        // wants to read without naming what it will protect.
-        let mut assignment = proto::FollowerScanAssignment::from(domain::FollowerScanAssignment {
-            scan_id: "scan-1".to_owned(),
-            binding: domain::TenantTableBinding {
-                tenant_id: wyrd_spec::DataTenantId::new_v7(),
-                namespace: "logs".to_owned(),
-                table: "records".to_owned(),
-            },
-            persisted: domain::PersistedFileAssignment {
-                files: vec![test_hot_descriptor()],
-            },
-            scribe_provider_cut: None,
-            schema_fingerprint: "ab".repeat(32),
-            required_columns: vec!["data_tenant_id".to_owned()],
-            predicates: Vec::new(),
-            reader_cut: domain_cut,
-        });
-        assert!(domain::FollowerScanAssignment::try_from(assignment.clone()).is_ok());
-        assignment.reader_cut = None;
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(assignment),
-            Err(PrivateConversionError::Missing("reader_cut"))
-        ));
-
-        let tampered = |mutate: fn(&mut proto::FollowerReaderCut)| {
-            let mut cut = wire.clone();
-            mutate(&mut cut);
-            domain::FollowerReaderCut::try_from(cut)
-        };
-        assert!(matches!(
-            tampered(|cut| cut.table_uid.truncate(15)),
-            Err(PrivateConversionError::InvalidUuid("table_uid"))
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.ancestry_path.clear()),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_path"
-            })
-        ));
-        // A head that the path does not start from, and a read snapshot the
-        // path does not end at, are both unprovable coverage claims.
-        assert!(matches!(
-            tampered(|cut| cut.retained_head_snapshot_id = 8_675_312),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_path"
-            })
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.snapshot_id = 8_675_308),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_path"
-            })
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.ancestry_path = vec![8_675_311, 8_675_311, 8_675_309]),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_path"
-            })
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.ancestry_path = vec![0; MAXIMUM_ANCESTRY_PATH + 1]),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_path"
-            } | PrivateConversionError::TooLarge {
-                field: "ancestry_path"
-            })
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.ancestry_digest_version = 2),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_digest_version"
-            })
-        ));
-        assert!(matches!(
-            tampered(|cut| cut.ancestry_digest.push(0)),
-            Err(PrivateConversionError::Invalid {
-                field: "ancestry_digest"
-            })
-        ));
-
-        // A single flipped digest byte survives decoding but is a different
-        // cut, which is what the signed assignment digest then refuses.
-        let mut flipped = wire;
-        flipped.ancestry_digest[0] ^= 0xff;
-        let decoded = domain::FollowerReaderCut::try_from(flipped).expect("width is still valid");
-        assert_ne!(decoded.ancestry_digest_hex, "22".repeat(32));
     }
 }

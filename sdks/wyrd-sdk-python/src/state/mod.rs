@@ -158,11 +158,7 @@ impl PyWyrdState {
     /// to seal one message, and the catalog error for a missing credential, an
     /// undialable ingest channel, or a missing, unauthorized, or incompatible
     /// fixed observation table.
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, tenant=None, client_byte_limit_bytes=None))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "pyo3 boundary; each keyword argument of the Python signature is one Rust parameter"
-    )]
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client_byte_limit_bytes=None))]
     fn start_bifrost(
         &self,
         py: Python<'_>,
@@ -170,10 +166,9 @@ impl PyWyrdState {
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
-        tenant: Option<&str>,
         client_byte_limit_bytes: Option<usize>,
     ) -> CardPyResult<()> {
-        let client = client_from_options(server_url, credential, grpc_url, tenant)
+        let client = client_from_options(server_url, credential, grpc_url)
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         let table = table.map(PyTableConfig::into_native);
         py.detach(|| {
@@ -1581,7 +1576,7 @@ impl PyRegistrationReceipt {
 ///
 /// ```python
 /// cards = Cards()
-/// reference = cards.model.resolve_latest(space="ml", name="fraud-model")
+/// reference = cards.model.resolve_latest(space="risk", name="fraud-model")
 /// model = cards.model.get(uid=reference.uid, eager_load=True)
 /// ```
 ///
@@ -1606,26 +1601,16 @@ impl PyCards {
     /// # Arguments
     /// * `server_url` - Optional Wyrd server URL override.
     /// * `credential` - Optional explicit credential override.
-    /// * `tenant` - Optional tenant route key selecting the saved user
-    ///   login.
     ///
     /// # Errors
     /// Returns a Wyrd error when local configuration, the credential override,
     /// or the saved-login selection cannot be loaded.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    fn __new__(
-        server_url: Option<String>,
-        credential: Option<String>,
-        tenant: Option<String>,
-    ) -> CardPyResult<Self> {
-        Cards::new(
-            server_url.as_deref(),
-            credential.map(SecretString::from),
-            tenant.as_deref(),
-        )
-        .map(|inner| Self { inner })
-        .map_err(WyrdPyError::from)
+    #[pyo3(signature = (server_url=None, credential=None))]
+    fn __new__(server_url: Option<String>, credential: Option<String>) -> CardPyResult<Self> {
+        Cards::new(server_url.as_deref(), credential.map(SecretString::from))
+            .map(|inner| Self { inner })
+            .map_err(WyrdPyError::from)
     }
 
     /// Return the typed view for `DataCard` operations.

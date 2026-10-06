@@ -67,6 +67,8 @@ env:
   - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
 ```
 
+A `forge-worker` process opens no peer listener. Give it `WYRD_PEER_TLS_DIR` alone so it can dial the Forge leader for compaction work; it refuses `WYRD_PEER_ADDRESS`.
+
 The peer listener accepts only mutual TLS from that CA. A valid certificate identifies a cluster process, not a tenant: each receiver still checks the tenant, query, fence, and deadline of every call against its own state.
 
 ## Authentication

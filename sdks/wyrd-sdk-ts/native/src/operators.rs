@@ -65,17 +65,14 @@ pub struct NativeOperatorConnectionsConnection {
 pub fn connect_operator_connections(
     server_url: Option<String>,
     credential: Option<String>,
-    tenant: Option<String>,
 ) -> NativeOperatorConnectionsConnection {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         None,
-        tenant.as_deref(),
     );
     drop(server_url);
     drop(credential);
-    drop(tenant);
     match client {
         Ok(client) => NativeOperatorConnectionsConnection {
             connections: Some(NativeOperatorConnections {

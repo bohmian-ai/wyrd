@@ -425,6 +425,39 @@ def test_compaction_target_registers_describes_and_conflicts(
 
 
 @pytest.mark.integration
+def test_compaction_type_registers_describes_and_conflicts(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """An explicit compaction type is stored, described back, idempotent, and fenced."""
+
+    fqn = f"vala.datasets.kind_{uuid.uuid4().hex}"
+
+    def writer(compaction_type: str | None) -> Bifrost:
+        return Bifrost(
+            TableConfig(Fixture, fqn, compaction_type=compaction_type),
+            server_url=wyrd_server.base_url,
+            credential=wyrd_server.api_key,
+        )
+
+    assert writer("small-files").register() == "created"
+    described = TableConfig.describe(
+        fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
+    )
+    assert described.compaction_type == "small-files"
+    assert writer("small-files").register() == "already_exists"
+    assert writer(None).register() == "already_exists"
+
+    with pytest.raises(WyrdError) as captured:
+        writer("full").register()
+    assert captured.value.code == "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH"
+    assert captured.value.status == 409
+    unchanged = TableConfig.describe(
+        fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
+    )
+    assert unchanged.compaction_type == "small-files"
+
+
+@pytest.mark.integration
 def test_negative_non_select_query_is_refused(
     wyrd_server: WyrdTestServer, query_table: str
 ) -> None:

@@ -1,20 +1,21 @@
 //! Public Forge production telemetry.
 //!
-//! Forge exposes exactly the seventeen Prometheus families operators need to
-//! read demand, queue depth and age, active ownership, durable results,
-//! latency, failure class, physical data flow, and compaction debt. Lease,
-//! fence, catalog, reconciliation, cursor, scheduler, and resource protocol
-//! detail belongs to structured traces and durable audit/task evidence, and
-//! unresolved authority belongs to role readiness — none of it is duplicated
-//! here.
+//! Forge exposes exactly the Prometheus families operators need to read
+//! active ownership, durable results, latency, failure class, physical data
+//! flow, the elected leader's in-memory decision time, the leader term's
+//! acquire/renew/revoke lifecycle, and the worker's readiness, back-offs, and
+//! restarts. Table lease, fence, catalog, reconciliation, cursor, and resource
+//! protocol detail belongs to structured traces and durable audit/task
+//! evidence — none of it is duplicated here.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::Gauge;
-use num_traits::ToPrimitive;
 use vala_sql::row_types::forge_tasks::{ForgeFailureClass, ForgeTaskStrategy};
+
+use super::error::ForgeError;
 
 /// Every `task_type` label Forge publishes, in durable strategy order.
 ///
@@ -28,14 +29,17 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
     ForgeTaskStrategy::OrphanCleanup,
 ];
 
+/// Unlabelled gauges [`ForgeTelemetry::new`] publishes as an explicit zero.
+const ZEROED_GAUGES: [&str; 3] = [
+    "bifrost_forge_leader_held",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_restart_backoff_seconds",
+];
+
 /// The exact public Forge family inventory, used by documentation coverage.
 #[cfg(test)]
-pub(super) const FORGE_METRIC_FAMILIES: [&str; 17] = [
-    "bifrost_forge_planning_demands",
-    "bifrost_forge_oldest_planning_demand_timestamp_seconds",
+pub(super) const FORGE_METRIC_FAMILIES: [&str; 23] = [
     "bifrost_forge_tasks_created_total",
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
     "bifrost_forge_task_duration_seconds",
@@ -46,9 +50,123 @@ pub(super) const FORGE_METRIC_FAMILIES: [&str; 17] = [
     "bifrost_forge_output_bytes_total",
     "bifrost_forge_deleted_objects_total",
     "bifrost_forge_snapshots_expired_total",
-    "bifrost_forge_compaction_debt_files",
-    "bifrost_forge_compaction_debt_bytes",
+    "bifrost_forge_leader_decision_seconds",
+    "bifrost_forge_leader_held",
+    "bifrost_forge_leader_acquisitions_total",
+    "bifrost_forge_leader_renewals_total",
+    "bifrost_forge_leader_renewal_seconds",
+    "bifrost_forge_leader_revocations_total",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_backoffs_total",
+    "bifrost_forge_worker_restarts_total",
+    "bifrost_forge_worker_restart_backoff_seconds",
+    "bifrost_forge_scheduler_restarts_total",
+    "bifrost_forge_expired_cleanup_refusals_total",
 ];
+
+/// One leader schedule operation, the closed `operation` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderDecision {
+    /// A commit notice updated one table's track.
+    Commit,
+    /// A compactor pull selected and dispatched due tables.
+    Pull,
+    /// A compactor report settled one dispatched task.
+    Report,
+}
+
+impl ForgeLeaderDecision {
+    /// Returns the stable `operation` label for this decision.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Pull => "pull",
+            Self::Report => "report",
+        }
+    }
+}
+
+/// Outcome of one leader term renewal, the closed `outcome` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderRenewal {
+    /// The election row extended this replica's term.
+    Ok,
+    /// The election row no longer names this replica's term.
+    Refused,
+    /// The renewal statement failed.
+    Failed,
+    /// The renewal was still pending at the term's local deadline.
+    Timeout,
+}
+
+impl ForgeLeaderRenewal {
+    /// Returns the stable `outcome` label for this renewal.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Why a held leader term ended, the closed revocation `reason` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeLeaderRevocation {
+    /// A renewal found the term no longer held.
+    RenewalRefused,
+    /// A renewal statement failed.
+    RenewalFailed,
+    /// A renewal outlived the term's local deadline.
+    RenewalTimeout,
+    /// A newly acquired term replaced it.
+    Replaced,
+    /// The coordinator stopped and resigned it.
+    Shutdown,
+    /// The scheduler exited, failed or was dropped before shutdown; the
+    /// election row is left to lapse.
+    SchedulerStopped,
+}
+
+impl ForgeLeaderRevocation {
+    /// Returns the stable `reason` label for this revocation.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RenewalRefused => "renewal_refused",
+            Self::RenewalFailed => "renewal_failed",
+            Self::RenewalTimeout => "renewal_timeout",
+            Self::Replaced => "replaced",
+            Self::Shutdown => "shutdown",
+            Self::SchedulerStopped => "scheduler_stopped",
+        }
+    }
+}
+
+/// The `reason` label of a worker back-off: the database could not answer.
+pub(super) const WORKER_BACKOFF_DATABASE_UNAVAILABLE: &str = "database_unavailable";
+
+/// The `reason` label of an expired-cleanup refusal: a table read is active.
+pub(super) const CLEANUP_REFUSAL_ACTIVE_READ: &str = "active_read";
+
+/// Where an expired-cleanup refusal was observed, the closed `stage` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeCleanupRefusalStage {
+    /// The durable preparation of one candidate was refused.
+    Prepare,
+    /// A prepared-claim replay retained its candidate after a refused preparation.
+    Replay,
+}
+
+impl ForgeCleanupRefusalStage {
+    /// Returns the stable `stage` label for this refusal.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Replay => "replay",
+        }
+    }
+}
 
 /// Closed durable result of one completed Forge ownership episode.
 ///
@@ -87,20 +205,6 @@ impl ForgeTaskResult {
     }
 }
 
-/// One authoritative pending-task observation for a single work type.
-///
-/// Produced by a complete durable scan and published together with its peers
-/// so an absent work type still exports an explicit zero.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ForgePendingTasks {
-    /// Work type this observation describes.
-    pub(super) task_type: ForgeTaskStrategy,
-    /// Count of rows whose state is exactly `ready` or `retryable`.
-    pub(super) count: u64,
-    /// Unix seconds of the oldest such row's `ready_at`, or zero when none.
-    pub(super) oldest_ready_at_unix: i64,
-}
-
 /// Registered Forge metric handles retained by one Forge owner.
 ///
 /// Only the gauges are registered here, because a gauge must export an
@@ -108,38 +212,23 @@ pub(super) struct ForgePendingTasks {
 /// are obtained at their emission site so Forge never publishes a series for a
 /// label combination no production event ever produced.
 pub struct ForgeTelemetry {
-    /// Unacknowledged planning demands after a complete fenced scan.
-    planning_demands: Gauge,
-    /// Unix seconds of the oldest unacknowledged planning demand.
-    oldest_planning_demand: Gauge,
-    /// `Ready` or `Retryable` durable tasks by work type.
-    pending_tasks: BTreeMap<ForgeTaskStrategy, Gauge>,
-    /// Unix seconds of the oldest pending task's `ready_at` by work type.
-    oldest_pending_task: BTreeMap<ForgeTaskStrategy, Gauge>,
     /// Attempts this process currently holds unsettled, by work type.
     active_tasks: BTreeMap<ForgeTaskStrategy, Gauge>,
-    /// Files the latest complete compaction inventory left outstanding.
-    compaction_debt_files: Gauge,
-    /// Bytes the latest complete compaction inventory left outstanding.
-    compaction_debt_bytes: Gauge,
 }
 
 impl ForgeTelemetry {
-    /// Registers the seven gauges that must export zero before first use.
+    /// Registers every gauge that must export zero before its first use.
+    ///
+    /// That is the per-task-type active gauges plus the leader, worker
+    /// readiness, and restart backoff gauges, which read zero until this
+    /// process holds a term, readies its worker, or restarts it.
     #[must_use]
     pub fn new() -> Self {
+        for gauge in ZEROED_GAUGES {
+            metrics::gauge!(gauge).set(0.0);
+        }
         Self {
-            planning_demands: zeroed_gauge("bifrost_forge_planning_demands"),
-            oldest_planning_demand: zeroed_gauge(
-                "bifrost_forge_oldest_planning_demand_timestamp_seconds",
-            ),
-            pending_tasks: zeroed_task_type_gauges("bifrost_forge_pending_tasks"),
-            oldest_pending_task: zeroed_task_type_gauges(
-                "bifrost_forge_oldest_pending_task_timestamp_seconds",
-            ),
             active_tasks: zeroed_task_type_gauges("bifrost_forge_active_tasks"),
-            compaction_debt_files: zeroed_gauge("bifrost_forge_compaction_debt_files"),
-            compaction_debt_bytes: zeroed_gauge("bifrost_forge_compaction_debt_bytes"),
         }
     }
 
@@ -234,36 +323,108 @@ impl ForgeTelemetry {
         metrics::counter!("bifrost_forge_snapshots_expired_total").increment(snapshots);
     }
 
-    /// Publishes the authoritative planning demand count and oldest timestamp.
+    /// Records how long one leader schedule operation held the caller.
     ///
-    /// The timestamp is the stored demand time in Unix seconds, never an age
-    /// recomputed at publication, so `time() - timestamp` keeps growing if this
-    /// producer later stalls.
-    pub(super) fn publish_planning_status(&self, demands: u64, oldest_requested_at_unix: i64) {
-        self.planning_demands.set(exact(demands));
-        self.oldest_planning_demand
-            .set(oldest_requested_at_unix.to_f64().unwrap_or(0.0));
+    /// The time includes waiting for the schedule lock, so contention between
+    /// concurrent pullers shows here, and excludes RPC and worker time.
+    pub(super) fn record_leader_decision(operation: ForgeLeaderDecision, elapsed: Duration) {
+        metrics::histogram!(
+            "bifrost_forge_leader_decision_seconds",
+            "operation" => operation.as_str()
+        )
+        .record(elapsed.as_secs_f64());
     }
 
-    /// Publishes pending counts and oldest `ready_at` for every work type.
-    ///
-    /// Work types absent from `observations` publish explicit zeroes, so an
-    /// emptied queue is visible rather than a stale retained value.
-    pub(super) fn publish_pending_tasks(&self, observations: &[ForgePendingTasks]) {
-        for task_type in TASK_TYPES {
-            let observed = observations
-                .iter()
-                .find(|observation| observation.task_type == task_type);
-            self.pending_tasks[&task_type].set(observed.map_or(0.0, |o| exact(o.count)));
-            self.oldest_pending_task[&task_type]
-                .set(observed.map_or(0.0, |o| o.oldest_ready_at_unix.to_f64().unwrap_or(0.0)));
-        }
+    /// Counts one leader term this replica acquired.
+    pub(super) fn record_leader_acquired() {
+        metrics::counter!("bifrost_forge_leader_acquisitions_total").increment(1);
     }
 
-    /// Publishes the latest complete compaction-debt inventory.
-    pub(super) fn record_compaction_debt(&self, files: u64, bytes: u64) {
-        self.compaction_debt_files.set(exact(files));
-        self.compaction_debt_bytes.set(exact(bytes));
+    /// Publishes whether this replica currently holds the leader term.
+    pub(super) fn record_leader_held(held: bool) {
+        metrics::gauge!("bifrost_forge_leader_held").set(if held { 1.0 } else { 0.0 });
+    }
+
+    /// Counts one leader renewal and records how long the election row took.
+    pub(super) fn record_leader_renewal(outcome: ForgeLeaderRenewal, elapsed: Duration) {
+        metrics::counter!(
+            "bifrost_forge_leader_renewals_total",
+            "outcome" => outcome.as_str()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_forge_leader_renewal_seconds",
+            "outcome" => outcome.as_str()
+        )
+        .record(elapsed.as_secs_f64());
+    }
+
+    /// Counts one held leader term ending, by why it ended.
+    pub(super) fn record_leader_revocation(reason: ForgeLeaderRevocation) {
+        metrics::counter!(
+            "bifrost_forge_leader_revocations_total",
+            "reason" => reason.as_str()
+        )
+        .increment(1);
+    }
+
+    /// Publishes whether this process's Forge worker currently advertises ready.
+    pub(super) fn record_worker_ready(ready: bool) {
+        metrics::gauge!("bifrost_forge_worker_ready").set(if ready { 1.0 } else { 0.0 });
+    }
+
+    /// Counts one worker turn that backed off because the database could not answer.
+    pub(super) fn record_worker_backoff() {
+        metrics::counter!(
+            "bifrost_forge_worker_backoffs_total",
+            "reason" => WORKER_BACKOFF_DATABASE_UNAVAILABLE
+        )
+        .increment(1);
+    }
+
+    /// Counts one failed Forge worker restart and publishes its backoff.
+    ///
+    /// Called by the process supervisor each time it schedules a rebuild of a
+    /// worker that stopped before shutdown. The `reason` label is the failure
+    /// class of the error the worker returned; an exit without a worker error
+    /// (`None`) has nothing to classify and is counted as an internal
+    /// invariant failure. The backoff gauge holds the wait before the most
+    /// recent rebuild and stays at zero until the first one.
+    pub fn record_worker_restart(error: Option<&ForgeError>, backoff: Duration) {
+        metrics::counter!(
+            "bifrost_forge_worker_restarts_total",
+            "reason" => restart_reason(error).as_str()
+        )
+        .increment(1);
+        metrics::gauge!("bifrost_forge_worker_restart_backoff_seconds").set(backoff.as_secs_f64());
+    }
+
+    /// Counts one failed Forge maintenance scheduler restart.
+    ///
+    /// Called by the process supervisor each time it schedules a rebuild of a
+    /// scheduler that stopped before shutdown, with the same `reason`
+    /// classification as [`Self::record_worker_restart`]. The backoff is the
+    /// supervisor's and is logged with the restart, so no gauge repeats it.
+    pub fn record_scheduler_restart(error: Option<&ForgeError>, _backoff: Duration) {
+        metrics::counter!(
+            "bifrost_forge_scheduler_restarts_total",
+            "reason" => restart_reason(error).as_str()
+        )
+        .increment(1);
+    }
+
+    /// Counts one expired-cleanup candidate an active Oracle table read refused.
+    ///
+    /// `stage` says where the refusal was observed: the durable preparation of
+    /// a candidate, or a prepared-claim replay that retained its candidate
+    /// because that preparation was refused.
+    pub(super) fn record_expired_cleanup_refusal(stage: ForgeCleanupRefusalStage) {
+        metrics::counter!(
+            "bifrost_forge_expired_cleanup_refusals_total",
+            "stage" => stage.as_str(),
+            "reason" => CLEANUP_REFUSAL_ACTIVE_READ
+        )
+        .increment(1);
     }
 
     /// Opens one balanced active-task guard for the duration of an attempt.
@@ -307,11 +468,15 @@ impl Drop for ForgeActiveTask {
     }
 }
 
-/// Registers one unlabelled gauge and publishes its explicit zero.
-fn zeroed_gauge(name: &'static str) -> Gauge {
-    let gauge = metrics::gauge!(name);
-    gauge.set(0.0);
-    gauge
+/// Classifies the error that stopped a restarted Forge loop.
+///
+/// An exit without a worker error has nothing to classify and is an internal
+/// invariant failure.
+fn restart_reason(error: Option<&ForgeError>) -> ForgeFailureClass {
+    error.map_or(
+        ForgeFailureClass::InternalInvariant,
+        ForgeError::failure_class,
+    )
 }
 
 /// Registers one gauge per `task_type` and publishes each explicit zero.
@@ -324,14 +489,6 @@ fn zeroed_task_type_gauges(name: &'static str) -> BTreeMap<ForgeTaskStrategy, Ga
             (task_type, gauge)
         })
         .collect()
-}
-
-/// Converts an exact durable count to its gauge value without silent wrapping.
-///
-/// Counts beyond `f64`'s exact integer range saturate rather than wrap so a
-/// pathological value reads as implausibly large instead of plausibly small.
-fn exact(value: u64) -> f64 {
-    value.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]
@@ -358,6 +515,30 @@ mod tests {
         ForgeTaskResult::Cancelled,
         ForgeTaskResult::Refused,
         ForgeTaskResult::Uncertain,
+    ];
+
+    /// Every `operation` value Forge may publish.
+    const LEADER_DECISIONS: [ForgeLeaderDecision; 3] = [
+        ForgeLeaderDecision::Commit,
+        ForgeLeaderDecision::Pull,
+        ForgeLeaderDecision::Report,
+    ];
+
+    /// Every renewal `outcome` value Forge may publish.
+    const LEADER_RENEWALS: [ForgeLeaderRenewal; 4] = [
+        ForgeLeaderRenewal::Ok,
+        ForgeLeaderRenewal::Refused,
+        ForgeLeaderRenewal::Failed,
+        ForgeLeaderRenewal::Timeout,
+    ];
+
+    /// Every revocation `reason` value Forge may publish.
+    const LEADER_REVOCATIONS: [ForgeLeaderRevocation; 5] = [
+        ForgeLeaderRevocation::RenewalRefused,
+        ForgeLeaderRevocation::RenewalFailed,
+        ForgeLeaderRevocation::RenewalTimeout,
+        ForgeLeaderRevocation::Replaced,
+        ForgeLeaderRevocation::Shutdown,
     ];
 
     /// Split one recorded series key into its family and its label pairs.
@@ -397,6 +578,26 @@ mod tests {
         let reasons = FAILURE_CLASSES
             .iter()
             .map(|reason| reason.as_str())
+            .chain(LEADER_REVOCATIONS.iter().map(|reason| reason.as_str()))
+            .chain([
+                WORKER_BACKOFF_DATABASE_UNAVAILABLE,
+                CLEANUP_REFUSAL_ACTIVE_READ,
+            ])
+            .collect::<BTreeSet<_>>();
+        let stages = [
+            ForgeCleanupRefusalStage::Prepare,
+            ForgeCleanupRefusalStage::Replay,
+        ]
+        .iter()
+        .map(|stage| stage.as_str())
+        .collect::<BTreeSet<_>>();
+        let operations = LEADER_DECISIONS
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<BTreeSet<_>>();
+        let outcomes = LEADER_RENEWALS
+            .iter()
+            .map(|outcome| outcome.as_str())
             .collect::<BTreeSet<_>>();
         for series in snapshot
             .counters
@@ -409,6 +610,9 @@ mod tests {
                     "task_type" => &task_types,
                     "result" => &results,
                     "reason" => &reasons,
+                    "operation" => &operations,
+                    "outcome" => &outcomes,
+                    "stage" => &stages,
                     other => panic!("{series} carries the unapproved label key {other}"),
                 };
                 assert!(
@@ -464,13 +668,31 @@ mod tests {
                 ForgeTelemetry::record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
             }
             ForgeTelemetry::record_snapshots_expired(3);
-            telemetry.publish_planning_status(4, 1_767_312_000);
-            telemetry.publish_pending_tasks(&[ForgePendingTasks {
-                task_type: ForgeTaskStrategy::SmallFiles,
-                count: 2,
-                oldest_ready_at_unix: 1_767_311_000,
-            }]);
-            telemetry.record_compaction_debt(9, 900);
+            for operation in LEADER_DECISIONS {
+                ForgeTelemetry::record_leader_decision(operation, Duration::from_micros(2));
+            }
+            ForgeTelemetry::record_leader_acquired();
+            ForgeTelemetry::record_leader_held(true);
+            for outcome in LEADER_RENEWALS {
+                ForgeTelemetry::record_leader_renewal(outcome, Duration::from_millis(3));
+            }
+            for reason in LEADER_REVOCATIONS {
+                ForgeTelemetry::record_leader_revocation(reason);
+            }
+            ForgeTelemetry::record_leader_held(false);
+            ForgeTelemetry::record_worker_ready(true);
+            ForgeTelemetry::record_worker_backoff();
+            ForgeTelemetry::record_worker_ready(false);
+            ForgeTelemetry::record_worker_restart(None, Duration::from_secs(1));
+            ForgeTelemetry::record_worker_restart(
+                Some(&ForgeError::Capacity {
+                    detail: "the worker refused its own capacity".to_owned(),
+                }),
+                Duration::from_secs(2),
+            );
+            ForgeTelemetry::record_scheduler_restart(None, Duration::from_secs(1));
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
 
             drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
             let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -490,8 +712,8 @@ mod tests {
         );
         assert_eq!(
             registered.gauges.len(),
-            4 + 3 * TASK_TYPES.len(),
-            "construction registers exactly the scalar and per-task-type gauges"
+            TASK_TYPES.len() + ZEROED_GAUGES.len(),
+            "construction registers exactly the per-task-type active gauges and the zeroed gauges"
         );
         for (series, value) in &registered.gauges {
             assert!(

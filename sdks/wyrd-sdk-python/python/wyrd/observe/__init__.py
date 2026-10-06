@@ -27,8 +27,22 @@ def record(
 
     Telemetry names its own ``table`` and ``schema`` per call rather than using
     the client's active binding, so an instrumented process writes its signals
-    alongside whatever the application is writing. Queue-full is swallowed and
-    counted on ``bifrost.dropped``, never raised.
+    alongside whatever the application writes. If the producer refuses the row,
+    for example because its queue is full, the row is dropped and counted on
+    ``bifrost.dropped`` instead of raising.
+
+    Args:
+        bifrost: the ``Bifrost`` client whose producers carry the row.
+        table: the destination table name.
+        schema: the table's JSON Schema text, mapped to the Arrow schema of
+            the row.
+        row: the row as JSON object text.
+        correlation: optional ``card_ref`` (``space/Kind/name@version``) and
+            ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
+
+    Raises:
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for malformed or unsupported
+            ``schema`` text or an invalid ``card_ref``.
     """
 
     correlation = correlation or {}

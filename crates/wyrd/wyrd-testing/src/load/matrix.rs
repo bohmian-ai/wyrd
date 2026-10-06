@@ -1728,6 +1728,14 @@ impl PhaseProgress {
 }
 
 /// Execute one tenant's synchronized warmup, measured, and read phases.
+///
+/// # Errors
+///
+/// Returns [`ClusterLoadError::Client`] when a payload cannot be built, a
+/// write or read fails outside the retried refusals, or a phase task cannot be
+/// joined; [`ClusterLoadError::Assertion`] when the tenant completes fewer
+/// strict reads than its target or a phase barrier is abandoned after another
+/// tenant fails.
 async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, ClusterLoadError> {
     let TenantRunContext {
         tenant,
@@ -1786,7 +1794,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_request_id) => {
                         result.acknowledged_batches += 1;
                         result.acknowledged_rows += u64::from(profile.rows_per_batch);
                         result.acknowledged_bytes += payload.len() as u64;

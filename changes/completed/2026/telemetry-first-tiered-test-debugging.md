@@ -17,4 +17,3 @@ Current owners and evidence:
 - [Testing map](../../../TESTING.md), [agent rules](../../../architecture/agent-rules.md), and [Bifrost design](../../../architecture/bifrost-design.md).
 - [Telemetry runtime](../../../crates/shared/wyrd-runtime/src/otel.rs), [Bifrost test capture](../../../crates/wyrd/wyrd-testing/src/bifrost/telemetry.rs), and [process harness](../../../crates/wyrd/wyrd-testing/src/bifrost/cluster.rs).
 - [Repository checks](../../../scripts/checks).
-

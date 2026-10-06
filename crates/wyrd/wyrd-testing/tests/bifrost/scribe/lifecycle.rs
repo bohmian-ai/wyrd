@@ -8,6 +8,7 @@ use vala_bifrost_redux::scribe::geometry::{
     DEFAULT_GENERATION_ROTATION_BYTES, DEFAULT_SHARD_COUNT, DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
     DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
 };
+use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -96,6 +97,331 @@ async fn scribe_publishes_idle_rows_on_its_own_clock() {
         expected,
         "publication may not change which rows are readable"
     );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Claims the pod may hold at once: the harness runs the default Scribe
+/// configuration, whose four WAL IO workers size the claim budget.
+const CLAIM_BUDGET: usize = 4;
+
+/// Tables the concurrent-publication case makes due together: twice the
+/// budget, so a publisher that honours the budget must queue half of them.
+const CONCURRENT_TABLES: usize = 2 * CLAIM_BUDGET;
+
+/// How long each claim's publication is held open in the concurrent case, so
+/// claims that run together are observed overlapping.
+const HELD_PUBLICATION: Duration = Duration::from_millis(1_500);
+
+/// Due claims publish together, never more at once than the claim budget.
+///
+/// Every table here is written once and goes quiet, so each becomes one claim
+/// that the pod's own lifecycle tick makes due when its dwell expires — the
+/// production path a busy pod with many tables takes every few seconds. Each
+/// publication is held open at the real object-write seam, so the fault
+/// controls observe how many claims are in flight together: more than one
+/// proves due claims do not wait for each other, and no more than the budget
+/// proves the bound holds. Every acknowledged row must still publish exactly
+/// once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, when
+/// the due claims do not all publish within [`IDLE_PUBLICATION_DEADLINE`],
+/// when no two claims overlap, when more than [`CLAIM_BUDGET`] run at once, or
+/// when a row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_publishes_due_claims_concurrently_within_the_claim_budget() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    let faults = PersistenceFaults::default();
+    faults.set_object_write_delay_for_test(HELD_PUBLICATION);
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..16).collect();
+    let mut tables = Vec::with_capacity(CONCURRENT_TABLES);
+    for index in 0..CONCURRENT_TABLES {
+        let name = unique_table(&format!("concurrent_due_{index}"));
+        let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+        append_values(&client, &table, Uuid::now_v7(), &expected)
+            .await
+            .expect("the append is acknowledged");
+        tables.push((name, table));
+    }
+
+    let deadline = tokio::time::Instant::now() + IDLE_PUBLICATION_DEADLINE;
+    for (name, _) in &tables {
+        while published_rows(&server, tenant, name).await < expected.len() as u64 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "due claims were not all published within {IDLE_PUBLICATION_DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let overlap = faults.max_concurrent_object_writes_for_test();
+    assert!(
+        overlap > 1,
+        "due claims must publish together, but at most {overlap} was in flight at once"
+    );
+    assert!(
+        overlap <= CLAIM_BUDGET,
+        "{overlap} claims were in flight at once; the claim budget is {CLAIM_BUDGET}"
+    );
+    for (name, table) in &tables {
+        assert_eq!(
+            published_rows(&server, tenant, name).await,
+            expected.len() as u64,
+            "concurrent publication must publish every acknowledged row exactly once"
+        );
+        assert_eq!(
+            sorted_values(&client, table).await,
+            expected,
+            "publication may not change which rows are readable"
+        );
+    }
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Two flushes that meet over a full claim budget publish every claim once.
+///
+/// The first flush takes every claim slot and its publications are held at
+/// the real object-write seam. The second flush then finds each slot held by
+/// a claim another publication is driving: it must neither drive those claims
+/// a second time nor fail because no slot is free, but wait for a slot and
+/// publish the rest. Both flushes succeed, no more claims than the budget are
+/// ever in flight, and every acknowledged row publishes exactly once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append, flush or read fails,
+/// when more than [`CLAIM_BUDGET`] claim publications run at once, or when a
+/// row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once() {
+    let faults = PersistenceFaults::default();
+    faults.hold_object_writes_for_test();
+    let server = WyrdTestServer::builder()
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..16).collect();
+    let mut tables = Vec::with_capacity(CONCURRENT_TABLES);
+    for index in 0..CONCURRENT_TABLES {
+        let name = unique_table(&format!("contended_flush_{index}"));
+        let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+        append_values(&client, &table, Uuid::now_v7(), &expected)
+            .await
+            .expect("the append is acknowledged");
+        tables.push((name, table));
+    }
+
+    let contending = async {
+        faults
+            .wait_for_held_object_writes_for_test(CLAIM_BUDGET)
+            .await;
+        let flush = server.flush_bifrost();
+        tokio::pin!(flush);
+        let settled_early = tokio::select! {
+            result = &mut flush => Some(result),
+            () = faults.wait_for_claim_contention_for_test(CLAIM_BUDGET) => None,
+        };
+        faults.release_object_writes_for_test();
+        match settled_early {
+            Some(result) => result,
+            None => flush.await,
+        }
+    };
+    let (first, second) = tokio::join!(server.flush_bifrost(), contending);
+    first.expect("the flush holding every claim slot publishes its claims");
+    second.expect("a flush that meets a full claim budget waits for a slot");
+    let overlap = faults.max_concurrent_object_writes_for_test();
+    assert!(
+        overlap <= CLAIM_BUDGET,
+        "{overlap} claim publications ran at once; the claim budget is {CLAIM_BUDGET}"
+    );
+    for (name, table) in &tables {
+        assert_eq!(
+            published_rows(&server, tenant, name).await,
+            expected.len() as u64,
+            "every acknowledged row publishes exactly once"
+        );
+        assert_eq!(sorted_values(&client, table).await, expected);
+    }
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A due claim whose publication fails is retried by the pod's own tick.
+///
+/// The first claim object write is refused, the way an object-store error
+/// refuses it. The claim keeps its slot and its members, and nothing but the
+/// lifecycle tick runs: no flush, drain, or further write. The tick must pick
+/// the refused claim up again and publish it, or a pod whose every slot has
+/// failed once would never publish again.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, when
+/// the claim does not publish within [`IDLE_PUBLICATION_DEADLINE`], or when a
+/// row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_tick_retries_a_failed_due_claim() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    let faults = PersistenceFaults::default();
+    faults.fail_next_object_write();
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("tick_retry");
+    let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..32).collect();
+    append_values(&client, &table, Uuid::now_v7(), &expected)
+        .await
+        .expect("the append is acknowledged");
+
+    tokio::time::timeout(
+        IDLE_PUBLICATION_DEADLINE,
+        faults.wait_for_published_claims_for_test(1),
+    )
+    .await
+    .expect("the tick retries the refused claim and publishes it");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        expected.len() as u64,
+        "the retried claim publishes every acknowledged row exactly once"
+    );
+    assert_eq!(sorted_values(&client, &table).await, expected);
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A claim that fails after its commit landed is finished by the pod's own
+/// tick, frees its claim slot, and lets publication continue.
+///
+/// The claim's fenced commit lands and every member records it as
+/// `Published`, then retirement fails before any member moves to cleanup.
+/// Nothing but the lifecycle tick runs: no flush, drain, or restart. The tick
+/// must finish the claim from its durable state without publishing its rows
+/// again, return its slot, and publish a second table written afterwards.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, when
+/// the injected failure is never reached, when either claim does not settle
+/// within [`IDLE_PUBLICATION_DEADLINE`], when a claim stays outstanding or a
+/// staged member survives, or when a row is lost or duplicated.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    let faults = PersistenceFaults::default();
+    faults.fail_next_claim_retirement();
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..32).collect();
+
+    let first_name = unique_table("post_commit_failure");
+    let first = register_table(&server, tenant, BifrostNamespace::Datasets, &first_name).await;
+    append_values(&client, &first, Uuid::now_v7(), &expected)
+        .await
+        .expect("the first append is acknowledged");
+    tokio::time::timeout(
+        IDLE_PUBLICATION_DEADLINE,
+        faults.wait_for_published_claims_for_test(1),
+    )
+    .await
+    .expect("the tick finishes the claim whose retirement failed after its commit");
+    assert!(
+        !faults.claim_retirement_failure_armed_for_test(),
+        "the claim failed after its commit before the tick finished it"
+    );
+    assert_eq!(
+        published_rows(&server, tenant, &first_name).await,
+        expected.len() as u64,
+        "the finished claim's rows are published exactly once"
+    );
+    assert_eq!(sorted_values(&client, &first).await, expected);
+    let settled = server
+        .scribe_staging_backlog_for_test()
+        .expect("the staging owner is inspectable");
+    assert_eq!(
+        (settled.outstanding_claims, settled.live_members),
+        (0, 0),
+        "the finished claim returned its slot and retired its members"
+    );
+
+    let second_name = unique_table("after_post_commit_failure");
+    let second = register_table(&server, tenant, BifrostNamespace::Datasets, &second_name).await;
+    append_values(&client, &second, Uuid::now_v7(), &expected)
+        .await
+        .expect("the second append is acknowledged");
+    tokio::time::timeout(
+        IDLE_PUBLICATION_DEADLINE,
+        faults.wait_for_published_claims_for_test(2),
+    )
+    .await
+    .expect("publication continues after the finished claim");
+    assert_eq!(
+        published_rows(&server, tenant, &second_name).await,
+        expected.len() as u64,
+        "the next claim publishes every acknowledged row exactly once"
+    );
+    assert_eq!(sorted_values(&client, &second).await, expected);
 
     server.shutdown().await.expect("the server drains cleanly");
 }

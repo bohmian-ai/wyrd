@@ -1,3 +1,6 @@
+//! Postgres-backed `vala-sql` integration tests; the proofs live in `pg_tests` so
+//! the credential-free lanes can skip them by module name.
+
 mod pg_tests {
     //! Real-Postgres lifecycle, fencing, audit, and isolation proofs for Forge tasks.
 
@@ -5,8 +8,8 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use sqlx::{PgPool, types::Uuid};
-    use vala_sql::TenantConn;
-    use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
+    use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+    use vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority;
     use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
     use vala_sql::row_types::forge_tasks::{
         ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
@@ -17,8 +20,46 @@ mod pg_tests {
         MAINTENANCE_STRATEGIES, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
         SnapshotWatermark,
     };
+    use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+    use vala_sql::{SqlError, TenantConn};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+
+    /// Prepares one cleanup candidate the way the Forge drain does: under the
+    /// table's live exclusive maintenance authority, surrendered afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when an Oracle read still holds
+    /// the table, so no authority exists, and otherwise the preparation's own
+    /// result.
+    async fn prepare_exclusively(
+        app: &PgPool,
+        tasks: &ForgeTasks,
+        tenant: DataTenantId,
+        request: ExpiredCleanupCandidateRequest<'_>,
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        let mut conn = TenantConn::acquire(app, tenant).await?;
+        let identity = TableAuthorityIdentity {
+            tenant,
+            table_uid: request.table.table_uid,
+            catalog_name: request.table.catalog_name.clone(),
+            namespace_name: request.table.namespace_name.clone(),
+            table_name: request.table.table_name.clone(),
+        };
+        let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
+            .exclusive(identity)
+            .await?
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            })?;
+        let prepared = tasks
+            .prepare_expired_cleanup_candidate(tenant, &exclusive, request)
+            .await;
+        drop(exclusive);
+        conn.commit().await?;
+        prepared
+    }
 
     /// Starts one isolated migrated database and returns its administrative pool.
     ///
@@ -140,11 +181,6 @@ mod pg_tests {
         let mut newer = task(tenant, "newer", 52);
         newer.ready_at = Some(Utc::now() - Duration::seconds(1));
         tasks.enqueue(&newer).await.expect("newer task");
-        tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
         assert_eq!(
             tasks
                 .claim_fair(owner, limits(2), None)
@@ -373,8 +409,8 @@ mod pg_tests {
     /// Superseded cancellation is terminal, audited, and repairable.
     ///
     /// # Panics
-    /// Panics when rollback, exact cancellation, demand repair, or reclaim
-    /// invariants fail against `PostgreSQL`.
+    /// Panics when rollback, exact cancellation, or reclaim invariants fail
+    /// against `PostgreSQL`.
     #[tokio::test]
     async fn superseded_cancellation_is_atomic_terminal_progress() {
         let (fixture, admin) = setup().await;
@@ -402,15 +438,15 @@ mod pg_tests {
                 .await
                 .expect("rollback cancellation");
         }
-        let rolled_back: (String, i64, i64) = sqlx::query_as(
-            "SELECT t.state,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_staging) FROM vala.forge_tasks t WHERE t.task_id=$1",
+        let rolled_back: (String, i64) = sqlx::query_as(
+            "SELECT t.state,(SELECT count(*) FROM vala.audit_staging) FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
         .await
         .expect("rolled-back cancellation state");
         assert_eq!(rolled_back.0, "claimed");
-        assert_eq!((rolled_back.1, rolled_back.2), (0, 0));
+        assert_eq!(rolled_back.1, 0);
 
         let mut commit = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -423,14 +459,14 @@ mod pg_tests {
             .commit()
             .await
             .expect("commit superseded cancellation");
-        let terminal: (String, Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
-            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands) FROM vala.forge_tasks t WHERE t.task_id=$1",
+        let terminal: (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT t.state,t.attempt_id,t.claimed_by FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
         .await
         .expect("committed cancellation state");
-        assert_eq!(terminal, ("cancelled".to_owned(), None, None, 1));
+        assert_eq!(terminal, ("cancelled".to_owned(), None, None));
         assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 0);
     }
 
@@ -480,11 +516,6 @@ mod pg_tests {
                 .expect("duplicate")
         );
         let owner = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
         let claim_limits = limits(1);
         let (left, right) = tokio::join!(
             tasks.claim_fair(owner, claim_limits, None),
@@ -521,16 +552,15 @@ mod pg_tests {
         assert!(tasks.retry(id, Uuid::now_v7(), owner, None).await.is_err());
     }
 
-    /// Proves the durable tenant cursor rotates strictly forward across a
-    /// scheduler takeover: after a leader claims one tenant's work and its fence
-    /// expires, a successor leader resumes at the next tenant. The worker cursor
-    /// is independent of scheduler leadership, so heartbeat expiry and reclaim
-    /// of the first claim do not rewind the ring.
+    /// Proves the durable worker tenant cursor rotates strictly forward across
+    /// an expired claim: after one worker claims a tenant's work and its claim
+    /// lease expires, the reclaim does not rewind the ring, so the next worker
+    /// resumes at the next tenant.
     ///
     /// # Panics
     /// Panics when `PostgreSQL` setup or a cursor assertion fails.
     #[tokio::test]
-    async fn scheduler_takeover_preserves_cursor() {
+    async fn worker_cursor_rotates_across_expired_claim_reclaim() {
         let (fixture, admin) = setup().await;
         let op = fixture.operator_pool();
         let tasks = ForgeTasks::new(op.clone());
@@ -549,11 +579,6 @@ mod pg_tests {
             .await
             .expect("b");
         let leader = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(leader, 30)
-            .await
-            .expect("leader")
-            .expect("fence");
         let claim_limits = ForgeClaimLimits {
             lease_seconds: 1,
             ..limits(1)
@@ -578,7 +603,6 @@ mod pg_tests {
                 .is_err(),
             "wrong owner cannot renew"
         );
-        sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire leader");
         sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1").bind(first.task_id).execute(&admin).await.expect("expire claim");
         assert!(
             tasks
@@ -589,11 +613,6 @@ mod pg_tests {
         );
         assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 1);
         let successor = Uuid::now_v7();
-        let _successor_fence = tasks
-            .acquire_scheduler(successor, 30)
-            .await
-            .expect("successor")
-            .expect("takeover fence");
         let second = tasks
             .claim_fair(successor, claim_limits, None)
             .await
@@ -629,11 +648,6 @@ mod pg_tests {
             .enqueue(&task(tenant, "independent", 63))
             .await
             .expect("independent task");
-        tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
         let claimed_first = tasks
             .claim_fair(owner, limits(4), None)
             .await
@@ -672,17 +686,12 @@ mod pg_tests {
             .expect("enqueue");
         sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{version}','99'::jsonb) WHERE task_id=$1").bind(task_id).execute(&admin).await.expect("corrupt plan");
         let owner = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
-        let scheduler_before: (i64, Option<Uuid>) = sqlx::query_as(
-            "SELECT fencing_token,last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        let cursor_before: (Option<Uuid>, chrono::DateTime<Utc>) = sqlx::query_as(
+            "SELECT last_tenant_id,updated_at FROM vala.forge_worker_claim_state WHERE singleton",
         )
         .fetch_one(&admin)
         .await
-        .expect("scheduler before");
+        .expect("cursor before");
         assert!(
             tasks.claim_fair(owner, limits(1), None).await.is_err(),
             "unknown persisted plan fails claim conversion"
@@ -699,16 +708,13 @@ mod pg_tests {
             ("ready".to_owned(), None, None),
             "malformed task claim rolled back"
         );
-        let scheduler_after: (i64, Option<Uuid>) = sqlx::query_as(
-            "SELECT fencing_token,last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        let cursor_after: (Option<Uuid>, chrono::DateTime<Utc>) = sqlx::query_as(
+            "SELECT last_tenant_id,updated_at FROM vala.forge_worker_claim_state WHERE singleton",
         )
         .fetch_one(&admin)
         .await
-        .expect("scheduler after");
-        assert_eq!(
-            scheduler_after, scheduler_before,
-            "cursor and generation rolled back"
-        );
+        .expect("cursor after");
+        assert_eq!(cursor_after, cursor_before, "worker cursor rolled back");
     }
 
     /// Proves Prepared replay and both lifecycle audit boundaries are atomic under rollback.
@@ -726,11 +732,6 @@ mod pg_tests {
             .await
             .expect("enqueue");
         let owner = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
         let (attempt, _) = claim_and_start(
             &tasks,
             id,
@@ -1053,12 +1054,17 @@ mod pg_tests {
         assert_eq!(taken.claimed_by, Some(successor));
     }
 
-    /// Proves success and successor demand share one caller-owned transaction.
+    /// Proves successful settlement belongs to the caller-owned transaction.
+    ///
+    /// A dropped transaction leaves the task Prepared; a committed one exposes
+    /// Succeeded and appends no audit, because settling evaluates no
+    /// permission. A no-op acknowledgement settles through the same path.
     ///
     /// # Panics
-    /// Panics when rollback exposes either effect or commit does not expose both.
+    /// Panics when rollback exposes the transition, commit does not expose it,
+    /// or settlement appends audit.
     #[tokio::test]
-    async fn terminal_success_atomically_requests_successor_demand() {
+    async fn terminal_success_is_caller_transactional_and_audit_free() {
         let (fixture, admin) = setup().await;
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
@@ -1116,14 +1122,14 @@ mod pg_tests {
             .await
             .expect("rollback tenant");
         tasks
-            .terminal_and_request_replan(
+            .terminal_success(
                 &mut rolled_back,
                 transition,
                 &table,
                 vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
             )
             .await
-            .expect("stage terminal and demand");
+            .expect("stage terminal success");
         drop(rolled_back);
         let state: String =
             sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
@@ -1132,13 +1138,6 @@ mod pg_tests {
                 .await
                 .expect("state after rollback");
         assert_eq!(state, "prepared");
-        let demand_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
-            .bind(tenant.as_uuid())
-            .bind(&table.table)
-            .fetch_one(&admin)
-            .await
-            .expect("demand after rollback");
-        assert_eq!(demand_count, 0);
 
         let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
@@ -1148,15 +1147,15 @@ mod pg_tests {
             .await
             .expect("commit tenant");
         tasks
-            .terminal_and_request_replan(
+            .terminal_success(
                 &mut committed,
                 transition,
                 &table,
                 vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
             )
             .await
-            .expect("commit terminal and demand");
-        committed.commit().await.expect("commit both effects");
+            .expect("commit terminal success");
+        committed.commit().await.expect("commit terminal success");
         let state: String =
             sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
                 .bind(task_id)
@@ -1164,20 +1163,13 @@ mod pg_tests {
                 .await
                 .expect("state after commit");
         assert_eq!(state, "succeeded");
-        let demand_generation: i64 = sqlx::query_scalar("SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
-            .bind(tenant.as_uuid())
-            .bind(&table.table)
-            .fetch_one(&admin)
-            .await
-            .expect("successor demand");
-        assert_eq!(demand_generation, 1);
         let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit after");
         assert_eq!(
             audit_after, audit_before,
-            "successor demand evaluates no permission, so it appends no audit"
+            "settlement evaluates no permission, so it appends no audit"
         );
 
         let noop_table = ForgeTaskTableIdentity::new(
@@ -1234,7 +1226,7 @@ mod pg_tests {
             .await
             .expect("no-op terminal tenant");
         tasks
-            .terminal_and_request_replan(
+            .terminal_success(
                 &mut noop_terminal,
                 ForgeTaskTransition {
                     task_id: noop_id,
@@ -1255,11 +1247,13 @@ mod pg_tests {
             .commit()
             .await
             .expect("commit no-op acknowledgement");
-        let acknowledged: (Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT acknowledged_snapshot_id,acknowledged_commit_count FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2",
-        ).bind(tenant.as_uuid()).bind(&noop_table.table).fetch_one(&admin).await
-            .expect("durable no-op acknowledgement");
-        assert_eq!(acknowledged, (Some(93), Some(7)));
+        let noop_state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(noop_id)
+                .fetch_one(&admin)
+                .await
+                .expect("no-op state");
+        assert_eq!(noop_state, "succeeded");
     }
 
     /// Proves bounded watermark/status failure modes, pruning safety, RLS, and grants.
@@ -1291,11 +1285,6 @@ mod pg_tests {
             .await
             .expect("terminal enqueue");
         let owner = Uuid::now_v7();
-        let _fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
         let first = tasks
             .claim_fair(owner, limits(4), None)
             .await
@@ -1457,279 +1446,19 @@ mod pg_tests {
         );
     }
 
-    /// Proves coalescing generations, CAS acknowledgement, fencing, RLS, grants, and no audit.
+    /// Proves the operator role can append platform decisions to tenant audit
+    /// staging and can do nothing else to it.
+    ///
+    /// Forge runs on the operator pool, so its grants are the boundary that
+    /// keeps maintenance from reading, rewriting, or forging tenant audit rows.
     ///
     /// # Panics
-    /// Panics when any durable demand invariant is violated.
+    /// Panics when a grant read fails or the operator role exceeds append-only
+    /// access to tenant audit staging.
     #[tokio::test]
-    async fn planning_demand_is_fenced_bounded_and_operational_only() {
+    async fn operator_cannot_read_or_mutate_tenant_audit_rows() {
         let (fixture, admin) = setup().await;
         let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let tenant = fixture.data_tenant_id();
-        let identity =
-            ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "demand").expect("identity");
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit before");
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant");
-        assert_eq!(
-            tasks
-                .upsert_hint(&mut conn, tenant, &identity)
-                .await
-                .expect("first"),
-            1
-        );
-        assert_eq!(
-            tasks
-                .upsert_hint(&mut conn, tenant, &identity)
-                .await
-                .expect("duplicate"),
-            2
-        );
-        assert!(
-            tasks
-                .upsert_hint(&mut conn, DataTenantId::new_v7(), &identity)
-                .await
-                .is_err()
-        );
-        conn.commit().await.expect("commit demand");
-        assert_eq!(
-            tasks
-                .upsert_periodic(tenant, &identity)
-                .await
-                .expect("periodic"),
-            3
-        );
-        let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("lease")
-            .expect("fence");
-        tasks
-            .renew_scheduler(owner, fence, StdDuration::from_secs(30))
-            .await
-            .expect("renew exact scheduler generation");
-        let generation_after_renewal: i64 = sqlx::query_scalar(
-            "SELECT fencing_token FROM vala.forge_scheduler_state WHERE singleton",
-        )
-        .fetch_one(&admin)
-        .await
-        .expect("read renewed scheduler generation");
-        assert_eq!(generation_after_renewal, fence);
-        let (listed, overflowed) = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("bounded list");
-        assert!(!overflowed);
-        assert_eq!(listed[0].generation, 3);
-        let captured = listed[0].clone();
-        let mismatched = task(DataTenantId::new_v7(), "demand", 41);
-        assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &captured,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&mismatched)
-                    }
-                )
-                .await
-                .is_err(),
-            "tenant mismatch must fail before any mutation"
-        );
-        let mismatched_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE plan_hash=$1")
-                .bind([41_u8; 32].as_slice())
-                .fetch_one(&admin)
-                .await
-                .expect("mismatch rollback count");
-        assert_eq!(mismatched_count, 0);
-        assert_eq!(
-            tasks
-                .upsert_periodic(tenant, &identity)
-                .await
-                .expect("newer"),
-            4
-        );
-        let exact = task(tenant, "demand", 42);
-        let stale_cursor_before: Option<Uuid> = sqlx::query_scalar(
-            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
-        )
-        .fetch_one(&admin)
-        .await
-        .expect("stale cursor before");
-        let stale_audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("stale audit before");
-        assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &captured,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact)
-                    }
-                )
-                .await
-                .is_err(),
-            "stale demand generation must abort the transaction"
-        );
-        let stale_task_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE plan_hash=$1")
-                .bind([42_u8; 32].as_slice())
-                .fetch_one(&admin)
-                .await
-                .expect("stale task rollback");
-        assert_eq!(stale_task_count, 0);
-        let stale_audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("stale audit after");
-        assert_eq!(stale_audit_after, stale_audit_before);
-        let stale_cursor_after: Option<Uuid> = sqlx::query_scalar(
-            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
-        )
-        .fetch_one(&admin)
-        .await
-        .expect("stale cursor after");
-        assert_eq!(stale_cursor_after, stale_cursor_before);
-        let (retryable, _) = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("retry list");
-        assert_eq!(retryable[0].generation, 4);
-        let successor = Uuid::now_v7();
-        sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire leader");
-        let successor_fence = tasks
-            .acquire_scheduler(successor, 30)
-            .await
-            .expect("takeover")
-            .expect("successor fence");
-        let stale_terminal = task(tenant, "demand", 44);
-        assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &retryable[0],
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&stale_terminal)
-                    }
-                )
-                .await
-                .is_err()
-        );
-        let stale_terminal_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE plan_hash=$1")
-                .bind([44_u8; 32].as_slice())
-                .fetch_one(&admin)
-                .await
-                .expect("stale task rollback");
-        assert_eq!(
-            stale_terminal_count, 0,
-            "fence loss rolls back terminal task and audit"
-        );
-        assert_eq!(
-            tasks
-                .enqueue_and_acknowledge(
-                    successor,
-                    successor_fence,
-                    &retryable[0],
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact)
-                    }
-                )
-                .await
-                .expect("successor ack")
-                .len(),
-            1
-        );
-        assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    successor,
-                    successor_fence,
-                    &retryable[0],
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact)
-                    }
-                )
-                .await
-                .is_err(),
-            "replayed acknowledged generation must fail without duplicates"
-        );
-        let committed_exact_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE plan_hash=$1")
-                .bind([42_u8; 32].as_slice())
-                .fetch_one(&admin)
-                .await
-                .expect("committed exact count");
-        assert_eq!(committed_exact_count, 1);
-        assert!(
-            tasks
-                .planning_demands(successor, successor_fence, 1)
-                .await
-                .expect("empty")
-                .0
-                .is_empty()
-        );
-        tasks
-            .upsert_periodic(tenant, &identity)
-            .await
-            .expect("terminal demand");
-        let terminal_demand = tasks
-            .planning_demands(successor, successor_fence, 1)
-            .await
-            .expect("terminal list")
-            .0
-            .remove(0);
-        let terminal = task(tenant, "demand", 43);
-        assert_eq!(
-            tasks
-                .enqueue_and_acknowledge(
-                    successor,
-                    successor_fence,
-                    &terminal_demand,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&terminal)
-                    }
-                )
-                .await
-                .expect("terminal ack")
-                .len(),
-            1
-        );
-        let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='ready'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("enqueued count");
-        assert_eq!(terminal_count, 2);
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit after");
-        assert_eq!(
-            audit_after, audit_before,
-            "demand coordination and enqueue emit no audit"
-        );
-        let forced: bool = sqlx::query_scalar("SELECT relforcerowsecurity FROM pg_class WHERE oid='vala.forge_planning_demands'::regclass").fetch_one(&admin).await.expect("forced RLS");
-        assert!(forced);
-        let grants: Vec<(String, String)> = sqlx::query_as("SELECT grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name='forge_planning_demands'").fetch_all(&admin).await.expect("grants");
-        assert!(
-            grants
-                .iter()
-                .any(|value| value.0 == "wyrd_app" && value.1 == "INSERT")
-        );
-        assert!(
-            !grants
-                .iter()
-                .any(|value| value.0 == "wyrd_app" && value.1 == "DELETE")
-        );
         let audit_grants: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name IN ('audit_chain_head','audit_staging')").fetch_all(&admin).await.expect("audit grants");
         assert!(
             !audit_grants
@@ -1766,400 +1495,6 @@ mod pg_tests {
                 .await
                 .is_err(),
             "operator cannot append tenant audit rows"
-        );
-        sqlx::query("INSERT INTO vala.forge_planning_demands(data_tenant_id,catalog_name,namespace_name,table_name,last_source) SELECT $1,'wyrd-redux','vala.bifrost','scale-'||g,'periodic' FROM generate_series(1,1000) g").bind(tenant.as_uuid()).execute(&admin).await.expect("scale demands");
-        sqlx::query("SET enable_seqscan=off")
-            .execute(&admin)
-            .await
-            .expect("force index visibility");
-        let plan: Vec<(String,)> = sqlx::query_as("EXPLAIN (FORMAT TEXT) SELECT data_tenant_id FROM vala.forge_planning_demands ORDER BY data_tenant_id,last_requested_at,catalog_name,namespace_name,table_name LIMIT 10").fetch_all(&admin).await.expect("explain");
-        assert!(
-            plan.iter()
-                .any(|line| line.0.contains("forge_planning_demands_ring")),
-            "bounded scale query can use the ring index: {plan:?}"
-        );
-    }
-
-    /// Proves failures after task, demand, and cursor mutations roll back the
-    /// complete fenced planning transaction.
-    ///
-    /// # Panics
-    /// Panics when failure injection or any rollback assertion fails.
-    #[tokio::test]
-    async fn enqueue_failure_after_each_atomic_step_rolls_back_everything() {
-        let (fixture, admin) = setup().await;
-        let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let tenant = fixture.data_tenant_id();
-        let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "step-failure")
-            .expect("identity");
-        let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
-        sqlx::query("CREATE FUNCTION vala.fail_forge_planning_step() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected Forge planning failure'; END $$")
-            .execute(&admin).await.expect("failure function");
-        let stages = [
-            (
-                "forge_planning_demands",
-                "CREATE TRIGGER forge_fail_step BEFORE DELETE ON vala.forge_planning_demands FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-            ),
-            (
-                "forge_scheduler_state",
-                "CREATE TRIGGER forge_fail_step BEFORE UPDATE ON vala.forge_scheduler_state FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-            ),
-            (
-                "forge_scheduler_state",
-                "CREATE CONSTRAINT TRIGGER forge_fail_step AFTER UPDATE ON vala.forge_scheduler_state DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-            ),
-        ];
-        for (index, (trigger_table, create_trigger)) in stages.into_iter().enumerate() {
-            tasks
-                .upsert_periodic(tenant, &identity)
-                .await
-                .expect("demand");
-            let demand = tasks
-                .planning_demands(owner, fence, 1)
-                .await
-                .expect("page")
-                .0
-                .remove(0);
-            let cursor_before: Option<Uuid> = sqlx::query_scalar(
-                "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
-            )
-            .fetch_one(&admin)
-            .await
-            .expect("cursor before");
-            let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-                .fetch_one(&admin)
-                .await
-                .expect("audit before");
-            sqlx::query(sqlx::AssertSqlSafe(create_trigger.to_owned()))
-                .execute(&admin)
-                .await
-                .expect("create trigger");
-            let hash = u8::try_from(80 + index).expect("bounded stage");
-            let terminal = task(tenant, "step-failure", hash);
-            assert!(
-                tasks
-                    .enqueue_and_acknowledge(
-                        owner,
-                        fence,
-                        &demand,
-                        ForgeEnqueueBatch {
-                            executable: std::slice::from_ref(&terminal)
-                        }
-                    )
-                    .await
-                    .is_err(),
-                "enqueue stage {index} must fail"
-            );
-            let drop_trigger = format!("DROP TRIGGER forge_fail_step ON vala.{trigger_table}");
-            sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-                .execute(&admin)
-                .await
-                .expect("drop trigger");
-            let task_count: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE plan_hash=$1")
-                    .bind([hash; 32].as_slice())
-                    .fetch_one(&admin)
-                    .await
-                    .expect("task count");
-            assert_eq!(task_count, 0, "task stage {index}");
-            let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-                .fetch_one(&admin)
-                .await
-                .expect("audit after");
-            assert_eq!(audit_after, audit_before, "audit stage {index}");
-            let generation: Option<i64> = sqlx::query_scalar("SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4").bind(tenant.as_uuid()).bind(&identity.catalog).bind(&identity.namespace).bind(&identity.table).fetch_optional(&admin).await.expect("demand generation");
-            assert_eq!(generation, Some(demand.generation), "demand stage {index}");
-            let cursor_after: Option<Uuid> = sqlx::query_scalar(
-                "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
-            )
-            .fetch_one(&admin)
-            .await
-            .expect("cursor after");
-            assert_eq!(cursor_after, cursor_before, "cursor stage {index}");
-        }
-        sqlx::query("DROP FUNCTION vala.fail_forge_planning_step()")
-            .execute(&admin)
-            .await
-            .expect("drop failure function");
-    }
-
-    /// One tenant's repeatedly re-demanded table cannot starve its siblings.
-    ///
-    /// Roster repair re-requests every table it knows about on each pass, in a
-    /// stable order, and each re-request resets `last_requested_at`. The table
-    /// refreshed first therefore stays its tenant's oldest demand forever, so a
-    /// page that carried only that one demand per tenant would never reach the
-    /// tables behind it. The page must reach them within one pass whenever the
-    /// bound has room.
-    ///
-    /// # Panics
-    /// Panics when a demanded table is absent from a page with room for it.
-    #[tokio::test]
-    async fn planning_demand_page_reaches_every_table_of_one_tenant() {
-        let (fixture, _admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let tenant = fixture.data_tenant_id();
-        let starved = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "starved")
-            .expect("starved identity");
-        let noisy = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "noisy")
-            .expect("noisy identity");
-        tasks
-            .upsert_periodic(tenant, &starved)
-            .await
-            .expect("starved demand");
-        tasks
-            .upsert_periodic(tenant, &noisy)
-            .await
-            .expect("noisy demand");
-        let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("lease")
-            .expect("fence");
-        for _ in 0..3 {
-            tasks
-                .upsert_periodic(tenant, &noisy)
-                .await
-                .expect("noisy re-demand");
-            tasks
-                .upsert_periodic(tenant, &starved)
-                .await
-                .expect("starved re-demand");
-            let page = tasks
-                .planning_demands(owner, fence, 8)
-                .await
-                .expect("tenant page")
-                .0;
-            assert!(
-                page.iter()
-                    .any(|demand| demand.table_ref.table == starved.table),
-                "a re-demanded sibling must not hold the tenant's only planning slot"
-            );
-        }
-    }
-
-    /// Proves tenant-qualified exclusion before ranking/overflow, live-generation
-    /// continuity, strict-after rotation, takeover, RLS, and malformed-row refusal.
-    ///
-    /// # Panics
-    /// Panics when the durable cursor or isolation boundary deviates.
-    #[tokio::test]
-    async fn planning_demand_cursor_bounds_hot_tenant_across_takeover() {
-        let (fixture, admin) = setup().await;
-        let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let hot = fixture.data_tenant_id();
-        let cold = DataTenantId::new_v7();
-        sqlx::query("INSERT INTO platform.tenants(data_tenant_id,slug,display_name,status) VALUES ($1,$2,$3,'active')").bind(cold.as_uuid()).bind(format!("cold-{cold}")).bind("cold").execute(&admin).await.expect("cold tenant");
-        let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "rotation")
-            .expect("identity");
-        tasks
-            .upsert_periodic(hot, &identity)
-            .await
-            .expect("hot demand");
-        let hot_second =
-            ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "rotation-hot-second")
-                .expect("second hot identity");
-        tasks
-            .upsert_periodic(hot, &hot_second)
-            .await
-            .expect("second hot demand");
-        tasks
-            .upsert_periodic(cold, &identity)
-            .await
-            .expect("cold demand");
-        let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("lease")
-            .expect("fence");
-        assert_eq!(
-            tasks
-                .acquire_scheduler(owner, 30)
-                .await
-                .expect("live reacquisition"),
-            Some(fence),
-            "the same live ownership generation must retain its local cycle"
-        );
-        let excluded = std::collections::BTreeSet::from([(hot, identity.clone())]);
-        let (eligible, overflow) = tasks
-            .planning_demands_excluding(owner, fence, 2, &excluded)
-            .await
-            .expect("cycle-aware tenant page");
-        assert!(!overflow, "excluded demand must not affect overflow");
-        assert_eq!(eligible.len(), 2);
-        assert!(
-            eligible
-                .iter()
-                .any(|d| d.data_tenant_id == hot && d.table_ref == hot_second)
-        );
-        assert!(
-            eligible
-                .iter()
-                .any(|d| d.data_tenant_id == cold && d.table_ref == identity),
-            "exclusion must include the tenant, not merely the logical table"
-        );
-        assert!(
-            tasks
-                .planning_demands_excluding(owner, fence, 1, &excluded)
-                .await
-                .expect("bounded eligible page")
-                .1
-        );
-        let excluded = std::collections::BTreeSet::from([
-            (hot, identity.clone()),
-            (hot, hot_second.clone()),
-            (cold, identity.clone()),
-        ]);
-        let (empty, overflow) = tasks
-            .planning_demands_excluding(owner, fence, 1, &excluded)
-            .await
-            .expect("exhausted traversal with durable demand remaining");
-        assert!(empty.is_empty() && !overflow);
-        let page = tasks
-            .planning_demands(owner, fence, 2)
-            .await
-            .expect("tenant page")
-            .0;
-        assert_eq!(page.len(), 2);
-        assert_ne!(
-            page[0].data_tenant_id, page[1].data_tenant_id,
-            "one hot tenant cannot fill the bounded page"
-        );
-        let first = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("first")
-            .0
-            .remove(0);
-        let retained = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("retry after interrupted planning")
-            .0
-            .remove(0);
-        assert_eq!(
-            retained.data_tenant_id, first.data_tenant_id,
-            "planning failure or cancellation without acknowledgement retains demand"
-        );
-        let status = tasks
-            .planning_demand_status()
-            .await
-            .expect("authoritative demand status");
-        assert_eq!(
-            status.demands, 3,
-            "the demand snapshot counts both hot tables and the cold table, not one bounded page"
-        );
-        assert!(status.oldest_requested_at.is_some());
-        tasks
-            .upsert_periodic(first.data_tenant_id, &first.table_ref)
-            .await
-            .expect("concurrent newer generation");
-        assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &first,
-                    ForgeEnqueueBatch { executable: &[] }
-                )
-                .await
-                .is_err(),
-            "a stale demand generation fails the atomic acknowledgement"
-        );
-        let current = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("current generation after rollback")
-            .0
-            .remove(0);
-        assert_eq!(
-            current.data_tenant_id, first.data_tenant_id,
-            "a stale generation conflict leaves the tenant cursor unchanged"
-        );
-        assert_eq!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &current,
-                    ForgeEnqueueBatch { executable: &[] }
-                )
-                .await
-                .expect("acknowledge current generation")
-                .len(),
-            0
-        );
-        let second = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("second")
-            .0
-            .remove(0);
-        assert_ne!(
-            first.data_tenant_id, second.data_tenant_id,
-            "acknowledging the current generation advances to the other tenant within bound two"
-        );
-        sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second'").execute(&admin).await.expect("expire");
-        assert!(
-            tasks.planning_demands(owner, fence, 1).await.is_err(),
-            "expired leadership cannot appear as a live empty demand page"
-        );
-        assert!(
-            tasks
-                .renew_scheduler(owner, fence, StdDuration::from_secs(30))
-                .await
-                .is_err(),
-            "expired leadership cannot be renewed"
-        );
-        let successor = Uuid::now_v7();
-        let successor_fence = tasks
-            .acquire_scheduler(successor, 30)
-            .await
-            .expect("takeover")
-            .expect("fence");
-        assert!(
-            tasks.planning_demands(owner, fence, 1).await.is_err(),
-            "replaced leadership remains stale"
-        );
-        let resumed = tasks
-            .planning_demands(successor, successor_fence, 1)
-            .await
-            .expect("resumed")
-            .0
-            .remove(0);
-        assert_eq!(
-            resumed.data_tenant_id, second.data_tenant_id,
-            "takeover preserves cursor-selected pending tenant"
-        );
-        let mut other = TenantConn::acquire(fixture.app_pool(), DataTenantId::new_v7())
-            .await
-            .expect("other tenant conn");
-        let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_planning_demands")
-            .fetch_one(&mut **other.transaction())
-            .await
-            .expect("RLS read");
-        assert_eq!(
-            visible, 0,
-            "forced RLS denies cross-tenant demand visibility"
-        );
-        other.commit().await.expect("other commit");
-        sqlx::query("ALTER TABLE vala.forge_planning_demands DROP CONSTRAINT forge_planning_demands_last_source_check").execute(&admin).await.expect("drop source check");
-        sqlx::query("UPDATE vala.forge_planning_demands SET last_source='malformed' WHERE data_tenant_id=$1").bind(second.data_tenant_id.as_uuid()).execute(&admin).await.expect("corrupt source");
-        assert!(
-            tasks
-                .planning_demands(successor, successor_fence, 2)
-                .await
-                .is_err(),
-            "malformed persisted demand fails closed"
         );
     }
 
@@ -2528,24 +1863,17 @@ mod pg_tests {
     /// the same handoff, so a source that only one of them rejects still reaches
     /// durable cleanup state. Each call seeds exactly one malformed source,
     /// drives both paths, and proves the enqueue transaction left no cleanup
-    /// row, no audit, and an untouched demand behind.
+    /// row and no audit behind.
     ///
     /// # Panics
     ///
     /// Panics when a diagnostic read fails or either path accepts the source.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the assertion needs the whole durable admission context and owns no state of its own"
-    )]
     async fn assert_malformed_handoff_source_is_refused(
-        fixture: &PgFixture,
         admin: &PgPool,
         tasks: &ForgeTasks,
         tenant: DataTenantId,
         table: &ForgeClaimTable,
         identity: &ForgeTaskTableIdentity,
-        owner: Uuid,
-        fence: i64,
         evidence: &ForgeTaskEvidence,
         axis: &str,
     ) {
@@ -2557,23 +1885,6 @@ mod pg_tests {
                 .is_err(),
             "the bounded handoff read accepted a source with {axis}"
         );
-
-        let mut hint = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("hint conn");
-        tasks
-            .upsert_hint(&mut hint, tenant, identity)
-            .await
-            .expect("demand");
-        hint.commit().await.expect("commit hint");
-        let (demands, _) = tasks
-            .planning_demands(owner, fence, 4)
-            .await
-            .expect("demands");
-        let demand = demands
-            .into_iter()
-            .find(|value| value.table_ref == *identity)
-            .expect("malformed source still raises a cleanup demand");
 
         let mut cleanup = task(tenant, "cleanup", 9);
         cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
@@ -2604,17 +1915,7 @@ mod pg_tests {
         let before_cleanup = cleanup_rows().await;
         let before_audits = audit_rows().await;
         assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &demand,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&cleanup)
-                    }
-                )
-                .await
-                .is_err(),
+            tasks.enqueue(&cleanup).await.is_err(),
             "the locked enqueue admission accepted a source with {axis}"
         );
         assert_eq!(
@@ -2627,34 +1928,29 @@ mod pg_tests {
             before_audits,
             "a refused {axis} source appends no enqueue audit"
         );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4")
-                .bind(tenant.as_uuid())
-                .bind(&identity.catalog)
-                .bind(&identity.namespace)
-                .bind(&identity.table)
-                .fetch_one(admin)
-                .await
-                .expect("demand survives"),
-            demand.generation,
-            "a refused {axis} source leaves the demand unacknowledged"
-        );
-
         sqlx::query("DELETE FROM vala.forge_tasks WHERE task_id=$1")
             .bind(source)
             .execute(admin)
             .await
             .expect("drop the malformed source");
-        sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4")
-            .bind(tenant.as_uuid())
-            .bind(&identity.catalog)
-            .bind(&identity.namespace)
-            .bind(&identity.table)
-            .execute(admin)
-            .await
-            .expect("drop the demand this subcase raised");
     }
 
+    /// Proves the expired-cleanup handoff and candidate lifecycle are exact and
+    /// atomic.
+    ///
+    /// The bounded handoff read and locked enqueue admit exactly one cleanup
+    /// task per consumed expiration source, refuse payload-less, malformed,
+    /// altered, or competing plans, and replay an identical plan read-only.
+    /// Candidate preparation is refused while an Oracle read holds the table, a
+    /// prepared tuple replays read-only, a stale owner can neither prepare nor
+    /// settle, and only a confirmed deletion advances the frontier while
+    /// refusal and uncertainty audit without moving it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, any SQL step fails unexpectedly,
+    /// or any admission, refusal, replay, frontier, or audit outcome differs
+    /// from the contract above.
     #[tokio::test]
     async fn expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited() {
         let (fixture, admin) = setup().await;
@@ -2666,12 +1962,12 @@ mod pg_tests {
         let candidates = vec![cleanup_candidate("a"), cleanup_candidate("b")];
         let source = seed_expiration_source(&admin, tenant, &table, &candidates).await;
 
-        // The generic enqueue path can never create a cleanup task.
+        // A cleanup plan that carries no handoff payload is refused.
         let mut generic = task(tenant, "cleanup", 3);
         generic.strategy = ForgeTaskStrategy::ExpiredCleanup;
         assert!(
             tasks.enqueue(&generic).await.is_err(),
-            "generic enqueue refuses expired cleanup"
+            "enqueue refuses expired cleanup without a handoff payload"
         );
 
         // The bounded handoff read names exactly that source and its candidates.
@@ -2706,29 +2002,7 @@ mod pg_tests {
                 .is_err()
         );
 
-        // The cleanup task is inserted and the demand acknowledged in one pass.
-        let mut hint = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("hint conn");
-        tasks
-            .upsert_hint(&mut hint, tenant, &identity)
-            .await
-            .expect("demand");
-        hint.commit().await.expect("commit hint");
-        let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler lease")
-            .expect("fence");
-        let (demands, _) = tasks
-            .planning_demands(owner, fence, 4)
-            .await
-            .expect("demands");
-        let demand = demands
-            .into_iter()
-            .find(|value| value.table_ref == identity)
-            .expect("cleanup demand");
+        // The cleanup task is admitted against its locked source.
         let mut cleanup = task(tenant, "cleanup", 5);
         cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
         cleanup.base_snapshot_id = payload.committed_snapshot_id;
@@ -2747,41 +2021,38 @@ mod pg_tests {
         divergent_payload.cleanup_candidates = shifted;
         divergent.plan.parameters = divergent_payload.to_value();
         assert!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &demand,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&divergent)
-                    }
-                )
-                .await
-                .is_err(),
+            matches!(
+                tasks.enqueue(&divergent).await,
+                Err(SqlError::Conflict { .. })
+            ),
             "a candidate vector that disagrees with its source is refused"
         );
 
+        let cleanup_id = tasks.enqueue(&cleanup).await.expect("enqueue cleanup");
         assert_eq!(
-            tasks
-                .enqueue_and_acknowledge(
-                    owner,
-                    fence,
-                    &demand,
-                    ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&cleanup)
-                    }
-                )
-                .await
-                .expect("enqueue cleanup")
-                .len(),
-            1
+            tasks.enqueue(&cleanup).await.expect("replay cleanup"),
+            cleanup_id,
+            "an identical-plan replay resolves to the admitted task"
         );
-        let cleanup_id: Uuid = sqlx::query_scalar(
-            "SELECT task_id FROM vala.forge_tasks WHERE strategy='expired_cleanup'",
-        )
-        .fetch_one(&admin)
-        .await
-        .expect("cleanup task id");
+        let mut conflicting = divergent.clone();
+        conflicting.plan_hash = [6; 32];
+        assert!(
+            matches!(
+                tasks.enqueue(&conflicting).await,
+                Err(SqlError::Conflict { .. })
+            ),
+            "a second, different plan for a consumed source is refused"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM vala.forge_tasks WHERE strategy='expired_cleanup'",
+            )
+            .fetch_one(&admin)
+            .await
+            .expect("cleanup row count"),
+            1,
+            "the handoff admits exactly one cleanup task"
+        );
 
         sqlx::query("DELETE FROM vala.forge_tasks WHERE task_id=$1")
             .bind(source)
@@ -2824,7 +2095,7 @@ mod pg_tests {
             (&foreign_table, "a candidate bound to another table"),
         ] {
             assert_malformed_handoff_source_is_refused(
-                &fixture, &admin, &tasks, tenant, &table, &identity, owner, fence, evidence, axis,
+                &admin, &tasks, tenant, &table, &identity, evidence, axis,
             )
             .await;
         }
@@ -2846,20 +2117,63 @@ mod pg_tests {
             .await
             .expect("claim cleanup task");
 
-        let index = 0_u32;
-        assert_eq!(
-            tasks
-                .prepare_expired_cleanup_candidate(
+        // An active Oracle read on the table refuses candidate preparation
+        // under the table's maintenance authority until the read releases.
+        let reader = Uuid::now_v7();
+        sqlx::query("INSERT INTO vala.oracle_active_table_reads (data_tenant_id,query_id,table_uid,catalog_name,namespace_name,table_name,node_id,fencing_token,acquired_at,abandon_after) VALUES ($1,$2,$3,$4,$5,$6,$7,1,now(),now()+interval '6 hours')")
+            .bind(tenant.as_uuid())
+            .bind(reader)
+            .bind(table.table_uid.as_slice())
+            .bind(&table.catalog_name)
+            .bind(&table.namespace_name)
+            .bind(&table.table_name)
+            .bind(Uuid::now_v7())
+            .execute(&admin)
+            .await
+            .expect("seed an active table read");
+        assert!(
+            matches!(
+                prepare_exclusively(
+                    fixture.app_pool(),
+                    &tasks,
                     tenant,
                     ExpiredCleanupCandidateRequest {
                         authority: &authority,
                         table: &table,
-                        index,
+                        index: 0,
                         candidate: &candidates[0]
                     },
                 )
-                .await
-                .expect("prepare candidate zero"),
+                .await,
+                Err(SqlError::Conflict { .. })
+            ),
+            "an active table read refuses cleanup preparation"
+        );
+        assert!(
+            evidence_of(&admin, cleanup_id).await.is_none(),
+            "the refused preparation wrote no evidence"
+        );
+        sqlx::query("DELETE FROM vala.oracle_active_table_reads WHERE query_id=$1")
+            .bind(reader)
+            .execute(&admin)
+            .await
+            .expect("release the active table read");
+
+        let index = 0_u32;
+        assert_eq!(
+            prepare_exclusively(
+                fixture.app_pool(),
+                &tasks,
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index,
+                    candidate: &candidates[0]
+                },
+            )
+            .await
+            .expect("prepare candidate zero"),
             ForgeTaskTransitionOutcome::Applied
         );
         let prepared = evidence_of(&admin, cleanup_id).await.expect("evidence");
@@ -2869,18 +2183,19 @@ mod pg_tests {
 
         // The exact already-prepared tuple replays read-only.
         assert_eq!(
-            tasks
-                .prepare_expired_cleanup_candidate(
-                    tenant,
-                    ExpiredCleanupCandidateRequest {
-                        authority: &authority,
-                        table: &table,
-                        index: 0,
-                        candidate: &candidates[0]
-                    },
-                )
-                .await
-                .expect("replay preparation"),
+            prepare_exclusively(
+                fixture.app_pool(),
+                &tasks,
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index: 0,
+                    candidate: &candidates[0]
+                },
+            )
+            .await
+            .expect("replay preparation"),
             ForgeTaskTransitionOutcome::AlreadyApplied
         );
 
@@ -2925,18 +2240,19 @@ mod pg_tests {
         assert_eq!(advanced.prepared_candidate_index, None);
 
         // Refusal and uncertainty audit without moving the frontier.
-        tasks
-            .prepare_expired_cleanup_candidate(
-                tenant,
-                ExpiredCleanupCandidateRequest {
-                    authority: &authority,
-                    table: &table,
-                    index: 1,
-                    candidate: &candidates[1],
-                },
-            )
-            .await
-            .expect("prepare candidate one");
+        prepare_exclusively(
+            fixture.app_pool(),
+            &tasks,
+            tenant,
+            ExpiredCleanupCandidateRequest {
+                authority: &authority,
+                table: &table,
+                index: 1,
+                candidate: &candidates[1],
+            },
+        )
+        .await
+        .expect("prepare candidate one");
         for outcome in [
             ExpiredCleanupOutcome::Refused,
             ExpiredCleanupOutcome::Uncertain,
@@ -3060,41 +2376,20 @@ mod pg_tests {
             .expect("state read")
     }
 
-    /// Plans one periodic demand generation and enqueues `executable` against it.
+    /// Admits one accepted orphan-cleanup attempt exactly as the leader does.
     ///
-    /// Returns the strategies actually inserted, exactly as the scheduler sees
-    /// them.
+    /// Returns whether the insert recorded a new claimed attempt; `false` is
+    /// the coalesced case where another nonterminal orphan task already holds
+    /// the table.
     ///
     /// # Panics
-    /// Panics when the demand cannot be requested, listed, or acknowledged.
-    async fn plan_periodic(
-        tasks: &ForgeTasks,
-        owner: Uuid,
-        fence: i64,
-        tenant: DataTenantId,
-        executable: &NewForgeTask,
-    ) -> Vec<ForgeTaskStrategy> {
+    /// Panics when the admission statement fails.
+    async fn admit_orphan(tasks: &ForgeTasks, owner: Uuid, executable: &NewForgeTask) -> bool {
         tasks
-            .upsert_periodic(tenant, &executable.table_ref)
+            .insert_claimed(Uuid::now_v7(), executable, owner, 30)
             .await
-            .expect("periodic demand");
-        let demand = tasks
-            .planning_demands(owner, fence, 1)
-            .await
-            .expect("demand page")
-            .0
-            .remove(0);
-        tasks
-            .enqueue_and_acknowledge(
-                owner,
-                fence,
-                &demand,
-                ForgeEnqueueBatch {
-                    executable: std::slice::from_ref(executable),
-                },
-            )
-            .await
-            .expect("enqueue and acknowledge")
+            .expect("orphan admission")
+            .is_some()
     }
 
     /// Reads every nonterminal orphan-cleanup task for `table` as `(task_id, plan_hash, plan)`.
@@ -3115,14 +2410,14 @@ mod pg_tests {
     /// Every periodic cycle derives a fresh age cutoff and therefore a fresh
     /// plan hash, so the exact-plan idempotency key alone would let the backlog
     /// grow without bound while the first task waits. The partial uniqueness
-    /// invariant coalesces the later demand onto the pending task inside the
-    /// same acknowledgement transaction, without a racy preflight read, and a
-    /// terminal task stops blocking its successor.
+    /// invariant coalesces the later admission onto the pending task inside the
+    /// same insert, without a racy preflight read, and a terminal task stops
+    /// blocking its successor.
     ///
     /// # Panics
     /// Panics when `PostgreSQL` setup or any invariant assertion fails.
     #[tokio::test]
-    async fn orphan_cleanup_demand_coalesces_onto_one_nonterminal_task() {
+    async fn orphan_cleanup_admission_coalesces_onto_one_nonterminal_task() {
         let (fixture, admin) = setup().await;
         let op = fixture.operator_pool();
         let tasks = ForgeTasks::new(op.clone());
@@ -3130,40 +2425,26 @@ mod pg_tests {
         let table = "coalesce";
         let prefix = format!("tenants/{tenant}/bifrost/{table}/data/forge/v1");
         let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
-        let demand_count = || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
-                .bind(tenant.as_uuid()).bind(table).fetch_one(&admin).await.expect("demand count")
-        };
 
-        // 1. The first plan inserts one ready task.
+        // 1. The first admission records one claimed attempt.
         let first = NewForgeTask {
             plan_hash: [1; 32],
             ..orphan_task(tenant, table, &prefix, 1_700_000_000_000)
         };
-        assert_eq!(
-            plan_periodic(&tasks, owner, fence, tenant, &first).await,
-            vec![ForgeTaskStrategy::OrphanCleanup]
-        );
+        assert!(admit_orphan(&tasks, owner, &first).await);
         let pending = nonterminal_orphan_tasks(&admin, tenant, table).await;
         assert_eq!(pending.len(), 1);
         let (first_id, first_hash, first_plan) = pending[0].clone();
         assert_eq!(first_hash, vec![1; 32]);
 
-        // 2-5. A later demand with a fresh cutoff and hash is acknowledged
-        // without inserting, and the pending task is untouched.
+        // 2-5. A later admission with a fresh cutoff and hash inserts nothing,
+        // and the pending task is untouched.
         let second = NewForgeTask {
             plan_hash: [2; 32],
             ..orphan_task(tenant, table, &prefix, 1_700_000_060_000)
         };
         assert!(
-            plan_periodic(&tasks, owner, fence, tenant, &second)
-                .await
-                .is_empty(),
+            !admit_orphan(&tasks, owner, &second).await,
             "a fresh cutoff coalesces onto the pending orphan task"
         );
         assert_eq!(
@@ -3171,28 +2452,12 @@ mod pg_tests {
             vec![(first_id, first_hash.clone(), first_plan.clone())],
             "coalescing leaves the stored task id, cutoff, plan, and hash unchanged"
         );
-        assert_eq!(
-            demand_count().await,
-            0,
-            "the coalesced demand is acknowledged"
-        );
-        let cursor: Option<Uuid> = sqlx::query_scalar(
-            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
-        )
-        .fetch_one(&admin)
-        .await
-        .expect("cursor");
-        assert_eq!(
-            cursor,
-            Some(tenant.as_uuid()),
-            "coalescing advances the cursor"
-        );
 
         // 6. Concurrent insertion cannot create two nonterminal orphan tasks.
         // Once the first task is terminal, an uncommitted competing row holds
-        // the invariant while the scheduler's insert blocks on it; when the
-        // competitor commits, the scheduler's insert is skipped, not errored.
-        sqlx::query("UPDATE vala.forge_tasks SET state='cancelled' WHERE task_id=$1")
+        // the invariant while the leader's insert blocks on it; when the
+        // competitor commits, the leader's insert is skipped, not errored.
+        sqlx::query("UPDATE vala.forge_tasks SET state='cancelled',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL WHERE task_id=$1")
             .bind(first_id)
             .execute(&admin)
             .await
@@ -3206,9 +2471,9 @@ mod pg_tests {
             plan_hash: [4; 32],
             ..orphan_task(tenant, table, &prefix, 1_700_000_120_000)
         };
-        let scheduler = tokio::spawn({
+        let leader = tokio::spawn({
             let tasks = tasks.clone();
-            async move { plan_periodic(&tasks, owner, fence, tenant, &racing).await }
+            async move { admit_orphan(&tasks, owner, &racing).await }
         });
         let mut blocked = false;
         for _ in 0..500 {
@@ -3223,16 +2488,15 @@ mod pg_tests {
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        assert!(blocked, "the scheduler insert waits on the competing row");
+        assert!(blocked, "the leader insert waits on the competing row");
         competitor.commit().await.expect("competitor commit");
         assert!(
-            scheduler.await.expect("scheduler task").is_empty(),
+            !leader.await.expect("leader task"),
             "the racing insert coalesces once the competitor commits"
         );
         let survivors = nonterminal_orphan_tasks(&admin, tenant, table).await;
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].0, competitor_id);
-        assert_eq!(demand_count().await, 0);
 
         // 7. A terminal task no longer blocks a fresh-cutoff successor.
         sqlx::query("UPDATE vala.forge_tasks SET state='succeeded' WHERE task_id=$1")
@@ -3244,10 +2508,7 @@ mod pg_tests {
             plan_hash: [5; 32],
             ..orphan_task(tenant, table, &prefix, 1_700_000_180_000)
         };
-        assert_eq!(
-            plan_periodic(&tasks, owner, fence, tenant, &successor).await,
-            vec![ForgeTaskStrategy::OrphanCleanup]
-        );
+        assert!(admit_orphan(&tasks, owner, &successor).await);
         let successors = nonterminal_orphan_tasks(&admin, tenant, table).await;
         assert_eq!(successors.len(), 1);
         assert_eq!(successors[0].1, vec![5; 32]);
@@ -3365,11 +2626,7 @@ mod pg_tests {
             .await
             .expect("orphan cleanup enqueue");
         let owner = Uuid::now_v7();
-        let fence = tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
+        let fence = 1_i64;
         let table = ForgeClaimTable {
             table_uid: [7_u8; 16],
             catalog_name: "wyrd-redux".to_owned(),
@@ -4047,156 +3304,142 @@ mod pg_tests {
         let _ = (ordinary, bare);
     }
 
-    /// The telemetry snapshot reports exact demand and exact pending work.
+    /// Accepted work is recorded already claimed, and one table admits one attempt.
     ///
-    /// Demand and pending tasks are two different populations: the demand
-    /// count is every unacknowledged row with its earliest request time, while
-    /// pending work counts only `ready` and `retryable` task rows per strategy
-    /// with their earliest `ready_at`. A claimed, running, prepared, or
-    /// terminal row is owned or finished and must not appear as queued work,
-    /// and a strategy with nothing pending must produce no row at all rather
-    /// than a stale one.
+    /// The leader or accepting executor chooses Forge work; the row only
+    /// records the attempt. The insert must return the claimed attempt under
+    /// the caller's task id, refuse a second active attempt on the same table
+    /// without error, refuse to duplicate that table's queued retry, and admit
+    /// a different table.
     ///
     /// # Panics
-    ///
-    /// Panics when the fixture, seeding, or either aggregate read fails, or
-    /// when a snapshot disagrees with the durable rows.
+    /// Panics when the claimed row is missing, unclaimed, or a busy table admits
+    /// a second attempt.
     #[tokio::test]
-    async fn forge_telemetry_snapshot_reports_exact_demand_and_pending_work() {
+    async fn insert_claimed_records_one_active_attempt_per_table() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let task_id = Uuid::now_v7();
+
+        let claim = tasks
+            .insert_claimed(task_id, &task(tenant, "events", 1), owner, 30)
+            .await
+            .expect("insert claimed")
+            .expect("idle table accepts the attempt");
+        assert_eq!(claim.task_id, task_id);
+        assert_eq!(claim.state, ForgeTaskState::Claimed);
+        assert_eq!(claim.claimed_by, Some(owner));
+        assert!(claim.attempt_id.is_some() && claim.claim_expires_at.is_some());
+
+        let busy = tasks
+            .insert_claimed(Uuid::now_v7(), &task(tenant, "events", 2), owner, 30)
+            .await
+            .expect("busy insert");
+        assert!(busy.is_none(), "one active attempt per table");
+
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state='retryable', attempt_id=NULL, claimed_by=NULL, \
+             claim_expires_at=NULL, failure_class='transient_coordination' WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .execute(fixture.operator_pool().pool())
+        .await
+        .expect("attempt settles retryable");
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "events", 5), owner, 30)
+                .await
+                .expect("queued insert")
+                .is_none(),
+            "queued work for the same table and strategy is retried, not duplicated"
+        );
+
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "spans", 3), owner, 30)
+                .await
+                .expect("other table")
+                .is_some()
+        );
+        assert!(
+            tasks
+                .insert_claimed(Uuid::now_v7(), &task(tenant, "logs", 4), owner, 0)
+                .await
+                .is_err(),
+            "a zero lease is refused"
+        );
+    }
+    /// A fair claim that loses a table's active slot to a concurrent accepted
+    /// attempt claims nothing instead of failing.
+    ///
+    /// The claim's snapshot cannot see an attempt another transaction is still
+    /// inserting, so it selects the table's queued task and then waits on the
+    /// one-active-attempt index. Once that attempt commits, the claim must
+    /// report nothing claimable; surfacing the unique violation stops the
+    /// worker loop that called it.
+    ///
+    /// # Panics
+    /// Panics when the claim errors, claims the busy table, or never blocks on
+    /// the competing attempt.
+    #[tokio::test]
+    async fn fair_claim_yields_table_to_concurrent_accepted_attempt() {
         let (fixture, admin) = setup().await;
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
+        tasks
+            .enqueue(&task(tenant, "events", 1))
+            .await
+            .expect("queued task");
+        let accepted = tasks
+            .enqueue(&task(tenant, "events", 2))
+            .await
+            .expect("second task on the same table");
 
-        for table in ["demand-old", "demand-new", "demand-third"] {
-            let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", table)
-                .expect("demand identity");
-            tasks
-                .upsert_periodic(tenant, &identity)
-                .await
-                .expect("planning demand");
-        }
-        let oldest_demand = Utc::now() - Duration::hours(3);
+        let mut competing = fixture
+            .operator_pool()
+            .pool()
+            .begin()
+            .await
+            .expect("competing transaction");
         sqlx::query(
-            "UPDATE vala.forge_planning_demands SET first_requested_at=$1 WHERE table_name='demand-old'",
+            "UPDATE vala.forge_tasks SET state='claimed', attempt_id=$2, claimed_by=$2, \
+             claim_expires_at=statement_timestamp() + interval '30 seconds' WHERE task_id=$1",
         )
-        .bind(oldest_demand)
-        .execute(&admin)
+        .bind(accepted)
+        .bind(Uuid::now_v7())
+        .execute(&mut *competing)
         .await
-        .expect("age the oldest demand");
+        .expect("competing attempt takes the table's active slot");
 
-        // Two pending rows per strategy for the three strategies that stay
-        // queued, plus one row each parked in every non-pending state.
-        let pending_strategies = [
-            ForgeTaskStrategy::SmallFiles,
-            ForgeTaskStrategy::SnapshotExpiry,
-            ForgeTaskStrategy::ScribePromotion,
-        ];
-        let oldest_ready = Utc::now() - Duration::hours(2);
-        let mut hash = 1_u8;
-        for (index, strategy) in pending_strategies.into_iter().enumerate() {
-            for suffix in ["ready", "retryable"] {
-                let table = format!("pending-{index}-{suffix}");
-                let seed = NewForgeTask {
-                    strategy,
-                    ..task(tenant, &table, hash)
-                };
-                hash += 1;
-                let task_id = tasks.enqueue(&seed).await.expect("pending seed");
-                sqlx::query("UPDATE vala.forge_tasks SET state=$1, ready_at=$2 WHERE task_id=$3")
-                    .bind(if suffix == "ready" {
-                        "ready"
-                    } else {
-                        "retryable"
-                    })
-                    .bind(if index == 0 && suffix == "ready" {
-                        oldest_ready
-                    } else {
-                        Utc::now()
-                    })
-                    .bind(task_id)
-                    .execute(&admin)
-                    .await
-                    .expect("park the pending row");
+        let claimer = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { tasks.claim_fair(Uuid::now_v7(), limits(4), None).await }
+        });
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            loop {
+                let (waiting,): (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE wait_event_type = 'Lock' AND query LIKE '%forge_tasks%'",
+                )
+                .fetch_one(&admin)
+                .await
+                .expect("lock waits");
+                if waiting > 0 {
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
             }
-        }
-        for (index, state) in [
-            "claimed",
-            "running",
-            "prepared",
-            "succeeded",
-            "failed",
-            "cancelled",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            // Parked under a strategy that is also pending, so an owned or
-            // finished row inflating its queue count fails here.
-            let seed = task(tenant, &format!("owned-{index}"), hash);
-            hash += 1;
-            let task_id = tasks.enqueue(&seed).await.expect("non-pending seed");
-            sqlx::query(
-                "UPDATE vala.forge_tasks SET state=$2,\
-                 claimed_by=CASE WHEN $2 IN ('claimed','running','prepared') THEN $3 END,\
-                 attempt_id=CASE WHEN $2 IN ('claimed','running','prepared') THEN $4 END,\
-                 claim_expires_at=CASE WHEN $2 IN ('claimed','running','prepared') \
-                     THEN statement_timestamp()+interval '10 minutes' END,\
-                 watermark_snapshot_id=CASE WHEN $2 IN ('running','prepared') THEN 41 END,\
-                 watermark_timestamp_ms=CASE WHEN $2 IN ('running','prepared') THEN 700 END,\
-                 evidence=CASE WHEN $2='prepared' \
-                     THEN '{\"version\":1,\"cleanup_candidates\":[],\"deleted_candidate_count\":0}'::jsonb END,\
-                 updated_at=statement_timestamp() WHERE task_id=$1",
-            )
-            .bind(task_id)
-            .bind(state)
-            .bind(Uuid::now_v7())
-            .bind(Uuid::now_v7())
-            .execute(&admin)
-            .await
-            .expect("park the non-pending row");
-        }
+        })
+        .await
+        .expect("the claim waits on the competing attempt");
+        competing.commit().await.expect("competing attempt commits");
 
-        let demand = tasks
-            .planning_demand_status()
+        let claimed = claimer
             .await
-            .expect("demand snapshot");
-        assert_eq!(demand.demands, 3, "every unacknowledged demand row counts");
-        assert_eq!(
-            demand
-                .oldest_requested_at
-                .expect("an outstanding demand has a request time")
-                .timestamp(),
-            oldest_demand.timestamp(),
-            "the demand snapshot reports the stored earliest request, not an age"
-        );
-
-        let pending = tasks.pending_task_status().await.expect("pending snapshot");
-        assert_eq!(
-            pending
-                .iter()
-                .map(|status| status.strategy)
-                .collect::<std::collections::BTreeSet<_>>(),
-            pending_strategies.into_iter().collect(),
-            "only strategies with ready or retryable rows appear at all"
-        );
-        for status in &pending {
-            assert_eq!(
-                status.pending, 2,
-                "{:?} counts exactly its ready and retryable rows",
-                status.strategy
-            );
-        }
-        let small_files = pending
-            .iter()
-            .find(|status| status.strategy == ForgeTaskStrategy::SmallFiles)
-            .expect("the aged strategy is pending");
-        assert_eq!(
-            small_files
-                .oldest_ready_at
-                .expect("a pending row has a ready time")
-                .timestamp(),
-            oldest_ready.timestamp(),
-            "the pending snapshot reports the stored earliest ready_at, not an age"
-        );
+            .expect("claim task joins")
+            .expect("losing the active slot is not an error");
+        assert!(claimed.is_none(), "the busy table yields nothing to claim");
     }
 }

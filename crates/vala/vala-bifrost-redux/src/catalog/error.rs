@@ -41,6 +41,12 @@ pub enum BifrostCatalogError {
     /// A prepared row cannot be placed safely in either snapshot or hot membership.
     #[error("catalog publication visibility is ambiguous")]
     AmbiguousPublication,
+    /// A requested table's snapshot expiration has an unknown catalog outcome.
+    ///
+    /// Its pointer may still change, so no cut is admitted until Forge
+    /// reconciliation establishes the stable pointer.
+    #[error("snapshot expiration unresolved: {0}")]
+    UnresolvedExpiry(String),
     /// The physical tenant/table binding is invalid.
     #[error("invalid tenant table binding: {0}")]
     InvalidBinding(String),
@@ -50,6 +56,30 @@ pub enum BifrostCatalogError {
 }
 
 impl BifrostCatalogError {
+    /// Reports whether this failure is an object-store `NotFound`.
+    ///
+    /// Oracle reacquires its active cut once when the exact metadata document
+    /// an acquisition selected has already been removed by a catalog move;
+    /// the storage owner's typed `NotFound` is the only evidence of that, and
+    /// it survives as a source of the Iceberg error.
+    #[must_use]
+    pub fn is_missing_object(&self) -> bool {
+        let Self::Iceberg(error) = self else {
+            return false;
+        };
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            if matches!(
+                current.downcast_ref::<crate::storage::BifrostStorageError>(),
+                Some(crate::storage::BifrostStorageError::NotFound { .. })
+            ) {
+                return true;
+            }
+            source = current.source();
+        }
+        false
+    }
+
     /// Convert the engine-local error into the stable public Bifrost catalog.
     #[must_use]
     pub fn into_public(self) -> wyrd_spec::vala::BifrostError {
@@ -63,7 +93,7 @@ impl BifrostCatalogError {
             Self::MetadataMismatch(detail) | Self::InvalidBinding(detail) => {
                 PublicError::MetadataMismatch { detail }
             }
-            Self::UnstableCut { .. } | Self::AmbiguousPublication => {
+            Self::UnstableCut { .. } | Self::AmbiguousPublication | Self::UnresolvedExpiry(_) => {
                 PublicError::QueryVisibilityUnavailable
             }
             Self::DataFusion(error) => {
@@ -97,6 +127,15 @@ mod tests {
     fn ambiguous_publication_maps_to_visibility_unavailable() {
         assert!(matches!(
             BifrostCatalogError::AmbiguousPublication.into_public(),
+            wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable
+        ));
+    }
+
+    /// An unresolved snapshot expiration fails as visibility unavailable.
+    #[test]
+    fn unresolved_expiry_maps_to_visibility_unavailable() {
+        assert!(matches!(
+            BifrostCatalogError::UnresolvedExpiry("pending".to_owned()).into_public(),
             wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable
         ));
     }

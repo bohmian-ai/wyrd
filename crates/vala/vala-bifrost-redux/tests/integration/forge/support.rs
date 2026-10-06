@@ -11,7 +11,9 @@
 //! a delegating [`iceberg::Catalog`] that can refuse or park one commit. Both
 //! are plumbing around the real dependency, not a second implementation of it.
 
+use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +22,7 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, Error as IcebergError, ErrorKind as IcebergErrorKind, Namespace, NamespaceIdent,
     TableCommit, TableCreation, TableIdent,
@@ -34,14 +37,14 @@ use vala_bifrost_redux::catalog::{
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeTelemetry,
-    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ResourceSource, SystemResourceSnapshot,
+    ForgeResources, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -50,7 +53,14 @@ use vala_bifrost_redux::scribe::{
     ScribeIngressCpuPool, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribePressureConfig,
     ScribeWalIoPool,
 };
+use vala_sql::OperatorPool;
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwner};
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use wyrd_bench::BenchmarkRecorder;
 use wyrd_spec::DataTenantId;
+use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
 const FIXTURE_BOUND: Duration = Duration::from_secs(30);
@@ -580,6 +590,15 @@ impl PromotionCatalogSeam {
         self.stall_response_budget.store(count, Ordering::Release);
     }
 
+    /// Release the parked commit to the real catalog.
+    ///
+    /// `notify_one` stores a permit, so the release holds even when the parked
+    /// call has not yet started waiting.
+    pub(crate) fn release_parked_commit(&self) {
+        self.reject_parked.store(false, Ordering::Release);
+        self.parked_release.notify_one();
+    }
+
     /// Release the parked commit as a definite conflict.
     pub(crate) fn reject_parked_commit(&self) {
         self.reject_parked.store(true, Ordering::Release);
@@ -772,23 +791,17 @@ pub(crate) struct ForgeTaskRow {
     pub(crate) state: String,
     /// Snapshot the task was bound to at enqueue.
     pub(crate) base_snapshot_id: i64,
-    /// Immutable plan payload bound at enqueue.
-    pub(crate) plan: serde_json::Value,
-    /// Canonical hash of that plan payload.
-    pub(crate) plan_hash: Vec<u8>,
     /// Number of settled attempts the failure taxonomy has counted.
     pub(crate) attempt_count: i32,
     /// Persisted failure class, or `None` while the task carries no failure.
     pub(crate) failure_class: Option<String>,
-    /// Earliest instant a claim may take this task again.
-    pub(crate) next_eligible_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub(crate) struct PromotionIntegrationFixture {
     /// Real catalog owner used for registration, cuts, and Forge commits.
     pub(crate) catalog: Arc<BifrostCatalog>,
     /// Privileged pool used for read-only durable inspection.
-    pub(crate) operator_pool: vala_sql::OperatorPool,
+    pub(crate) operator_pool: OperatorPool,
     /// Tenant-scoped SQL handle Forge transitions run through.
     pub(crate) vala: vala_sql::ValaPostgres,
     /// Raw staging operator shared by Scribe, the catalog, and Forge.
@@ -800,9 +813,9 @@ pub(crate) struct PromotionIntegrationFixture {
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
     /// Forge capability every supervised Forge owner is built with.
-    forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    pub(crate) forge_resources: ForgeResources,
     /// Existing spill directory every supervised Forge owner leases.
-    forge_spill: std::path::PathBuf,
+    pub(crate) forge_spill: PathBuf,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
@@ -820,15 +833,135 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
-    /// Plans the fixture's real promotion and returns its production worker with
-    /// the requested existing observer gates, without starting that worker yet.
+    /// Records one live Oracle query's active read on the fixture table.
+    ///
+    /// Goes through the production catalog acquisition, so the row is the
+    /// exact durable state a held query leaves and serializes with Forge on
+    /// the same table maintenance authority. The one-hour query deadline
+    /// keeps the row protective for the whole test.
     ///
     /// # Panics
-    /// Panics when scheduler construction, planning, or worker construction fails.
+    /// Panics when the acquisition fails.
+    pub(crate) async fn hold_active_read(&self) -> Uuid {
+        let (query_id, acquisition) = self.spawn_active_read();
+        acquisition.await.expect("the active read task joins");
+        query_id
+    }
+
+    /// Starts one Oracle query's production cut acquisition on its own task.
+    ///
+    /// Returns the query id at once and the acquisition as a join handle, so
+    /// a scenario can race the acquisition against a live destructive Forge
+    /// owner: the statement waits on the table's maintenance authority until
+    /// that owner yields, then returns the pointer it read.
+    ///
+    /// # Panics
+    /// The spawned task panics when the acquisition fails or the one-hour
+    /// deadline has already passed; awaiting the handle surfaces that panic.
+    pub(crate) fn spawn_active_read(&self) -> (Uuid, JoinHandle<AcquiredTableCut>) {
+        let query_id = Uuid::now_v7();
+        let catalog = Arc::clone(&self.catalog);
+        let tenant = self.tenant;
+        let table = self.binding.table_ref.clone();
+        let acquisition = tokio::spawn(async move {
+            catalog
+                .acquire_active_cut(
+                    tenant,
+                    ActiveReadOwner {
+                        query_id,
+                        node_id: Uuid::now_v7(),
+                        fencing_token: 1,
+                    },
+                    std::time::Instant::now() + std::time::Duration::from_hours(1),
+                    std::slice::from_ref(&table),
+                )
+                .await
+                .expect("the registered table's active read commits")
+                .expect("an hour remains before the deadline")
+                .pop()
+                .expect("one acquired table")
+        });
+        (query_id, acquisition)
+    }
+
+    /// Waits until exactly one Oracle cut acquisition is blocked on a row lock.
+    ///
+    /// Observes `pg_stat_activity` rather than elapsed time, so a returning
+    /// call proves the acquisition statement reached `PostgreSQL` and is waiting
+    /// on the table's maintenance authority rather than merely not yet run.
+    /// The probe runs as the fixture superuser because `PostgreSQL` hides other
+    /// roles' wait state and statement text from the operator role.
+    ///
+    /// # Panics
+    /// Panics when the superuser pool or the activity read fails, or no
+    /// acquisition blocks within thirty seconds.
+    pub(crate) async fn await_blocked_cut_acquisition(&self) {
+        let observer = self
+            .database
+            .superuser_pool()
+            .expect("fixture superuser pool");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let blocked: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity \
+                      WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                        AND query LIKE '%oracle_acquire_table_cut%'",
+                )
+                .fetch_one(&observer)
+                .await
+                .expect("lock waits read");
+                if blocked == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cut acquisition blocks on the table authority");
+    }
+
+    /// Releases one query's active reads through the production statement.
+    ///
+    /// # Panics
+    /// Panics when the release fails or removes no row.
+    pub(crate) async fn release_active_read(&self, query_id: Uuid) {
+        let released = self
+            .catalog
+            .release_active_reads(self.tenant, query_id)
+            .await
+            .expect("the active read releases");
+        assert_eq!(released, 1, "the query held exactly one table read");
+    }
+
+    /// Reads the fixture table's maintenance-authority identity.
+    ///
+    /// # Panics
+    /// Panics when the table is unregistered or its UID is malformed.
+    pub(crate) async fn table_identity(&self) -> TableAuthorityIdentity {
+        let table_uid: Vec<u8> =
+            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE data_tenant_id=$1")
+                .bind(self.tenant.as_uuid())
+                .fetch_one(self.operator_pool.pool())
+                .await
+                .expect("the fixture table is registered");
+        TableAuthorityIdentity {
+            tenant: self.tenant,
+            table_uid: table_uid.try_into().expect("table uid is 16 bytes"),
+            catalog_name: vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME.to_owned(),
+            namespace_name: self.binding.table_ref.namespace.as_str().to_owned(),
+            table_name: self.binding.table_ref.name.clone(),
+        }
+    }
+
+    /// Enqueues the fixture's owed promotion and returns its production worker
+    /// with the requested existing observer gates, without starting it yet.
+    ///
+    /// # Panics
+    /// Panics when the promotion cannot be built or enqueued, or worker
+    /// construction fails.
     pub(crate) async fn plan_worker_for_test(
         &self,
         observer: ForgeWorkerCompletionObserver,
-        stop: &CancellationToken,
     ) -> ForgeWorker {
         let store = CountingObjectStore::new(Arc::clone(&self.staging));
         let forge = self.build_forge_for_test(
@@ -838,11 +971,21 @@ impl PromotionIntegrationFixture {
             observer,
             ForgeSchedulerTrigger::default(),
         );
-        ForgeScheduler::new(&forge)
-            .expect("scheduler")
-            .schedule_once(stop)
+        let identity = ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            self.binding.table_ref.namespace.as_str(),
+            &self.binding.table_ref.name,
+        )
+        .expect("fixture table identity");
+        let promotion = forge
+            .promotion_task_for_test(self.tenant, &identity)
             .await
-            .expect("plan");
+            .expect("promotion task builds")
+            .expect("the sealed rows are owed a promotion");
+        ForgeTasks::new(self.operator_pool.clone())
+            .enqueue(&promotion)
+            .await
+            .expect("the promotion enqueues");
         ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker")
     }
 
@@ -873,7 +1016,7 @@ impl PromotionIntegrationFixture {
         assert!(
             first.execute_one_for_test(stop).await.is_err(),
             "terminal SQL refusal must surface; tasks at {}: {:?}",
-            chrono::Utc::now(),
+            Utc::now(),
             self.forge_tasks().await
         );
         let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
@@ -902,6 +1045,7 @@ impl PromotionIntegrationFixture {
     /// be registered, or when a real Scribe seal publishes fewer than the two
     /// `vala.file_list` rows a promotion group needs.
     pub(crate) async fn start(table_name: &str) -> Self {
+        ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
@@ -939,7 +1083,7 @@ impl PromotionIntegrationFixture {
 
         let binding = create_table(&catalog, tenant, table_name).await;
         let operator_pool = database.operator_pool().clone();
-        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(operator_pool.pool())
             .await
             .expect("fixture seed marker");
@@ -1006,35 +1150,6 @@ impl PromotionIntegrationFixture {
         )
     }
 
-    /// Build one production Forge owner whose worker cadence a scenario can wait on.
-    ///
-    /// A worker's own delayed cadence is the maintenance interval, which is
-    /// also the scheduler's periodic planning period. A supervised worker is
-    /// therefore built over its own Forge: the scheduler keeps the inert hour
-    /// that makes planning explicit, and the worker gets a cadence short enough
-    /// that a scenario can wait for one exact-operation reconciliation pass.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture cannot produce a validated Forge graph.
-    pub(crate) fn build_worker_forge_for_test(
-        &self,
-        catalog: Arc<dyn Catalog>,
-        object_store: Arc<dyn ForgeObjectStore>,
-        clock: ForgeClock,
-        completion_observer: ForgeWorkerCompletionObserver,
-        scheduler_trigger: ForgeSchedulerTrigger,
-    ) -> Arc<Forge> {
-        self.build_forge_with_interval(
-            catalog,
-            object_store,
-            clock,
-            completion_observer,
-            scheduler_trigger,
-            Duration::from_secs(1),
-        )
-    }
-
     /// Build one production Forge owner over an explicit maintenance interval.
     ///
     /// # Panics
@@ -1067,6 +1182,43 @@ impl PromotionIntegrationFixture {
                 clock,
                 completion_observer: Some(completion_observer),
                 scheduler_trigger: Some(scheduler_trigger),
+                telemetry: Arc::new(ForgeTelemetry::new()),
+            })
+            .expect("fixture Forge"),
+        )
+    }
+
+    /// Build one production Forge owner whose operator SQL runs over `operator_pool`.
+    ///
+    /// Everything else is the fixture's real graph: its catalog, staging
+    /// store, system clock and an idle trigger. A scenario passes a narrowed
+    /// pool to control when the operator database can answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot produce a validated Forge graph.
+    pub(crate) fn build_forge_over_operator_pool_for_test(
+        &self,
+        operator_pool: OperatorPool,
+    ) -> Arc<Forge> {
+        let (_publisher, hints) =
+            staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
+        Arc::new(
+            Forge::new(ForgeBuildConfig {
+                resources: self.forge_resources.clone(),
+                spill_root: self.forge_spill.clone(),
+                vala: self.vala.clone(),
+                operator_pool,
+                catalog: self.catalog.iceberg_catalog(),
+                staging: Arc::clone(&self.staging),
+                object_store: CountingObjectStore::new(Arc::clone(&self.staging)),
+                hints,
+                config: self.config.clone(),
+                maintenance_interval: Duration::from_hours(1),
+                scheduler_owner: Uuid::now_v7(),
+                clock: ForgeClock::system(),
+                completion_observer: None,
+                scheduler_trigger: Some(ForgeSchedulerTrigger::default()),
                 telemetry: Arc::new(ForgeTelemetry::new()),
             })
             .expect("fixture Forge"),
@@ -1159,7 +1311,7 @@ impl PromotionIntegrationFixture {
     pub(crate) async fn seal_more(&self, count: usize) {
         let before = self.file_rows().await.len();
         let first = i64::try_from(before).expect("fixture row counts stay representable");
-        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(self.operator_pool.pool())
             .await
             .expect("fixture seed marker");
@@ -1172,6 +1324,78 @@ impl PromotionIntegrationFixture {
                 self.tenant,
                 &self.binding,
                 &ingress_batch(&schema, first + file_number),
+            )
+            .await;
+        }
+        age_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
+        assert_eq!(
+            self.file_rows().await.len(),
+            before + count,
+            "a real Scribe seal publishes one row per batch"
+        );
+    }
+
+    /// Seals `count` hot objects of `rows` rows each into one closed day.
+    ///
+    /// [`Self::seal_more`] puts every object in its own day, which is right for
+    /// multi-plan scenarios but never gives a partition two small files. This
+    /// seals into the single day `days_before` the fixture day, so the objects
+    /// share a partition and the small-files planner can group them. Values
+    /// are a fixed pseudo-random sequence: they do not compress, so an
+    /// object's size grows with its row count and a scenario can size its
+    /// table target from the sealed objects. `first_value` keeps sequences
+    /// from different calls disjoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seal publishes no new `vala.file_list` row.
+    pub(crate) async fn seal_partition_files(
+        &self,
+        days_before: i64,
+        rows: usize,
+        count: usize,
+        first_value: u64,
+    ) {
+        let before = self.file_rows().await.len();
+        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("fixture seed marker");
+        let schema = ingress_schema();
+        let noon = (fixture_day() - chrono::Duration::days(days_before))
+            .and_hms_opt(12, 0, 0)
+            .expect("fixture timestamp")
+            .and_utc()
+            .timestamp_micros();
+        let rows_u64 = u64::try_from(rows).expect("fixture row counts fit u64");
+        for file in 0..u64::try_from(count).expect("fixture seal counts fit u64") {
+            let start = first_value + file * rows_u64;
+            let values: Vec<i64> = (start..start + rows_u64)
+                .map(|index| {
+                    // SplitMix64: a bijective scramble, so values stay distinct.
+                    let mut mixed = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    i64::from_ne_bytes((mixed ^ (mixed >> 31)).to_ne_bytes())
+                })
+                .collect();
+            let times: Vec<i64> = (0..rows)
+                .map(|row| noon + i64::try_from(row).expect("fixture row offsets fit i64"))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(values)),
+                    Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                ],
+            )
+            .expect("fixture partition batch");
+            append_and_seal(
+                &self.scribe,
+                &self.catalog,
+                self.tenant,
+                &self.binding,
+                &batch,
             )
             .await;
         }
@@ -1214,7 +1438,7 @@ impl PromotionIntegrationFixture {
         count: usize,
     ) {
         let binding = create_table(&self.catalog, tenant, name).await;
-        let seeded_at = chrono::Utc::now();
+        let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
             append_and_seal(
@@ -1238,7 +1462,7 @@ impl PromotionIntegrationFixture {
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
         let binding = create_table(&self.catalog, self.tenant, name).await;
-        let seeded_at = chrono::Utc::now();
+        let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
             append_and_seal(
@@ -1267,22 +1491,9 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the read-only diagnostic query fails.
     pub(crate) async fn forge_tasks(&self) -> Vec<ForgeTaskRow> {
-        sqlx::query_as::<
-            _,
-            (
-                uuid::Uuid,
-                String,
-                String,
-                i64,
-                serde_json::Value,
-                Vec<u8>,
-                i32,
-                Option<String>,
-                chrono::DateTime<chrono::Utc>,
-            ),
-        >(
-            "SELECT task_id, strategy, state, base_snapshot_id, plan, plan_hash, \
-                    attempt_count, failure_class, next_eligible_at \
+        sqlx::query_as::<_, (uuid::Uuid, String, String, i64, i32, Option<String>)>(
+            "SELECT task_id, strategy, state, base_snapshot_id, \
+                    attempt_count, failure_class \
              FROM vala.forge_tasks \
              WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
              ORDER BY created_at, task_id",
@@ -1295,26 +1506,15 @@ impl PromotionIntegrationFixture {
         .expect("fixture Forge task inspection")
         .into_iter()
         .map(
-            |(
-                task_id,
-                strategy,
-                state,
-                base_snapshot_id,
-                plan,
-                plan_hash,
-                attempt_count,
-                failure_class,
-                next_eligible_at,
-            )| ForgeTaskRow {
-                task_id,
-                strategy,
-                state,
-                base_snapshot_id,
-                plan,
-                plan_hash,
-                attempt_count,
-                failure_class,
-                next_eligible_at,
+            |(task_id, strategy, state, base_snapshot_id, attempt_count, failure_class)| {
+                ForgeTaskRow {
+                    task_id,
+                    strategy,
+                    state,
+                    base_snapshot_id,
+                    attempt_count,
+                    failure_class,
+                }
             },
         )
         .collect()
@@ -1463,30 +1663,6 @@ impl PromotionIntegrationFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture backoff aging");
-    }
-
-    /// Moves another tenant's Forge tasks to `offset_secs` from now.
-    ///
-    /// A scenario that must decide *when* a second tenant's work becomes
-    /// claimable cannot rely on planning order: the scheduler plans every
-    /// eligible table in one pass. Holding that tenant's tasks past the window
-    /// and releasing them afterwards makes the moment exact, with no race
-    /// against a running worker.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the update fails.
-    pub(crate) async fn offer_tasks_of(&self, tenant: DataTenantId, offset_secs: i64) {
-        sqlx::query(
-            "UPDATE vala.forge_tasks \
-             SET next_eligible_at = statement_timestamp() + ($2::text || ' seconds')::interval \
-             WHERE data_tenant_id = $1",
-        )
-        .bind(tenant.as_uuid())
-        .bind(offset_secs.to_string())
-        .execute(self.operator_pool.pool())
-        .await
-        .expect("fixture task offer window");
     }
 
     /// Moves one exact task to `offset_secs` from now.
@@ -1700,12 +1876,6 @@ pub(crate) struct SupervisedPromotion {
     /// is never released on shutdown, so a second supervisor in one test would
     /// stand by and plan nothing.
     forge: Arc<Forge>,
-    /// Graph every generation of this supervisor's worker is built over.
-    ///
-    /// Identical to [`Self::forge`] except for its maintenance interval, which
-    /// is the worker's own delayed reconciliation cadence rather than the
-    /// scheduler's deliberately inert planning period.
-    worker_forge: Arc<Forge>,
     /// Worker bounds every generation of this supervisor's worker is built with.
     worker_config: ForgeWorkerConfig,
     /// Readiness bit every generation of this supervisor's worker publishes.
@@ -1781,27 +1951,17 @@ impl SupervisedPromotion {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let forge = fixture.build_forge_for_test(
-            Arc::clone(&catalog),
-            Arc::clone(&object_store),
-            clock.clone(),
-            worker_observer.clone(),
-            scheduler_trigger.clone(),
-        );
-        // Every supervised worker generation is built over this one, so the
-        // cadence a scenario waits on is the worker's, not the scheduler's.
-        let worker_forge = fixture.build_worker_forge_for_test(
             catalog,
             object_store,
             clock,
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        let worker = ForgeWorker::new(
-            Arc::clone(&worker_forge),
-            worker_config,
-            uuid::Uuid::now_v7(),
-        )
-        .expect("fixture Forge worker");
+        // Every worker generation shares the scheduler's Forge, as one server
+        // process does, so its compaction pulls reach the leader term that
+        // Forge holds in-process.
+        let worker = ForgeWorker::new(Arc::clone(&forge), worker_config, uuid::Uuid::now_v7())
+            .expect("fixture Forge worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let readiness = ForgeRoleReadiness::detached();
@@ -1824,7 +1984,6 @@ impl SupervisedPromotion {
             worker_task: Some(worker_task),
             worker_armed: false,
             forge,
-            worker_forge,
             worker_config,
             readiness,
         }
@@ -1866,7 +2025,7 @@ impl SupervisedPromotion {
     /// Panics when the worker cannot be built or the reclaim fails.
     pub(crate) async fn reclaim_expired_claims(&self) {
         let worker = ForgeWorker::new(
-            Arc::clone(&self.worker_forge),
+            Arc::clone(&self.forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -1914,7 +2073,7 @@ impl SupervisedPromotion {
             return;
         }
         let worker = ForgeWorker::new(
-            Arc::clone(&self.worker_forge),
+            Arc::clone(&self.forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -1957,8 +2116,40 @@ impl SupervisedPromotion {
     ///
     /// Panics when the scheduler misses its deterministic bound.
     async fn schedule_once(&self) {
+        let expected = self.request_pass();
+        self.await_pass(expected).await;
+    }
+
+    /// Request and await one leader maintenance pass.
+    ///
+    /// The pass runs on the production timer loop: manifest rewrite, snapshot
+    /// expiry and cleanup for the held term's maintenance members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pass misses its deterministic bound.
+    pub(crate) async fn maintain_only(&self) {
+        let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
+        self.scheduler_trigger.request_maintenance();
+        self.await_pass(expected).await;
+    }
+
+    /// Requests one production pass without awaiting it.
+    ///
+    /// Returns the completed-pass count that marks the requested pass done,
+    /// for a scenario that must act while the pass is still running.
+    pub(crate) fn request_pass(&self) -> usize {
         let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
         self.scheduler_trigger.request_pass();
+        expected
+    }
+
+    /// Awaits the pass whose completion count [`Self::request_pass`] returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler misses its deterministic bound.
+    pub(crate) async fn await_pass(&self, expected: usize) {
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.scheduler_trigger.wait_for_passes_at_least(expected),
@@ -1980,7 +2171,7 @@ impl SupervisedPromotion {
         let expected_errors = self.worker_observer.returned_errors().len();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -1994,6 +2185,7 @@ impl SupervisedPromotion {
             self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
@@ -2089,7 +2281,7 @@ impl SupervisedPromotion {
             .saturating_add(1);
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
@@ -2100,6 +2292,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             expected_errors,
@@ -2128,7 +2321,7 @@ impl SupervisedPromotion {
         let errors_before = self.worker_observer.returned_errors().len();
         let released_before = self.worker_observer.released_attempts_for_test().len();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
@@ -2140,6 +2333,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge unresolved-release bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             errors_before,
@@ -2167,11 +2361,12 @@ impl SupervisedPromotion {
     {
         let settled_before = self.worker_observer.returned_errors().len();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
         self.join_worker().await;
+        self.await_pass(pass).await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             settled_before,
@@ -2193,7 +2388,7 @@ impl SupervisedPromotion {
         let before = self.worker_observer.returned_errors();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
@@ -2201,6 +2396,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();
         assert_eq!(
             after.len(),
@@ -2238,7 +2434,7 @@ impl SupervisedPromotion {
             .hold_after_next_rewrite_handoff_for_test();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
-        self.schedule_once().await;
+        let pass = self.request_pass();
         tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer
@@ -2257,6 +2453,7 @@ impl SupervisedPromotion {
         .await
         .expect("production Forge worker attempt bound");
         self.stop_worker().await;
+        self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();
         assert_eq!(
             after.len(),
@@ -2267,6 +2464,11 @@ impl SupervisedPromotion {
             .last()
             .expect("one error was just returned")
             .to_owned()
+    }
+
+    /// Borrows the token the coordinator, and its inline promotions, observe as shutdown.
+    pub(crate) fn coordinator_stop(&self) -> CancellationToken {
+        self.scheduler_stop.clone()
     }
 
     /// Borrows the token production worker execution observes as shutdown.
@@ -2334,7 +2536,7 @@ impl SupervisedPromotion {
     ///
     /// Panics when the worker misses its bounded shutdown or exits
     /// unexpectedly.
-    async fn join_worker(&mut self) {
+    pub(crate) async fn join_worker(&mut self) {
         self.worker_stop.cancel();
         let task = self.worker_task.take().expect("worker is stopped once");
         tokio::time::timeout(FIXTURE_BOUND, task)
@@ -2527,7 +2729,7 @@ async fn register_scribe_fence(
     .expect("register the Scribe publication fence");
 }
 
-/// The partition day every fixture row lands in: yesterday, UTC.
+/// The newest partition day a fixture row lands in: yesterday, UTC.
 ///
 /// Scribe sets the floor with its event-time acceptance window, and Forge sets
 /// the ceiling by refusing to act on a partition that is still open. Yesterday
@@ -2537,7 +2739,7 @@ async fn register_scribe_fence(
 ///
 /// Panics when midnight is not representable, which cannot happen for a UTC day.
 pub(crate) fn fixture_day() -> chrono::NaiveDate {
-    chrono::Utc::now().date_naive() - chrono::Duration::days(1)
+    Utc::now().date_naive() - chrono::Duration::days(1)
 }
 
 /// User-visible ingress schema for the fixture table.
@@ -2555,21 +2757,23 @@ fn ingress_schema() -> Arc<ArrowSchema> {
     ]))
 }
 
-/// Builds one two-row ingress batch whose event times land inside the fixture day.
+/// Builds one two-row ingress batch whose event times land in its own closed day.
 ///
 /// `file_number` separates the batches so each sealed object carries a distinct
-/// value and event-time range, which makes the pair a genuine promotion group.
+/// value and lands `file_number` days before the fixture day. One file per
+/// partition gives Forge's per-partition planner one plan per sealed file, so
+/// multi-plan scenarios stay multi-plan; Scribe's 30-day acceptance window
+/// bounds a fixture table to 29 files.
 ///
 /// # Panics
 ///
 /// Panics when the fixture timestamp or batch cannot be constructed.
 fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
-    let base = fixture_day()
+    let base = (fixture_day() - chrono::Duration::days(file_number))
         .and_hms_opt(12, 0, 0)
         .expect("fixture timestamp")
         .and_utc()
-        .timestamp_micros()
-        + file_number * 1_000_000;
+        .timestamp_micros();
     RecordBatch::try_new(
         Arc::clone(schema),
         vec![
@@ -2625,7 +2829,90 @@ async fn create_table(
         })
         .await
         .expect("fixture table");
+    enable_compaction(catalog, &binding).await;
     binding
+}
+
+/// Declares the fixture table compaction-enabled, due on every commit, and
+/// compacted `full`.
+///
+/// Rewrites are dispatched by the leader from table properties, as in
+/// `RisingWave`; a snapshot-count trigger of one makes each promotion commit
+/// due on the next worker pull, so a scenario never waits out the interval.
+/// The fixture seals one object per day, which the default `small-files`
+/// type leaves waiting for a partner; `full` rewrites each of them, which is
+/// what the publication, recovery, admission, and cleanup scenarios built on
+/// this fixture need. Small-files scenarios remove the type or seal partners.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+async fn enable_compaction(catalog: &BifrostCatalog, binding: &TenantTableBinding) {
+    set_table_properties(
+        catalog,
+        binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
+            ("wyrd.forge.compaction.type", "full"),
+        ],
+    )
+    .await;
+}
+
+/// Removes Iceberg table properties and returns the committed table.
+///
+/// A scenario about a default removes the fixture's declaration of it, so the
+/// table carries what registration alone writes.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn remove_table_properties(
+    catalog: &BifrostCatalog,
+    binding: &TenantTableBinding,
+    keys: &[&str],
+) -> Table {
+    let iceberg = catalog.iceberg_catalog();
+    let table = iceberg
+        .load_table(&binding.table_ident())
+        .await
+        .expect("fixture table load");
+    let tx = Transaction::new(&table);
+    let mut update = tx.update_table_properties();
+    for key in keys {
+        update = update.remove((*key).to_owned());
+    }
+    let tx = update.apply(tx).expect("fixture property removal");
+    tx.commit(iceberg.as_ref())
+        .await
+        .expect("fixture property removal commit")
+}
+
+/// Commits Iceberg table properties, such as the fixture table's Forge settings.
+///
+/// The leader reads these settings from the table on each promotion commit it
+/// is notified of, so they govern every later commit.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or the property commit fails.
+pub async fn set_table_properties(
+    catalog: &BifrostCatalog,
+    binding: &TenantTableBinding,
+    properties: &[(&str, &str)],
+) {
+    let iceberg = catalog.iceberg_catalog();
+    let table = iceberg
+        .load_table(&binding.table_ident())
+        .await
+        .expect("fixture table load");
+    let tx = Transaction::new(&table);
+    let mut update = tx.update_table_properties();
+    for (key, value) in properties {
+        update = update.set((*key).to_owned(), (*value).to_owned());
+    }
+    let tx = update.apply(tx).expect("fixture table properties");
+    tx.commit_once(iceberg.as_ref())
+        .await
+        .expect("fixture table properties commit");
 }
 
 /// Drives one real Scribe append and seal for the fixture table.
@@ -2702,10 +2989,10 @@ async fn append_only(
 ///
 /// Panics when the aging update fails.
 async fn age_files(
-    operator_pool: &vala_sql::OperatorPool,
+    operator_pool: &OperatorPool,
     tenant: DataTenantId,
     binding: &TenantTableBinding,
-    since: chrono::DateTime<chrono::Utc>,
+    since: DateTime<Utc>,
 ) {
     sqlx::query(
         "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' \
@@ -2726,60 +3013,97 @@ async fn age_files(
 ///
 /// Panics when the manual clock cannot be initialized.
 pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
-    ForgeClock::manual(chrono::Utc::now())
+    ForgeClock::manual(Utc::now())
+}
+
+/// The integration binary's one production-shaped telemetry installation.
+///
+/// The metrics recorder and the tracing subscriber are process-global and can
+/// be set only once, so this binary has exactly one owner for both. Every
+/// fixture entry point initialises it, which is what makes `WYRD_LOG` (else
+/// `RUST_LOG`) trace any test that starts a fixture, and
+/// [`ForgeTelemetryCheckpoint`] reads from it instead of installing its own.
+/// The subscriber is the production pipeline with an in-memory exporter, so
+/// what a checkpoint asserts on is production emission.
+pub(crate) struct ProcessTelemetry {
+    /// Process-wide metrics recorder every production counter writes into.
+    recorder: Arc<BenchmarkRecorder>,
+    /// Handle over spans exported by the production tracing pipeline.
+    capture: TestTraceCapture,
+    /// Keeps the installed provider alive for the life of the process.
+    _guard: TelemetryGuard,
+}
+
+/// The one [`ProcessTelemetry`] of this test process.
+static PROCESS_TELEMETRY: std::sync::OnceLock<ProcessTelemetry> = std::sync::OnceLock::new();
+
+impl ProcessTelemetry {
+    /// Returns the process telemetry, installing it on first use.
+    ///
+    /// The filter is `WYRD_LOG`, else `RUST_LOG`, else `info`. Concurrent
+    /// first callers block until the one installation finishes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another owner already installed a global metrics recorder
+    /// or tracing subscriber in this process, because no assertion over this
+    /// owner's recorder or capture could then be trusted.
+    pub(crate) fn shared() -> &'static Self {
+        PROCESS_TELEMETRY.get_or_init(|| {
+            let recorder = BenchmarkRecorder::new()
+                .install()
+                .expect("no other global metrics recorder is installed in this test process");
+            let (guard, capture) =
+                wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig {
+                    filter: "info".to_owned(),
+                    service_name: Some("forge-integration".to_owned()),
+                    sample_ratio: Some(1.0),
+                    ..wyrd_telemetry::TelemetryConfig::default()
+                })
+                .expect("no other global tracing subscriber is installed in this test process");
+            Self {
+                recorder,
+                capture,
+                _guard: guard,
+            }
+        })
+    }
 }
 
 /// The one Tier-2 telemetry observer every Forge integration test installs.
 ///
 /// A Forge integration test that only proves durable state cannot distinguish
 /// "the route ran" from "the route ran and reported what it did", and the
-/// production route is the *only* thing allowed to report. This owner installs
-/// the real metrics recorder and the production-shaped OpenTelemetry pipeline
-/// once per test process, then exposes deltas relative to the moment it was
-/// installed, so a test asserts on production emission rather than on a
-/// test-only signal. It exists here, centrally, so no test grows a private
-/// telemetry path of its own.
+/// production route is the *only* thing allowed to report. This observer reads
+/// the process's [`ProcessTelemetry`] — the real metrics recorder and the
+/// production-shaped OpenTelemetry pipeline — so a test asserts on production
+/// emission rather than on a test-only signal. It exists here, centrally, so
+/// no test grows a private telemetry path of its own.
 ///
-/// Installation is process-wide and happens exactly once. Nextest runs every
-/// test in its own process, so a checkpoint per test is a checkpoint per
-/// process; a second installation in one process is a fixture defect and
-/// panics rather than silently observing nothing.
+/// Spans are counted from this checkpoint's own mark. Metric snapshots are
+/// the recorder's absolute values; nextest runs each test in its own process,
+/// and every caller creates its checkpoint before starting a fixture, so those
+/// values are the test's own emission.
 pub(crate) struct ForgeTelemetryCheckpoint {
-    /// Process-wide metrics recorder every production counter writes into.
-    recorder: Arc<wyrd_bench::BenchmarkRecorder>,
-    /// Handle over spans exported by the production tracing pipeline.
-    capture: wyrd_telemetry::TestTraceCapture,
+    /// Process telemetry this checkpoint observes.
+    telemetry: &'static ProcessTelemetry,
     /// Number of spans finished before the workload started.
     span_checkpoint: usize,
-    /// Keeps the installed provider alive for the lifetime of the test.
-    _telemetry: wyrd_telemetry::TelemetryGuard,
 }
 
 impl ForgeTelemetryCheckpoint {
-    /// Installs the production telemetry pipeline and marks a starting point.
+    /// Marks a starting point in the process telemetry, installing it first
+    /// when no fixture has yet.
     ///
     /// # Panics
     ///
-    /// Panics when a global metrics recorder or tracing subscriber is already
-    /// installed in this process, which means two fixtures are competing for
-    /// one process-wide seam and no delta would be trustworthy.
+    /// Panics when another owner already installed a global metrics recorder
+    /// or tracing subscriber in this process (see [`ProcessTelemetry::shared`]).
     pub(crate) fn install() -> Self {
-        let recorder = wyrd_bench::BenchmarkRecorder::new()
-            .install()
-            .expect("no other global metrics recorder is installed in this test process");
-        let (telemetry, capture) =
-            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig {
-                filter: "info".to_owned(),
-                service_name: Some("forge-integration".to_owned()),
-                sample_ratio: Some(1.0),
-                ..wyrd_telemetry::TelemetryConfig::default()
-            })
-            .expect("no other global tracing subscriber is installed in this test process");
+        let telemetry = ProcessTelemetry::shared();
         Self {
-            span_checkpoint: capture.checkpoint(),
-            recorder,
-            capture,
-            _telemetry: telemetry,
+            span_checkpoint: telemetry.capture.checkpoint(),
+            telemetry,
         }
     }
 
@@ -2796,7 +3120,7 @@ impl ForgeTelemetryCheckpoint {
     /// commit an earlier phase legitimately made. Pass the returned mark to
     /// [`Self::spans_named_since`].
     pub(crate) fn mark(&self) -> usize {
-        self.capture.checkpoint()
+        self.telemetry.capture.checkpoint()
     }
 
     /// Returns the production spans finished since `mark`, by name.
@@ -2805,7 +3129,8 @@ impl ForgeTelemetryCheckpoint {
         mark: usize,
         name: &str,
     ) -> Vec<wyrd_telemetry::CapturedSpan> {
-        self.capture
+        self.telemetry
+            .capture
             .finished_since(mark)
             .into_iter()
             .filter(|span| span.name == name)
@@ -2818,7 +3143,7 @@ impl ForgeTelemetryCheckpoint {
     /// leaked one, so a scenario that must prove exact label sets or a return
     /// to zero reads the raw series instead.
     pub(crate) fn snapshot(&self) -> wyrd_bench::BenchmarkMetricSnapshot {
-        self.recorder.snapshot()
+        self.telemetry.recorder.snapshot()
     }
 
     /// Asserts every named production metric family was registered and used.
@@ -2827,7 +3152,8 @@ impl ForgeTelemetryCheckpoint {
     ///
     /// Panics naming the missing families when the route did not emit them.
     pub(crate) fn require_metrics(&self, families: &[&str]) {
-        self.recorder
+        self.telemetry
+            .recorder
             .require_metrics(families)
             .expect("the production route emits its declared metric families");
     }

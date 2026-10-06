@@ -180,8 +180,7 @@ pub struct Backlog {
     /// Audit decisions still owned: pending in any replica's outbox writer,
     /// or staged above their tenant's publication watermark.
     pub audit: u64,
-    /// Forge planning demands requested before load stopped and not yet
-    /// settled.
+    /// Forge tasks created before load stopped and not yet terminal.
     pub forge: u64,
 }
 
@@ -253,7 +252,7 @@ impl Queue {
         })
     }
 
-    /// PostgreSQL's clock, which stamps every run, audit row, and demand.
+    /// PostgreSQL's clock, which stamps every run, audit row, and Forge task.
     ///
     /// # Errors
     ///
@@ -272,11 +271,11 @@ impl Queue {
     /// terminal with `activations` accepted queued requests expected to have
     /// created one each, every audit row staged above its tenant's
     /// `vala.audit_publication` watermark (zero before its first
-    /// publication), and Forge demands first requested by
-    /// `stopped`. Audit rows are not cut at `stopped`: a decision a request
-    /// left pending commits later, and its row is still the step's backlog.
-    /// A coalesced demand keeps its first request time, so one re-requested
-    /// but never settled stays counted. Replica-held work is read from
+    /// publication), and Forge tasks created by `stopped` that have not
+    /// reached a terminal state. Audit rows are not cut at `stopped`: a
+    /// decision a request left pending commits later, and its row is still
+    /// the step's backlog. A retried task keeps its creation time, so one
+    /// never settled stays counted. Replica-held work is read from
     /// metrics instead and added by [`Backlog::with_replicas`].
     ///
     /// # Errors
@@ -300,8 +299,9 @@ impl Queue {
                (SELECT COUNT(*) FROM vala.audit_staging s \
                   LEFT JOIN vala.audit_publication p USING (data_tenant_id) \
                  WHERE s.seq > COALESCE(p.published_seq, 0)), \
-               (SELECT COUNT(*) FROM vala.forge_planning_demands \
-                 WHERE first_requested_at <= $2)",
+               (SELECT COUNT(*) FROM vala.forge_tasks \
+                 WHERE created_at <= $2 \
+                   AND state NOT IN ('succeeded','failed','cancelled'))",
         )
         .bind(since)
         .bind(stopped)

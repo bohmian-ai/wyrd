@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
 use chrono::{DateTime, Utc};
+use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::storage::{
     BifrostStorage, BifrostStorageError, StorageInspection, StorageLifecycle, StorageOperation,
     StorageOperationBarrier, StorageRequestOutcome,
@@ -66,15 +67,35 @@ async fn published_cache_pruning_and_shutdown_are_production_governed() {
 ///
 /// Returns a client, Postgres, ingest, Forge-scheduling, telemetry, or
 /// cluster-lifecycle error surfaced by any phase.
+///
+/// # Panics
+///
+/// Panics when a phase's observation does not hold: tenant-isolated reads,
+/// metadata-cache and pruning counters, or settled shutdown reports.
 #[expect(
     clippy::float_cmp,
     reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
 )]
 async fn prove_published_governance() -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+    // Forge promotes each Scribe flush to Iceberg as soon as it is published
+    // (REQ-002), but phases 1-3 and 5 observe hot objects. The pod's Forge
+    // catalog is therefore wrapped in the production commit seam, and the
+    // journey parks the first promotion commit before any write: promotion
+    // runs inline on the coordinator's supervisor, so every later hint queues
+    // behind the parked one and each published object stays hot until the
+    // journey releases it. The parked supervisor skips its heartbeats, which
+    // the 30 s leader term outlasts for these few-second phases.
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
+        ForgeConfig::default(),
+        false,
+        true,
     )
     .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the pod wraps its Forge catalog in the commit seam")?;
+    promotion.pause_before_commit();
     let server = cluster
         .server(0)
         .ok_or("the one-pod cluster runs one server")?;
@@ -133,8 +154,11 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     //    concurrent identical query provably arrives while that load is still
     //    in flight rather than after it. The event-time floor excludes the
     //    phase-1 object before its footer, so the stalled range belongs to the
-    //    identity under test and to nothing else.
-    let since_phase_one = Utc::now();
+    //    identity under test and to nothing else. Scribe stamps event time
+    //    from PostgreSQL, so the floor is read from that same clock.
+    let since_phase_one: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&cluster.pg_fixture().superuser_pool()?)
+        .await?;
     owner
         .write(&fqn, &journey_schema(), [journey_row(3, "row-3")])
         .await?;
@@ -227,7 +251,13 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 
     // 4. Hot to Iceberg authority transition. The same rows must survive the
     //    move to snapshot authority exactly: no duplicate, no omission.
+    //    The parked promotion is released to commit, the hints queued behind
+    //    it follow, and the requested passes below promote any remaining debt.
     let before_promotion = query_ids(owner.client(), &fqn, None).await?;
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the first promotion never reached the parked commit")?;
+    promotion.release_paused_before_commit();
     compact_sealed_batch(&cluster, owner_tenant, &table, 3).await?;
     cluster.refresh_oracle_snapshots().await?;
     let after_promotion = query_ids(owner.client(), &fqn, None).await?;
@@ -238,11 +268,17 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 
     // 5. Pre-footer pruning. One hot object and one current-snapshot object
     //    both declare bounds disjoint from the queried interval, so both are
-    //    excluded before any footer is opened.
+    //    excluded before any footer is opened. Promotion is parked again so
+    //    the new object stays hot; the parked commit is drained, unsettled,
+    //    by the production shutdown in phase 7.
+    promotion.pause_before_commit();
     owner
         .write(&fqn, &journey_schema(), [journey_row(5, "row-5")])
         .await?;
     server.flush_bifrost().await?;
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the new object's promotion never reached the parked commit")?;
     cluster.refresh_oracle_snapshots().await?;
     let (compacted, hot) = file_tier_counts(&cluster, owner_tenant, &table).await?;
     assert!(

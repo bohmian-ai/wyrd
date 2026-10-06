@@ -1,37 +1,28 @@
 //! Tier-2 coverage for the separate expired-object cleanup task.
 //!
 //! Cleanup consumes an immutable handoff one committed expiration left behind,
-//! prepares exactly one candidate at a time with Postgres closed before any
-//! object-store call, blocks Oracle reader widening while a preparation is
-//! unresolved, and advances only for a confirmed deletion or a proven absence.
+//! prepares exactly one candidate at a time and commits that preparation before
+//! any object-store call, deletes only while it holds the table's exclusive
+//! maintenance authority, refuses while any Oracle query holds an active read
+//! on the table, and advances only for a confirmed deletion or a proven
+//! absence.
 
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeError, ForgeScheduler, ForgeWorker, ForgeWorkerConfig,
+    Forge, ForgeError, ForgeWorker, ForgeWorkerConfig, cleanup_projection,
 };
-use vala_bifrost_redux::oracle::reader_pins::{
-    OracleReaderAuthority, OracleReaderAuthorityConfig, RecordingEpochTerminator,
-};
-use vala_sql::queries::cluster_nodes::ClusterNodes;
-use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
-use vala_sql::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
-use vala_sql::row_types::cluster_nodes::RoleRegistration;
+use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
     ForgeTaskClaim, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{
-    ClusterCapabilities, ClusterNodeKey, ClusterRole, NodeId, OracleCapabilitiesV1, QueryClass,
-};
-
-use crate::oracle::reader_authority::cut;
 
 use super::snapshot_expiration::{
     ExpirableTable, expirable_table, object_exists, seed_ready_expiry_task,
@@ -87,7 +78,7 @@ async fn cursor(
 /// Panics when the expiration does not settle with candidates or the cleanup
 /// task cannot be planned and enqueued.
 async fn drained_expiration(name: &str) -> DrainedExpiration {
-    let table = expirable_table(name, true).await;
+    let table = expirable_table(name).await;
     let worker = ForgeWorker::new(
         table.supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -120,33 +111,12 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
         .expect("the settled expiration left one handoff");
     assert!(!payload.cleanup_candidates.is_empty());
 
-    // The supervised production scheduler holds the singleton planning fence;
-    // ageing it out lets this test own one deterministic planning pass.
-    sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at = now() - interval '1 hour'")
-        .execute(table.fixture.operator_pool.pool())
-        .await
-        .expect("the live scheduler fence ages out");
-    let owner = Uuid::now_v7();
-    let fence = tasks
-        .acquire_scheduler(owner, 30)
-        .await
-        .expect("scheduler lease")
-        .expect("uncontended fence");
-    let (demands, _) = tasks
-        .planning_demands(owner, fence, 8)
-        .await
-        .expect("demands");
-    let demand = demands
-        .into_iter()
-        .find(|value| value.table_ref == identity)
-        .expect("settlement created cleanup demand");
-    let forge = table.supervised.forge();
-    let projected: NewForgeTask = ForgeScheduler::with_owner_for_test(&forge, owner)
-        .expect("fixture scheduler")
-        .expired_cleanup_task_for_test(&demand)
-        .await
-        .expect("the fixed bounded projection builds")
-        .expect("one unconsumed handoff projects one cleanup task");
+    let key = vala_bifrost_redux::forge::ForgeTableKey {
+        tenant: table.fixture.tenant,
+        table: identity.clone(),
+    };
+    let projected: NewForgeTask =
+        cleanup_projection(&key, &payload).expect("the fixed bounded projection builds");
     assert_eq!(projected.strategy, ForgeTaskStrategy::ExpiredCleanup);
     assert_eq!(projected.base_snapshot_id, payload.committed_snapshot_id);
     assert_eq!(
@@ -154,22 +124,10 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
         payload.cleanup_candidates.len()
     );
     assert!(projected.plan.inputs.is_empty());
-
-    assert_eq!(
-        tasks
-            .enqueue_and_acknowledge(
-                owner,
-                fence,
-                &demand,
-                ForgeEnqueueBatch {
-                    executable: std::slice::from_ref(&projected),
-                },
-            )
-            .await
-            .expect("cleanup enqueue")
-            .len(),
-        1
-    );
+    tasks
+        .enqueue(&projected)
+        .await
+        .expect("the handoff admits one cleanup enqueue");
     let cleanup_id: Uuid =
         sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE strategy='expired_cleanup'")
             .fetch_one(table.fixture.operator_pool.pool())
@@ -221,82 +179,6 @@ async fn release_cleanup_claim(fixture: &PromotionIntegrationFixture, task_id: U
         .expect("the cleanup claim releases");
 }
 
-/// Starts one real Oracle reader authority over the fixture's own database.
-///
-/// Nothing about the authority is simulated: it registers a real Oracle role,
-/// acquires and activates a real epoch, and commits real protection frontiers
-/// through `vala.bifrost_table_maintenance_authority` — the same row an
-/// expired-cleanup preparation serializes against.
-///
-/// # Panics
-///
-/// Panics when the role, epoch, or activation cannot be established.
-async fn reader_authority(
-    fixture: &PromotionIntegrationFixture,
-    shutdown: &CancellationToken,
-) -> (Arc<OracleReaderAuthority>, TableAuthorityIdentity) {
-    let node_id = Uuid::now_v7();
-    let mut conn = fixture
-        .database
-        .vala_postgres()
-        .tenant_conn(DataTenantId::SYSTEM_OWNER)
-        .await
-        .expect("system connection");
-    let row = ClusterNodes::new(fixture.database.vala_postgres().clone())
-        .register(
-            &mut conn,
-            &RoleRegistration {
-                key: ClusterNodeKey {
-                    node_id: NodeId::new(node_id),
-                    role: ClusterRole::Oracle,
-                },
-                address: "http://oracle:5002".into(),
-                capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                    storage_protocol_version: 1,
-                    cpu_cores: 4.0,
-                    memory_budget_bytes: 4096,
-                    cpu_cores_per_slot: 1.0,
-                    memory_bytes_per_slot: 1024,
-                    raw_slots: 4,
-                    usable_slots: 3,
-                    supported_classes: vec![QueryClass::Interactive],
-                    max_workers_per_query: 3,
-                }),
-                started_at: chrono::Utc::now(),
-            },
-        )
-        .await
-        .expect("oracle role registers");
-    conn.commit().await.expect("registration commits");
-
-    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
-        vala: fixture.database.vala_postgres().clone(),
-        operator_pool: fixture.database.operator_pool().clone(),
-        node_id,
-        fencing_token: row.lease.fencing_token,
-        terminator: Arc::new(RecordingEpochTerminator::default()) as Arc<_>,
-        shutdown: shutdown.clone(),
-    })
-    .await
-    .expect("epoch acquires");
-    authority.activate().await.expect("epoch activates");
-
-    let table_uid: Vec<u8> =
-        sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE data_tenant_id=$1")
-            .bind(fixture.tenant.as_uuid())
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("the fixture table is registered");
-    let identity = TableAuthorityIdentity {
-        tenant: fixture.tenant,
-        table_uid: table_uid.try_into().expect("table uid is 16 bytes"),
-        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-        namespace_name: fixture.binding.table_ref.namespace.as_str().to_owned(),
-        table_name: fixture.binding.table_ref.name.clone(),
-    };
-    (authority, identity)
-}
-
 /// Counts every live maintenance lease, which a refused claim must not change.
 ///
 /// # Panics
@@ -327,17 +209,19 @@ fn sibling_path(candidate: &ForgeCleanupCandidate, file_name: &str) -> String {
     format!("{directory}/{file_name}")
 }
 
-/// Asserts the preparation committed and released its table-authority lock.
+/// Asserts the preparation committed while the exclusive authority stays held.
 ///
 /// The drain is suspended between its committed preparation and its first
-/// external call, so an independent transaction taking the same row without
-/// waiting is the direct proof that no Postgres resource spans object IO.
+/// external call. The preparation is already durable, yet an independent
+/// transaction cannot take the table's maintenance-authority row: the drain's
+/// live exclusive authority holds it through the delete's known outcome, so no
+/// reader can be admitted between the fresh proof and the deletion.
 ///
 /// # Panics
 ///
-/// Panics when the cursor differs, a deletion was submitted, or the probe lock
-/// is blocked.
-async fn assert_preparation_closed_its_transaction(
+/// Panics when the cursor differs, a deletion was submitted, or the probe
+/// lock is granted or fails for any reason other than the held row.
+async fn assert_preparation_committed_under_held_authority(
     table: &ExpirableTable,
     identity: &TableAuthorityIdentity,
     cleanup_id: Uuid,
@@ -359,59 +243,38 @@ async fn assert_preparation_closed_its_transaction(
         .begin()
         .await
         .expect("independent transaction");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR UPDATE NOWAIT")
-            .bind(identity.tenant.as_uuid())
-            .bind(&identity.catalog_name)
-            .bind(&identity.namespace_name)
-            .bind(&identity.table_name)
-            .fetch_one(&mut *lock),
-    )
-    .await
-    .expect("the independent lock is not blocked")
-    .expect("the preparation transaction released the table-authority row");
-    lock.rollback().await.expect("release the probe lock");
+    let refused = sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR UPDATE NOWAIT")
+        .bind(identity.tenant.as_uuid())
+        .bind(&identity.catalog_name)
+        .bind(&identity.namespace_name)
+        .bind(&identity.table_name)
+        .fetch_one(&mut *lock)
+        .await
+        .expect_err("the drain's exclusive authority holds the table-authority row");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("55P03"),
+        "the probe is refused only because the row is locked: {refused}"
+    );
+    lock.rollback().await.expect("end the probe transaction");
 }
 
-/// Asserts an unresolved preparation excludes every competing authority.
+/// Asserts an unresolved preparation excludes every competing Forge authority.
 ///
-/// Reader widening, a second Forge claim, and a competing destructive effect
-/// are each refused by their own production mechanism while the prepared row
-/// stands, and widening is refused before any manifest or data object is read.
+/// A second Forge claim and a competing destructive effect are each refused by
+/// their own production mechanism while the prepared row stands.
 ///
 /// # Panics
 ///
-/// Panics when any competitor is admitted or widening reads an object first.
+/// Panics when any competitor is admitted.
 async fn assert_prepared_candidate_excludes_competitors(
-    table: &ExpirableTable,
     worker: &ForgeWorker,
     forge: &Arc<Forge>,
     binding: &TenantTableBinding,
-    oracle: &Arc<OracleReaderAuthority>,
-    identity: &TableAuthorityIdentity,
-    payload: &ExpiredCleanupPayload,
 ) {
-    let reads_before = table.store.reads();
-    assert!(
-        oracle
-            .acquire_guard_for_cuts(vec![(
-                identity.clone(),
-                cut(
-                    payload.committed_snapshot_id,
-                    1,
-                    &[payload.committed_snapshot_id],
-                ),
-            )])
-            .await
-            .is_err(),
-        "an unresolved cleanup preparation blocks reader widening"
-    );
-    assert_eq!(
-        table.store.reads(),
-        reads_before,
-        "reader widening is refused before any manifest or data read"
-    );
     assert!(
         worker
             .claim_for_test()
@@ -515,8 +378,9 @@ async fn assert_self_exemption_is_exact(
 ///
 /// The drain is suspended between its committed preparation and its first
 /// external call, so each assertion here observes production state directly:
-/// the SQL transaction is closed, the prepared row is the reader-widening and
-/// competing-Forge boundary, and the self-exemption covers exactly one tuple.
+/// the preparation is durable while the exclusive authority is held, the
+/// prepared row is the competing-Forge boundary, and the self-exemption covers
+/// exactly one tuple.
 ///
 /// # Panics
 ///
@@ -525,22 +389,31 @@ async fn assert_self_exemption_is_exact(
     clippy::too_many_arguments,
     reason = "the gate proof observes the whole live drain context and owns no state of its own"
 )]
+/// Asserts every durable gate a paused cleanup candidate must hold.
+///
+/// Runs while the first candidate's reachability stat is suspended, after
+/// the preparation committed and before any deletion: the preparation is
+/// committed under the held table authority, the prepared candidate
+/// excludes competing Forge claims, and the self-exemption names exactly
+/// this cleanup attempt.
+///
+/// # Panics
+///
+/// Panics when the preparation is not visible under the held authority, a
+/// competing claim is admitted, or the self-exemption does not match the
+/// cleanup, attempt, and candidate.
 async fn assert_paused_candidate_gates(
     table: &ExpirableTable,
     worker: &ForgeWorker,
     forge: &Arc<Forge>,
     binding: &TenantTableBinding,
-    oracle: &Arc<OracleReaderAuthority>,
     identity: &TableAuthorityIdentity,
     cleanup_id: Uuid,
     attempt: Uuid,
     payload: &ExpiredCleanupPayload,
 ) {
-    assert_preparation_closed_its_transaction(table, identity, cleanup_id).await;
-    assert_prepared_candidate_excludes_competitors(
-        table, worker, forge, binding, oracle, identity, payload,
-    )
-    .await;
+    assert_preparation_committed_under_held_authority(table, identity, cleanup_id).await;
+    assert_prepared_candidate_excludes_competitors(worker, forge, binding).await;
     assert_self_exemption_is_exact(
         forge,
         binding,
@@ -630,8 +503,23 @@ async fn assert_cross_table_plan_is_refused(
     release_cleanup_claim(&table.fixture, cleanup_id).await;
 }
 
+/// Proves a prepared cleanup candidate gates readers and competing claims.
+///
+/// A persisted cross-table plan is refused first. The cleanup claim then
+/// excludes a second Forge claim for the table, and with the first deletion
+/// paused the candidate's durable gates hold while a racing reader waits on
+/// the exclusive authority and commits its cut only after the delete. The
+/// drain succeeds with every candidate deleted once and an empty prepared
+/// frontier.
+///
+/// # Panics
+///
+/// Panics when the cleanup task is not claimable, a second claim is
+/// admitted, the racing reader commits before the delete, the drain fails,
+/// or the final cursor, delete count, or object absence differ from one
+/// deletion per candidate.
 #[tokio::test]
-async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forge_claims() {
+async fn candidate_preparation_releases_sql_and_blocks_active_reads_and_competing_forge_claims() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let DrainedExpiration {
         table,
@@ -675,8 +563,7 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
     // after the preparation committed and before any deletion was submitted,
     // which is the only place the durable gates can be observed at all.
     let attempt = claim.attempt_id.expect("a claimed task has an attempt");
-    let epoch_shutdown = CancellationToken::new();
-    let (oracle, identity) = reader_authority(&table.fixture, &epoch_shutdown).await;
+    let identity = table.fixture.table_identity().await;
     let binding = table.fixture.binding.clone();
     let forge = table.supervised.forge();
     table.store.pause_stat_at(1);
@@ -686,15 +573,32 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
         async {
             table.store.stat_paused().await;
             assert_paused_candidate_gates(
-                &table, &worker, &forge, &binding, &oracle, &identity, cleanup_id, attempt,
-                &payload,
+                &table, &worker, &forge, &binding, &identity, cleanup_id, attempt, &payload,
             )
             .await;
+            // A query racing the live exclusive authority waits on it; it
+            // cannot commit its cut until the delete's outcome is known.
+            let (reader, acquisition) = table.fixture.spawn_active_read();
+            table.fixture.await_blocked_cut_acquisition().await;
+            assert!(
+                !acquisition.is_finished(),
+                "no reader commits while the cleanup's exclusive authority is live"
+            );
             table.store.release_stat();
+            acquisition.await.expect("the raced acquisition joins");
+            assert_eq!(
+                table.store.deletes(),
+                deletes_before + 1,
+                "the racing reader committed only after the delete finished"
+            );
+            assert!(
+                !object_exists(&table.fixture, payload.cleanup_candidates[0].path.as_str()).await,
+                "the racing reader observes the candidate already deleted"
+            );
+            table.fixture.release_active_read(reader).await;
         }
     );
     drained.expect("the drained cleanup task succeeds");
-    epoch_shutdown.cancel();
 
     let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
     assert_eq!(state, "succeeded");
@@ -734,11 +638,16 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
 ///
 /// Keeps the durable owner assertion out of the scenario body so the replay
 /// sequence stays one readable narrative.
+///
+/// # Panics
+///
+/// Panics when the second worker cannot be built, when it is allowed to drain
+/// the claim, or when the task row no longer names the original owner.
 async fn assert_foreign_takeover_is_refused(
     table: &ExpirableTable,
     claim: &ForgeTaskClaim,
     cleanup_id: Uuid,
-    pool: &sqlx::PgPool,
+    pool: &PgPool,
 ) {
     let foreign = ForgeWorker::new(
         table.supervised.forge(),
@@ -814,7 +723,7 @@ async fn seed_extra_candidates(
 /// # Panics
 ///
 /// Panics when the update fails.
-async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
+pub(super) async fn expire_claim(pool: &PgPool, task_id: Uuid) {
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 hour' WHERE task_id=$1")
         .bind(task_id)
         .execute(pool)
@@ -827,7 +736,7 @@ async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
 /// # Panics
 ///
 /// Panics when the task is unreadable.
-async fn attempt_of(pool: &sqlx::PgPool, task_id: Uuid) -> Option<Uuid> {
+async fn attempt_of(pool: &PgPool, task_id: Uuid) -> Option<Uuid> {
     sqlx::query_scalar("SELECT attempt_id FROM vala.forge_tasks WHERE task_id = $1")
         .bind(task_id)
         .fetch_one(pool)
@@ -896,7 +805,7 @@ async fn assert_stat_failure_settles_as_refusal(
         .await
         .expect_err("a refused candidate does not complete the drain");
     assert!(
-        matches!(retained, ForgeError::Reconciliation { .. }),
+        matches!(retained, ForgeError::CleanupRetained { index: 0, .. }),
         "a refusal retains the candidate for replay: {retained}"
     );
     assert!(
@@ -943,7 +852,7 @@ async fn assert_cancelled_stat_settles_as_refusal(
     });
     let retained = result.expect_err("pre-submission cancellation retains the candidate");
     assert!(
-        matches!(retained, ForgeError::Reconciliation { .. }),
+        matches!(retained, ForgeError::CleanupRetained { index: 0, .. }),
         "cancellation observed before submission settles as a refusal: {retained}"
     );
     assert!(
@@ -1016,7 +925,7 @@ async fn assert_lost_acknowledgement_is_uncertain(
         .await
         .expect_err("an uncertain acceptance does not complete the drain");
     assert!(
-        matches!(retained, ForgeError::Reconciliation { .. }),
+        matches!(retained, ForgeError::CleanupRetained { index: 0, .. }),
         "an unknown acceptance retains the candidate: {retained}"
     );
     assert_eq!(
@@ -1063,7 +972,7 @@ async fn assert_polled_delete_cancellation_is_uncertain(
     });
     let retained = result.expect_err("cancellation racing a submitted delete does not complete");
     assert!(
-        matches!(retained, ForgeError::Reconciliation { .. }),
+        matches!(retained, ForgeError::CleanupRetained { index: 0, .. }),
         "cancellation after submission retains the candidate: {retained}"
     );
     assert_eq!(
@@ -1111,7 +1020,7 @@ async fn assert_partial_frontier_is_left_for_the_successor(
     assert!(
         matches!(
             result.expect_err("the interrupted drain does not complete"),
-            ForgeError::Reconciliation { .. }
+            ForgeError::CleanupRetained { index: 1, .. }
         ),
         "the second candidate is retained at the partial frontier"
     );
@@ -1296,5 +1205,494 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     assert_cleanup_finished_exactly(&table, cleanup_id, &payload, deletes_before).await;
 
     let _ = Arc::strong_count(&table.store);
+    table.supervised.shutdown().await;
+}
+
+/// Proves a refused prepared candidate settles without an ownership conflict
+/// and replays under its exact identity once the refusing root clears.
+///
+/// The fair-claimed attempt prepares candidate zero and is refused before its
+/// delete; generic retry settlement accepts only `claimed`/`running` rows, so
+/// the retained `prepared` row must bypass it. The same owner then replays the
+/// prepared candidate through the production prepared-claim route while a fresh
+/// active read — taken after the preparation committed — refuses the delete
+/// proof. Releasing the read lets the identical task and attempt converge.
+///
+/// # Panics
+///
+/// Panics when a refusal reports an ownership or settlement error, the cursor
+/// or attempt identity changes, a delete is submitted while refused, or the
+/// replay does not converge after the read is released.
+#[tokio::test]
+async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        table,
+        worker,
+        cleanup_id,
+        payload,
+    } = Box::pin(drained_expiration("cleanup_root_refusal")).await;
+    let pool = table.fixture.operator_pool.pool();
+    let deletes_before = table.store.deletes();
+
+    // Fair-claimed attempt: candidate zero is prepared, then refused before
+    // any delete is submitted. The refusal is a retained outcome, not a
+    // failed retry of a row that is no longer `claimed` or `running`.
+    table.store.fail_next_stats(1);
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("a refused prepared candidate settles without an ownership conflict"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "the refused candidate stays prepared at its own index"
+    );
+    let attempt = attempt_of(pool, cleanup_id)
+        .await
+        .expect("the retained candidate keeps its attempt");
+
+    // A query admitted after the preparation committed is a newly visible
+    // root: the same owner's immediate replay refuses the delete proof again
+    // and still reports the retained outcome rather than a slot-fatal error.
+    let reader = table.fixture.hold_active_read().await;
+    let refused = worker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect_err("an active read refuses the prepared candidate's delete");
+    assert!(
+        matches!(refused, ForgeError::CleanupRetained { index: 0, .. }),
+        "the newly visible root retains the candidate for replay: {refused}"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "the active read advances nothing"
+    );
+    assert_eq!(
+        attempt_of(pool, cleanup_id).await,
+        Some(attempt),
+        "the refused replay keeps the exact task and attempt identity"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before,
+        "no delete is submitted while the read is active"
+    );
+
+    // Once the root clears, the identical prepared identity converges.
+    table.fixture.release_active_read(reader).await;
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("the retained candidate replays after the read is released"),
+        "the prepared cleanup task is reconciled"
+    );
+    let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
+    assert_eq!(state, "succeeded");
+    assert_eq!(frontier as usize, payload.cleanup_candidates.len());
+    assert_eq!(prepared, None);
+    for candidate in &payload.cleanup_candidates {
+        assert!(
+            !object_exists(&table.fixture, candidate.path.as_str()).await,
+            "every candidate is removed once the read is released"
+        );
+    }
+
+    table.supervised.shutdown().await;
+}
+
+/// Reads one task's durable state, failure class, and consumed attempt count.
+///
+/// # Panics
+///
+/// Panics when the task is unreadable.
+async fn retry_state(pool: &PgPool, task_id: Uuid) -> (String, Option<String>, i32) {
+    sqlx::query_as(
+        "SELECT state, failure_class, attempt_count FROM vala.forge_tasks WHERE task_id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await
+    .expect("cleanup task readable")
+}
+
+/// Proves an active read refusing a candidate preparation never reaches
+/// generic retry settlement.
+///
+/// The first preparation is refused while the row is still `running`: nothing
+/// durable exists, so the claim is released without consuming retry budget.
+/// A later preparation is refused after the row is already `prepared` at a
+/// nonzero frontier: the exact identity is retained for the prepared-claim
+/// route, which replays it — still refused while the read is held — and
+/// converges once the read is released.
+///
+/// # Panics
+///
+/// Panics when a refused preparation reports lost ownership, consumes retry
+/// budget, moves the cursor, changes the attempt, is not counted once at its
+/// `prepare` or `replay` refusal stage, or the replay does not converge after
+/// the read is released.
+#[tokio::test]
+async fn active_read_refusing_preparation_is_released_or_retained_without_retry() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        table,
+        worker,
+        cleanup_id,
+        mut payload,
+    } = Box::pin(drained_expiration("cleanup_prepare_refusal")).await;
+    let pool = table.fixture.operator_pool.pool();
+    payload
+        .cleanup_candidates
+        .extend(seed_extra_candidates(&table, &payload, &["wyrd-second-expired.parquet"]).await);
+    payload.cleanup_candidates.sort();
+    persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
+    let deletes_before = table.store.deletes();
+
+    // First preparation refused while the row is still `running`.
+    let reader = table.fixture.hold_active_read().await;
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("a refused first preparation releases its claim"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    assert_eq!(
+        retry_state(pool, cleanup_id).await,
+        (
+            "retryable".to_owned(),
+            Some("capacity_refused".to_owned()),
+            0
+        ),
+        "a refused first preparation consumes no retry budget"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("retryable".to_owned(), 0, None)
+    );
+    assert_refusal_counts(&telemetry, (1, 0));
+    table.fixture.release_active_read(reader).await;
+    sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=now()-interval '1 second',ready_at=now()-interval '1 second' WHERE task_id=$1")
+        .bind(cleanup_id)
+        .execute(pool)
+        .await
+        .expect("the released refusal becomes eligible now");
+
+    // Candidate zero is proven, then a read arrives before its delete is
+    // submitted. It waits on the live exclusive authority and commits only
+    // after the delete's outcome is known, so candidate one's authority is
+    // refused with the row already `prepared` at frontier one.
+    table.store.pause_delete_at(1);
+    let stop = CancellationToken::new();
+    let (result, reader) = tokio::join!(worker.execute_one_for_test(&stop), async {
+        table.store.delete_paused().await;
+        let (reader, acquisition) = table.fixture.spawn_active_read();
+        table.fixture.await_blocked_cut_acquisition().await;
+        table.store.release_delete();
+        acquisition.await.expect("the raced acquisition joins");
+        reader
+    });
+    assert!(
+        result.expect("a refused later preparation settles without an ownership conflict"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 1, None),
+        "the refused preparation retains the advanced frontier"
+    );
+    let attempt = attempt_of(pool, cleanup_id)
+        .await
+        .expect("the retained row keeps its attempt");
+
+    let refused = worker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect_err("the held read refuses the replayed preparation");
+    assert!(
+        matches!(refused, ForgeError::CleanupRetained { index: 1, .. }),
+        "the replay is retained, not slot-fatal: {refused}"
+    );
+    assert_refusal_counts(&telemetry, (1, 2));
+    assert_eq!(attempt_of(pool, cleanup_id).await, Some(attempt));
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "only candidate zero was ever submitted"
+    );
+
+    table.fixture.release_active_read(reader).await;
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("the retained frontier replays after the read is released"),
+        "the prepared cleanup task is reconciled"
+    );
+    let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
+    assert_eq!(state, "succeeded");
+    assert_eq!(frontier as usize, payload.cleanup_candidates.len());
+    assert_eq!(prepared, None);
+    for candidate in &payload.cleanup_candidates {
+        assert!(
+            !object_exists(&table.fixture, candidate.path.as_str()).await,
+            "every candidate is removed once the read is released"
+        );
+    }
+
+    table.supervised.shutdown().await;
+}
+
+/// Asserts the active-read cleanup refusals counted so far, as
+/// `(prepare, replay)`.
+///
+/// A released first preparation counts at `prepare`; a retained later
+/// preparation and each refused replay of it count at `replay`.
+///
+/// # Panics
+///
+/// Panics when either stage's `bifrost_forge_expired_cleanup_refusals_total`
+/// series differs from `expected`.
+fn assert_refusal_counts(telemetry: &ForgeTelemetryCheckpoint, expected: (u64, u64)) {
+    let snapshot = telemetry.snapshot();
+    let count = |stage| {
+        super::production_routes::counter_total(
+            &snapshot,
+            "bifrost_forge_expired_cleanup_refusals_total",
+            &[("stage", stage), ("reason", "active_read")],
+        )
+    };
+    assert_eq!(
+        (count("prepare"), count("replay")),
+        expected,
+        "active-read cleanup refusals by stage"
+    );
+}
+
+/// Copies one promoted `file_list` row under a new identity, path, and table.
+///
+/// The copy keeps the source row's settlement columns, so a copy of a
+/// terminal row is terminal. A fresh writer node keeps the stream-range
+/// uniqueness index satisfied.
+///
+/// # Panics
+///
+/// Panics when no promoted row exists or the insert fails.
+async fn copy_terminal_row(fixture: &PromotionIntegrationFixture, path: &str, table_name: &str) {
+    let copied = sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,compacted,committed_snapshot_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record,file_ordinal,file_checksum,forge_publication_operation_id) SELECT $1,data_tenant_id,namespace,$3,$2,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,compacted,committed_snapshot_id,$1,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record,file_ordinal,file_checksum,forge_publication_operation_id FROM vala.file_list WHERE data_tenant_id=$4 AND compacted AND committed_snapshot_id IS NOT NULL LIMIT 1")
+        .bind(Uuid::now_v7())
+        .bind(path)
+        .bind(table_name)
+        .bind(fixture.tenant.as_uuid())
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the terminal row copies")
+        .rows_affected();
+    assert_eq!(copied, 1, "a promoted terminal row exists to copy");
+}
+
+/// Lists the tenant's `file_list` rows as `(table, path)` pairs.
+///
+/// # Panics
+///
+/// Panics when the read fails.
+async fn file_list_paths(fixture: &PromotionIntegrationFixture) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT table_name, file_path FROM vala.file_list WHERE data_tenant_id=$1 ORDER BY table_name, file_path")
+        .bind(fixture.tenant.as_uuid())
+        .fetch_all(fixture.operator_pool.pool())
+        .await
+        .expect("file_list rows read")
+}
+
+/// Proves cleanup retires a terminal `file_list` row only with its object.
+///
+/// Two extra candidates carry terminal rows: one object is present, the other
+/// is already absent, as after a delete that landed before its SQL settlement.
+/// A terminal row at a non-candidate path and a same-path row of another table
+/// are bystanders. A failed delete leaves every row in place; the drain that
+/// follows removes exactly the candidates' rows, by deletion and by observed
+/// absence, and keeps both bystanders.
+///
+/// # Panics
+///
+/// Panics when a row is removed before its object, a candidate row survives
+/// the completed drain, or a bystander row is removed.
+#[tokio::test]
+async fn terminal_file_list_row_is_removed_only_after_object_cleanup() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        table,
+        worker,
+        cleanup_id,
+        mut payload,
+    } = Box::pin(drained_expiration("cleanup_file_list")).await;
+    let fixture = &table.fixture;
+    let seeded = seed_extra_candidates(
+        &table,
+        &payload,
+        &[
+            "wyrd-terminal-present.parquet",
+            "wyrd-terminal-absent.parquet",
+        ],
+    )
+    .await;
+    let present = seeded[0].path.as_str().to_owned();
+    let absent = seeded[1].path.as_str().to_owned();
+    let bystander = sibling_path(&seeded[0], "wyrd-terminal-bystander.parquet");
+    payload.cleanup_candidates.extend(seeded);
+    payload.cleanup_candidates.sort();
+    persist_cleanup_plan(fixture, cleanup_id, &payload).await;
+    fixture
+        .staging
+        .delete(&absent)
+        .await
+        .expect("the absent candidate's object is removed up front");
+    let own = fixture.binding.table_ref.name.clone();
+    for path in [&present, &absent, &bystander] {
+        copy_terminal_row(fixture, path, &own).await;
+    }
+    copy_terminal_row(fixture, &present, "other_table").await;
+    let rows_before = file_list_paths(fixture).await;
+
+    table.store.fail_next_deletes(1);
+    assert!(
+        worker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("an uncertain delete settles as a retained candidate"),
+        "the fair-claimed cleanup attempt ran"
+    );
+    let (state, frontier, prepared) = cursor(fixture, cleanup_id).await;
+    assert_eq!(
+        (state.as_str(), prepared),
+        ("prepared", Some(frontier)),
+        "a failed delete retains its prepared candidate at the frontier"
+    );
+    assert_eq!(
+        file_list_paths(fixture).await,
+        rows_before,
+        "a failed delete removes no file_list row"
+    );
+
+    // The lapsed claim is recovered by a takeover worker through the
+    // production prepared-claim route, which replays the retained candidate.
+    expire_claim(fixture.operator_pool.pool(), cleanup_id).await;
+    let taker = ForgeWorker::new(
+        table.supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("takeover worker");
+    taker
+        .execute_one_for_test(&CancellationToken::new())
+        .await
+        .expect("the takeover drains every candidate");
+    assert_eq!(cursor(fixture, cleanup_id).await.0, "succeeded");
+    let expected: Vec<(String, String)> = rows_before
+        .into_iter()
+        .filter(|(table_name, path)| !(table_name == &own && (path == &present || path == &absent)))
+        .collect();
+    assert_eq!(
+        file_list_paths(fixture).await,
+        expected,
+        "exactly the cleaned candidates' terminal rows are removed"
+    );
+}
+
+/// Proves a hung cleanup delete surrenders the table's exclusive authority at
+/// the lease bound and settles as uncertain.
+///
+/// The delete is suspended inside the object store and never released, the
+/// shape of a hung store request. The worker's Forge runs a short lease TTL, so
+/// the bound arrives quickly: the candidate settles as an unknown acceptance
+/// and stays prepared for replay, and the maintenance-authority row is free for
+/// an Oracle cut again instead of being held for as long as the store hangs.
+///
+/// # Panics
+///
+/// Panics when the drain does not return within the scenario bound, settles as
+/// anything but a retained candidate, advances the cursor, or leaves the
+/// authority row locked.
+#[tokio::test]
+async fn hung_cleanup_delete_surrenders_table_authority_at_the_lease_bound() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let DrainedExpiration {
+        mut table,
+        cleanup_id,
+        ..
+    } = Box::pin(drained_expiration("cleanup_hung_delete")).await;
+    let lease_ttl = std::time::Duration::from_secs(6);
+    table.fixture.config = vala_bifrost_redux::forge::ForgeConfig {
+        lease_ttl,
+        iceberg_total_retry_timeout: std::time::Duration::from_secs(2),
+        catalog_request_timeout: std::time::Duration::from_secs(2),
+        uncertainty_margin: std::time::Duration::from_secs(1),
+        ..table.fixture.config.clone()
+    };
+    let forge = table.fixture.build_forge_for_test(
+        Arc::clone(&table.seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&table.store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        table.supervised.forge().clock_for_test(),
+        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
+        vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7()),
+    );
+    let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7())
+        .expect("short-lease Forge worker");
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the cleanup task is claimable");
+    assert_eq!(claim.task_id, cleanup_id);
+    let deletes_before = table.store.deletes();
+
+    table.store.pause_delete_at(1);
+    let drained = tokio::time::timeout(
+        lease_ttl * 4,
+        worker.execute_expired_cleanup_claim_for_test(claim, &CancellationToken::new()),
+    )
+    .await
+    .expect("a hung delete does not hold the drain past the lease bound");
+    let retained = drained.expect_err("an unknown acceptance does not complete the drain");
+    assert!(
+        matches!(retained, ForgeError::CleanupRetained { index: 0, .. }),
+        "a delete cut off at the bound is an unknown acceptance: {retained}"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "the bounded delete was submitted"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "an unknown acceptance advances nothing"
+    );
+
+    let identity = table.fixture.table_identity().await;
+    let mut probe = table
+        .fixture
+        .operator_pool
+        .pool()
+        .begin()
+        .await
+        .expect("independent transaction");
+    sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR SHARE NOWAIT")
+        .bind(identity.tenant.as_uuid())
+        .bind(&identity.catalog_name)
+        .bind(&identity.namespace_name)
+        .bind(&identity.table_name)
+        .fetch_one(&mut *probe)
+        .await
+        .expect("the surrendered authority admits an Oracle cut's share lock");
+    probe.rollback().await.expect("end the probe transaction");
+
+    table.store.release_delete();
     table.supervised.shutdown().await;
 }

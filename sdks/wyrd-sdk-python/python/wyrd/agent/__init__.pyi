@@ -16,9 +16,12 @@ from ..prompt import Prompt, ProviderResponse
 class Role:
     """Session turn role.
 
-    Values identify whether a turn came from the user, assistant, or tool.
+    Values identify whether a turn is a system instruction or came from the
+    user, assistant, or a tool. ``str(role)`` is the lowercase name
+    (``"system"``, ``"user"``, ``"assistant"``, or ``"tool"``).
     """
 
+    System: Role
     User: Role
     Assistant: Role
     Tool: Role
@@ -31,84 +34,131 @@ class SessionTurn:
 
     def __init__(
         self,
-        role: Role,
-        content: str,
         *,
-        tool_call_id: str | None = ...,
+        role: Role | str,
+        content: str,
+        call_id: str | None = None,
     ) -> None:
-        """Create a session turn.
+        """Create a session turn; every argument is keyword-only.
 
         Args:
-            role (Role): Role for the turn.
-            content (str): Turn content.
-            tool_call_id (str | None): Optional tool call id for tool turns.
+            role: a ``Role`` or its name, lowercase (``"system"``,
+                ``"user"``, ``"assistant"``, ``"tool"``) or capitalized.
+            content: the turn text.
+            call_id: the provider tool call id a ``tool`` turn answers.
+                Omitted, the turn answers no tool call.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` for an unknown
+                role name.
         """
         ...
 
     @property
-    def role(self) -> Role:
-        """Return the turn role."""
+    def role(self) -> str:
+        """Return the lowercase role name, such as ``"user"``."""
         ...
 
     @property
     def content(self) -> str:
-        """Return the turn content."""
+        """Return the turn text."""
         ...
 
     @property
-    def tool_call_id(self) -> str | None:
-        """Return the optional tool call id."""
+    def call_id(self) -> str | None:
+        """Return the tool call id a ``tool`` turn answers, or ``None``."""
         ...
 
-    def to_dict(self) -> JsonDict:
-        """Return a JSON-compatible session turn mapping."""
+    def model_dump(self) -> JsonDict:
+        """Return the turn as ``{"role", "content", "call_id"}``."""
+        ...
+
+    def model_dump_json(self) -> str:
+        """Return the turn as JSON text in the ``model_dump()`` shape."""
+        ...
+
+    @staticmethod
+    def model_validate(value: SessionTurn | Mapping[str, Any]) -> SessionTurn:
+        """Build a turn from a ``SessionTurn`` or a ``model_dump()``-shaped mapping.
+
+        Raises:
+            WyrdError: when the mapping is not one valid turn.
+        """
+        ...
+
+    @staticmethod
+    def model_validate_json(data: str) -> SessionTurn:
+        """Build a turn from ``model_dump_json()`` text.
+
+        Raises:
+            WyrdError: when the text is not one valid turn.
+        """
         ...
 
 @runtime_checkable
 class SessionMemory(Protocol):
-    """Protocol for Python session memory objects.
+    """Backend that stores and replays an Agent's conversation turns per session.
 
-    Implement this protocol to provide recent and append behavior to Agent runs.
+    Pass an object with ``recent`` and ``append`` methods as
+    ``Agent(session=...)``. The Agent uses it only for runs given a
+    ``session_id``. An exception raised by either method fails the run.
     """
 
     def recent(self, session_id: str, limit: int) -> Sequence[SessionTurn | JsonDict]:
-        """Return recent session turns.
+        """Return a session's most recent turns, oldest first.
+
+        Called once at the start of each run that has a ``session_id``; the
+        turns are replayed in the order returned, before the new user input.
 
         Args:
-            session_id (str): Session id for the run.
-            limit (int): Maximum recent turns requested.
+            session_id: the ``session_id`` passed to ``Agent.run()``.
+            limit: the most turns to return: ``RunConfig.session_recent_limit``,
+                or 50 when that is ``None``.
 
         Returns:
-            Sequence[SessionTurn | JsonDict]: Recent turns.
+            ``SessionTurn`` values or mappings with ``role`` (``"system"``,
+            ``"user"``, ``"assistant"``, or ``"tool"``), ``content``, and an
+            optional ``call_id``.
+
+        Raises:
+            Exception: any exception fails the run with
+                ``WYRD_SESSION_500_RECENT``.
         """
         ...
 
     def append(self, session_id: str, turn: SessionTurn) -> None:
-        """Append one session turn.
+        """Store one new turn of a session.
+
+        Called for the run's user input, each assistant response, and each
+        successful tool result. Failed tool calls are not appended.
 
         Args:
-            session_id (str): Session id for the run.
-            turn (SessionTurn): Turn to append.
+            session_id: the ``session_id`` passed to ``Agent.run()``.
+            turn: the turn to store.
+
+        Raises:
+            Exception: any exception fails the run with
+                ``WYRD_SESSION_500_APPEND``.
         """
         ...
 
 class NoSession:
-    """No-op session memory implementation.
-
-    Use this when an Agent should not persist session turns.
-    """
+    """Session memory that stores nothing; ``recent`` always returns ``[]``."""
 
     def recent(self, session_id: str, limit: int) -> list[SessionTurn]:
-        """Return an empty recent-turn list."""
+        """Return ``[]``; both arguments are ignored."""
         ...
 
     def append(self, session_id: str, turn: SessionTurn) -> None:
-        """Ignore one session turn."""
+        """Discard ``turn``; both arguments are ignored."""
         ...
 
 if True:
     class RunConfig:
-        """Run configuration for the bounded Agent loop."""
+        """Limits for one Agent's bounded model/tool loop.
+
+        The read-only attributes mirror the constructor arguments.
+        """
 
         max_iterations: int
         tool_concurrency_cap: int | None
@@ -126,15 +176,33 @@ if True:
             """Create run configuration.
 
             Args:
-                max_iterations (int): Maximum model/tool loop iterations.
-                tool_concurrency_cap (int | None): Maximum concurrent tool calls.
-                session_recent_limit (int | None): Maximum recent session turns.
-                timeout_ms (int | None): Overall run timeout in milliseconds.
+                max_iterations: the most model calls one run may make; defaults
+                    to 10. A run that still has tool calls to answer after the
+                    last iteration raises ``WYRD_AGENT_500_MAX_ITERATIONS``, as
+                    does every run when this is 0.
+                tool_concurrency_cap: the most tool calls of one model response
+                    run concurrently; defaults to 8. ``None`` also means 8 and
+                    0 means 1.
+                session_recent_limit: the ``limit`` passed to
+                    ``SessionMemory.recent()``. ``None`` (the default) means 50.
+                timeout_ms: the wall-clock budget for a whole run in
+                    milliseconds. ``None`` (the default) means no timeout; an
+                    expired run raises ``WYRD_AGENT_504_TIMEOUT``.
             """
             ...
 
     class FinishReason:
-        """Reason an Agent run terminated."""
+        """Reason an Agent run terminated.
+
+        A returned ``AgentRun`` reports ``ModelStopped`` (the model answered
+        without tool calls) or ``CallbackAborted`` (a ``before_agent``,
+        ``before_model``, ``after_model``, or ``after_agent`` callback raised
+        or returned a value of the wrong type; see ``AgentRun.error``). Iteration
+        exhaustion, provider failure, and timeout raise ``WyrdError`` from
+        ``Agent.run()`` instead of returning ``MaxIterations``,
+        ``ProviderError``, or ``Timeout``, and failed tools are reported back
+        to the model rather than ending the run with ``ToolError``.
+        """
 
         ModelStopped: FinishReason
         MaxIterations: FinishReason
@@ -144,7 +212,7 @@ if True:
         Timeout: FinishReason
 
     class AgentRun:
-        """Output of one Agent run."""
+        """Result of one completed ``Agent.run()``."""
 
         @property
         def finish_reason(self) -> FinishReason:
@@ -153,47 +221,60 @@ if True:
 
         @property
         def output(self) -> str:
-            """Return final assistant output text."""
+            """Return the final assistant text; ``""`` when a callback aborted the run."""
             ...
 
         @property
         def iterations(self) -> int:
-            """Return loop iteration count."""
+            """Return how many loop iterations ran; 0 when ``before_agent`` aborted."""
             ...
 
         @property
         def tokens_in(self) -> int:
-            """Return provider input token count."""
+            """Return the input tokens the final provider response reports.
+
+            Earlier iterations are not summed. 0 when the run reached no
+            response or the provider reported no usage.
+            """
             ...
 
         @property
         def tokens_out(self) -> int:
-            """Return provider output token count."""
+            """Return the output tokens the final provider response reports, as ``tokens_in``."""
             ...
 
         @property
         def conversation(self) -> JsonDict:
-            """Return the run conversation."""
+            """Return the run's accumulated conversation as a JSON-compatible mapping."""
             ...
 
         @property
         def error(self) -> WyrdError | None:
-            """Return the structured terminal error when the run aborted."""
+            """Return the callback's error when the run ended ``CallbackAborted``, else ``None``."""
             ...
 
         @property
         def structured_output(self) -> dict[str, Any] | None:
-            """Return parsed JSON output when the prompt declared an output schema."""
+            """Return the final output parsed as a JSON object.
+
+            Present only when the Prompt declared an output schema; ``None``
+            for text prompts.
+            """
             ...
 
         @property
         def parsed(self) -> Any:
-            """Return the typed model instance when output_type was a class, or None."""
+            """Return the output as an ``output_type`` instance, or ``None``.
+
+            Set only when the run produced ``structured_output`` and an output
+            class came from ``Agent.run(output_type=)``, ``Agent(output_type=)``,
+            or ``Prompt(output=)``, in that order of precedence.
+            """
             ...
 
         @property
         def provider_response(self) -> ProviderResponse | None:
-            """Return the final provider response as a typed wrapper, if the run reached one."""
+            """Return the final provider response, or ``None`` if the run reached none."""
             ...
 
 class ConversationTurn:
@@ -281,7 +362,7 @@ class MockProvider:
         ...
 
 class Agent:
-    """Declarative and runnable Wyrd Agent."""
+    """A Prompt-backed agent that runs a bounded model/tool loop and saves as an Agent Card."""
 
     def __init__(
         self,
@@ -308,6 +389,15 @@ class Agent:
         mock_provider: MockProvider | None = ...,
     ) -> None:
         """Create an Agent.
+
+        Every callback receives a ``ctx`` mapping with ``agent_id``,
+        ``session_id``, ``iteration``, and ``conversation`` as its first
+        argument. Returning ``None`` keeps the value unchanged. A callback
+        that returns a value of the wrong type is treated as raising, with
+        ``WYRD_AGENT_422_CALLBACK_RETURN_TYPE`` as the error. A raised
+        ``WyrdError``, or any exception whose ``args`` start with a catalog
+        code and a message, keeps that code; any other exception becomes
+        ``WYRD_AGENT_422_VALIDATION``.
 
         Args:
             prompt (Prompt | Mapping[str, Any]): Resolved prompt or inlineable prompt-reference mapping.
@@ -343,22 +433,22 @@ class Agent:
 
     @property
     def name(self) -> str | None:
-        """Return the optional envelope name."""
+        """Return the Agent Card name, or ``None`` when unset."""
         ...
 
     @property
     def version(self) -> str | None:
-        """Return the optional envelope version."""
+        """Return the Agent Card version, or ``None`` when unset."""
         ...
 
     @property
     def space(self) -> str | None:
-        """Return the optional envelope space."""
+        """Return the Agent Card space, or ``None`` when unset."""
         ...
 
     @property
     def id(self) -> str:
-        """Return the stable runtime id."""
+        """Return the runtime id: the ``id`` argument or a generated UUIDv7."""
         ...
 
     @property
@@ -378,31 +468,35 @@ class Agent:
 
     @property
     def tool_names(self) -> list[str]:
-        """Return runtime-local tool names."""
+        """Return the names of the attached runtime-local tools."""
         ...
 
     def save(self, path: PathLike) -> None:
-        """Save this Agent as local YAML.
+        """Write this Agent Card to ``path`` as YAML.
 
-        Args:
-            path (PathLike): Destination YAML path.
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_MISSING_NAME`` or
+                ``WYRD_AGENT_422_MISSING_VERSION`` when identity is incomplete,
+                or the IO or serialization error.
         """
         ...
 
     @staticmethod
     def from_yaml(path: PathLike) -> Agent:
-        """Load an Agent from local YAML.
+        """Load an Agent from an Agent Card YAML file.
 
-        Args:
-            path (PathLike): Source YAML path.
+        Tool names in the Card resolve against the process-wide tool registry,
+        so decorate the tools before loading.
 
-        Returns:
-            Agent: Loaded Agent.
+        Raises:
+            WyrdError: ``WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND`` for an
+                unregistered tool, ``WYRD_AGENT_404_PROMPT_CARD`` for an
+                unresolvable Prompt reference, or the IO or parse error.
         """
         ...
 
     def to_yaml_string(self) -> str:
-        """Return this Agent Card as YAML text."""
+        """Return this Agent Card as YAML text; raises as ``save()``."""
         ...
 
     def to_card(self) -> AgentCard:
@@ -410,23 +504,26 @@ class Agent:
         ...
 
     def model_dump_json(self) -> str:
-        """Return this Agent Card as JSON text."""
+        """Return this Agent Card as JSON text; raises as ``save()``."""
         ...
 
     @staticmethod
     def model_validate_json(data: str) -> Agent:
-        """Validate JSON into an Agent.
+        """Build an Agent from Agent Card JSON text.
 
-        Args:
-            data (str): Agent Card JSON text.
-
-        Returns:
-            Agent: Validated Agent.
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` for invalid JSON,
+                otherwise as ``from_yaml()``.
         """
         ...
 
     def validate_registrable(self) -> None:
-        """Validate whether this local Agent can be durably registered."""
+        """Check that this Agent can be registered as a durable Card.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE``
+                when runtime-local tools are attached.
+        """
         ...
 
     def run(
@@ -436,27 +533,111 @@ class Agent:
         session_id: str | None = ...,
         output_type: type | None = ...,
     ) -> AgentRun:
-        """Run the bounded tool loop.
+        """Run the bounded model/tool loop to completion, blocking until it ends.
+
+        Each iteration calls the model once and then runs any requested tools,
+        feeding their results (including tool errors) back to the model. The
+        run ends when the model answers without tool calls.
 
         Args:
-            input (str | Mapping[str, Any]): User input for the run.
-            session_id (str | None): Optional session id.
-            output_type (type | None): Per-call class override for AgentRun.parsed.
-                Overrides Agent(output_type=...) and Prompt(output=...) for this call only.
+            input: the user message. A string is sent as-is; a mapping is sent
+                as its JSON text.
+            session_id: the session whose recent turns seed the conversation
+                and receive this run's turns. Omitted, session memory is not
+                used.
+            output_type: as ``Agent(output_type=)``, for this call only; it
+                takes precedence over the Agent's and the Prompt's class.
 
-        Returns:
-            AgentRun: Completed run result.
+        Raises:
+            WyrdError: ``WYRD_AGENT_500_MAX_ITERATIONS``,
+                ``WYRD_AGENT_502_PROVIDER``, ``WYRD_AGENT_504_TIMEOUT``,
+                ``WYRD_AGENT_404_TOOL_NOT_IN_AGENT`` when the model calls an
+                unattached tool, ``WYRD_AGENT_422_STRUCTURED_DECODE`` when the
+                declared JSON output or ``output_type`` cannot be parsed,
+                ``WYRD_SESSION_500_RECENT`` or ``WYRD_SESSION_500_APPEND``.
         """
         ...
 
-    def as_tool(self, *, description: str | None = ...) -> object:
-        """Return this Agent as a runtime-local delegate tool.
+    def add_tool(self, tool: object) -> None:
+        """Attach one more runtime-local tool in place.
 
         Args:
-            description (str | None): Optional tool description override.
+            tool: a callable decorated with ``tool()`` or returned by
+                ``as_tool()``.
 
-        Returns:
-            object: Decorated tool-compatible callable.
+        Raises:
+            WyrdError: ``WYRD_TOOL_400_INVALID_SCHEMA`` for an undecorated
+                callable.
+        """
+        ...
+
+    def set_tools(self, tools: Sequence[object]) -> None:
+        """Replace every runtime-local tool in place; raises as ``add_tool()``."""
+        ...
+
+    def with_prompt(self, prompt: Prompt) -> None:
+        """Replace the Prompt in place.
+
+        Unlike ``Agent(prompt=)``, only a ``Prompt`` instance is accepted.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``prompt`` is
+                not a ``Prompt``.
+        """
+        ...
+
+    def with_session(self, session: SessionMemory) -> None:
+        """Replace the session memory in place.
+
+        Raises:
+            WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``session``
+                lacks callable ``recent`` and ``append`` methods.
+        """
+        ...
+
+    def with_run_config(self, run_config: RunConfig) -> None:
+        """Replace the loop limits in place."""
+        ...
+
+    def add_before_agent(self, callback: Callable[..., object]) -> None:
+        """Append a callback after any registered ``before_agent_callback``.
+
+        Callbacks of one hook run in registration order, each seeing the
+        previous one's replacement; the first that raises stops the chain with
+        that hook's raise behavior from ``Agent()``.
+        """
+        ...
+
+    def add_after_agent(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_agent_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_before_model(self, callback: Callable[..., object]) -> None:
+        """Append a ``before_model_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_after_model(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_model_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_before_tool(self, callback: Callable[..., object]) -> None:
+        """Append a ``before_tool_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def add_after_tool(self, callback: Callable[..., object]) -> None:
+        """Append an ``after_tool_callback``, chained as ``add_before_agent()``."""
+        ...
+
+    def as_tool(self, *, description: str | None = ...) -> object:
+        """Return this Agent as a tool another Agent can call.
+
+        The tool is named after ``Agent.id``, takes one ``input`` string,
+        runs this Agent on it, and returns its output text. Delegation nests at
+        most three levels deep. The tool is not added to any registry.
+
+        Args:
+            description: the description the calling model sees. Omitted, it
+                is ``"Delegate to agent <id>"``.
         """
         ...
 
@@ -466,23 +647,36 @@ def tool(
     name: str | None = ...,
     description: str | None = ...,
 ) -> object:
-    """Decorate and register a runtime-local tool.
+    """Decorate a function as a runtime-local tool and register it.
+
+    The input schema comes from the parameters' annotations (parameters without
+    defaults are required) and the output schema from the return annotation.
+    The model's arguments are passed as keyword arguments, and the return value
+    must be JSON-compatible. The returned callable still calls ``fn`` directly.
+    Registration goes to the innermost ``local_registry()`` on this thread, or
+    the process-wide registry outside one.
 
     Args:
-        fn (Callable[..., object] | None): Optional callable to decorate.
-        name (str | None): Optional tool name override.
-        description (str | None): Optional tool description override.
+        fn: the function to decorate. Omitted, returns a decorator, so both
+            ``@tool`` and ``@tool(name=...)`` work.
+        name: the tool name the model sees. Omitted, ``fn.__name__``.
+        description: the description the model sees. Omitted, ``fn``'s
+            docstring, or ``""`` without one.
 
-    Returns:
-        object: Decorated callable, or a decorator when `fn` is omitted.
+    Raises:
+        WyrdError: ``WYRD_TOOL_409_NAME_TAKEN`` when the active registry
+            already holds a tool with that name.
     """
     ...
 
 def local_registry() -> AbstractContextManager[None]:
-    """Return a scoped runtime-local tool registry context manager.
+    """Scope tool registration to a temporary, thread-local registry.
 
-    Returns:
-        AbstractContextManager[None]: Context manager for isolated tool registration.
+    Tools decorated inside the ``with`` block register into a fresh registry
+    that is discarded on exit, so names may repeat across blocks (useful in
+    tests). Nested blocks stack. ``Agent.from_yaml()`` and
+    ``Agent.model_validate_json()`` still resolve tool names against the
+    process-wide registry.
     """
     ...
 
@@ -555,7 +749,11 @@ class WorkflowRun:
         ...
 
 class Workflow:
-    """Authoring + run surface for a DAG of agents."""
+    """Authoring and run surface for a DAG of Agent steps.
+
+    Each step is identified by its Agent's ``name``, or its ``id`` when the
+    Agent is unnamed.
+    """
 
     def __init__(
         self,
@@ -582,7 +780,7 @@ class Workflow:
         name: str,
         *agents: Agent,
     ) -> Workflow:
-        """Build a workflow whose steps run sequentially.
+        """Build a workflow whose steps run in the given order.
 
         Args:
             name (str): Workflow name.
@@ -601,7 +799,7 @@ class Workflow:
         name: str,
         *agents: Agent,
     ) -> Workflow:
-        """Build a workflow whose steps run in parallel with no dependencies.
+        """Build a workflow whose steps are independent roots that run in parallel.
 
         Args:
             name (str): Workflow name.
@@ -616,13 +814,7 @@ class Workflow:
         ...
 
     def add(self, agent: Agent) -> Workflow:
-        """Append `agent` as a new step with no dependencies.
-
-        Args:
-            agent (Agent): Agent to append.
-
-        Returns:
-            Workflow: This workflow (for chaining).
+        """Append ``agent`` as a new step with no dependencies and return this workflow.
 
         Raises:
             WyrdError: When the resulting DAG is invalid.
@@ -630,15 +822,11 @@ class Workflow:
         ...
 
     def add_after(self, agent: Agent, after: Agent | str | Sequence[Agent | str]) -> Workflow:
-        """Append `agent` as a new step depending on the supplied predecessors.
+        """Append ``agent`` as a step depending on ``after`` and return this workflow.
 
         Args:
-            agent (Agent): Agent to append.
-            after (Agent | str | Sequence[Agent | str]): Predecessor step ids
-                or Agent values (their names are used as ids).
-
-        Returns:
-            Workflow: This workflow (for chaining).
+            agent: the Agent to append.
+            after: the predecessor steps, as step ids or Agents.
 
         Raises:
             WyrdError: When the resulting DAG is invalid.
@@ -716,12 +904,12 @@ class Workflow:
 
     @property
     def version(self) -> str | None:
-        """Return the workflow version."""
+        """Return the workflow version, or ``None`` when unset."""
         ...
 
     @property
     def space(self) -> str | None:
-        """Return the workflow space."""
+        """Return the workflow space, or ``None`` when unset."""
         ...
 
     @property
@@ -732,19 +920,13 @@ class Workflow:
     def to_yaml(self) -> str:
         """Serialize this workflow to a canonical envelope YAML string.
 
-        Returns:
-            str: Canonical envelope YAML body.
-
         Raises:
             WyrdError: When identity or codec fails.
         """
         ...
 
     def save(self, path: PathLike) -> None:
-        """Save this workflow to disk as canonical envelope YAML.
-
-        Args:
-            path (PathLike): Filesystem path.
+        """Save this workflow to ``path`` as canonical envelope YAML.
 
         Raises:
             WyrdError: When identity, IO, or codec fails.
@@ -790,13 +972,7 @@ class Workflow:
 
     @staticmethod
     def from_yaml(yaml: str) -> Workflow:
-        """Parse a workflow from a canonical envelope YAML string.
-
-        Args:
-            yaml (str): Envelope YAML body.
-
-        Returns:
-            Workflow: Reconstructed workflow with eager inline agent resolution.
+        """Parse a workflow from envelope YAML text, resolving inline Agents eagerly.
 
         Raises:
             WyrdError: When parse or resolution fails.

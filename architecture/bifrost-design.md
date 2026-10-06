@@ -41,10 +41,22 @@ durable Wyrd state independently.
 Every Bifrost table has one server-owned managed envelope with these required,
 non-null columns:
 
-- `wyrd_event_time`: validated caller event time or server receipt time;
-- `wyrd_ingested_at`: server-stamped ingestion time;
-- `wyrd_batch_id`: immutable UUIDv7 identity of one accepted logical batch;
-- `wyrd_request_id`: server-minted or validated request correlation.
+- `wyrd_request_id`: server-minted or validated request correlation, the
+  join key to audit and to the batch-commit fence;
+- `wyrd_event_time`: when the observed thing happened — the caller's value,
+  validated against the acceptance window, or `wyrd_ingested_at` when the
+  caller supplies none;
+- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe reads it once per
+  batch from PostgreSQL (`statement_timestamp()`) at admission, stamps the same
+  value on every row, and stores it on the batch's
+  `vala.scribe_batch_commits` fence. A caller can never supply it.
+
+The column names, types, stable ids, and order are declared once, in
+`vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`; every physical
+schema and every reserved-name check derives from that declaration.
+`wyrd_ingested_at` comes from the database clock, so it is comparable across
+replicas, but it is the admission instant, not a commit order, and is not an
+incremental-read checkpoint.
 
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
@@ -60,8 +72,9 @@ attributes losslessly. The values use the existing `CardRef` and `RunId` text
 grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
 verified principal scope.
 
-Identity is batch-level. Within a tenant-qualified physical table, one
-accepted logical batch is:
+Identity is batch-level. The batch identity is the client-generated UUIDv7
+`wyrd_batch_id` request field; it is not stored on rows. Within a
+tenant-qualified physical table, one accepted logical batch is:
 
 ```text
 wyrd_batch_id
@@ -263,9 +276,10 @@ validate and split by canonical physical partition
 ```
 
 Caller-supplied `wyrd_event_time` is accepted only within the server window,
-defaulting to 30 days before through 24 hours after receipt. An out-of-window
-value fails with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or
-normalizes it. When the column is absent, the server stamps receipt time.
+defaulting to 30 days before through 24 hours after the batch's
+`wyrd_ingested_at`. An out-of-window value fails with
+`WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or normalizes it.
+When the column is absent, the server stamps `wyrd_ingested_at` into it.
 
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
@@ -308,9 +322,9 @@ node. Membership is deterministic and durable before merge; one member cannot
 be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
-`PhysicalLayout` order with `wyrd_batch_id` as the stable tie-breaker; rows
-that still tie keep claim-member order, then their position within the staged
-run, so the merged order is deterministic without a per-row column. It writes Parquet row groups toward a soft 128 MiB target and
+`PhysicalLayout` order; rows that tie on every layout key keep claim-member
+order, then their position within the staged run, so the merged order is
+deterministic without a per-row tie-breaker column. It writes Parquet row groups toward a soft 128 MiB target and
 closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
@@ -583,11 +597,14 @@ class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
-Snapshot preparation has no admission gate of its own. Table lookup, reader
-guard, and hot-cut work wait on the bounded runtime PostgreSQL pool; the
-metadata pointer read and revalidation wait on the Iceberg SQL catalog's own
-bounded pool, which pings a reused connection only after it has sat idle. All
-wait within the leader deadline. `oracle_query_phase_seconds` times the
+Snapshot preparation has no admission gate of its own. One tenant-scoped
+statement on the bounded runtime PostgreSQL pool resolves every referenced
+table, registers one active read per table under the table's maintenance
+authority, and returns each catalog metadata pointer with its hot rows. Oracle
+then reads the selected metadata documents directly and concurrently; a
+document missing after a catalog move reacquires the whole cut once, and a
+second `NotFound` is terminal. The active reads live until the leader settles
+every descendant fragment, and all of this waits within the leader deadline. `oracle_query_phase_seconds` times the
 leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
 preparation substep above), `scribe_listing`, `provider_setup`,
 `physical_planning`, and `admission` — so they may be read as additive; total
@@ -695,9 +712,31 @@ Drift schedule window does not determine partition size.
 
 ### Scheduling, admission, and fences
 
-Forge schedules durable Postgres tasks with tenant-fair admission. At most one
-durable task attempt owns the lease and fence for a tenant-qualified table.
-Within that attempt, admitted ordinary compaction plans are independent child
+Forge follows `RisingWave`'s Iceberg maintenance model. One replica holds the
+Forge leader term through a single Postgres election row with a heartbeat and
+expiry; every replica can execute Forge work, but only the leader decides it.
+The leader's schedule is process memory and starts empty on every new term:
+no compaction count, in-flight dispatch, or maintenance membership survives a
+leader change. A successful Iceberg commit notifies the leader in-process on
+its own replica or over the private peer route from another pod. Compactors on
+any replica pull due table identities up to their free capacity; the worker
+loads current Iceberg metadata and plans the rewrite itself, so no leader
+decision performs catalog or object-store IO. Reports settle only the commits
+the dispatch captured, and a report for an unknown or timed-out dispatch
+changes nothing.
+
+Scribe hot-promotion debt is the one durable scheduling input: a new leader
+and every heartbeat read outstanding `file_list` promotion debt, so a
+promotion lost with a dead leader is recovered by its successor. An hourly
+leader timer runs maintenance for tables that joined its sets through a commit
+since the term began: manifest rewrite for opted-in tables, then snapshot
+expiry, then expired-object and never-published orphan cleanup. A failure on
+one table is logged and the pass continues. Durable task rows record attempt
+evidence and recovery; retryable rows are reclaimed with tenant-fair
+admission, but no durable queue decides what runs next.
+
+At most one durable task attempt owns the lease and fence for a
+tenant-qualified table. Within that attempt, admitted ordinary compaction plans are independent child
 operations: fitting siblings may rewrite and publish concurrently, while
 bounded per-tenant and per-worker admission also permits independent tables to
 progress concurrently. Each plan binds the owning tenant, table, task, plan
@@ -723,8 +762,9 @@ revalidates the exact `file_list` rows, object/footer evidence, absence of an
 equivalent promoted entry, branch, lease, and fence. When all assumptions hold,
 the same attempt and operation ID may make at most one additional `commit_once`
 within the original deadline. Another conflict, changed assumption, or expired
-deadline settles the attempt as definitely uncommitted and returns the rows to
-durable promotion demand under a new attempt. No retry rewrites or reuploads
+deadline settles the attempt as definitely uncommitted and leaves the rows as
+`file_list` promotion debt that a later leader sweep retries under a new
+attempt. No retry rewrites or reuploads
 the Scribe object.
 
 An ambiguous catalog result keeps the same attempt and operation ID. Forge
@@ -849,13 +889,34 @@ Path churn alone never authorizes another rewrite. Missing, expired, partial,
 or contradictory lineage evidence fails closed.
 
 Data-file compaction, manifest rewriting, snapshot expiration, expired-object
-cleanup, and never-published orphan cleanup are separate protocols. Snapshot
-expiration preserves active refs, unresolved attempts, reconciliation evidence,
-and the lineage snapshot referenced by the branch head. Orphan GC deletes only
+cleanup, and never-published orphan cleanup are separate protocols. The leader
+timer orders them per pass as manifest rewrite, snapshot expiry, then cleanup.
+Expiry has no age or retain-last window: a replaced snapshot is eligible as
+soon as no active Oracle read, in-flight compaction, unsettled promotion, or
+other authoritative root retains it. A table with an active read is skipped;
+snapshot expiration preserves active refs, unresolved attempts, reconciliation
+evidence, and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects retained by a pinned Oracle cut, are hard GC roots even when no
-Iceberg snapshot references them.
+and objects of a table with an active Oracle read, are hard GC roots even
+when no Iceberg snapshot references them. Once the last reader releases,
+expired-object cleanup deletes without an age floor and removes the matching
+terminal `file_list` row in the same completion transaction.
+Every destructive effect holds the table's exclusive maintenance authority
+through its known outcome, and the Forge lease TTL bounds that hold: an
+object-store call still running at the bound is an uncertain effect left for
+idempotent replay, so a hung store never blocks the table's readers
+indefinitely. An Oracle cut that waits on the authority waits at most until
+its query deadline and then fails with the query timeout.
+Snapshot expiry uses the existing prepared expiration claims when its catalog
+commit remains acceptance-unknown at that bound. After the authority lock is
+released, those claims block a new Oracle cut for the table with
+`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` until reconciliation establishes
+the stable old or new pointer and removes them. This is not a reader claim or a
+second coordination protocol; the same prepared operation already required for
+expiry recovery is the barrier. Acceptance-unknown object deletion needs no
+such barrier because its candidate was proved unreachable before submission
+and cannot be named by a new cut.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.

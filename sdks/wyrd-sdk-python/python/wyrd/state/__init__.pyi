@@ -123,11 +123,14 @@ class WyrdState:
     def from_path(
         path: str | Path,
         *,
-        interfaces: Mapping[str, object] | None = ...,
-        load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]] | None = ...,
-        trusted_artifact_hashes: Mapping[str, str] | None = ...,
+        interfaces: Mapping[str, object] | None = None,
+        load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]
+        | None = None,
+        trusted_artifact_hashes: Mapping[str, str] | None = None,
     ) -> WyrdState:
         """Load, validate, and eagerly hydrate a complete local bundle.
+
+        This method performs no network access.
 
         Args:
             path: Directory produced by complete ``wyrd get`` hydration.
@@ -135,9 +138,10 @@ class WyrdState:
                 by friendly alias.
             load_kwargs: Model/Data loader arguments keyed by friendly alias.
             trusted_artifact_hashes: Externally verified canonical artifact
-                manifest hashes keyed by Model/Data alias. Joblib-backed built-in
-                Models require an exact hash for their persisted CardRef before
-                local deserialization can run.
+                manifest hashes keyed by Model/Data alias. Built-in sklearn,
+                XGBoost, LightGBM, and CatBoost Models require an exact hash for
+                their persisted CardRef before local deserialization can run;
+                without one, construction fails.
 
         Returns:
             A fully hydrated offline runtime state.
@@ -146,7 +150,6 @@ class WyrdState:
             WyrdError: With a stable ``WYRD_SDK_*`` code for invalid bundles,
                 aliases, kinds, conflicting configuration, or holder hydration.
 
-        This method performs no network access.
         """
         ...
 
@@ -156,7 +159,6 @@ class WyrdState:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
-        tenant: str | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.

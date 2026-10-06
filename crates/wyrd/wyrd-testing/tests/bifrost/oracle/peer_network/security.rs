@@ -15,9 +15,8 @@ use vala_bifrost_redux::oracle::peer::{
 };
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerReaderCut, FollowerScanAssignment, NodeId,
-    OracleRoleFence, PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut,
-    TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
+    PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut, TenantTableBinding,
 };
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic;
@@ -475,15 +474,10 @@ impl ScribeFragment {
             &OraclePhysicalExtensionCodec::encoder(),
         )?
         .to_vec();
-        let table_uid = catalog.table_uid(&table_ref, tenant).await?;
         Ok(Self {
             fingerprint: physical_plan_fingerprint(&plan),
             plan,
             assignment: FollowerScanAssignment {
-                reader_cut: FollowerReaderCut::no_snapshot(
-                    uuid::Uuid::from_bytes(*table_uid.as_bytes()),
-                    stream.writer_epoch,
-                ),
                 scan_id,
                 binding,
                 persisted: PersistedFileAssignment { files: Vec::new() },

@@ -6,6 +6,7 @@ import {
   IncompleteQueryStreamError,
   TableConfig,
   WyrdError,
+  type CompactionType,
   type TableDescription,
 } from "@wyrd/sdk";
 
@@ -186,6 +187,7 @@ describe("bifrost public typing", () => {
         bloom_columns: ["trace_id"],
       },
       compaction_target_file_size_bytes: 1_073_741_824,
+      compaction_type: "small-files",
     };
     const nested = description.user_fields[0].data_type;
     const item = typeof nested === "string" || !("List" in nested) ? undefined : nested.List;
@@ -195,6 +197,7 @@ describe("bifrost public typing", () => {
     expect(description.physical_layout.sort_keys[0].column).toBe("trace_id");
     expect(description.canonical_physical_fingerprint).toBe("canonical-fp");
     expect(description.compaction_target_file_size_bytes).toBe(1_073_741_824);
+    expect(description.compaction_type).toBe("small-files");
   });
 });
 
@@ -219,6 +222,41 @@ describe("TableConfig compaction target", () => {
       expect(() =>
         TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionTargetFileSizeBytes: bytes }),
       ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
+    }
+  });
+});
+
+describe("TableConfig compaction type", () => {
+  const SCHEMA = {
+    type: "object",
+    properties: { id: { type: "integer" } },
+    required: ["id"],
+  };
+
+  it("defaults to small-files by declaring nothing and carries an explicit type", () => {
+    expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA).compactionType).toBeUndefined();
+    expect(
+      TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, undefined, "small-files").compactionType,
+    ).toBe("small-files");
+  });
+
+  it("carries every hyphenated wire compaction type", () => {
+    for (const kind of ["auto", "full", "small-files", "files-with-delete"] as const) {
+      expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, undefined, kind).compactionType).toBe(kind);
+    }
+  });
+
+  it("refuses a spelling that is not a wire compaction type", () => {
+    for (const refused of ["small_files", "files_with_delete"]) {
+      expect(() =>
+        TableConfig.fromJsonSchema(
+          "unit.rows",
+          SCHEMA,
+          undefined,
+          undefined,
+          refused as unknown as CompactionType,
+        ),
+      ).toThrow(/compaction type/);
     }
   });
 });

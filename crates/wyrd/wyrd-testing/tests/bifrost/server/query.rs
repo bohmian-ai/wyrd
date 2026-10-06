@@ -655,6 +655,12 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     );
     prove_scheduled_analytical_completion(&cluster, &sql).await?;
 
+    // Counted before the pause is armed: the count is itself an audited
+    // Analytical read, and a stage it placed on the paused follower would
+    // stall it instead of the statement under test.
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
+
     // The pause is armed on one follower before the statement runs, so the
     // peer this phase kills is provably holding an activated stage rather than
     // racing the query's own completion.
@@ -673,9 +679,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         .worker()
         .bind_execute_pause_for_test(std::sync::Arc::clone(&pause));
 
-    let leader = cluster.server(0).ok_or("missing leader node")?;
     let leader_state = leader.state().clone();
-    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
 
     let scheduled = {
         let context = scheduled_context(tenant)?;
@@ -1249,6 +1253,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         }],
         physical_layout: None,
         compaction_target_file_size_bytes: None,
+        compaction_type: None,
     };
     let refused = delegated
         .request_json::<_, serde_json::Value>(
@@ -2003,4 +2008,93 @@ async fn problem_code(response: reqwest::Response) -> Result<String, ServerJourn
         .as_str()
         .ok_or_else(|| format!("problem without code: {problem}"))?
         .to_owned())
+}
+
+/// Non-default Oracle deadline the shared-deadline journey configures.
+const CONFIGURED_DEADLINE_MS: i64 = 600_000;
+
+/// Explicit request deadline longer than both the configured and built-in defaults.
+const EXPLICIT_DEADLINE_MS: i64 = 9_000_000;
+
+/// Proves local and forwarded entry share the configured default deadline.
+///
+/// A role-separated cluster boots with a non-default Oracle default deadline.
+/// The same deadline-less statement is issued on the Scribe ingress, which
+/// forwards it, and on the Oracle node, which executes it locally. Both
+/// streams pin the configured deadline rather than the built-in two hours. A
+/// request carrying a longer explicit deadline keeps it on both paths, so no
+/// cap is imposed.
+///
+/// # Errors
+/// Returns cluster setup, catalog, or query errors.
+///
+/// # Panics
+/// Panics when a pinned deadline falls outside the configured or explicit window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn configured_default_deadline_is_shared_by_local_and_forwarded_queries()
+-> Result<(), ServerJourneyError> {
+    let cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+        wyrd_testing::bifrost::BifrostClusterSpec::role_separated().with_oracle_runtime_for_test(
+            wyrd_server::config::OracleRuntimeConfig {
+                default_query_deadline_ms: CONFIGURED_DEADLINE_MS.unsigned_abs(),
+                ..wyrd_server::config::OracleRuntimeConfig::default()
+            },
+        ),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let table = format!("shared_deadline_{}", uuid::Uuid::now_v7().simple());
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    assert!(
+        ingress.state().bifrost.oracle().is_none(),
+        "the ingress must forward"
+    );
+    let local = cluster
+        .servers()
+        .find(|server| server.state().bifrost.oracle().is_some())
+        .ok_or("missing Oracle node")?;
+    ingress
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+        })
+        .await?;
+    let sql = format!("SELECT value FROM vala.bifrost.{table}");
+    for (path, server) in [("forwarded", ingress), ("local", local)] {
+        for (requested, expected) in [
+            (None, CONFIGURED_DEADLINE_MS),
+            (Some(EXPLICIT_DEADLINE_MS), EXPLICIT_DEADLINE_MS),
+        ] {
+            let mut query = request(&sql);
+            query.deadline_ms = requested;
+            let before = chrono::Utc::now().timestamp_millis();
+            let mut stream = server
+                .state()
+                .bifrost
+                .query_sql(scheduled_context(tenant)?, query)
+                .await?;
+            let after = chrono::Utc::now().timestamp_millis();
+            // The deadline is pinned between the two reads; one millisecond on
+            // each side absorbs the truncation of sub-millisecond instants.
+            assert!(
+                (before + expected - 1..=after + expected + 1).contains(&stream.deadline_ms),
+                "{path} query with {requested:?} pinned {} ms, outside {expected} ms of [{before}, {after}]",
+                stream.deadline_ms
+            );
+            while let Some(frame) = stream.frames.next().await {
+                frame?;
+            }
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
 }

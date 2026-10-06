@@ -26,6 +26,7 @@ use crate::prompt::wrong_variant;
 // Anthropic — request + response
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read-only view of an Anthropic Messages request.
 #[pyclass(module = "wyrd.prompt", name = "AnthropicMessagesRequest")]
 pub struct PyAnthropicMessagesRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -43,6 +44,7 @@ impl PyAnthropicMessagesRequest {
 }
 #[pymethods]
 impl PyAnthropicMessagesRequest {
+    /// The `model` field.
     #[getter]
     fn model(&self) -> &str {
         &self.req().model
@@ -310,6 +312,7 @@ impl PyAnthropicThinkingConfig {
     }
 }
 
+/// One entry of an Anthropic Messages request's `messages`.
 #[pyclass(module = "wyrd.prompt", name = "AnthropicMessage")]
 pub struct PyAnthropicMessage {
     inner: Arc<ProviderRequest>,
@@ -325,10 +328,12 @@ impl PyAnthropicMessage {
 }
 #[pymethods]
 impl PyAnthropicMessage {
+    /// The `role`, `"user"` or `"assistant"`.
     #[getter]
     fn role(&self) -> &str {
         &self.m().role
     }
+    /// The `content` blocks.
     #[getter]
     fn content(&self) -> Vec<PyAnthropicContentBlock> {
         (0..self.m().content.len())
@@ -344,6 +349,7 @@ impl PyAnthropicMessage {
     }
 }
 
+/// One content block of an Anthropic message.
 #[pyclass(module = "wyrd.prompt", name = "AnthropicContentBlock")]
 pub struct PyAnthropicContentBlock {
     inner: Arc<ProviderRequest>,
@@ -362,6 +368,10 @@ impl PyAnthropicContentBlock {
 }
 #[pymethods]
 impl PyAnthropicContentBlock {
+    /// The block `type`.
+    ///
+    /// One of `"text"`, `"image"`, `"document"`, `"thinking"`, `"redacted_thinking"`, `"tool_use"`,
+    /// or `"tool_result"`.
     #[getter]
     fn kind(&self) -> &'static str {
         match self.b() {
@@ -374,6 +384,10 @@ impl PyAnthropicContentBlock {
             AnthropicContentBlock::ToolResult { .. } => "tool_result",
         }
     }
+    /// Return the `text` of a `"text"` block.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_text(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicContentBlock::Text { text, .. } => Ok(text.clone()),
@@ -579,6 +593,7 @@ impl PyAnthropicCitationV1 {
 
 // Anthropic response
 
+/// Read-only view of an Anthropic Messages response.
 #[pyclass(module = "wyrd.prompt", name = "AnthropicMessagesResponse")]
 pub struct PyAnthropicMessagesResponse {
     inner: Arc<ProviderResponse>,
@@ -596,6 +611,7 @@ impl PyAnthropicMessagesResponse {
 }
 #[pymethods]
 impl PyAnthropicMessagesResponse {
+    /// The message `id`.
     #[getter]
     fn id(&self) -> &str {
         &self.resp().id
@@ -604,14 +620,20 @@ impl PyAnthropicMessagesResponse {
     fn response_type(&self) -> &str {
         &self.resp().r#type
     }
+    /// The message `role`, `"assistant"` from Anthropic.
     #[getter]
     fn role(&self) -> &str {
         &self.resp().role
     }
+    /// The `model` that produced the message.
     #[getter]
     fn model(&self) -> &str {
         &self.resp().model
     }
+    /// The `stop_reason`.
+    ///
+    /// One of `"end_turn"`, `"max_tokens"`, `"stop_sequence"`, `"tool_use"`, `"pause_turn"`, or
+    /// `"refusal"`.
     #[getter]
     fn stop_reason(&self) -> Option<&'static str> {
         self.resp().stop_reason.as_ref().map(|r| match r {
@@ -623,10 +645,12 @@ impl PyAnthropicMessagesResponse {
             AnthropicStopReason::Refusal => "refusal",
         })
     }
+    /// The `stop_sequence` that ended generation, if any.
     #[getter]
     fn stop_sequence(&self) -> Option<&str> {
         self.resp().stop_sequence.as_deref()
     }
+    /// The token `usage`.
     #[getter]
     fn usage(&self) -> PyAnthropicUsage {
         PyAnthropicUsage {
@@ -642,6 +666,7 @@ impl PyAnthropicMessagesResponse {
     }
 }
 
+/// The `usage` object of an Anthropic Messages response.
 #[pyclass(module = "wyrd.prompt", name = "AnthropicUsage")]
 pub struct PyAnthropicUsage {
     inner: Arc<ProviderResponse>,
@@ -656,18 +681,22 @@ impl PyAnthropicUsage {
 }
 #[pymethods]
 impl PyAnthropicUsage {
+    /// The `input_tokens` count.
     #[getter]
     fn input_tokens(&self) -> u64 {
         self.u().input_tokens
     }
+    /// The `output_tokens` count.
     #[getter]
     fn output_tokens(&self) -> u64 {
         self.u().output_tokens
     }
+    /// The `cache_creation_input_tokens` count written to the prompt cache.
     #[getter]
     fn cache_creation_input_tokens(&self) -> u64 {
         self.u().cache_creation_input_tokens
     }
+    /// The `cache_read_input_tokens` count read from the prompt cache.
     #[getter]
     fn cache_read_input_tokens(&self) -> u64 {
         self.u().cache_read_input_tokens

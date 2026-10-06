@@ -21,23 +21,17 @@ use super::error::ForgeError;
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
-/// Small-file candidacy threshold.
-pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+/// Default small-file threshold as a percentage of a table's file target.
+///
+/// At the 1 GiB default target this is 768 MiB: a 512 MiB staged file is
+/// selected, while a merged output that reached the target is not.
+const DEFAULT_SMALL_FILE_THRESHOLD_PERCENT: u8 = 75;
 /// Deployment-wide rewrite file target for tables that declare none: 1 GiB.
 ///
 /// Replaces Iceberg's 512 MiB writer default so every Bifrost table, built-in
 /// or registered, compacts toward the same soft target unless its own
 /// `write.target-file-size-bytes` property says otherwise.
 pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-/// Default commit count past `retain_last` that makes snapshot expiry due on
-/// its own. Chosen well above ordinary per-tick compaction commit counts so a
-/// table under steady ingest still accrues history before maintenance fires,
-/// but far below `max_retained_snapshots_per_table` so history never wedges.
-const DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT: usize = 32;
-/// Default oldest-snapshot age that makes snapshot expiry due when at least one
-/// commit exists past `retain_last`. Bounds retained-history age for a
-/// low-commit table that never reaches the count trigger.
-const DEFAULT_MAINTENANCE_TRIGGER_INTERVAL: Duration = Duration::from_hours(1);
 /// Default cap on metadata records one maintenance pass visits. Retained from
 /// the per-tick bound that previously governed every Forge pass, so a single
 /// manifest rewrite or cleanup traversal stays bounded on a fragmented table.
@@ -80,15 +74,14 @@ pub struct ForgeConfig {
     pub uncertainty_bound: Duration,
     /// Number of audit rows read per reconciliation page.
     pub audit_page_size: i64,
-    /// Age after which old Iceberg snapshots become eligible for expiry.
-    pub snapshot_retention: Duration,
-    /// Number of snapshots retained along each current/ref ancestry.
-    pub retain_last: usize,
-    /// Whether periodic snapshot expiry is enabled for this Forge owner.
-    pub snapshot_expiry_enabled: bool,
-    /// Whether periodic fragmented-manifest rewrite is enabled.
-    /// Independent small-file candidacy threshold used by live planning.
-    pub small_file_threshold_bytes: u64,
+    /// Small-file threshold as a percentage of each table's resolved file
+    /// target, in `1..=99`.
+    ///
+    /// A live file below this share of its table's target is a small-file
+    /// candidate. Expressing it as a share rather than a byte count keeps the
+    /// threshold below every table's own target, so an output that reached
+    /// the target is never selected again.
+    pub small_file_threshold_percent: u8,
     /// Soft rewrite file target for a table without its own
     /// `write.target-file-size-bytes` property.
     ///
@@ -96,8 +89,6 @@ pub struct ForgeConfig {
     /// changing the deployment default also moves every table that never
     /// declared an override.
     pub default_target_file_size_bytes: u64,
-    /// Maximum bytes packed into one selected manifest rewrite bin.
-    /// Minimum count required for the newest under-filled manifest bin.
     /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
@@ -122,15 +113,6 @@ pub struct ForgeConfig {
     pub max_open_operations_per_table: usize,
     /// Maximum retained snapshots traversed by one reconciliation observation.
     pub max_retained_snapshots_per_table: usize,
-    /// Count of accumulated commits past `retain_last` that makes snapshot
-    /// expiry due on its own, independent of compaction backlog. Evaluated
-    /// every planning tick so maintenance can never be starved by compaction
-    /// load; see [`super::planning_scheduler`].
-    pub maintenance_trigger_snapshot_count: usize,
-    /// Age of the oldest retained snapshot past which snapshot expiry becomes
-    /// due, provided at least one commit exists past `retain_last`. Paired with
-    /// `maintenance_trigger_snapshot_count` as a count-OR-interval trigger.
-    pub maintenance_trigger_interval: Duration,
     /// Maximum object-store listing pages an orphan-GC candidate scan consumes
     /// in one run. Bounds a single run's listing work on a table whose orphan
     /// prefix holds more pages than one run should walk; a run that hits the cap
@@ -156,10 +138,7 @@ impl Default for ForgeConfig {
             uncertainty_margin: Duration::from_secs(30),
             uncertainty_bound: Duration::from_mins(2),
             audit_page_size: 256,
-            snapshot_retention: Duration::from_hours(24),
-            retain_last: 1,
-            snapshot_expiry_enabled: false,
-            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            small_file_threshold_percent: DEFAULT_SMALL_FILE_THRESHOLD_PERCENT,
             default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
@@ -169,8 +148,6 @@ impl Default for ForgeConfig {
             max_hints_per_wake: 256,
             max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
             max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
-            maintenance_trigger_snapshot_count: DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT,
-            maintenance_trigger_interval: DEFAULT_MAINTENANCE_TRIGGER_INTERVAL,
             orphan_gc_max_list_pages: DEFAULT_ORPHAN_GC_MAX_LIST_PAGES,
             orphan_gc_run_budget: DEFAULT_ORPHAN_GC_RUN_BUDGET,
         }
@@ -183,10 +160,8 @@ impl ForgeConfig {
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when a limit is zero, a bin cannot
-    /// contain two files, the lease cannot cover the configured commit window,
-    /// or `retain_last` exceeds the retained-snapshot traversal cap
-    /// (`max_retained_snapshots_per_table`), which would make reconciliation
-    /// unable to see every snapshot the expiry policy is asked to retain.
+    /// contain two files, the small-file threshold percentage is not below 100,
+    /// or the lease cannot cover the configured commit window.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.lease_ttl.is_zero()
             || self.iceberg_total_retry_timeout.is_zero()
@@ -194,9 +169,7 @@ impl ForgeConfig {
             || self.uncertainty_margin.is_zero()
             || self.uncertainty_bound.is_zero()
             || self.audit_page_size <= 0
-            || self.snapshot_retention.is_zero()
-            || self.retain_last == 0
-            || self.small_file_threshold_bytes == 0
+            || self.small_file_threshold_percent == 0
             || self.default_target_file_size_bytes == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
@@ -206,8 +179,6 @@ impl ForgeConfig {
             || self.max_hints_per_wake == 0
             || self.max_open_operations_per_table == 0
             || self.max_retained_snapshots_per_table == 0
-            || self.maintenance_trigger_snapshot_count == 0
-            || self.maintenance_trigger_interval.is_zero()
             || self.orphan_gc_max_list_pages == 0
             || self.orphan_gc_run_budget.is_zero()
         {
@@ -215,9 +186,9 @@ impl ForgeConfig {
                 detail: "Forge limits must be positive".to_owned(),
             });
         }
-        if self.retain_last > self.max_retained_snapshots_per_table {
+        if self.small_file_threshold_percent >= 100 {
             return Err(ForgeError::InvalidConfig {
-                detail: "retain_last must not exceed max_retained_snapshots_per_table".to_owned(),
+                detail: "small_file_threshold_percent must be below 100".to_owned(),
             });
         }
         let required = self
@@ -590,25 +561,23 @@ mod tests {
         assert!(zero_budget.validate().is_err());
     }
 
-    /// `retain_last` may not exceed the retained-snapshot traversal cap.
+    /// The small-file threshold percentage defaults to 75 and stays in `1..=99`.
     ///
-    /// The default (`retain_last` 1, cap 256) is well within bound, and equal
-    /// values are accepted; only a `retain_last` above the traversal cap fails,
-    /// because reconciliation could then never observe every retained snapshot.
+    /// Zero would select nothing and 100 or more would select a file that
+    /// already reached its table's target, so both bounds are refused.
+    ///
+    /// # Panics
+    /// Panics when the default or a boundary percentage is classified wrongly.
     #[test]
-    fn forge_config_rejects_retain_last_above_traversal_cap() {
-        let at_bound = ForgeConfig {
-            retain_last: 4,
-            max_retained_snapshots_per_table: 4,
-            ..ForgeConfig::default()
-        };
-        assert!(at_bound.validate().is_ok());
-        let over_bound = ForgeConfig {
-            retain_last: 5,
-            max_retained_snapshots_per_table: 4,
-            ..ForgeConfig::default()
-        };
-        assert!(over_bound.validate().is_err());
+    fn forge_config_bounds_the_small_file_threshold_percent() {
+        assert_eq!(ForgeConfig::default().small_file_threshold_percent, 75);
+        for (percent, valid) in [(0, false), (1, true), (99, true), (100, false)] {
+            let config = ForgeConfig {
+                small_file_threshold_percent: percent,
+                ..ForgeConfig::default()
+            };
+            assert_eq!(config.validate().is_ok(), valid, "percent {percent}");
+        }
     }
 
     /// The history readers may continue to call the audit query module until

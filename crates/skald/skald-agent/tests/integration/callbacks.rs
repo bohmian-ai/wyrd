@@ -579,3 +579,94 @@ fn last_assistant_text(run: &AgentRun) -> Option<&str> {
             _ => None,
         })
 }
+
+/// An `after_model` abort discards the completed response and ends the run
+/// `CallbackAborted` with the abort as its error, instead of panicking.
+///
+/// # Panics
+/// Panics when the run errors or its result differs from the aborted shape.
+#[tokio::test]
+async fn agent_run_after_model_abort_returns_callback_aborted() {
+    let provider = RecordingProvider::new(vec![openai_text_response("discarded")]);
+    let providers = registry(provider);
+    let agent = Agent::from_resolved("test", test_prompt())
+        .after_model(Arc::new(|_ctx, _response| callback_abort()));
+
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
+
+    assert_eq!(run.finish_reason, FinishReason::CallbackAborted);
+    assert_eq!(run.output, "");
+    assert_eq!(run.iterations, 1);
+    assert_eq!(last_assistant_text(&run), None);
+    assert_eq!(
+        run.error.as_ref().map(WyrdError::code),
+        Some("WYRD_AGENT_499_CALLBACK_ABORTED")
+    );
+}
+
+/// An `after_agent` abort replaces the completed run with a `CallbackAborted`
+/// one that keeps its iterations and conversation, instead of panicking.
+///
+/// # Panics
+/// Panics when the run errors or its result differs from the aborted shape.
+#[tokio::test]
+async fn agent_run_after_agent_abort_returns_callback_aborted() {
+    let provider = RecordingProvider::new(vec![openai_text_response("model")]);
+    let providers = registry(provider);
+    let agent = Agent::from_resolved("test", test_prompt())
+        .after_agent(Arc::new(|_ctx, _run| callback_abort()));
+
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
+
+    assert_eq!(run.finish_reason, FinishReason::CallbackAborted);
+    assert_eq!(run.output, "");
+    assert!(run.final_response.is_none());
+    assert_eq!(run.iterations, 1);
+    assert_eq!(last_assistant_text(&run), Some("model"));
+    assert_eq!(
+        run.error.as_ref().map(WyrdError::code),
+        Some("WYRD_AGENT_499_CALLBACK_ABORTED")
+    );
+}
+
+/// An `after_tool` abort reports that tool call to the model as failed with
+/// the abort's code and the run continues to the model's next answer.
+///
+/// # Panics
+/// Panics when the run errors or the tool result is not the abort failure.
+#[tokio::test]
+async fn agent_run_after_tool_abort_records_error_result() {
+    let provider = RecordingProvider::new(vec![
+        openai_tool_call_response(vec![tool_call("c1", "recorder", json!({"a": 1}))]),
+        openai_text_response("done"),
+    ]);
+    let providers = registry(provider);
+    let tool = Arc::new(RecordingTool::new("recorder", json!({"original": true})));
+    let agent = Agent::from_resolved("test", test_prompt())
+        .add_tool(tool.clone())
+        .after_tool(Arc::new(|_ctx, _tool, _result| callback_abort()))
+        .with_run_config(RunConfig {
+            max_iterations: 3,
+            ..Default::default()
+        });
+
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
+
+    assert_eq!(tool.calls().len(), 1);
+    assert_eq!(run.finish_reason, FinishReason::ModelStopped);
+    assert_eq!(run.output, "done");
+    assert!(run.conversation.turns().iter().any(|turn| matches!(
+        turn,
+        ConversationTurn::ToolResult { call_id, ok, content }
+            if call_id == "c1" && !*ok && content["code"] == "WYRD_AGENT_499_CALLBACK_ABORTED"
+    )));
+}

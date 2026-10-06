@@ -170,6 +170,8 @@ impl VerifierEngines {
         implementation: &VerifierImplementation,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
+        // Boxed: each engine's query chain is large, and inlining it into
+        // every runner frame overflows a worker stack in unoptimized builds.
         match implementation {
             VerifierImplementation::Drift(spec) => {
                 Box::pin(self.drift.verify(tenant, run, spec, telemetry)).await

@@ -141,7 +141,7 @@ async fn starts_a_keyed_manual_run_and_reads_its_status() {
         .expect("bound server has a URL")
         .to_owned();
     let client = |credential: &str| {
-        client_from_options(Some(&base_url), Some(credential), None, None).expect("client builds")
+        client_from_options(Some(&base_url), Some(credential), None).expect("client builds")
     };
     let admin = api_key(
         server

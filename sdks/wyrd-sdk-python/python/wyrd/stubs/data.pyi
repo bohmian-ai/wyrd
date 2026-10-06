@@ -38,12 +38,12 @@ class Dim:
         ...
 
 class FieldSpec:
-    """One column or tensor field in a DataCard schema.
+    """One column or tensor field in a DataCard schema or model signature.
 
-    A field records the durable name, normalized dtype, optional shape
-    dimensions, nullability, and small string metadata. Constructing a
-    `FieldSpec` validates the field name but does not inspect data or touch the
-    filesystem.
+    Construction validates only the name; it does not inspect data or touch
+    the filesystem. ``shape`` and its alias ``dims`` return serialized
+    dimensions: ``{"kind": "Fixed", "value": n}`` or
+    ``{"kind": "Dynamic", "value": name_or_None}``.
     """
 
     name: str
@@ -61,7 +61,7 @@ class FieldSpec:
         nullable: bool = ...,
         extra: StringMap | None = ...,
     ) -> None:
-        """Declare a schema field.
+        """Declare a field.
 
         Args:
             name (str): Column or field name stored in the Wyrd spec.
@@ -75,21 +75,22 @@ class FieldSpec:
                 field spec.
 
         Raises:
-            WyrdError: If `name` is not a valid Wyrd column name or the shape
-                cannot be parsed as serialized dimensions.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``name`` is not a
+                valid column name, or a ``WyrdError`` if ``shape`` cannot be
+                parsed as dimensions.
         """
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return this field as a JSON-compatible Wyrd spec dictionary."""
+        """Return this field as a JSON-compatible spec dictionary."""
         ...
 
 class DataSchema:
-    """Ordered schema for a DataCard.
+    """Ordered fields describing a DataCard's data.
 
-    `DataSchema` is local metadata. It can be supplied by a caller or inferred
-    from a live interface when the backing library exposes enough type
-    information.
+    ``fields`` is an alias of ``columns``. A DataCard infers its schema from
+    live built-in interface data; custom interfaces and sourceless
+    interfaces produce an empty schema.
     """
 
     columns: list[FieldSpec]
@@ -99,51 +100,50 @@ class DataSchema:
         """Create a schema from ordered fields.
 
         Args:
-            columns (Sequence[FieldSpec | Mapping[str, Any]] | None): Existing
-                `FieldSpec` objects or serialized field dictionaries. Omit
-                this for an empty schema.
+            columns: ``FieldSpec`` objects or serialized field dictionaries,
+                in order. Omitted, the schema is empty.
 
         Raises:
-            WyrdError: If any serialized field is invalid.
+            WyrdError: If a serialized field cannot be parsed.
         """
         ...
 
     def is_empty(self) -> bool:
-        """Return `True` when the schema has no fields."""
+        """Return ``True`` when the schema has no fields."""
         ...
 
     def contains_column(self, name: str) -> bool:
-        """Return whether `name` is present in this schema.
-
-        Args:
-            name (str): Column name to look up.
+        """Return whether a field named ``name`` exists.
 
         Raises:
-            WyrdError: If `name` is not a valid Wyrd column name.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``name`` is not a
+                valid column name.
         """
         ...
 
     def column(self, name: str) -> FieldSpec | None:
-        """Return the field named `name`, or `None` when it is absent.
-
-        Args:
-            name (str): Column name to return.
+        """Return the field named ``name``, or ``None`` when it is absent.
 
         Raises:
-            WyrdError: If `name` is not a valid Wyrd column name.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``name`` is not a
+                valid column name.
         """
         ...
 
     def column_names(self) -> list[str]:
-        """Return schema field names in order."""
+        """Return field names in schema order."""
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return this schema as a JSON-compatible Wyrd spec dictionary."""
+        """Return this schema as a JSON-compatible spec dictionary."""
         ...
 
 class DataStats:
-    """Byte and shape statistics for a local DataCard artifact."""
+    """Size, digest, and shape statistics for a saved DataCard artifact.
+
+    Interfaces return these from ``save``. A card that has never been saved
+    holds placeholder statistics: ``byte_count`` 0 and an all-zero digest.
+    """
 
     byte_count: int
     sha256: str
@@ -157,119 +157,121 @@ class DataStats:
         row_count: int | None = ...,
         col_count: int | None = ...,
     ) -> None:
-        """Create artifact statistics.
+        """Create artifact statistics, typically from a custom ``save``.
 
         Args:
-            byte_count (int): Number of bytes materialized for the local
-                artifact.
-            sha256 (str): Hex SHA-256 digest for the materialized artifact
-                bytes.
-            row_count (int | None): Optional row count when the interface can
-                infer it.
-            col_count (int | None): Optional column count when the interface
-                can infer it.
+            byte_count: number of artifact bytes written.
+            sha256: lowercase hex SHA-256 digest of those bytes.
+            row_count: row count, or ``None`` (the default) when unknown.
+            col_count: column count, or ``None`` (the default) when unknown.
         """
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return these statistics as a JSON-compatible Wyrd spec dictionary."""
+        """Return these statistics as a JSON-compatible spec dictionary."""
         ...
 
 class DataInterface:
-    """Base class for Python data interfaces.
+    """Base class for DataCard data interfaces.
 
-    Subclass this class for custom Python-only materialization. A subclass must
-    override `save` and `load`; the base methods raise `WyrdError` so missing
-    implementations fail before a card silently records unusable artifacts.
+    Subclass it for data no built-in interface handles. A subclass must
+    override ``save`` and ``load``; the base methods raise so a missing
+    override cannot record an empty artifact. ``kind`` is the interface kind
+    stored in the card: the built-in name, or ``Custom`` for subclasses.
     """
 
     kind: str
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize a custom interface base.
+        """Initialize a custom interface; all arguments are ignored.
 
-        Positional and keyword arguments are accepted so custom subclasses can
-        call `super().__init__(...)` without matching a built-in constructor.
-        The base class records the interface kind as `Custom`.
-
-        Args:
-            *args (Any): Positional arguments accepted for subclass
-                compatibility.
-            **kwargs (Any): Keyword arguments accepted for subclass
-                compatibility.
+        Accepting anything lets a subclass call ``super().__init__(...)``
+        with its own arguments.
         """
         ...
 
     @property
     def has_source(self) -> bool:
-        """Return whether this interface currently holds live Python data."""
+        """Whether this built-in interface currently holds live data.
+
+        ``False`` for an interface rebuilt from metadata until ``load``
+        attaches data. Only built-in interfaces define it.
+        """
         ...
 
     @classmethod
     def from_metadata(cls, metadata: DataCardMetadata) -> DataInterface:
-        """Build an interface instance from serialized DataCard metadata.
+        """Build an interface instance from a stored card's metadata.
 
-        Registry and client retrieval surfaces call this hook when a user
-        passes a custom interface class, such as
-        `wyrd.cards.get(..., interface=MyInterface)`. The default
-        implementation constructs the subclass with no arguments. Override
-        this method when an interface needs metadata values to reconstruct
-        local configuration before `DataCard.load(...)` hydrates data.
+        Card retrieval calls this when given an interface class, as in
+        ``cards.data.get(..., interface=MyInterface)``. The default calls
+        the class with no arguments; override it when reconstruction needs
+        values from ``metadata``.
 
         Args:
-            metadata (DataCardMetadata): Metadata parsed from the serialized
-                DataCard envelope.
+            metadata: metadata parsed from the stored DataCard.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if the default
+                implementation cannot construct the class with no arguments.
         """
         ...
 
     def to_dict(self) -> JsonDict:
-        """Return interface metadata as a JSON-compatible dictionary.
+        """Return the interface metadata stored in the DataCard spec.
 
-        The dictionary is the metadata stored in the DataCard spec. It does not
-        include live Python objects.
+        Only built-in interfaces define it. The result never contains live
+        Python objects.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` if an
+                option value is invalid.
         """
         ...
 
     def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> DataStats:
-        """Write this interface's data into a local DataCard directory.
+        """Write this interface's data under a local card directory.
 
-        Built-in interfaces write to their convention path under `path`, such
-        as `data/data.parquet` or `data/manifest.json`. Custom subclasses must
-        implement the same contract and return `DataStats` for the bytes they
+        Built-in interfaces write to a fixed path under ``path``, such as
+        ``data/data.parquet`` or ``data/manifest.json``. A subclass override
+        must write under ``path`` and return ``DataStats`` for the bytes it
         wrote.
 
         Args:
-            path (PathLike): Local DataCard materialization directory.
-            save_kwargs (dict[str, Any] | None): Optional interface-specific
-                save options.
+            path: local card directory.
+            save_kwargs: interface-specific options. The image and text
+                interfaces read ``copy_bytes`` (default ``False``) to copy
+                referenced files into the card; other built-ins ignore it.
 
         Raises:
-            WyrdError: If the interface has no live source data, the source
-                object is not supported, an option is invalid, or local IO
-                fails.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if the interface holds no
+                data (always, for the base class) or the data is the wrong
+                type, ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                invalid option, or another ``WyrdError`` if writing fails.
         """
         ...
 
     def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
-        """Load this interface's data from a local DataCard directory.
+        """Read this interface's data from a local card directory and hold it.
 
-        The interface reconstructs its convention path from `path`; Wyrd does
-        not store a local absolute path in the card JSON.
+        The artifact location is derived from ``path`` and the interface
+        options; the card JSON stores no local path.
 
         Args:
-            path (PathLike): Local DataCard materialization directory.
-            load_kwargs (dict[str, Any] | None): Optional interface-specific
-                load options.
+            path: local card directory.
+            load_kwargs: interface-specific options. ``HuggingfaceInterface``
+                requires ``allow_remote=True`` to load a remote dataset
+                pointer; other built-ins ignore it.
 
         Raises:
-            WyrdError: If the expected artifact is missing, deserialization
-                fails, remote loading is not explicitly allowed, or local IO
-                fails.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` for the base class or a
+                remote Hugging Face load without ``allow_remote``, or another
+                ``WyrdError`` if the artifact is missing or cannot be read.
         """
         ...
 
 class PandasInterface(DataInterface):
-    """Data interface for pandas DataFrames saved as parquet."""
+    """pandas ``DataFrame`` data, saved to ``data/data.parquet``."""
 
     compression: str
 
@@ -277,15 +279,19 @@ class PandasInterface(DataInterface):
         """Create a pandas interface.
 
         Args:
-            data (Any): Optional pandas `DataFrame` to materialize during
-                `save`.
-            compression (str): Parquet codec: `none`, `snappy`, `gzip`,
-                `zstd`, or `lz4`.
+            data: the ``DataFrame`` to save. Omitted, the interface has no
+                data until ``load``.
+            compression: parquet codec: ``"none"``, ``"snappy"`` (default),
+                ``"gzip"``, ``"zstd"``, or ``"lz4"``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``compression``.
         """
         ...
 
 class PolarsInterface(DataInterface):
-    """Data interface for polars DataFrames saved as parquet."""
+    """polars ``DataFrame`` data, saved to ``data/data.parquet``."""
 
     compression: str
 
@@ -293,15 +299,19 @@ class PolarsInterface(DataInterface):
         """Create a polars interface.
 
         Args:
-            data (Any): Optional polars `DataFrame` to materialize during
-                `save`.
-            compression (str): Parquet codec: `none`, `snappy`, `gzip`,
-                `zstd`, or `lz4`.
+            data: the ``DataFrame`` to save. Omitted, the interface has no
+                data until ``load``.
+            compression: parquet codec: ``"none"``, ``"snappy"`` (default),
+                ``"gzip"``, ``"zstd"``, or ``"lz4"``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``compression``.
         """
         ...
 
 class ArrowInterface(DataInterface):
-    """Data interface for PyArrow tables saved as parquet or IPC."""
+    """``pyarrow.Table`` data, saved to ``data/data.parquet`` or ``data/data.arrow``."""
 
     format: str
 
@@ -309,13 +319,21 @@ class ArrowInterface(DataInterface):
         """Create an Arrow interface.
 
         Args:
-            data (Any): Optional `pyarrow.Table` to materialize during `save`.
-            format (str): Serialization format: `parquet` or `ipc`.
+            data: the table to save. Omitted, the interface has no data until
+                ``load``.
+            format: ``"parquet"`` (default) or ``"ipc"`` (Arrow IPC file).
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``format``.
         """
         ...
 
 class ParquetInterface(DataInterface):
-    """Data interface for parquet paths or table-like parquet sources."""
+    """Parquet data from a local file or a table-like object.
+
+    Saved to ``data/data.parquet``; ``load`` returns a ``pyarrow.Table``.
+    """
 
     compression: str
     row_group_size: int | None
@@ -330,15 +348,25 @@ class ParquetInterface(DataInterface):
         """Create a parquet interface.
 
         Args:
-            data (Any): Optional parquet path, table-like object, or `None`.
-            compression (str): Parquet codec for table-like writes.
-            row_group_size (int | None): Optional declared row group size
-                metadata.
+            data: a local parquet file path, copied as-is, or a table-like
+                object written with ``pyarrow.parquet``. Omitted, the
+                interface has no data until ``load``.
+            compression: codec for table-like writes: ``"none"``,
+                ``"snappy"`` (default), ``"gzip"``, ``"zstd"``, or ``"lz4"``.
+            row_group_size: row group size recorded in the card metadata.
+                It is not applied when writing.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``compression``.
         """
         ...
 
 class NumpyInterface(DataInterface):
-    """Data interface for NumPy arrays saved as `.npy` or `.npz`."""
+    """NumPy ``ndarray`` data, saved to ``data/data.npy`` or ``data/data.npz``.
+
+    Saving and loading never use pickle.
+    """
 
     dtype: str | None
     shape: list[int] | None
@@ -355,32 +383,46 @@ class NumpyInterface(DataInterface):
         """Create a NumPy interface.
 
         Args:
-            data (Any): Optional NumPy ndarray to materialize during `save`.
-            dtype (str | None): Optional dtype. If omitted, Wyrd infers it
-                from `data`.
-            shape (Sequence[int] | None): Optional array shape. If omitted,
-                Wyrd infers it from `data`.
-            format (str): Serialization format: `npy` or `npz`.
+            data: the array to save. Omitted, the interface has no data until
+                ``load``.
+            dtype: declared dtype. Omitted, it is inferred from ``data``.
+            shape: declared array shape. Omitted, it is inferred from
+                ``data``.
+            format: ``"npy"`` (default) or ``"npz"``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``format``.
         """
         ...
 
 class TorchInterface(DataInterface):
-    """Data interface for Torch tensors or mappings of tensors."""
+    """Torch tensor or tensor-mapping data.
+
+    Saved to ``data/data.safetensors`` or ``data/data.pt``.
+    """
 
     save_format: str
 
     def __init__(self, *, data: Any = ..., save_format: str = ...) -> None:
-        """Create a Torch interface.
+        """Create a Torch data interface.
 
         Args:
-            data (Any): Optional Torch tensor or tensor mapping.
-            save_format (str): Serialization format: `safetensors` or
-                `pickle`.
+            data: a tensor or a mapping of names to tensors. Omitted, the
+                interface has no data until ``load``.
+            save_format: ``"safetensors"`` (default) or ``"pickle"``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``save_format``.
         """
         ...
 
 class SqlInterface(DataInterface):
-    """Data interface for SQL query bundles."""
+    """Named SQL queries, saved to ``data/sql.json``.
+
+    Wyrd records the queries; it never connects to a database.
+    """
 
     dialect: str
     connection_hint: str | None
@@ -395,16 +437,22 @@ class SqlInterface(DataInterface):
         """Create a SQL interface.
 
         Args:
-            data (Any): Optional query mapping or JSON-compatible SQL logic.
-            dialect (str): SQL dialect label recorded in the DataCard spec.
-            connection_hint (str | None): Optional human-readable connection
-                hint. Wyrd records it as metadata and does not connect to a
-                database.
+            data: a mapping of query name to SQL string, or
+                ``{"queries": {...}, "default_query": name}``. Omitted, an
+                empty query set is saved.
+            dialect: SQL dialect label, such as ``"duckdb"`` or
+                ``"postgres"``. Surrounding whitespace is trimmed.
+            connection_hint: human-readable hint recorded as metadata.
+                Omitted, none is recorded.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` if
+                ``dialect`` is blank.
         """
         ...
 
 class JsonlInterface(DataInterface):
-    """Data interface for JSON Lines rows or JSONL files."""
+    """JSON Lines data from records or a local JSONL file."""
 
     compression: str
     lines_per_file: int | None
@@ -419,17 +467,24 @@ class JsonlInterface(DataInterface):
         """Create a JSON Lines interface.
 
         Args:
-            data (Any): Optional iterable of JSON-compatible rows, JSONL path,
-                or `None`.
-            compression (str): JSONL compression mode: `none`, `gzip`, or
-                `zstd`.
-            lines_per_file (int | None): Optional declared line-count
-                partition size.
+            data: an iterable of JSON-compatible records or a JSONL file
+                path. Omitted, the interface has no data until ``load``.
+            compression: ``"none"`` (default), ``"gzip"``, or ``"zstd"``.
+            lines_per_file: partition size recorded in the card metadata. It
+                is not applied when writing.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``compression``.
         """
         ...
 
 class ImageInterface(DataInterface):
-    """Data interface for image manifests."""
+    """Image data described by a file manifest saved to ``data/manifest.json``.
+
+    Pass ``save_kwargs={"copy_bytes": True}`` to ``save`` to also copy the
+    referenced files into ``data/images``.
+    """
 
     format: str
     color_mode: str
@@ -445,19 +500,28 @@ class ImageInterface(DataInterface):
         """Create an image manifest interface.
 
         Args:
-            data (Any): Optional image file, image directory, iterable
-                manifest, or serialized manifest-like value.
-            format (str): Image format family: `png`, `jpeg`, `webp`, or
-                `mixed`.
-            color_mode (str): Declared color mode: `rgb`, `rgba`, or
-                `grayscale`.
-            manifest_ref (Mapping[str, Any] | None): Optional CardRef for an
-                external manifest card.
+            data: an image directory, an iterable of image paths, or a
+                manifest-like value. Omitted, the interface has no data until
+                ``load``.
+            format: ``"png"``, ``"jpeg"``, ``"webp"``, or ``"mixed"``
+                (default).
+            color_mode: ``"rgb"`` (default), ``"rgba"``, or ``"grayscale"``.
+            manifest_ref: serialized CardRef of an external manifest card.
+                Omitted, none is recorded.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_INTERFACE_OPTION`` for an
+                unknown ``format`` or ``color_mode``, or a ``WyrdError`` if
+                ``manifest_ref`` is not a valid CardRef.
         """
         ...
 
 class TextInterface(DataInterface):
-    """Data interface for text manifests."""
+    """Text data described by a file manifest saved to ``data/manifest.json``.
+
+    Pass ``save_kwargs={"copy_bytes": True}`` to ``save`` to also copy the
+    referenced files into ``data/files``.
+    """
 
     encoding: str
 
@@ -471,16 +535,27 @@ class TextInterface(DataInterface):
         """Create a text manifest interface.
 
         Args:
-            data (Any): Optional text file, text directory, iterable manifest,
-                or serialized manifest-like value.
-            encoding (str): Text encoding label recorded in the DataCard spec.
-            manifest_ref (Mapping[str, Any] | None): Optional CardRef for an
-                external manifest card.
+            data: a text directory, an iterable of text file paths, or a
+                manifest-like value. Omitted, the interface has no data until
+                ``load``.
+            encoding: encoding label recorded in the card. Defaults to
+                ``"utf-8"``.
+            manifest_ref: serialized CardRef of an external manifest card.
+                Omitted, none is recorded.
+
+        Raises:
+            WyrdError: If ``manifest_ref`` is not a valid CardRef.
         """
         ...
 
 class HuggingfaceInterface(DataInterface):
-    """Data interface for local Hugging Face datasets or pinned dataset pointers."""
+    """A Hugging Face dataset saved locally or as a pinned remote pointer.
+
+    With live data, ``save`` writes the dataset to ``data/dataset``. Without
+    it, ``save`` writes ``data/dataset_pointer.json``, which requires
+    ``revision``; loading that pointer requires
+    ``load_kwargs={"allow_remote": True}``.
+    """
 
     dataset_id: str
     revision: str | None
@@ -499,66 +574,84 @@ class HuggingfaceInterface(DataInterface):
         """Create a Hugging Face dataset interface.
 
         Args:
-            data (Any): Optional Hugging Face dataset object to materialize
-                locally.
-            dataset_id (str): Dataset identifier recorded in the DataCard
-                spec.
-            revision (str | None): Optional pinned dataset revision.
-                Pointer-only saves require a revision.
-            split (str | None): Optional dataset split.
-            config (str | None): Optional dataset config name.
+            data: the dataset object to save locally. Omitted, ``save``
+                writes a remote pointer.
+            dataset_id: Hub dataset identifier recorded in the card.
+            revision: pinned commit: lowercase hex, 7 to 40 characters.
+                Omitted, pointer-only saves fail.
+            split: dataset split. Omitted, none is recorded.
+            config: dataset config name. Omitted, none is recorded.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``revision`` is not
+                lowercase hex of 7 to 40 characters.
         """
         ...
 
 class Split:
-    """Builder for a DataCard split strategy."""
+    """One DataCard split strategy; build it with a static method.
+
+    ``strategy`` is the serialized strategy, the same value ``to_dict``
+    returns.
+    """
 
     strategy: JsonDict
 
     @staticmethod
     def column(col: str, op: str, value: Any) -> Split:
-        """Declare a split using a column predicate.
+        """Select rows whose column satisfies a predicate.
 
         Args:
-            col (str): Column name to evaluate.
-            op (str): Predicate operator: `==`, `!=`, `<`, `<=`, `>`, `>=`,
-                or `in`.
-            value (Any): Predicate value. Lists are accepted only for `in`.
+            col: column name.
+            op: ``"=="``, ``"!="``, ``"<"``, ``"<="``, ``">"``, ``">="``, or
+                ``"in"``.
+            value: a ``bool``, ``int``, ``float``, ``str``, ``datetime``, or
+                a list of those (for ``"in"``).
 
         Raises:
-            WyrdError: If the column name, operator, or value cannot be encoded
-                as a Wyrd split strategy.
+            WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` for an invalid
+                column name, unknown operator, or unsupported value type.
         """
         ...
 
     @staticmethod
     def materialized(card_ref: Mapping[str, Any] | CardRefLike) -> Split:
-        """Declare a split backed by an Artifact card reference.
+        """Use rows already materialized in an Artifact card.
 
         Args:
-            card_ref (Mapping[str, Any] | CardRefLike): Mapping or object
-                that serializes to a CardRef with `kind` set to `Artifact`.
+            card_ref: a CardRef, or a mapping that serializes to one, whose
+                ``kind`` is ``Artifact``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if ``card_ref``
+                is not a valid CardRef or does not target an Artifact card.
         """
         ...
 
     @staticmethod
     def index_range(start: int, stop: int) -> Split:
-        """Declare a non-negative half-open index range split.
+        """Select the half-open row index range ``[start, stop)``.
 
         Args:
-            start (int): Inclusive starting index.
-            stop (int): Exclusive stopping index. Must be greater than or
-                equal to `start`.
+            start: first included index; not negative.
+            stop: first excluded index; at least ``start``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if a bound is
+                negative or ``start > stop``.
         """
         ...
 
     @staticmethod
     def indices(values: Sequence[int]) -> Split:
-        """Declare a split from explicit row indices.
+        """Select explicit row indices.
 
         Args:
-            values (Sequence[int]): Non-empty sequence of non-negative row
-                indices. Duplicate values are preserved for spec validation.
+            values: non-empty, unique, non-negative row indices.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if ``values`` is
+                empty or contains a negative or duplicate index.
         """
         ...
 
@@ -567,23 +660,33 @@ class Split:
         ...
 
 class DataCardMetadata:
-    """Python holder metadata used to build a durable DataCard spec."""
+    """Interface, schema, split, SQL, artifact-reference, and statistics
+    metadata a DataCard accumulates before it becomes a durable Data spec.
+
+    Only a ``DataCard`` creates it; direct construction raises ``TypeError``."""
+
+    def to_dict(self) -> JsonDict:
+        """Return this metadata as a JSON-compatible dictionary for inspection."""
+        ...
 
 class DataCard:
     """Local DataCard holder and spec builder.
 
-    A DataCard owns local identity, labels, annotations, schema metadata, and an
-    optional live data interface. Registration belongs to registry/client APIs,
-    not the card:
+    A DataCard holds identity, labels, annotations, metadata, and an optional
+    live data interface. It never registers itself; registration and
+    retrieval belong to ``Cards``:
 
     ```python
     cards = Cards()
-    card = cards.data.get(space="ml", name="training-data", interface=MyDataInterface)
-    card.load()
+    card = cards.data.get(space="ml", name="training-data", eager_load=True)
+    frame = card.data
     ```
 
-    `get` validates the server-stored Card envelope. `load` is the separate
-    operation that downloads and hydrates registered data artifacts.
+    ``get`` returns the validated envelope without data bytes unless
+    ``eager_load=True``, which downloads the artifacts and calls ``load``.
+
+    Identity fields are validated when the card is serialized
+    (``save``, ``model_dump``, ``as_card_ref``), not at construction.
     """
 
     space: str
@@ -639,26 +742,29 @@ class DataCard:
         splits: Mapping[str, Split] | None = ...,
         target_columns: Sequence[str] | None = ...,
     ) -> None:
-        """Create a DataCard from an explicit data interface.
+        """Create a DataCard from an initialized data interface.
+
+        The schema is inferred from the interface's live data, if any.
 
         Args:
-            data (DataInterface): Built-in interface or Python subclass that
-                owns local save/load behavior.
-            space (str | None): Optional card space. Defaults to `default`.
-            name (str | None): Optional card name. Defaults to `data`.
-            version (str | None): Optional semantic version. Defaults to
-                `0.1.0`.
-            uid (str | None): Optional card UID. Defaults to a generated UID.
-            labels (StringMap | None): Queryable user labels copied into the
-                card metadata.
-            annotations (StringMap | None): Free-form user annotations copied
-                into the card metadata.
-            metadata (DataCardMetadata | None): Existing holder metadata to
-                seed before interface inference.
+            data: a built-in interface or subclass instance. An interface
+                class is rejected; pass classes to ``Cards.data.get``.
+            space: card space. Omitted, the nearest ``wyrd.toml`` default
+                applies, else ``"default"``.
+            name: card name. Defaults to ``"data"``.
+            version: semantic version. Defaults to ``"0.1.0"``.
+            uid: card UID. Omitted, a new UUIDv7 is generated.
+            labels: queryable labels. Defaults from ``wyrd.toml`` fill keys
+                not given here.
+            annotations: free-form annotations. Defaults from ``wyrd.toml``
+                fill keys not given here.
+            metadata: metadata to start from. Its interface, schema, and SQL
+                entries are replaced from ``data``. Omitted, it starts empty.
 
         Raises:
-            WyrdError: If labels, annotations, interface metadata, or inferred
-                schema data violate the DataCard contract.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` for an interface class or
+                an invalid label or annotation, or another ``WyrdError`` if
+                interface metadata or schema inference fails.
         """
         ...
 
@@ -676,26 +782,27 @@ class DataCard:
         splits: Mapping[str, Split] | None = ...,
         target_columns: Sequence[str] | None = ...,
     ) -> None:
-        """Create a DataCard from a local path or SQL query mapping.
+        """Create a DataCard from a local path or a SQL query mapping.
+
+        A ``.parquet`` file gets ``ParquetInterface``, a JSONL file
+        ``JsonlInterface``, a directory containing images ``ImageInterface``,
+        any other directory ``TextInterface``, and a ``dict``
+        ``SqlInterface`` with dialect ``"sql"``.
 
         Args:
-            data (PathLike | Mapping[str, Any]): Local path to infer as a data
-                interface, or a SQL query mapping.
-            space (str | None): Optional card space. Defaults to `default`.
-            name (str | None): Optional card name. Defaults to `data`.
-            version (str | None): Optional semantic version. Defaults to
-                `0.1.0`.
-            uid (str | None): Optional card UID. Defaults to a generated UID.
-            labels (StringMap | None): Queryable user labels copied into the
-                card metadata.
-            annotations (StringMap | None): Free-form user annotations copied
-                into the card metadata.
-            metadata (DataCardMetadata | None): Existing holder metadata to
-                seed before interface inference.
+            data: the local path or query mapping.
+            space: as for the interface overload.
+            name: as for the interface overload.
+            version: as for the interface overload.
+            uid: as for the interface overload.
+            labels: as for the interface overload.
+            annotations: as for the interface overload.
+            metadata: as for the interface overload.
 
         Raises:
-            WyrdError: If Wyrd cannot infer a supported data interface or the
-                supplied metadata violates the DataCard contract.
+            WyrdError: ``WYRD_DATA_400_UNKNOWN_DATA_TYPE`` if the path is not
+                a supported file or directory, or the errors of the interface
+                overload.
         """
         ...
 
@@ -713,7 +820,10 @@ class DataCard:
         splits: Mapping[str, Split] | None = ...,
         target_columns: Sequence[str] | None = ...,
     ) -> None:
-        """Create a DataCard from an existing Artifact card reference.
+        """Create a DataCard whose data is an existing Artifact card.
+
+        The reference is appended to the metadata's card references and no
+        interface is attached.
 
         Args:
             data (CardRef): Reference with kind `Kind.Artifact` or
@@ -735,8 +845,8 @@ class DataCard:
                 names; each must exist in the schema when one is known.
 
         Raises:
-            WyrdError: If the CardRef kind is not Artifact or holder metadata
-                is invalid.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if the CardRef kind is not
+                ``Artifact`` or a label or annotation is invalid.
         """
         ...
 
@@ -754,53 +864,60 @@ class DataCard:
         splits: Mapping[str, Split] | None = ...,
         target_columns: Sequence[str] | None = ...,
     ) -> None:
-        """Create a DataCard by inferring the interface from runtime data.
+        """Create a DataCard by detecting the interface for a data object.
+
+        Detection covers pandas and polars DataFrames, ``pyarrow.Table``,
+        NumPy arrays, Torch tensors, and Hugging Face datasets, each with the
+        default options of its interface.
 
         Args:
-            data (object): Runtime object such as a pandas DataFrame, polars
-                DataFrame, PyArrow table, NumPy array, Torch tensor, SQL
-                mapping, or supported local path.
-            space (str | None): Optional card space. Defaults to `default`.
-            name (str | None): Optional card name. Defaults to `data`.
-            version (str | None): Optional semantic version. Defaults to
-                `0.1.0`.
-            uid (str | None): Optional card UID. Defaults to a generated UID.
-            labels (StringMap | None): Queryable user labels copied into the
-                card metadata.
-            annotations (StringMap | None): Free-form user annotations copied
-                into the card metadata.
-            metadata (DataCardMetadata | None): Existing holder metadata to
-                seed before interface inference.
+            data: the data object.
+            space: as for the interface overload.
+            name: as for the interface overload.
+            version: as for the interface overload.
+            uid: as for the interface overload.
+            labels: as for the interface overload.
+            annotations: as for the interface overload.
+            metadata: as for the interface overload.
 
         Raises:
-            WyrdError: If Wyrd cannot infer a supported interface or the
-                inferred schema data violates the DataCard contract.
+            WyrdError: ``WYRD_DATA_400_UNKNOWN_DATA_TYPE`` if no interface
+                matches, ``WYRD_DATA_400_INTERFACE_METADATA_REQUIRED`` if a
+                Hugging Face dataset id cannot be inferred, or the errors of
+                the interface overload.
         """
         ...
 
     @property
     def data(self) -> object:
-        """Return live local data from the held interface.
+        """The live data held by the interface.
+
+        For a custom interface this is its ``data`` attribute.
 
         Raises:
-            WyrdError: If no interface is attached or the interface has no live
-                Python source data.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if no interface is
+                attached, it holds no data, or a custom interface has no
+                ``data`` attribute.
         """
         ...
 
     def save(self, path: PathLike, save_kwargs: Mapping[str, JsonValue] | None = ...) -> None:
-        """Materialize local data artifacts and write `card.json`.
+        """Write the data artifacts and ``card.json`` to a local directory.
 
-        This is a local filesystem operation only. It updates interface
-        metadata and byte statistics, then writes the DataCard envelope. It
-        does not create ArtifactCards, upload bytes, or register the card.
+        Updates the interface metadata and ``stats`` from the write. Local
+        only: nothing is uploaded or registered, and no Artifact cards are
+        created.
 
         Args:
-            path (PathLike): Local directory where Wyrd writes artifact bytes
-                and `card.json`.
-            save_kwargs (Mapping[str, JsonValue] | None): Optional
-                interface-specific
-                save options.
+            path: local card directory.
+            save_kwargs: a ``dict`` of interface options forwarded to the
+                interface's ``save``; see ``DataInterface.save``.
+
+        Raises:
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if no interface is
+                attached, the errors of the interface's ``save``, or a
+                ``WyrdError`` if identity is invalid or ``card.json`` cannot
+                be written.
         """
         ...
 
@@ -809,31 +926,36 @@ class DataCard:
         path: PathLike | None = ...,
         load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> None:
-        """Hydrate data through the held interface.
-
-        Pass `path` to load a saved local directory. Without a path, call this
-        only to reload a card returned by `Cards.data.get(eager_load=True)`;
-        Wyrd reuses the verified workspace retained by that eager operation.
-        An envelope-only `get` does not download data bytes.
+        """Read data into the held interface from a local card directory.
 
         Args:
-            path (PathLike | None): Optional local materialization directory.
-            load_kwargs (DataLoadArgs | Mapping[str, JsonValue] | None):
-                Optional interface-specific load options.
+            path: local card directory. Omit it only to reload a card
+                returned by ``Cards.data.get(eager_load=True)``, which reuses
+                the artifacts that call downloaded.
+            load_kwargs: options forwarded to the interface's ``load``; see
+                ``DataInterface.load``.
 
         Raises:
-            WyrdError: If neither a local path nor an eager-load workspace is
-                available, no interface is attached, or interface loading
-                fails.
+            WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``path`` is omitted
+                without eager-loaded artifacts or no interface is attached,
+                or the errors of the interface's ``load``.
         """
         ...
 
     def model_dump_json(self) -> str:
-        """Return this DataCard envelope as JSON without filesystem IO."""
+        """Return the DataCard envelope as a JSON string.
+
+        Raises:
+            WyrdError: If identity fields are invalid.
+        """
         ...
 
     def model_dump(self) -> JsonDict:
-        """Return this DataCard envelope as a JSON-compatible dictionary."""
+        """Return the DataCard envelope as a JSON-compatible dictionary.
+
+        Raises:
+            WyrdError: If identity fields are invalid.
+        """
         ...
 
     def _to_card_envelope_json(self) -> str:
@@ -841,13 +963,10 @@ class DataCard:
         ...
 
     def as_card_ref(self) -> CardRef:
-        """Return a CardRef pointing at this DataCard.
-
-        Returns:
-            CardRef: Reference with kind `Kind.Data`.
+        """Return a ``Data`` CardRef for this card's identity.
 
         Raises:
-            WyrdError: If holder identity fields are invalid.
+            WyrdError: If name, version, space, or UID is invalid.
         """
         ...
 
@@ -856,25 +975,24 @@ class DataCard:
         json_string: str,
         interface: DataInterface | type[DataInterface] | CardRefLike | None = ...,
     ) -> DataCard:
-        """Build a DataCard from serialized Wyrd card JSON.
+        """Rebuild a DataCard from serialized card JSON.
 
-        The JSON must contain a complete `Data` Card envelope, including its
-        resolved version. This method rebuilds the holder and its interface;
-        it does not download data artifacts.
+        The JSON must be a complete ``Data`` envelope with a resolved
+        version, space, and UID. No data artifacts are downloaded or read.
 
         Args:
-            json_string (str): Serialized DataCard envelope.
-            interface (DataInterface | type[DataInterface] | CardRefLike | None):
-                Optional built-in interface, Python subclass instance, Python
-                subclass type reconstructed through `from_metadata`, or an
-                Artifact CardRef to attach after parsing.
-
-        Returns:
-            A DataCard holder populated from the serialized envelope.
+            json_string: the serialized envelope.
+            interface: an interface instance, or an interface class rebuilt
+                with its ``from_metadata``. It must match the stored
+                interface kind. Omitted, built-in interfaces are rebuilt from
+                the stored metadata; a card with a custom interface requires
+                this argument. A CardRef is rejected.
 
         Raises:
-            WyrdError: If JSON parsing, envelope validation, or custom
-                interface reconstruction fails.
+            WyrdError: If the JSON or envelope is invalid, the stored
+                interface is custom and ``interface`` is omitted, or
+                ``interface`` is a CardRef or does not match the stored
+                interface.
         """
         ...
 

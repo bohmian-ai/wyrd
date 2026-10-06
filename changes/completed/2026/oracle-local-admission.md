@@ -19,4 +19,3 @@ Current owners and evidence:
 - [Bifrost design](../../../architecture/bifrost-design.md).
 - [Oracle admission](../../../crates/vala/vala-bifrost-redux/src/oracle/admission.rs), [Oracle resources](../../../crates/vala/vala-bifrost-redux/src/resources.rs), and [Oracle runtime](../../../crates/vala/vala-bifrost-redux/src/oracle/mod.rs).
 - [Capacity journeys](../../../crates/wyrd/wyrd-testing/tests/bifrost/oracle/capacity.rs).
-

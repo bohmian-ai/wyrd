@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryBuilder, StringArray, TimestampMicrosecondArray,
-};
+use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use iceberg::spec::Schema as IcebergSchema;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
@@ -31,9 +30,11 @@ use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-    WYRD_REQUEST_ID,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
+
+use crate::tables::CorrelationPolicy;
+use crate::tables::managed_columns::{ensure_managed_columns, is_managed_column};
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
@@ -219,9 +220,10 @@ impl ScribeIngressCpuPool {
             principal,
             expected_schema_fingerprint,
             request_id,
-            batch_id,
+            receipt_micros,
             window,
             definition,
+            registered_schema,
         } = inputs;
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
@@ -246,12 +248,15 @@ impl ScribeIngressCpuPool {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 decode(
                     payload,
-                    &principal,
-                    expected_schema_fingerprint,
-                    &request_id,
-                    batch_id,
-                    window,
-                    definition,
+                    &DecodeContext {
+                        principal: &principal,
+                        expected_schema_fingerprint,
+                        request_id: &request_id,
+                        window,
+                        receipt_micros,
+                        definition,
+                        registered_schema: registered_schema.as_deref(),
+                    },
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
@@ -395,8 +400,8 @@ impl ScribeIngressCpuPool {
 /// columns, so accepting a caller event-time column never perturbs a
 /// registered-schema fingerprint.
 ///
-/// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
-/// `wyrd_request_id`, principal, and card columns) remain
+/// All other managed columns (`wyrd_ingested_at`, `wyrd_request_id`,
+/// principal, and card columns) remain
 /// unconditionally server-owned and are rejected when supplied.
 ///
 /// # Errors
@@ -410,12 +415,7 @@ impl ScribeIngressCpuPool {
 /// table contract.
 fn decode(
     payload: IngressPayload,
-    principal: &Principal,
-    expected_schema_fingerprint: SchemaFingerprint,
-    request_id: &RequestId,
-    batch_id: uuid::Uuid,
-    window: EventTimeWindow,
-    definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
@@ -439,18 +439,7 @@ fn decode(
     } else {
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
-    decode_rows(
-        &rows,
-        &DecodeContext {
-            principal,
-            expected_schema_fingerprint,
-            request_id,
-            batch_id,
-            window,
-            receipt_micros: None,
-            definition,
-        },
-    )
+    decode_rows(&rows, context)
 }
 
 /// Validates and stamps one current native record batch.
@@ -480,19 +469,25 @@ pub(crate) struct IngressDecodeInputs {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
-    /// Stable batch identity stamped into every accepted row.
-    pub(crate) batch_id: uuid::Uuid,
+    /// Admission instant stamped as `wyrd_ingested_at` and anchoring the
+    /// event-time window.
+    pub(crate) receipt_micros: i64,
     /// Accepted caller event-time window.
     pub(crate) window: EventTimeWindow,
     /// Canonical built-in whose physical identity the decode must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    pub(crate) registered_schema: Option<Arc<IcebergSchema>>,
 }
 
 /// Immutable validation and stamping context for one decoded batch.
 ///
 /// Native persistence preprocessing builds one of these per record batch of a
-/// request; every batch of one request stamps the same batch and request
-/// identity.
+/// request; every batch of one request stamps the same request identity and
+/// admission instant.
 pub(crate) struct DecodeContext<'a> {
     /// Authenticated principal used for scope checks and managed columns.
     pub(crate) principal: &'a Principal,
@@ -500,27 +495,38 @@ pub(crate) struct DecodeContext<'a> {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
-    /// Stable batch identity stamped into every accepted row.
-    pub(crate) batch_id: uuid::Uuid,
     /// Accepted caller event-time window.
     pub(crate) window: EventTimeWindow,
-    /// Fixed receipt time retained by current-only native production.
-    pub(crate) receipt_micros: Option<i64>,
+    /// Admission instant in epoch microseconds, read once per batch.
+    ///
+    /// Stamped as `wyrd_ingested_at`, used as `wyrd_event_time` when the caller
+    /// supplies none, and the anchor of the event-time acceptance window.
+    pub(crate) receipt_micros: i64,
     /// Canonical built-in whose physical identity this decode must preserve.
     ///
     /// `Some` only for a canonical signal table. A dynamic or pre-declared
     /// table leaves this `None` and keeps the existing catalog-fingerprint and
     /// managed-field policy.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Registered Iceberg schema whose field ids every stamped batch carries.
+    ///
+    /// `None` only for the embedded engine seam, which has no catalog owner
+    /// and writes objects that no registered table promotes.
+    pub(crate) registered_schema: Option<&'a IcebergSchema>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
+///
+/// The final step stamps the registered Iceberg table's field ids onto every
+/// field when the context carries that schema, so the WAL, staged runs, and
+/// sealed objects all number their columns exactly as the table does.
 ///
 /// # Errors
 ///
 /// Returns a stable Scribe refusal for a duplicated column name, reserved
 /// columns, fingerprint mismatch, card-scope failure, invalid event
-/// time, or managed column construction failure.
+/// time, or managed column construction failure, and a fingerprint mismatch
+/// when a stamped field has no registered counterpart.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -536,17 +542,14 @@ fn decode_rows(
         if !seen.insert(field.name().as_str()) {
             return Err(ScribeError::InvalidFrame);
         }
-        // `wyrd_event_time` is intentionally absent from this reserved set: a
-        // caller MAY supply it as the authoritative event time, and it is then
-        // validated and preserved in `stamp_correlation_columns`. `run_id` is
-        // likewise absent: it is caller correlation that this function
-        // relinquishes and restamps exactly once in its canonical slot. Every
+        // A caller MAY supply `wyrd_event_time` as the authoritative event
+        // time; it is then validated and preserved in
+        // `stamp_correlation_columns`. `run_id` is caller correlation that this
+        // function relinquishes and restamps exactly once in its slot. Every
         // other managed column is unconditionally server-owned, so supplying
         // one is a refusal rather than an override.
-        if matches!(
-            field.name().as_str(),
-            CARD_UID | PRINCIPAL_ID | WYRD_BATCH_ID | WYRD_INGESTED_AT | WYRD_REQUEST_ID
-        ) {
+        let name = field.name().as_str();
+        if is_managed_column(name) && name != WYRD_EVENT_TIME && name != RUN_ID {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -563,7 +566,14 @@ fn decode_rows(
         enforce_canonical_source_contract(rows, definition)?;
     }
     validate_card_scope(rows, context.principal)?;
-    stamp_correlation_columns(rows, context)
+    let stamped = stamp_correlation_columns(rows, context)?;
+    match context.registered_schema {
+        Some(registered) => crate::tables::stamp_registered_field_ids(&stamped, registered)
+            .map_err(|_| ScribeError::FingerprintMismatch {
+                table: "resolved ingress table".to_owned(),
+            }),
+        None => Ok(stamped),
+    }
 }
 
 /// Enforces one canonical built-in's exact user contract before stamping.
@@ -575,8 +585,9 @@ fn decode_rows(
 /// the remaining user block, and then requires that block to match
 /// `(definition.arrow_fields)()` in order, name, nullability, and type shape,
 /// so no structurally different Arrow spelling reaches the physical schema.
-/// Field metadata is not compared: the stable id and sensitivity tag are the
-/// server's own physical identity, stamped downstream from the definition, so
+/// Field metadata is not compared: the field id and sensitivity tag are the
+/// server's own physical identity, stamped downstream from the registered
+/// table and the definition, so
 /// a writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
@@ -638,7 +649,7 @@ fn enforce_canonical_source_contract(
 /// Confirms a stamped canonical batch still carries its table-owned identity.
 ///
 /// The stamped batch is built from `(definition.schema)()`, so its correlation
-/// and managed `Field`s — stable ids, sensitivity metadata, nullability — are
+/// and managed `Field`s — sensitivity metadata, nullability — are
 /// the table's own rather than locally reconstructed. This re-derives the
 /// canonical physical fingerprint from the stamped schema and compares it with
 /// the definition's resolved identity, so any future divergence between the
@@ -788,17 +799,16 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// column is removed from the user projection and its array is reinserted
 /// verbatim (never re-stamped) in the canonical managed slot by
 /// [`append_managed_columns`]; when the column is absent the server stamps
-/// `wyrd_event_time` with the ingest receipt time in that same slot. Either way
-/// `wyrd_event_time` is written exactly once and lands between `wyrd_request_id`
-/// and `wyrd_ingested_at`, so the stamped batch's full field order equals
-/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
-/// mode (D88). `wyrd_ingested_at` is always the server receipt time regardless of
-/// caller event time. Projected payloads retain their remaining correlation
-/// values unchanged.
+/// `wyrd_event_time` with the admission instant in that same slot. Either way
+/// `wyrd_event_time` is written exactly once in its declared slot, so the
+/// stamped batch's managed field order is the
+/// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS) order in
+/// every payload mode (D88). `wyrd_ingested_at` is always the admission instant
+/// regardless of caller event time. Projected payloads retain their remaining
+/// correlation values unchanged.
 ///
-/// The `window` check uses a single `receipt_micros` computed once at the
-/// entry of this function so an in-flight clock tick cannot split a batch
-/// verdict.
+/// The `window` check and both time columns use the one admission instant in
+/// `context`, read once per batch at admission.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
@@ -821,10 +831,6 @@ fn stamp_correlation_columns(
     } = context;
     let (principal, request_id, window) = (*principal, *request_id, *window);
     let receipt_micros = *receipt_micros;
-    let row_count = rows.num_rows();
-    // Compute one receipt instant for the whole batch so clock ticks mid-batch
-    // cannot split the verdict.
-    let receipt_micros = receipt_micros.map_or_else(current_receipt_micros, Ok)?;
     // Type/null/duplicate checks come first (T38). A malformed column stays
     // `InvalidFrame` regardless of window membership.
     validate_native_event_time(rows)?;
@@ -837,51 +843,42 @@ fn stamp_correlation_columns(
     }
     // A present `wyrd_event_time` (validated above for native payloads and
     // window-checked above for both modes) is always lifted out of the user
-    // projection here and reinserted verbatim in the canonical managed slot by
-    // `append_managed_columns`, never re-stamped. When absent, the server stamps
-    // the receipt time into that slot instead. Decoupling "exclude from the user
-    // block" from "stamp the receipt value" keeps the stamped field order equal
-    // to `with_managed_columns` in every payload mode (D88).
+    // projection here and reinserted verbatim in its managed slot by
+    // `managed_arrays`, never re-stamped. When absent, the server stamps the
+    // admission instant into that slot instead. Decoupling "exclude from the
+    // user block" from "stamp the admission value" keeps the stamped field
+    // order equal to the managed-column declaration in every payload mode (D88).
     let caller_event_time = rows
         .schema()
         .index_of(WYRD_EVENT_TIME)
         .ok()
         .map(|index| Arc::clone(rows.column(index)));
     let caller_run_id = caller_run_id_column(rows)?;
-    let server_owned = server_owned_columns();
-    let mut fields = user_fields(rows, &server_owned);
-    let mut columns = user_columns(rows, &server_owned);
+    let mut fields = user_fields(rows);
+    let mut columns = user_columns(rows);
     // A table whose rows carry their own identity declares
     // `CorrelationPolicy::None`, and its registered physical schema has no
-    // envelope slots at all. Stamping one anyway would seal an object with more
-    // columns than the table it is promoted into.
-    let appends_envelope = correlation_envelope_applies(context);
-    if appends_envelope {
-        let card_uids = resolve_card_uids(rows, principal, row_count)?;
-        fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-        columns.push(caller_run_id.unwrap_or_else(|| {
-            Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
-        }));
-        columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
-        columns.push(Arc::new(StringArray::from(vec![
-            principal.id.to_string();
-            row_count
-        ])));
-        columns.push(Arc::new(StringArray::from(vec![
-            request_id.as_str();
-            row_count
-        ])));
-    }
-    append_managed_columns(
-        &mut fields,
-        &mut columns,
-        context,
-        row_count,
-        caller_event_time,
-        receipt_micros,
-    )?;
+    // correlation or request slots. Stamping them anyway would seal an object
+    // with more columns than the table it is promoted into.
+    let policy = if correlation_envelope_applies(context) {
+        CorrelationPolicy::Observation
+    } else {
+        CorrelationPolicy::None
+    };
+    fields.extend(ensure_managed_columns(Vec::new(), policy));
+    columns.extend(managed_arrays(
+        rows,
+        &ManagedValues {
+            principal,
+            request_id,
+            receipt_micros,
+            caller_run_id,
+            caller_event_time,
+        },
+        policy,
+    )?);
     // A canonical built-in constructs only the arrays here: every correlation
-    // and managed `Field` — with its stable id and sensitivity metadata — is
+    // and managed `Field` — with its sensitivity metadata — is
     // cloned from the table's own physical schema, and the locally assembled
     // field list is compared against it first so a drifting stamping order is
     // refused rather than silently relabelled.
@@ -907,8 +904,8 @@ fn stamp_correlation_columns(
     }
     // The arrays are the writer's; the identity on them is the table's. Every
     // column is re-typed onto the physical field it fills, so the stamped
-    // batch carries the table layer's stable ids and sensitivity tags whether
-    // or not the writer echoed them.
+    // batch carries the table layer's sensitivity tags whether or not the
+    // writer echoed them.
     let columns = physical
         .fields()
         .iter()
@@ -1041,68 +1038,39 @@ fn enforce_event_time_window(
     Ok(())
 }
 
-/// Return physical columns excluded from user projection for one payload mode.
+/// Reports whether `name` is excluded from the user projection.
 ///
-/// Every managed column is unconditionally excluded from the user projection and
-/// materialized in its canonical slot by [`append_managed_columns`], regardless
-/// of whether the caller supplied it. In particular `wyrd_event_time` is always
-/// excluded: when the caller supplied a valid value it is reinserted verbatim in
-/// the canonical slot, and when it is absent the server stamps the receipt time
-/// there. Decoupling exclusion from the value source keeps the stamped field
-/// order equal to [`with_managed_columns`](crate::schema::with_managed_columns)
-/// in every payload mode (D88). `run_id` is listed here for the same reason:
-/// the caller relinquishes it from the user projection so the canonical
-/// nullable physical column can be stamped exactly once.
-fn server_owned_columns() -> Vec<&'static str> {
-    vec![
-        CARD_REF,
-        CARD_UID,
-        PRINCIPAL_ID,
-        WYRD_REQUEST_ID,
-        WYRD_EVENT_TIME,
-        WYRD_INGESTED_AT,
-        WYRD_BATCH_ID,
-        RUN_ID,
-    ]
+/// Every managed column is unconditionally excluded from the user projection
+/// and materialized in its declared slot by [`managed_arrays`], regardless of
+/// whether the caller supplied it. In particular `wyrd_event_time` is always
+/// excluded: when the caller supplied a valid value it is reinserted verbatim
+/// in its slot, and when it is absent the server stamps the admission instant
+/// there. `run_id` is excluded for the same reason, so the canonical nullable
+/// physical column is stamped exactly once. `card_ref` is a Gate input that
+/// resolves to `card_uid` and is never stored.
+fn is_server_owned(name: &str) -> bool {
+    name == CARD_REF || is_managed_column(name)
 }
 
-fn user_fields(rows: &RecordBatch, server_owned: &[&str]) -> Vec<Field> {
-    let schema = rows.schema();
-    let capacity = schema
+/// Returns the caller's user fields, in order, without server-owned columns.
+fn user_fields(rows: &RecordBatch) -> Vec<Field> {
+    rows.schema()
         .fields()
         .iter()
-        .filter(|field| !server_owned.contains(&field.name().as_str()))
-        .count();
-    let mut fields = Vec::with_capacity(capacity);
-    fields.extend(
-        schema
-            .fields()
-            .iter()
-            .filter(|field| !server_owned.contains(&field.name().as_str()))
-            .map(|field| field.as_ref().clone()),
-    );
-    debug_assert_eq!(fields.capacity(), capacity);
-    fields
+        .filter(|field| !is_server_owned(field.name()))
+        .map(|field| field.as_ref().clone())
+        .collect()
 }
 
-fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
-    let schema = rows.schema();
-    let capacity = schema
+/// Returns the caller's user columns, in order, without server-owned columns.
+fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
+    rows.schema()
         .fields()
         .iter()
-        .filter(|field| !server_owned.contains(&field.name().as_str()))
-        .count();
-    let mut columns = Vec::with_capacity(capacity);
-    columns.extend(
-        schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !server_owned.contains(&field.name().as_str()))
-            .map(|(index, _)| Arc::clone(rows.column(index))),
-    );
-    debug_assert_eq!(columns.capacity(), capacity);
-    columns
+        .zip(rows.columns())
+        .filter(|(field, _)| !is_server_owned(field.name()))
+        .map(|(_, column)| Arc::clone(column))
+        .collect()
 }
 
 /// Resolves row card references against the principal's signed Card scope.
@@ -1186,76 +1154,77 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
     })
 }
 
-/// Appends the server-owned managed columns to a partially-stamped batch.
+/// The per-batch values the managed columns are stamped from.
+struct ManagedValues<'a> {
+    /// Authenticated writer stamped as `principal_id` and used to resolve Cards.
+    principal: &'a Principal,
+    /// Request identity stamped as `wyrd_request_id`.
+    request_id: &'a RequestId,
+    /// Admission instant stamped as `wyrd_ingested_at`.
+    receipt_micros: i64,
+    /// Caller `run_id` column lifted out of the user projection, if supplied.
+    caller_run_id: Option<ArrayRef>,
+    /// Validated caller `wyrd_event_time` column, if supplied.
+    caller_event_time: Option<ArrayRef>,
+}
+
+/// Builds one array per managed column `policy` appends, in declared order.
 ///
-/// The event time, receipt timestamp, batch id, and tenant are
-/// appended unconditionally, values and all. The correlation envelope —
-/// `card_uid`, `wyrd_principal_id`, and `wyrd_request_id` — is conditional: its
-/// fields are declared here only when
-/// [`correlation_envelope_applies`] holds for this table, and their arrays were
-/// already pushed onto `columns` by the caller that decoded them, which is what
-/// makes the batch "partially stamped" on entry. A table whose correlation
-/// policy is `None` carries no such column at all.
-/// `wyrd_ingested_at` is always the server receipt time. `wyrd_event_time` is
-/// always materialized in the canonical slot (between `wyrd_request_id` and
-/// `wyrd_ingested_at`), so the stamped field order equals
-/// [`with_managed_columns`](crate::schema::with_managed_columns) in every payload
-/// mode (D88). Only the event-time *value* varies: `caller_event_time` carries a
-/// valid caller-supplied array (already validated and window-checked, lifted out
-/// of the user projection) that is written verbatim exactly once and never
-/// re-stamped; when it is `None` the server stamps the receipt time into the same
-/// slot.
+/// The layout — which columns, in which order, with which type — comes from
+/// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS); this
+/// function supplies only each column's values. `wyrd_event_time` is the
+/// caller's validated array verbatim when supplied, otherwise the admission
+/// instant, and `wyrd_ingested_at` is always the admission instant.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
-/// epoch, the receipt timestamp exceeds Arrow's range, or batch-id stamping
-/// fails.
-fn append_managed_columns(
-    fields: &mut Vec<Field>,
-    columns: &mut Vec<ArrayRef>,
-    context: &DecodeContext<'_>,
-    row_count: usize,
-    caller_event_time: Option<ArrayRef>,
-    receipt_micros: i64,
-) -> Result<(), ScribeError> {
-    let batch_id = context.batch_id;
-    if correlation_envelope_applies(context) {
-        fields.extend([
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(PRINCIPAL_ID, DataType::Utf8, false),
-            Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-        ]);
-    }
-    fields.extend([
-        Field::new(
-            WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new(
-            WYRD_INGESTED_AT,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
-    ]);
-    let timestamp_array = Arc::new(
-        TimestampMicrosecondArray::from(vec![receipt_micros; row_count]).with_timezone("UTC"),
+///
+/// Returns [`ScribeError::CardUnresolved`] when a `card_ref` cannot be resolved
+/// against the principal's signed scope, and [`ScribeError::Internal`] when a
+/// declared managed column has no stamping rule here.
+fn managed_arrays(
+    rows: &RecordBatch,
+    values: &ManagedValues<'_>,
+    policy: CorrelationPolicy,
+) -> Result<Vec<ArrayRef>, ScribeError> {
+    let row_count = rows.num_rows();
+    let admitted_at = Arc::new(
+        TimestampMicrosecondArray::from(vec![values.receipt_micros; row_count])
+            .with_timezone("UTC"),
     ) as ArrayRef;
-    // Event time lands in the canonical slot exactly once: the caller's array
-    // verbatim when supplied, otherwise the server receipt instant.
-    columns.push(caller_event_time.unwrap_or_else(|| Arc::clone(&timestamp_array)));
-    columns.push(timestamp_array);
-    let mut batch_id_builder = FixedSizeBinaryBuilder::with_capacity(row_count, 16);
-    for _ in 0..row_count {
-        batch_id_builder
-            .append_value(batch_id.as_bytes())
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("batch id stamping failed: {error}"),
-            })?;
-    }
-    columns.push(Arc::new(batch_id_builder.finish()));
-    Ok(())
+    policy
+        .managed_columns()
+        .map(|column| {
+            Ok(match column.field.name {
+                RUN_ID => values.caller_run_id.as_ref().map_or_else(
+                    || Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef,
+                    Arc::clone,
+                ),
+                CARD_UID => Arc::new(StringArray::from(resolve_card_uids(
+                    rows,
+                    values.principal,
+                    row_count,
+                )?)),
+                PRINCIPAL_ID => Arc::new(StringArray::from(vec![
+                    values.principal.id.to_string();
+                    row_count
+                ])),
+                WYRD_REQUEST_ID => Arc::new(StringArray::from(vec![
+                    values.request_id.as_str();
+                    row_count
+                ])),
+                WYRD_EVENT_TIME => values
+                    .caller_event_time
+                    .as_ref()
+                    .map_or_else(|| Arc::clone(&admitted_at), Arc::clone),
+                WYRD_INGESTED_AT => Arc::clone(&admitted_at),
+                other => {
+                    return Err(ScribeError::Internal {
+                        detail: format!("managed column {other} has no stamping rule"),
+                    });
+                }
+            })
+        })
+        .collect()
 }
 
 /// Closed set of CPU work permitted after admission has returned.
@@ -1509,6 +1478,12 @@ impl ScribePersistenceCpuPool {
             drained: Arc::new(Notify::new()),
             capacity,
         })
+    }
+
+    /// Returns how many Rayon threads run this lane's work.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.pool.current_num_threads()
     }
 
     /// Acquires one application-level persistence lane permit.
@@ -2157,14 +2132,13 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-        WYRD_REQUEST_ID,
+        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
 
     use super::{
-        ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
+        DecodeContext, ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
         ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
         source_schema_fingerprint, stamp_correlation_columns, wait_lane_drained,
     };
@@ -2175,6 +2149,7 @@ mod tests {
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
+    use crate::tables::CorrelationPolicy;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -2201,10 +2176,20 @@ mod tests {
             principal,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
-            batch_id: Uuid::now_v7(),
             window: EventTimeWindow::default(),
-            receipt_micros: None,
+            receipt_micros: receipt_now(),
+            registered_schema: None,
         }
+    }
+
+    /// The current admission instant, for fixtures whose event times are
+    /// derived from the same clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the system clock cannot be read as microseconds since the epoch.
+    fn receipt_now() -> i64 {
+        super::current_receipt_micros().expect("the receipt clock is readable")
     }
 
     fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
@@ -2226,6 +2211,12 @@ mod tests {
     }
 
     /// Native stamping writes the complete canonical physical schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when stamping fails, when the stamped batch has no nullable all-null
+    /// `run_id`, or when its fingerprint differs from the canonical managed schema
+    /// for the same user field.
     #[test]
     fn native_stamping_materializes_nullable_run_id() {
         let rows = batch(
@@ -2240,14 +2231,52 @@ mod tests {
         let run_id = stamped.schema().index_of("run_id").expect("run_id field");
         assert!(stamped.schema().field(run_id).is_nullable());
         assert_eq!(stamped.column(run_id).null_count(), stamped.num_rows());
-        let expected = Schema::new(crate::schema::with_managed_columns(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
+        let expected = Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+            vec![Field::new("value", DataType::Int64, false)],
+            CorrelationPolicy::Observation,
+        ));
         assert_eq!(
             SchemaFingerprint::from_arrow_schema(stamped.schema().as_ref()),
             SchemaFingerprint::from_arrow_schema(&expected),
+        );
+    }
+
+    /// Stamping writes the one admission instant as `wyrd_ingested_at` on every
+    /// row and writes no per-row batch column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stamped batch carries `wyrd_batch_id`, or when any row's
+    /// ingestion time differs from the admission instant in the context.
+    #[test]
+    fn stamping_writes_the_admission_instant_and_no_batch_column() {
+        /// Fixed admission instant, distinct from any live clock reading, so every
+        /// stamped row can be compared against one exact value.
+        const ADMITTED_AT: i64 = 1_700_000_000_123_456;
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
+        );
+        let principal = principal();
+        let request_id = RequestId::now_v7();
+        let mut context = stamping_context(&principal, &request_id);
+        context.receipt_micros = ADMITTED_AT;
+
+        let stamped = stamp_correlation_columns(&rows, &context).expect("stamp");
+
+        assert!(
+            stamped.schema().index_of("wyrd_batch_id").is_err(),
+            "rows carry no per-row batch identity"
+        );
+        let ingested = stamped
+            .column_by_name(WYRD_INGESTED_AT)
+            .expect("ingestion time is stamped")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("ingestion time is a microsecond timestamp");
+        assert!(
+            ingested.iter().all(|value| value == Some(ADMITTED_AT)),
+            "every row carries the admission instant"
         );
     }
 
@@ -2606,6 +2635,11 @@ mod tests {
 
     /// Projected payloads retain their caller-provided run identifier as the
     /// correlation value used by the projected-observation path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projected payload is refused or when its `run_id` column is
+    /// missing, not UTF-8, or not the caller's value.
     #[test]
     fn projected_run_id_remains_correlation_data() {
         let rows = batch(
@@ -2616,12 +2650,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected run_id is correlation data");
         let run_id = error
@@ -2658,12 +2695,15 @@ mod tests {
     ) -> Result<RecordBatch, ScribeError> {
         decode(
             payload,
-            principal,
-            source_schema_fingerprint(schema),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal,
+                expected_schema_fingerprint: source_schema_fingerprint(schema),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
     }
 
@@ -2753,6 +2793,13 @@ mod tests {
         assert!(matches!(dup_err, ScribeError::InvalidFrame));
     }
 
+    /// A `card_ref` value outside the service principal's own Card scope is refused
+    /// during decode, before any writer admission sees the frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode accepts the out-of-scope row or refuses it with anything
+    /// other than `CardScopeDenied`.
     #[test]
     fn card_scope_rejects_before_writer_admission() {
         let card = CardRef::from_str("prod/Service/billing@1.0.0").expect("card");
@@ -2776,12 +2823,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("card outside scope");
         assert!(matches!(
@@ -2798,6 +2848,11 @@ mod tests {
     /// projection while name lookup only ever sees the first occurrence. An
     /// authorized (here null) first column could therefore hide a second,
     /// out-of-scope assertion. The shared decode guard rejects the frame first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode accepts the duplicated column or refuses it with anything
+    /// other than `InvalidFrame`.
     #[test]
     fn duplicate_arrow_column_names_fail_closed_for_dynamic_tables() {
         let rows = batch(
@@ -2814,17 +2869,28 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("a duplicated column name fails closed before WAL");
         assert!(matches!(error, ScribeError::InvalidFrame));
     }
 
+    /// Decode keeps the caller's field order and binds each value to its field by
+    /// name, so a payload whose fields are not in alphabetical order keeps every
+    /// value under its own name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode refuses the payload, when the decoded fields change
+    /// order, or when either column's value moves to the other field.
     #[test]
     fn schema_fields_map_by_name_not_position() {
         let rows = batch(
@@ -2841,12 +2907,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("schema is valid");
         assert_eq!(decoded.schema().field(0).name(), "second");
@@ -2871,28 +2940,39 @@ mod tests {
         );
     }
 
+    /// Decode finishes schema validation and server stamping before
+    /// acknowledgement: the decoded batch carries the principal, event-time,
+    /// ingestion-time, and request columns, and neither a tenant column nor a
+    /// per-row batch column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when decode refuses the payload, when a stamped managed column is
+    /// missing, or when a tenant or batch-identity column is present.
     #[test]
     fn ipc_decode_schema_type_validation_and_stamping_precede_ack() {
         let rows = batch(
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         );
-        let batch_id = Uuid::now_v7();
         let decoded = decode(
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            batch_id,
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of("data_tenant_id").is_err());
         assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
-        assert!(decoded.schema().index_of(WYRD_BATCH_ID).is_ok());
+        assert!(decoded.schema().index_of("wyrd_batch_id").is_err());
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
@@ -2952,11 +3032,10 @@ mod tests {
 
     /// The canonical managed field-name order for a single `value` user column.
     fn canonical_managed_order() -> Vec<String> {
-        Schema::new(crate::schema::with_managed_columns(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]))
+        Schema::new(crate::tables::managed_columns::ensure_managed_columns(
+            vec![Field::new("value", DataType::Int64, false)],
+            CorrelationPolicy::Observation,
+        ))
         .fields()
         .iter()
         .map(|field| field.name().clone())
@@ -2968,7 +3047,12 @@ mod tests {
     /// the user block into the managed slot (between `wyrd_request_id` and
     /// `wyrd_ingested_at`) — the order the Oracle's pinned sealed-fragment
     /// fingerprint requires. Before D88 the caller column stayed in the user block
-    /// and diverged from [`with_managed_columns`], breaking every sealed read.
+    /// and diverged from [`ensure_managed_columns`], breaking every sealed read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller event time is refused or when the stamped field order
+    /// differs from the canonical managed order.
     #[test]
     fn native_caller_event_time_lands_in_canonical_managed_slot() {
         let (principal, card) = scoped_service_principal();
@@ -2988,12 +3072,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -3006,6 +3093,11 @@ mod tests {
     /// D88: a stamped native payload WITHOUT a caller `wyrd_event_time` (server
     /// stamps receipt time) has the identical canonical field order — the
     /// event-time value source does not perturb the physical layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused or when the stamped field order differs
+    /// from the canonical managed order.
     #[test]
     fn native_server_stamped_event_time_lands_in_canonical_managed_slot() {
         let (principal, card) = scoped_service_principal();
@@ -3021,12 +3113,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native ingest without event time is server-stamped");
         assert_eq!(
@@ -3039,6 +3134,11 @@ mod tests {
     /// D88: a stamped projected payload with a preserved caller `wyrd_event_time`
     /// also produces the canonical managed field order (`run_id` retained as
     /// correlation data, event time lifted into the managed slot).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projected event time is refused or when the stamped field
+    /// order differs from the canonical managed order.
     #[test]
     fn projected_preserved_event_time_lands_in_canonical_managed_slot() {
         let (event_field, event_array) = managed_event_time(vec![now_micros_offset(-3600)]);
@@ -3058,12 +3158,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected preserved event time is accepted");
         assert_eq!(
@@ -3077,6 +3180,12 @@ mod tests {
     /// slot and is never re-stamped — it is distinct from the receipt-time
     /// `wyrd_ingested_at`, proving the managed slot holds the caller value, not a
     /// server-stamped one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller event time is refused, when either time column is
+    /// missing or not a microsecond timestamp, when the event time differs from the
+    /// caller value, or when it equals the receipt time.
     #[test]
     fn caller_event_time_value_is_verbatim_not_receipt_time() {
         let (principal, card) = scoped_service_principal();
@@ -3098,12 +3207,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         let event = decoded
@@ -3133,6 +3245,12 @@ mod tests {
     /// A native payload MAY carry a valid caller `wyrd_event_time`: its values
     /// survive decode+stamp unchanged, exactly once, and the user-schema
     /// fingerprint is identical to the same payload without the column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the user-schema fingerprints differ, when the caller event time
+    /// is refused, or when the decoded event-time column is missing, mistyped, or
+    /// not the caller's values.
     #[test]
     fn native_caller_event_time_is_preserved_without_fingerprint_drift() {
         let (principal, card) = scoped_service_principal();
@@ -3170,12 +3288,15 @@ mod tests {
 
         let decoded = decode(
             ipc_payload(&rows_with),
-            &principal,
-            source_schema_fingerprint(rows_with.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows_with.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -3200,6 +3321,11 @@ mod tests {
 
     /// A native payload WITHOUT `wyrd_event_time` is still server-stamped exactly
     /// as before, and `wyrd_ingested_at` remains the server receipt time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused, when the server-stamped event time is
+    /// missing, mistyped, or nullable, or when no ingestion time is stamped.
     #[test]
     fn native_without_event_time_is_server_stamped() {
         let (principal, card) = scoped_service_principal();
@@ -3215,12 +3341,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("native ingest without event time is server-stamped");
         let event_field = decoded
@@ -3238,6 +3367,11 @@ mod tests {
 
     /// A native `wyrd_event_time` with the wrong Arrow type, unit, timezone,
     /// nulls, or a duplicate field fails closed with `InvalidFrame`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any malformed event-time variant is accepted or refused with
+    /// anything other than `InvalidFrame`.
     #[test]
     fn native_event_time_physical_type_is_validated() {
         let (principal, card) = scoped_service_principal();
@@ -3314,12 +3448,15 @@ mod tests {
         ] {
             let error = decode(
                 ipc_payload(&rows),
-                &principal,
-                source_schema_fingerprint(rows.schema().as_ref()),
-                &RequestId::now_v7(),
-                Uuid::now_v7(),
-                EventTimeWindow::default(),
-                None,
+                &DecodeContext {
+                    principal: &principal,
+                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    request_id: &RequestId::now_v7(),
+                    window: EventTimeWindow::default(),
+                    receipt_micros: receipt_now(),
+                    definition: None,
+                    registered_schema: None,
+                },
             )
             .expect_err("invalid native event time fails closed");
             assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
@@ -3352,6 +3489,11 @@ mod tests {
 
     /// Native batch with event times inside the default window is accepted and
     /// the values are preserved verbatim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-window value is refused or when the decoded event time is
+    /// missing, mistyped, or not the caller value.
     #[test]
     fn native_event_time_within_window_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3371,12 +3513,15 @@ mod tests {
         );
         let decoded = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("in-window native event time is accepted");
         let arr = decoded
@@ -3389,6 +3534,10 @@ mod tests {
     }
 
     /// Value exactly at the past edge (receipt − past) is accepted (inclusive).
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value exactly at the past bound is refused.
     #[test]
     fn native_event_time_past_edge_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3411,17 +3560,24 @@ mod tests {
         );
         decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            window,
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("past-edge value is accepted (inclusive bound)");
     }
 
     /// Value exactly at the future edge (receipt + future) is accepted (inclusive).
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value exactly at the future bound is refused.
     #[test]
     fn native_event_time_future_edge_accepted() {
         let (principal, card) = scoped_service_principal();
@@ -3443,18 +3599,26 @@ mod tests {
         );
         decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            window,
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("future-edge value is accepted (inclusive bound)");
     }
 
     /// A value older than the past bound is rejected with `EventTimeOutOfRange`.
     /// The whole batch is refused; no partial write occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value older than the past bound is not refused with
+    /// `EventTimeOutOfRange`.
     #[test]
     fn native_event_time_before_past_bound_rejected() {
         let (principal, card) = scoped_service_principal();
@@ -3475,12 +3639,15 @@ mod tests {
         );
         let err = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("31-day-old value must be rejected");
         assert!(
@@ -3496,6 +3663,11 @@ mod tests {
     }
 
     /// A value further in the future than the future bound is rejected with
+    /// `EventTimeOutOfRange`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the value beyond the future bound is not refused with
     /// `EventTimeOutOfRange`.
     #[test]
     fn native_event_time_after_future_bound_rejected() {
@@ -3517,12 +3689,15 @@ mod tests {
         );
         let err = decode(
             ipc_payload(&rows),
-            &principal,
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal,
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("25-hour-future value must be rejected");
         assert!(
@@ -3538,6 +3713,11 @@ mod tests {
     }
 
     /// A projected (OTLP) batch with an in-window event time is accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-window projected value is refused or when the decoded
+    /// event time is missing, mistyped, or not the caller value.
     #[test]
     fn projected_event_time_within_window_accepted() {
         let t = now_micros_offset(-3600);
@@ -3550,12 +3730,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("projected in-window event time is accepted");
         let arr = decoded
@@ -3569,6 +3752,11 @@ mod tests {
 
     /// A projected (OTLP) batch with an out-of-range event time is rejected with
     /// `EventTimeOutOfRange` — proving both paths share enforcement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the out-of-range projected value is not refused with
+    /// `EventTimeOutOfRange`.
     #[test]
     fn projected_event_time_out_of_range_rejected() {
         let old = now_micros_offset(-(31 * 24 * 60 * 60));
@@ -3581,12 +3769,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect_err("projected out-of-range event time must be rejected");
         assert!(
@@ -3603,6 +3794,11 @@ mod tests {
 
     /// When `wyrd_event_time` is absent the server stamps receipt time and no
     /// window check runs — behavior is byte-identical to the prior contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload is refused or when the server-stamped event time is
+    /// missing, mistyped, or null.
     #[test]
     fn absent_event_time_unchanged_regression() {
         let rows = batch(
@@ -3618,12 +3814,15 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
                 rows.clone(),
             ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            tight_window,
-            None,
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                request_id: &RequestId::now_v7(),
+                window: tight_window,
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: None,
+            },
         )
         .expect("absent event time is server-stamped without window check");
         assert!(
@@ -3674,10 +3873,15 @@ mod tests {
 
     /// Managed columns other than `wyrd_event_time` remain reserved and are
     /// rejected when a native payload supplies them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a native payload supplying any other managed column is accepted
+    /// or refused with anything other than `InvalidFrame`.
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();
-        for reserved in [WYRD_INGESTED_AT, WYRD_BATCH_ID, WYRD_REQUEST_ID] {
+        for reserved in [WYRD_INGESTED_AT, WYRD_REQUEST_ID, PRINCIPAL_ID] {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),
@@ -3690,12 +3894,15 @@ mod tests {
             );
             let error = decode(
                 ipc_payload(&rows),
-                &principal,
-                source_schema_fingerprint(rows.schema().as_ref()),
-                &RequestId::now_v7(),
-                Uuid::now_v7(),
-                EventTimeWindow::default(),
-                None,
+                &DecodeContext {
+                    principal: &principal,
+                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    request_id: &RequestId::now_v7(),
+                    window: EventTimeWindow::default(),
+                    receipt_micros: receipt_now(),
+                    definition: None,
+                    registered_schema: None,
+                },
             )
             .expect_err("server-owned managed columns are reserved");
             assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");

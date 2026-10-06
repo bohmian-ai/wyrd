@@ -31,7 +31,7 @@ const MAX_BUFFERS: usize = MAX_FIELDS * 3;
 const MAX_NESTING_DEPTH: usize = 8;
 /// Maximum accepted `custom_metadata` entries on one field.
 ///
-/// Canonical fields carry at most a stable field id and a sensitivity tag. The
+/// Stamped fields carry at most a registered field id and a sensitivity tag. The
 /// bound lets both metadata passes sort entries in fixed inline storage so the
 /// counted and written `FlatBuffer` layouts cannot diverge on map iteration
 /// order.
@@ -1091,9 +1091,9 @@ fn validate_schema(schema: &Schema) -> Result<(), ScribeError> {
 
 /// Validates one canonical field and, for `List`/`Struct`, its children.
 ///
-/// Field `custom_metadata` is accepted and preserved: the canonical signal
-/// ledgers carry their stable field ids and sensitivity tags there, and
-/// dropping them at the WAL boundary would lose the identity replay needs.
+/// Field `custom_metadata` is accepted and preserved: stamped batches carry
+/// their registered field ids and sensitivity tags there, and dropping them at
+/// the WAL boundary would lose the identity replay needs.
 ///
 /// # Errors
 ///

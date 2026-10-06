@@ -3,11 +3,17 @@
 //! Snapshot expiry is the first Forge protocol whose mistake is unrecoverable:
 //! a snapshot removed while something still needs it cannot be put back. The
 //! protections that keep that from happening do not live in one place in the
-//! table — refs and retained ancestry come from Iceberg, open attempts and
-//! pinned readers come from Postgres, and the lineage a no-progress check
+//! table — refs come from Iceberg, open attempts and existing claims come
+//! from Postgres, and the lineage a no-progress check
 //! depends on is a property on the branch head. This module is where they are
 //! composed into a single decision, so that adding a protection means adding a
 //! root here rather than another guard somewhere along the call path.
+//!
+//! Active Oracle readers are not a root here: any active table read refuses
+//! the whole expiration at preparation, under the table's maintenance
+//! authority, so selection never reasons about which snapshots a reader needs.
+
+use std::collections::HashSet;
 
 use vala_sql::row_types::forge_tasks::SnapshotWatermark;
 
@@ -17,17 +23,19 @@ use super::live_reconcile::DestructiveMaintenance;
 
 /// Every authority outside the Iceberg table that can protect a snapshot.
 ///
-/// Iceberg can answer which snapshots its refs and their retained ancestry
-/// still need. It cannot answer whether a Forge attempt is mid-flight, whether
-/// a reader has pinned a cut, or whether the branch head's rewrite lineage
+/// Iceberg can answer which snapshots its refs still need. It cannot answer
+/// whether a Forge attempt is mid-flight, whether another expiration already
+/// owns a snapshot, or whether the branch head's rewrite lineage
 /// still has to be readable for the next no-progress check. Those answers come
 /// from Postgres and from the head snapshot's own properties, and they are
 /// gathered here so the decision below sees all of them or none.
 pub(super) struct SnapshotProtectionRoots {
     /// Base snapshots held by open Forge attempts on this table.
+    ///
+    /// Each protects itself and every retained snapshot between it and a
+    /// head, so the attempt's commit-time conflict validation can still walk
+    /// from the head back to its base.
     pub(super) attempt_watermarks: Vec<SnapshotWatermark>,
-    /// Snapshots held by pinned Oracle cuts.
-    pub(super) reader_watermarks: Vec<SnapshotWatermark>,
     /// Base snapshot the branch head's rewrite lineage still references.
     ///
     /// Convergence refuses a rewrite that would make no progress, and it
@@ -36,7 +44,7 @@ pub(super) struct SnapshotProtectionRoots {
     pub(super) lineage_snapshot_id: Option<i64>,
     /// Snapshots an unresolved snapshot-expiration claim already owns.
     ///
-    /// A claim is not a reader protection: nothing needs the snapshot, another
+    /// A claim is not a read protection: nothing needs the snapshot, another
     /// prepared operation is already responsible for removing it. Selecting it
     /// again would prepare two operations for the same deletion, so the claim
     /// removes it from this pass rather than refusing the pass.
@@ -48,12 +56,10 @@ pub(super) struct SnapshotProtectionRoots {
 /// What one expiry pass may do to this table right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SnapshotExpiryDecision {
-    /// Exactly these snapshots are eligible, under this proven cutoff.
+    /// Exactly these snapshots are eligible.
     Expire {
         /// Ascending snapshot identifiers, exactly as selected.
         snapshot_ids: Vec<i64>,
-        /// The cutoff every selected snapshot was proven older than.
-        cutoff_ms: i64,
     },
     /// Nothing may be expired, and the reason is not a failure.
     NoOp(SnapshotExpiryNoOp),
@@ -68,7 +74,7 @@ pub(super) enum SnapshotExpiryDecision {
 pub(super) enum SnapshotExpiryNoOp {
     /// A durable operation is open or its outcome is still uncertain.
     UnreconciledWork,
-    /// Every retained snapshot is protected or younger than the cutoff.
+    /// Every retained snapshot is protected by some root.
     NothingEligible,
 }
 
@@ -86,10 +92,6 @@ pub(super) struct SnapshotExpiryPolicy<'inputs> {
     pub(super) ref_heads: &'inputs [i64],
     /// Non-catalog protection gathered for this pass.
     pub(super) roots: &'inputs SnapshotProtectionRoots,
-    /// Cutoff derived from configured retention and the pass's captured clock.
-    pub(super) retention_cutoff_ms: i64,
-    /// Minimum ancestry depth retained behind every head.
-    pub(super) retain_last: usize,
     /// Bound on ancestry traversal, so a malformed graph cannot spin.
     pub(super) traversal_limit: usize,
 }
@@ -100,9 +102,10 @@ impl SnapshotExpiryPolicy<'_> {
     /// Order is deliberate. Unreconciled work refuses the protocol outright
     /// rather than narrowing the selection, because a smaller selection from
     /// incomplete evidence is still a selection from incomplete evidence. The
-    /// watermarks are then corroborated against Iceberg before they are allowed
-    /// to lower the cutoff, so a watermark the table cannot account for fails
-    /// the pass instead of silently protecting nothing.
+    /// watermarks are then corroborated against Iceberg before they protect
+    /// anything, so a watermark the table cannot account for fails the pass
+    /// instead of silently protecting nothing. There is no age or depth
+    /// retention: every replaced snapshot no root holds is selected.
     ///
     /// # Errors
     ///
@@ -116,48 +119,70 @@ impl SnapshotExpiryPolicy<'_> {
                 SnapshotExpiryNoOp::UnreconciledWork,
             ));
         }
+        validate_watermarks(
+            self.snapshots,
+            self.current_snapshot_id,
+            self.ref_heads,
+            &self.roots.attempt_watermarks,
+            self.traversal_limit,
+        )?;
+        let held = self.watermark_chains();
+        let mut snapshot_ids =
+            select_expirable_snapshots(self.snapshots, self.current_snapshot_id, self.ref_heads);
+        snapshot_ids.retain(|id| {
+            !held.contains(id)
+                && Some(*id) != self.roots.lineage_snapshot_id
+                && !self.roots.claimed_snapshot_ids.contains(id)
+        });
+        Ok(if snapshot_ids.is_empty() {
+            SnapshotExpiryDecision::NoOp(SnapshotExpiryNoOp::NothingEligible)
+        } else {
+            SnapshotExpiryDecision::Expire { snapshot_ids }
+        })
+    }
+
+    /// Returns every snapshot on a head's ancestry from the head down to and
+    /// including an attempt watermark.
+    ///
+    /// Runs after [`validate_watermarks`] proved the graph acyclic, bounded,
+    /// and every watermark reachable, so each walk ends at a root or at a
+    /// parent an earlier expiration removed.
+    fn watermark_chains(&self) -> HashSet<i64> {
+        let parents = self
+            .snapshots
+            .iter()
+            .map(|snapshot| (snapshot.id, snapshot.parent_id))
+            .collect::<std::collections::HashMap<_, _>>();
         let watermarks = self
             .roots
             .attempt_watermarks
             .iter()
-            .chain(self.roots.reader_watermarks.iter())
+            .map(|watermark| watermark.snapshot_id)
+            .collect::<HashSet<_>>();
+        let mut held = HashSet::new();
+        for head in self
+            .ref_heads
+            .iter()
             .copied()
-            .collect::<Vec<_>>();
-        let cutoff_ms = validate_watermarks(
-            self.snapshots,
-            self.current_snapshot_id,
-            self.ref_heads,
-            &watermarks,
-            self.retention_cutoff_ms,
-            self.traversal_limit,
-        )?;
-        let mut snapshot_ids = select_expirable_snapshots(
-            self.snapshots,
-            self.current_snapshot_id,
-            self.ref_heads,
-            cutoff_ms,
-            self.retain_last,
-        );
-        if let Some(lineage) = self.roots.lineage_snapshot_id {
-            snapshot_ids.retain(|id| *id != lineage);
-        }
-        snapshot_ids.retain(|id| !self.roots.claimed_snapshot_ids.contains(id));
-        Ok(if snapshot_ids.is_empty() {
-            SnapshotExpiryDecision::NoOp(SnapshotExpiryNoOp::NothingEligible)
-        } else {
-            SnapshotExpiryDecision::Expire {
-                snapshot_ids,
-                cutoff_ms,
+            .chain(self.current_snapshot_id)
+        {
+            let mut path = Vec::new();
+            let mut cursor = Some(head);
+            while let Some(id) = cursor.filter(|id| parents.contains_key(id)) {
+                path.push(id);
+                if watermarks.contains(&id) {
+                    held.extend(path.iter().copied());
+                }
+                cursor = parents.get(&id).copied().flatten();
             }
-        })
+        }
+        held
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vala_sql::row_types::oracle_reader_authority::{ProtectionMember, TableAuthorityIdentity};
-    use wyrd_spec::DataTenantId;
 
     /// A linear four-snapshot history: 10 -> 20 -> 30 -> 40.
     fn history() -> Vec<SnapshotSummary> {
@@ -189,7 +214,6 @@ mod tests {
     fn bare_roots() -> SnapshotProtectionRoots {
         SnapshotProtectionRoots {
             attempt_watermarks: Vec::new(),
-            reader_watermarks: Vec::new(),
             lineage_snapshot_id: None,
             claimed_snapshot_ids: Vec::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
@@ -197,12 +221,16 @@ mod tests {
     }
 
     /// Builds the policy under test with one shared geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's [`ForgeError::SnapshotExpiry`] when `roots` carry a
+    /// watermark the fixture history cannot corroborate.
     fn decide(
         ref_heads: &[i64],
         roots: &SnapshotProtectionRoots,
-        retain_last: usize,
-    ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
-        decide_from(Some(40), ref_heads, roots, retain_last)
+    ) -> Result<SnapshotExpiryDecision, ForgeError> {
+        decide_from(Some(40), ref_heads, roots)
     }
 
     /// Builds the policy under test with an explicit current snapshot.
@@ -210,19 +238,21 @@ mod tests {
     /// Removing the current snapshot is its own root: a table with no current
     /// snapshot protects nothing through it, which is only visible when the
     /// geometry can be decided both ways.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy's [`ForgeError::SnapshotExpiry`] when `roots` carry a
+    /// watermark the fixture history cannot corroborate.
     fn decide_from(
         current_snapshot_id: Option<i64>,
         ref_heads: &[i64],
         roots: &SnapshotProtectionRoots,
-        retain_last: usize,
-    ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
+    ) -> Result<SnapshotExpiryDecision, ForgeError> {
         SnapshotExpiryPolicy {
             snapshots: &history(),
             current_snapshot_id,
             ref_heads,
             roots,
-            retention_cutoff_ms: 3_500,
-            retain_last,
             traversal_limit: 16,
         }
         .decide()
@@ -246,8 +276,6 @@ mod tests {
         ref_heads: Vec<i64>,
         /// Non-catalog roots for this case.
         roots: SnapshotProtectionRoots,
-        /// Ancestry depth retained behind every head.
-        retain_last: usize,
     }
 
     /// Each root, in isolation, with nothing else covering for it.
@@ -258,7 +286,6 @@ mod tests {
                 protected: vec![20],
                 ref_heads: vec![20],
                 roots: bare_roots(),
-                retain_last: 1,
             },
             RootCase {
                 what: "a watermark held by an open Forge attempt",
@@ -271,20 +298,6 @@ mod tests {
                     }],
                     ..bare_roots()
                 },
-                retain_last: 1,
-            },
-            RootCase {
-                what: "a watermark held by a pinned Oracle cut",
-                protected: vec![20, 30],
-                ref_heads: Vec::new(),
-                roots: SnapshotProtectionRoots {
-                    reader_watermarks: vec![SnapshotWatermark {
-                        snapshot_id: 20,
-                        timestamp_ms: 2_000,
-                    }],
-                    ..bare_roots()
-                },
-                retain_last: 1,
             },
             RootCase {
                 what: "an unresolved expiration claim on the same table",
@@ -294,14 +307,13 @@ mod tests {
                     claimed_snapshot_ids: vec![20],
                     ..bare_roots()
                 },
-                retain_last: 1,
             },
             RootCase {
-                what: "two incomparable frontier members on a forked lineage",
+                what: "two attempt watermarks on one lineage",
                 protected: vec![10, 20, 30],
                 ref_heads: Vec::new(),
                 roots: SnapshotProtectionRoots {
-                    reader_watermarks: vec![
+                    attempt_watermarks: vec![
                         SnapshotWatermark {
                             snapshot_id: 10,
                             timestamp_ms: 1_000,
@@ -313,7 +325,6 @@ mod tests {
                     ],
                     ..bare_roots()
                 },
-                retain_last: 1,
             },
             RootCase {
                 what: "the rewrite lineage the branch head still references",
@@ -323,7 +334,6 @@ mod tests {
                     lineage_snapshot_id: Some(10),
                     ..bare_roots()
                 },
-                retain_last: 1,
             },
         ]
     }
@@ -339,15 +349,21 @@ mod tests {
     /// some *other* root happened to cover it is not proof that this root
     /// works, and it is exactly how a protection is silently lost.
     ///
-    /// This inventory covers pinned Oracle cuts and carries no live-tail case
-    /// because a v1 live-tail lease names no Forge-collectable object and so
-    /// contributes no independent Forge GC root. No case here may be widened to
-    /// stand for both roots at once.
+    /// This inventory carries no Oracle reader case because an active table
+    /// read refuses the whole expiration at preparation rather than protecting
+    /// individual snapshots, and no live-tail case because a v1 live-tail lease
+    /// names no Forge-collectable object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a case fails to decide, when a root no longer protects its
+    /// snapshot, or when removing that root alone does not make the snapshot
+    /// eligible.
     #[test]
-    fn snapshot_expiry_root_and_frontier_mutation_matrix() {
-        // Baseline: with no protection beyond the current head and one retained
-        // ancestor, everything strictly older than the cutoff is eligible.
-        let baseline = decide(&[], &bare_roots(), 1).expect("bare policy decides");
+    fn snapshot_expiry_root_mutation_matrix() {
+        // Baseline: with no protection beyond the current head, every replaced
+        // snapshot is eligible however recent it is.
+        let baseline = decide(&[], &bare_roots()).expect("bare policy decides");
         assert_eq!(
             expired(&baseline),
             [10, 20, 30],
@@ -360,9 +376,8 @@ mod tests {
                 protected,
                 ref_heads,
                 roots,
-                retain_last,
             } = case;
-            let with_root = decide(&ref_heads, &roots, retain_last)
+            let with_root = decide(&ref_heads, &roots)
                 .unwrap_or_else(|error| panic!("{what} decides: {error}"));
             for snapshot in &protected {
                 assert!(
@@ -371,7 +386,7 @@ mod tests {
                 );
             }
 
-            let without_root = decide(&[], &bare_roots(), 1)
+            let without_root = decide(&[], &bare_roots())
                 .unwrap_or_else(|error| panic!("{what} decides without its root: {error}"));
             for snapshot in &protected {
                 assert!(
@@ -383,28 +398,13 @@ mod tests {
         }
 
         // The current snapshot is a root in its own right: without one, the
-        // head stops being protected by anything but the age floor.
-        let headless = decide_from(None, &[], &bare_roots(), 1)
+        // head stops being protected at all.
+        let headless = decide_from(None, &[], &bare_roots())
             .expect("a table with no current snapshot decides");
         assert_eq!(
             expired(&headless),
-            [10, 20, 30],
+            [10, 20, 30, 40],
             "removing the current snapshot removes only what it alone protected"
-        );
-
-        // The age floor is a floor, not a preference: nothing at or after the
-        // cutoff is eligible however little else protects it.
-        assert!(
-            !expired(&baseline).contains(&40),
-            "a snapshot at or after the retention cutoff is never eligible"
-        );
-
-        // The count floor protects retained ancestry independently of age.
-        let count_floor = decide(&[], &bare_roots(), 3).expect("count floor decides");
-        assert_eq!(
-            expired(&count_floor),
-            [10],
-            "retain_last protects the head's ancestry regardless of timestamps"
         );
 
         // Unreconciled durable work is a refusal, not a smaller selection.
@@ -414,7 +414,6 @@ mod tests {
                 destructive_maintenance: DestructiveMaintenance::Blocked,
                 ..bare_roots()
             },
-            1,
         )
         .expect("blocked policy decides");
         assert_eq!(
@@ -424,7 +423,6 @@ mod tests {
         );
 
         assert_uncorroborated_watermarks_fail_closed();
-        assert_frontier_member_proof_refuses();
     }
 
     /// Proves a watermark Iceberg cannot corroborate fails the pass instead of
@@ -454,47 +452,13 @@ mod tests {
                 decide(
                     &[],
                     &SnapshotProtectionRoots {
-                        reader_watermarks: vec![watermark],
+                        attempt_watermarks: vec![watermark],
                         ..bare_roots()
                     },
-                    1,
                 )
                 .is_err(),
                 "{case} must fail closed"
             );
         }
-    }
-
-    /// Proves a frontier member whose stored proof no longer reproduces is
-    /// contradictory evidence rather than an absence of protection.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a corrupted digest or ancestry path still validates.
-    fn assert_frontier_member_proof_refuses() {
-        let identity = TableAuthorityIdentity {
-            tenant: DataTenantId::new_v7(),
-            table_uid: [5_u8; 16],
-            catalog_name: "wyrd-redux".to_owned(),
-            namespace_name: "vala.bifrost".to_owned(),
-            table_name: "events".to_owned(),
-        };
-        let mut member = ProtectionMember::new(&identity, vec![30, 20], 3_000, 2_000)
-            .expect("a well-formed member builds");
-        assert!(
-            member.validate(&identity).is_ok(),
-            "the member it built validates"
-        );
-        member.ancestry_digest[0] ^= 0xff;
-        assert!(
-            member.validate(&identity).is_err(),
-            "a member whose ancestry digest does not reproduce must refuse"
-        );
-        member.ancestry_digest[0] ^= 0xff;
-        member.ancestry_path = vec![30, 25];
-        assert!(
-            member.validate(&identity).is_err(),
-            "a member whose ancestry no longer matches its endpoints must refuse"
-        );
     }
 }

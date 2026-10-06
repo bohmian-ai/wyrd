@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::StreamExt;
 #[cfg(feature = "test-support")]
@@ -150,7 +150,7 @@ impl vala_bifrost_redux::contracts::OracleQueryDispatch for ReadyOracleForwarder
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.forward(context, request).await
+        Box::pin(self.forward(context, request)).await
     }
 }
 
@@ -168,7 +168,7 @@ pub struct ReadyOracleForwarderInputs {
     pub tls: Option<BifrostPeerTls>,
     /// Receiver-side envelope checks.
     pub authority: Arc<OraclePeerAuthority>,
-    /// Query floor and classification configuration.
+    /// Query floor, classification, and boot-resolved default deadline.
     pub config: OracleConfig,
 }
 
@@ -222,13 +222,7 @@ impl ReadyOracleForwarder {
     ) -> Result<OracleQueryStream, BifrostError> {
         Self::validate_context(&context)?;
         self.planner.validate_query(&request)?;
-        let duration = request
-            .deadline_ms
-            .and_then(|deadline| u64::try_from(deadline).ok())
-            .map_or(
-                OracleConfig::default().default_deadline,
-                Duration::from_millis,
-            );
+        let duration = self.planner.request_deadline(request.deadline_ms);
         let monotonic_deadline = Instant::now()
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
@@ -756,6 +750,7 @@ impl ForwardedQueryIpc {
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use wyrd_runtime::permission::PermissionSet;

@@ -600,7 +600,7 @@ export declare class NativeWyrdClient {
    * serialized `TableConfig`; the conflict, byte-budget, and ingest-dial
    * failures are returned as catalog metadata.
    */
-  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
+  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
 }
 
 /**
@@ -664,7 +664,7 @@ export declare class NativeWyrdState {
    * a second start, a closed state, and credential, byte-budget, dial, and
    * fixed-table failures are returned in [`NativeLifecycleResult`].
    */
-  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
+  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting `card` or the root Service.
    *
@@ -800,7 +800,7 @@ export declare function cliRevokeProviderCredential(name: string, server?: strin
  * serialized `TableConfig`; credential, byte-budget, and ingest-dial failures
  * are returned as catalog metadata.
  */
-export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
+export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, clientByteLimitBytes?: number | undefined | null): Promise<NativeBifrostConnection>
 
 /**
  * Builds one Card registry handle without performing IO.
@@ -809,7 +809,7 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * chain as `connectBifrost`, so both capabilities authenticate identically.
  * Credential and configuration failures are returned as catalog metadata.
  */
-export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeCardsConnection
+export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
 
 /**
  * Builds one gateway administration handle without performing IO.
@@ -822,7 +822,7 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  * Returns a napi error when no credential resolves or the HTTP client cannot
  * be built.
  */
-export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeGateway
+export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
 
 /**
  * Builds one Operator connection handle without performing IO.
@@ -830,19 +830,19 @@ export declare function connectGateway(serverUrl?: string | undefined | null, cr
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectCards`.
  */
-export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeOperatorConnectionsConnection
+export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeOperatorConnectionsConnection
 
 /**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
- * then the saved `wyrd auth login` for this server (the one for `tenant`, a
- * tenant route key, when given, otherwise the newest), then
+ * then the saved `wyrd auth login` for this server (the one for
+ * `WYRD_TENANT` when set, otherwise the newest), then
  * `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
  * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
- * has saved logins but none for `tenant`.
+ * has saved logins but none for `WYRD_TENANT`.
  */
-export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): NativeWyrdClientResult
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
 
 /**
  * Fetches an already-registered table's config by name.
@@ -855,7 +855,7 @@ export declare function connectWyrdClient(serverUrl?: string | undefined | null,
  * Returns a napi error only when the described config cannot be encoded;
  * credential, transport, and server refusals are returned as catalog metadata.
  */
-export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeTableConfigResult>
+export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfigResult>
 
 /**
  * Load an authored Workflow file and the Cards it references.
@@ -1111,7 +1111,8 @@ export declare function runWyrdCli(args: Array<string>): Promise<number>
  * Returns a napi error only when the declared config cannot be encoded. A
  * table that is not `namespace.name`, a document that is not one mappable
  * JSON Schema, a server-owned column, a layout that is not one
- * physical-layout declaration, or a compaction target that is not a
- * non-negative integer is returned as catalog metadata.
+ * physical-layout declaration, a compaction target that is not a
+ * non-negative integer, or a compaction type that is not one known
+ * hyphenated wire spelling is returned as catalog metadata.
  */
-export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null): NativeTableConfigResult
+export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult

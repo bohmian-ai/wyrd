@@ -36,24 +36,23 @@ impl PyWyrdClient {
     /// Build a client from optionally overridden transport values.
     ///
     /// Omitted values resolve through `client_from_options`: the environment,
-    /// then the saved user login for this server (the one for `tenant`, a
-    /// tenant route key, when given, otherwise the newest), then
+    /// then the saved user login for this server (the one for `WYRD_TENANT`
+    /// when set, otherwise the newest), then
     /// `~/.config/wyrd/credentials.toml`.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this
-    /// server has saved logins but none for `tenant`, or the saved login
+    /// server has saved logins but none for `WYRD_TENANT`, or the saved login
     /// cannot be used, or a transport error when the client cannot be built.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None, tenant=None))]
+    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None))]
     fn __new__(
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
-        tenant: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        client_from_options(server_url, credential, grpc_url, tenant)
+        client_from_options(server_url, credential, grpc_url)
             .map(|inner| Self { inner })
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))
     }
@@ -65,7 +64,8 @@ impl PyWyrdClient {
     }
 
     /// The effective gRPC endpoint: the explicit `grpc_url` when one was given,
-    /// else the server URL's scheme and host on the public gRPC port `50051`.
+    /// else `WYRD_GRPC_URL`, else the server URL's scheme and host on the
+    /// public gRPC port `50051`.
     #[getter]
     fn grpc_url(&self) -> &str {
         self.inner.grpc_url()

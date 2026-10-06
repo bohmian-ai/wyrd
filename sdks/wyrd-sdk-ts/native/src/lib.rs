@@ -32,8 +32,8 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
+use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
 
@@ -462,20 +462,23 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// Returns a napi error only when the declared config cannot be encoded. A
 /// table that is not `namespace.name`, a document that is not one mappable
 /// JSON Schema, a server-owned column, a layout that is not one
-/// physical-layout declaration, or a compaction target that is not a
-/// non-negative integer is returned as catalog metadata.
+/// physical-layout declaration, a compaction target that is not a
+/// non-negative integer, or a compaction type that is not one known
+/// hyphenated wire spelling is returned as catalog metadata.
 #[napi]
 pub fn table_config_from_json_schema(
     table: String,
     schema_json: String,
     layout_json: Option<String>,
     compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<String>,
 ) -> Result<NativeTableConfigResult> {
     match declared_table_config(
         &table,
         &schema_json,
         layout_json.as_deref(),
         compaction_target_file_size_bytes,
+        compaction_type.as_deref(),
     ) {
         Ok(config) => Ok(NativeTableConfigResult {
             config: Some(NativeTableConfig::project(&config)?),
@@ -493,18 +496,22 @@ pub fn table_config_from_json_schema(
 /// # Errors
 ///
 /// Returns the shared validation refusal for unparsable schema or layout
-/// text and a non-integer compaction target, and the owner's mapping error for
-/// a schema that does not map to the table.
+/// text, a non-integer compaction target, and an unknown compaction type, and
+/// the owner's mapping error for a schema that does not map to the table.
 fn declared_table_config(
     table: &str,
     schema_json: &str,
     layout_json: Option<&str>,
     compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<&str>,
 ) -> StdResult<TableConfig, BifrostClientError> {
     let schema: Value = serde_json::from_str(schema_json)
         .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
     let config = apply_layout(TableConfig::from_json_schema(table, &schema)?, layout_json)?;
-    apply_compaction_target(config, compaction_target_file_size_bytes)
+    apply_compaction_type(
+        apply_compaction_target(config, compaction_target_file_size_bytes)?,
+        compaction_type,
+    )
 }
 
 /// Fetches an already-registered table's config by name.
@@ -522,13 +529,11 @@ pub async fn describe_table_config(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-    tenant: Option<String>,
 ) -> Result<NativeTableConfigResult> {
     let described = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
-        tenant.as_deref(),
     ) {
         Ok(client) => TableConfig::describe(&client, &table).await,
         Err(error) => Err(error),
@@ -597,6 +602,34 @@ fn apply_compaction_target(
     }
 }
 
+/// Applies one optional explicit Forge compaction type to a config.
+///
+/// The spelling is the hyphenated wire value, parsed by the wire type's own
+/// serde contract so JavaScript accepts exactly what the server accepts.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal when the spelling is not one known
+/// compaction type.
+fn apply_compaction_type(
+    config: TableConfig,
+    raw: Option<&str>,
+) -> StdResult<TableConfig, BifrostClientError> {
+    match raw {
+        None => Ok(config),
+        Some(raw) => {
+            let kind: CompactionTypeWire = serde_json::from_value(Value::String(raw.to_owned()))
+                .map_err(|error| {
+                    validation_error(
+                        format!("invalid compaction type: {error}"),
+                        "compactionType",
+                    )
+                })?;
+            Ok(config.with_compaction_type(kind))
+        }
+    }
+}
+
 /// The queue configuration for an optional JavaScript byte-budget override.
 ///
 /// `None` keeps the 256 MiB default. A negative number cannot be a budget, so
@@ -640,7 +673,6 @@ pub async fn connect_bifrost(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-    tenant: Option<String>,
     client_byte_limit_bytes: Option<i64>,
 ) -> Result<NativeBifrostConnection> {
     let table = table.map(|table| table.parse()).transpose()?;
@@ -648,7 +680,6 @@ pub async fn connect_bifrost(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
-        tenant.as_deref(),
     ) {
         Ok(client) => {
             Bifrost::connect_with_config(&client, table, queue_config(client_byte_limit_bytes))

@@ -898,7 +898,18 @@ mod tests {
             "{plan}"
         );
         assert!(plan.contains("get_field(t.s, Utf8(\"method\"))"), "{plan}");
+    }
 
+    /// `parse_json` keeps integers past 64 bits exact and refuses with typed
+    /// errors: invalid text, and the first integer a Variant decimal cannot
+    /// hold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an integer loses digits or a refusal changes identity.
+    #[tokio::test]
+    async fn parse_json_keeps_exact_integers_and_refuses_the_rest() {
+        let context = session(&[None]);
         assert_eq!(
             refusal(&context, "SELECT parse_json('{nope')").await.code(),
             "WYRD_VALA_400_VARIANT_INVALID_JSON"

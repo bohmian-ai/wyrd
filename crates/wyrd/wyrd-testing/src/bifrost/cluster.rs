@@ -134,6 +134,8 @@ pub struct BifrostClusterSpec {
     /// Optional deterministic controls for the real Scribe publisher.
     scribe_persistence_faults_for_test:
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
+    /// Whether every node starts without its audit publisher.
+    audit_publication_disabled: bool,
     /// Storage I/O bounds every node in this cluster resolves its owner from.
     ///
     /// Carried on the spec rather than applied per start so a restarted node
@@ -190,6 +192,17 @@ impl BifrostClusterSpec {
         faults: vala_bifrost_redux::scribe::persistence::PersistenceFaults,
     ) -> Self {
         self.scribe_persistence_faults_for_test = Some(faults);
+        self
+    }
+
+    /// Keeps every node's audit publisher from starting.
+    ///
+    /// A journey that arms a one-shot fault on a pod-wide seam (a catalog
+    /// commit, a lease release) opts in, so the tenant's audit table cannot
+    /// reach that seam first and take the fault meant for the journey's table.
+    #[must_use]
+    pub fn without_audit_publication_for_test(mut self) -> Self {
+        self.audit_publication_disabled = true;
         self
     }
 
@@ -258,6 +271,7 @@ impl BifrostClusterSpec {
             ],
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -281,6 +295,7 @@ impl BifrostClusterSpec {
             ],
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -309,6 +324,7 @@ impl BifrostClusterSpec {
             nodes,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -340,6 +356,7 @@ impl BifrostClusterSpec {
             nodes,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -383,6 +400,7 @@ impl BifrostClusterSpec {
                 .collect(),
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -407,6 +425,7 @@ impl BifrostClusterSpec {
                 .collect(),
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            audit_publication_disabled: false,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             oracle_runtime: None,
             gateway_provider_root: None,
@@ -882,6 +901,8 @@ pub struct WyrdTestCluster {
     /// Optional test-only persistence controls retained across restarts.
     scribe_persistence_faults_for_test:
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
+    /// Whether every node start and restart omits its audit publisher.
+    audit_publication_disabled: bool,
     /// Storage I/O bounds every node start and restart resolves its owner from.
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Oracle runtime bounds every node start and restart boots with.
@@ -1440,12 +1461,16 @@ impl WyrdTestCluster {
 
     /// Start an embedded `all` process with a completion observer.
     ///
+    /// The audit publisher stays off: these journeys arm one-shot worker and
+    /// catalog faults and read per-tenant dispatch, which the tenant's audit
+    /// table would otherwise reach and consume first.
+    ///
     /// # Errors
     /// Returns a topology, resource, or role-supervision error.
     pub async fn start_with_embedded_forge_observer() -> Result<Self, ClusterError> {
         let observer = ForgeWorkerCompletionObserver::new();
         Self::start_spec_with_all_options(
-            BifrostClusterSpec::one_mixed(),
+            BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
             Duration::ZERO,
             None,
             None,
@@ -1498,7 +1523,9 @@ impl WyrdTestCluster {
     /// pass it did not request could plan or claim the very task it is about to
     /// observe. Everything else is the production composition — one bound pod
     /// serving public HTTP and gRPC, with Scribe, Oracle, and the server-owned
-    /// Forge scheduler and worker roles.
+    /// Forge scheduler and worker roles. The audit publisher stays off, so the
+    /// tenant's audit table cannot take the one-shot commit uncertainty armed
+    /// for the journey's table.
     ///
     /// # Errors
     /// Returns a topology, resource, or role-supervision error.
@@ -1506,7 +1533,7 @@ impl WyrdTestCluster {
         interval: Duration,
     ) -> Result<Self, ClusterError> {
         Self::start_spec_with_all_options(
-            BifrostClusterSpec::one_mixed(),
+            BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
             Duration::ZERO,
             None,
             None,
@@ -1650,6 +1677,7 @@ impl WyrdTestCluster {
         spec.validate()?;
         let scribe_geometry_for_test = spec.scribe_geometry_for_test;
         let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
+        let audit_publication_disabled = spec.audit_publication_disabled;
         let storage_io = spec.storage_io;
         let oracle_runtime = spec.oracle_runtime.clone();
         let gateway_provider_root = spec.gateway_provider_root.clone();
@@ -1774,6 +1802,7 @@ impl WyrdTestCluster {
             scribe_admission_node,
             scribe_geometry_for_test,
             scribe_persistence_faults_for_test,
+            audit_publication_disabled,
             storage_io,
             oracle_runtime,
             gateway_provider_root,
@@ -1859,6 +1888,9 @@ impl WyrdTestCluster {
         }
         if let Some(faults) = &self.scribe_persistence_faults_for_test {
             builder = builder.with_scribe_persistence_faults_for_test(faults.clone());
+        }
+        if self.audit_publication_disabled {
+            builder = builder.without_audit_publication_for_test();
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
             builder = builder.with_peer_tls(tls.clone());
@@ -2399,6 +2431,25 @@ impl WyrdTestCluster {
             items: self.servers.values().filter_map(Option::as_ref).collect(),
             cursor: 0,
         }
+    }
+
+    /// Waits until every running Oracle has staged its read decisions and
+    /// `tenant` owes retained audit history nothing.
+    ///
+    /// One server's barrier drains only its own Oracle's read-audit commits.
+    /// A read a peer Oracle served is staged by that peer, so a node without an
+    /// Oracle would otherwise settle before the decision exists. Each server
+    /// drains its own outbox and then waits on the shared chain head, so the
+    /// last call's wait follows every drain.
+    ///
+    /// # Errors
+    /// Returns the first server's read-audit drain, Postgres, or publication
+    /// timeout failure.
+    pub async fn await_audit_published(&self, tenant: DataTenantId) -> Result<(), ClusterError> {
+        for server in self.servers() {
+            server.await_audit_published(tenant).await?;
+        }
+        Ok(())
     }
 
     /// Count currently retained bound supervisor tasks across running servers.

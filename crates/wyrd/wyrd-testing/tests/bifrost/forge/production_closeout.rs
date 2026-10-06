@@ -953,7 +953,11 @@ impl CloseoutJourney {
             .count()
     }
 
-    /// Corroborates every completed rewrite with its lineage and metrics.
+    /// Corroborates every completed rewrite of one table with its lineage and
+    /// metrics.
+    ///
+    /// Only `binding`'s own operations are read: the tenant's audit table is
+    /// maintained alongside it and settles rewrites of its own.
     ///
     /// An attempt publishes each of its admitted plans independently, so a
     /// completed rewrite settles *one operation per plan*, not one per task —
@@ -969,7 +973,8 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on unsettled operation evidence, on two plans sharing one
     /// operation identity, or on missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self, tenant: DataTenantId) -> usize {
+    async fn assert_rewrite_evidence(&self, binding: &TenantTableBinding) -> usize {
+        let tenant = binding.tenant;
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
@@ -978,8 +983,12 @@ impl CloseoutJourney {
         let rows: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
             "SELECT operation_id, phase, prepared_detail \
              FROM vala.forge_operation_state \
-             WHERE family='iceberg_rewrite'",
+             WHERE family='iceberg_rewrite' AND resource = $1",
         )
+        .bind(format!(
+            "bifrost://{}/{}/{}",
+            binding.tenant, binding.table_ref.namespace, binding.table_ref.name
+        ))
         .fetch_all(&mut **conn.transaction())
         .await
         .expect("rewrite lineage evidence");
@@ -1360,7 +1369,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     journey.assert_objects(&inputs).await;
     // Each admitted plan publishes on its own, so the rewrite passes owe one
     // operation per snapshot they added — not one per completed task.
-    let operations = journey.assert_rewrite_evidence(tenant).await;
+    let operations = journey.assert_rewrite_evidence(&table.binding).await;
     assert_eq!(
         operations,
         journey.snapshot_count(&table.binding).await - published_before,
@@ -2849,10 +2858,15 @@ async fn empty_maintenance_restart_protects_orphans() {
     journey.pass(leader).await;
     assert_eq!(journey.leaders().len(), 1);
     let term = journey.held(successor).expect("the successor leads");
-    assert_eq!(
-        term.schedule().sizes_for_test(),
-        (0, 0, 0),
-        "the successor starts with empty maintenance membership"
+    // The successor may legitimately schedule the tenant's audit table, whose
+    // retained reads keep promoting; this table must start with no membership.
+    let schedule = term.schedule();
+    let (manifest_rewrite, snapshot_expiration) = schedule.maintenance_tables();
+    assert!(
+        schedule.track_for_test(&key).is_none()
+            && !manifest_rewrite.contains(&key)
+            && !snapshot_expiration.contains(&key),
+        "the successor starts with empty maintenance membership for this table"
     );
 
     // Past retention and the orphan floor, both replicas tick and nothing runs.

@@ -205,6 +205,9 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
 async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), ServerJourneyError>
 {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
+    // The Oracles boot before the Scribe joins, so their membership must
+    // include it before a read can see the decision still in its live tail.
+    cluster.refresh_oracle_snapshots().await?;
     let tenant = cluster.data_tenant_id();
     let scribe = cluster
         .servers()
@@ -233,6 +236,9 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
             },
         )
         .await?;
+    // The runner node hosts no Oracle, so the peer that serves the read
+    // stages its decision; the cluster barrier drains every Oracle first.
+    cluster.await_audit_published(tenant).await?;
     let reads = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
 
     let runtime = VerificationRuntime::builder(scribe.state())
@@ -257,6 +263,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     if row.status != "completed" || row.result_id.is_none() || row.attempts != 1 {
         return Err(format!("the forwarded Drift run settled {row:?}").into());
     }
+    cluster.await_audit_published(tenant).await?;
     let after = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
     if after != reads + 1 {
         return Err(format!("expected one audited peer read, counted {}", after - reads).into());

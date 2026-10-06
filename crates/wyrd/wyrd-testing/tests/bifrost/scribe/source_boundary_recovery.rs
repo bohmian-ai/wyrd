@@ -35,6 +35,7 @@ async fn scribe_failure_retry_replay_remain_atomic() {
     let faults = PersistenceFaults::default();
     let server = WyrdTestServer::builder()
         .with_scribe_persistence_faults_for_test(faults.clone())
+        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts with publication faults");

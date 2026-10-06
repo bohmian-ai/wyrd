@@ -656,6 +656,12 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     );
     prove_scheduled_analytical_completion(&cluster, &sql).await?;
 
+    // Counted before the pause is armed: the count is itself an audited
+    // Analytical read, and a stage it placed on the paused follower would
+    // stall it instead of the statement under test.
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
+
     // The pause is armed on one follower before the statement runs, so the
     // peer this phase kills is provably holding an activated stage rather than
     // racing the query's own completion.
@@ -674,9 +680,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         .worker()
         .bind_execute_pause_for_test(std::sync::Arc::clone(&pause));
 
-    let leader = cluster.server(0).ok_or("missing leader node")?;
     let leader_state = leader.state().clone();
-    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
 
     let scheduled = {
         let context = scheduled_context(tenant)?;

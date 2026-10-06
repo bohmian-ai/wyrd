@@ -45,14 +45,24 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
 /// only on the clean path so a lifecycle failure can never be mistaken for a
 /// completed drain. A supervisor terminal message and a Bifrost lifecycle error
 /// both remain terminal, with the Bifrost error taking precedence because it
-/// describes the state the process is actually leaving behind.
+/// describes the state the process is actually leaving behind. When both are
+/// present the supervisor message is appended to the Bifrost error, so the
+/// exit reason still names the failure that triggered the shutdown.
+///
+/// # Errors
+///
+/// Returns [`BootExit::Other`] when either a supervisor terminal message or a
+/// Bifrost lifecycle error is present.
 fn server_shutdown_result(
     terminal: Option<String>,
     bifrost_error: Option<wyrd_spec::vala::error::BifrostError>,
     report: BifrostShutdownReport,
 ) -> Result<BifrostShutdownReport, BootExit> {
     match (terminal, bifrost_error) {
-        (_, Some(error)) => Err(BootExit::Other(Box::new(error))),
+        (Some(message), Some(error)) => Err(BootExit::Other(
+            format!("{error}; shutdown was triggered by: {message}").into(),
+        )),
+        (None, Some(error)) => Err(BootExit::Other(Box::new(error))),
         (Some(message), None) => Err(BootExit::Other(
             Box::<dyn std::error::Error + Send + Sync>::from(message),
         )),
@@ -1068,7 +1078,8 @@ mod pg_tests {
         drop(server2);
     }
 
-    /// Preserves an observable Bifrost lifecycle failure after the required abort.
+    /// Preserves an observable Bifrost lifecycle failure after the required
+    /// abort, together with the supervisor failure that triggered it.
     #[tokio::test]
     async fn bound_server_run_preserves_bifrost_shutdown_failure_after_abort() {
         let result = server_shutdown_result(
@@ -1082,6 +1093,9 @@ mod pg_tests {
         else {
             panic!("Bifrost lifecycle failure must use the runtime error channel");
         };
-        assert_eq!(error.to_string(), "Scribe role unavailable");
+        assert_eq!(
+            error.to_string(),
+            "Scribe role unavailable; shutdown was triggered by: worker exited"
+        );
     }
 }

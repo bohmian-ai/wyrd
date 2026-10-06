@@ -9,11 +9,13 @@
 // raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
+use sqlx::types::Uuid;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
-use crate::SqlError;
 use crate::row_types::audit_staging::AuditStagingRow;
+use crate::{OperatorPool, SqlError};
 
 /// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
@@ -279,6 +281,47 @@ pub async fn list_publication_batch(
     .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
+}
+
+/// List the active tenants that still owe audit rows to retained history.
+///
+/// A tenant owes publication while its chain head's `last_seq` is above its
+/// `published_seq` watermark. This is the publisher's one cross-tenant read per
+/// turn, so an idle deployment costs one scan of the per-tenant chain heads
+/// rather than one transaction per tenant. Only tenants the directory reports
+/// active and undeleted are listed, matching the tenants Wyrd serves.
+///
+/// The read runs on the admin-owned [`OperatorPool`]: the chain head is
+/// tenant-isolated by row-level security, and this role is already granted the
+/// read it needs to append platform decisions. Only tenant ids are returned;
+/// no staged audit content crosses tenants.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when Postgres rejects the read, and
+/// [`SqlError::InvalidDataTenantId`] when a stored id violates the Wyrd
+/// UUIDv7 tenant-id contract.
+// tenant-isolation: cross-tenant OperatorPool
+pub async fn list_tenants_owing_publication(
+    directory: &OperatorPool,
+) -> Result<Vec<DataTenantId>, SqlError> {
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT head.data_tenant_id
+          FROM vala.audit_chain_head AS head
+          JOIN platform.tenants AS tenant USING (data_tenant_id)
+         WHERE head.last_seq > head.published_seq
+           AND tenant.status = 'active'
+           AND tenant.deleted_at IS NULL
+         ORDER BY head.data_tenant_id
+        "#,
+    )
+    .fetch_all(directory.pool())
+    .await
+    .map_err(SqlError::from)?;
+    rows.into_iter()
+        .map(DataTenantId::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SqlError::InvalidDataTenantId)
 }
 
 /// One frozen contiguous audit range owed to retained history.

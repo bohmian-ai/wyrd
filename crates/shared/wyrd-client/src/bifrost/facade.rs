@@ -485,12 +485,15 @@ impl Bifrost {
     /// binding one would invite a registration this caller does not want.
     ///
     /// The call first describes `table` — one authoritative describe per
-    /// call, never cached — and normalizes only the columns the destination
-    /// declares as Variant through [`wyrd_queue::normalize_declared_variants`]:
-    /// the `arrow.parquet.variant` extension passes, and `Utf8`/`LargeUtf8`
-    /// JSON text is encoded to it. Every other column is sent verbatim; whether
-    /// it satisfies the destination's canonical contract is the server's
-    /// judgement, and it answers with its own stable whole-batch refusal.
+    /// call, never cached — and conforms the batch to the declared columns
+    /// through [`wyrd_queue::RowPreflight::prepare_batch`], the same owner
+    /// and rules as row insertion: columns match by name in any order, an omitted nullable
+    /// column is sent as nulls, and a declared Variant column may be the
+    /// `arrow.parquet.variant` extension or `Utf8`/`LargeUtf8` JSON text,
+    /// which is encoded to it. Every supplied non-Variant column keeps its
+    /// type; whether it satisfies the destination's canonical contract is the
+    /// server's judgement, and it answers with its own stable whole-batch
+    /// refusal.
     ///
     /// Unlike [`Self::insert`], durability is complete when this resolves — the
     /// batch is not buffered and needs no [`Self::flush`].
@@ -498,8 +501,10 @@ impl Bifrost {
     /// # Errors
     ///
     /// Returns the describe error for an unknown, unauthorized, or unavailable
-    /// table and any normalization refusal (`BIFROST_UNSUPPORTED_TYPE` or a
-    /// catalogued Variant error) before admission, so neither changes queue,
+    /// table and any conformance refusal (`BIFROST_UNDECLARED_FIELD`,
+    /// `SCHEMA_PARSE` for an omitted required column,
+    /// `BIFROST_UNSUPPORTED_TYPE`, or a catalogued Variant error) before
+    /// admission, so neither changes queue,
     /// budget, or direct-send state; then [`BifrostClientError::Queue`] when
     /// the batch cannot be encoded, exceeds the accepted frame ceiling, or
     /// cannot fit this client's byte envelope, and the server's stable refusal
@@ -507,7 +512,7 @@ impl Bifrost {
     ///
     /// # Cancellation
     ///
-    /// Abandoning the future during describe or normalization leaves no
+    /// Abandoning the future during describe or conformance leaves no
     /// state; once the send starts it follows the direct-send lifecycle.
     pub async fn write_batch(
         &self,
@@ -515,7 +520,8 @@ impl Bifrost {
         batch: &RecordBatch,
     ) -> Result<(), BifrostClientError> {
         let description = self.describe(table).await?;
-        let batch = wyrd_queue::normalize_declared_variants(&description.user_fields, batch)?;
+        let batch =
+            wyrd_queue::RowPreflight::from_description(&description)?.prepare_batch(batch)?;
         self.writer
             .write_batch(table, &batch)
             .await

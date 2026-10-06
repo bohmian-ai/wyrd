@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray};
+use arrow::array::{Array, AsArray, new_null_array};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatch,
@@ -24,7 +24,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec};
+use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
@@ -45,11 +45,14 @@ pub fn is_reserved_column(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX) || name == CARD_REF_COLUMN || name == RUN_ID_COLUMN
 }
 
-/// Converts complete JSON row inputs against one destination schema.
+/// Converts complete row inputs against one destination schema.
 ///
 /// The preflight owns the resolved user-only schema and the output schema
-/// that appends the correlation columns. [`Self::prepare`] is synchronous and
-/// mutates nothing, so every refusal happens before admission.
+/// that appends the correlation columns. It is the one owner of the column
+/// rules: [`Self::prepare`] applies them to JSON rows for `insert`, and
+/// [`Self::prepare_batch`] to Arrow batches for `write_batch`, through the
+/// same refusal and Variant-encoding helpers. Both are synchronous and mutate
+/// nothing, so every refusal happens before admission.
 #[derive(Debug, Clone)]
 pub struct RowPreflight {
     /// Declared user columns, in logical-schema order.
@@ -204,89 +207,142 @@ impl RowPreflight {
             .saturating_add(rows.len().saturating_mul(std::mem::size_of::<Row>()));
         Ok(PreparedRows { batch, charge })
     }
+
+    /// Validate and conform one caller Arrow batch, all or none.
+    ///
+    /// The Arrow counterpart of [`Self::prepare`], with the same column
+    /// rules. Columns match by name: the output carries every declared column
+    /// in declared order, then any reserved correlation or managed column the
+    /// caller supplied, in input order, for the server to judge. An omitted
+    /// nullable column becomes all-null with its declared type. A declared
+    /// Variant column passes when it already carries the
+    /// `arrow.parquet.variant` extension (the server validates its bytes) and
+    /// is encoded from `Utf8`/`LargeUtf8` JSON text exactly as a row value
+    /// is, row by row in input order and then column by column; a null text
+    /// is a null Variant. Every other supplied column keeps its type, which
+    /// the server checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first refusal: [`WyrdQueueError::Contract`] with
+    /// `BIFROST_UNDECLARED_FIELD` at row 0 for a non-reserved column the
+    /// schema does not declare; [`WyrdQueueError::SchemaParse`] at row 0 for
+    /// an omitted non-nullable column; `BIFROST_UNSUPPORTED_TYPE` for a
+    /// declared Variant column that is neither the extension nor text; the
+    /// catalogued Variant error for the first unstorable text; and
+    /// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
+    /// columns.
+    pub fn prepare_batch(&self, batch: &RecordBatch) -> Result<RecordBatch, WyrdQueueError> {
+        let schema = batch.schema();
+        if let Some(column) = schema
+            .fields()
+            .iter()
+            .find(|f| !is_reserved_column(f.name()) && self.fields.find(f.name()).is_none())
+        {
+            return Err(undeclared(column.name().clone(), 0));
+        }
+        let mut fields = Vec::with_capacity(schema.fields().len());
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        let mut texts = Vec::new();
+        for declared in &self.fields {
+            let Ok(index) = schema.index_of(declared.name()) else {
+                if !declared.is_nullable() {
+                    return Err(missing_required(declared.name(), 0));
+                }
+                fields.push(Arc::clone(declared));
+                columns.push(new_null_array(declared.data_type(), batch.num_rows()));
+                continue;
+            };
+            let (field, column) = (schema.field(index), batch.column(index));
+            if is_variant(declared) && !is_variant(field) {
+                if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                    return Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
+                        field: field.name().clone(),
+                        data_type: field.data_type().to_string(),
+                    }));
+                }
+                let text = cast(column, &DataType::Utf8View).map_err(arrow_failure)?;
+                texts.push((columns.len(), text));
+                fields.push(Arc::new(variant_field(field.name(), field.is_nullable())));
+                columns.push(Arc::clone(column));
+                continue;
+            }
+            fields.push(Arc::new(field.clone()));
+            columns.push(Arc::clone(column));
+        }
+        let mut builders: Vec<VariantColumnBuilder> = texts
+            .iter()
+            .map(|_| VariantColumnBuilder::with_capacity(batch.num_rows()))
+            .collect();
+        for row in 0..batch.num_rows() {
+            for ((index, text), builder) in texts.iter().zip(&mut builders) {
+                let text = text.as_string_view();
+                if text.is_null(row) {
+                    builder.append_null();
+                } else {
+                    builder.append(&encode_variant(
+                        fields[*index].name(),
+                        row,
+                        text.value(row),
+                    )?);
+                }
+            }
+        }
+        for ((index, _), builder) in texts.into_iter().zip(builders) {
+            columns[index] = builder.finish();
+        }
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            if is_reserved_column(field.name()) {
+                fields.push(Arc::clone(field));
+                columns.push(Arc::clone(column));
+            }
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+            columns,
+        )
+        .map_err(arrow_failure)
+    }
 }
 
-/// Normalize the columns `declared` as Variant to the canonical extension.
+/// The refusal for a key or column the destination does not declare.
 ///
-/// This is the Arrow-batch counterpart of [`RowPreflight::prepare`], driven by
-/// the destination's described user fields. A column the destination declares
-/// as Variant passes unchanged when it already carries the
-/// `arrow.parquet.variant` extension (the server validates its bytes), and is
-/// encoded from JSON text through [`EncodedVariant::from_json_text`] when it is
-/// `Utf8` or `LargeUtf8`; a null text is a null Variant. Text columns are
-/// encoded row by row in input order, then column by column, so the first
-/// refusal follows the locked check order. Every other column, including a
-/// text column the destination does not declare as Variant, is untouched.
+/// Row insertion and Arrow batches share it, so both name the same code,
+/// dotted path, and first offending row.
+fn undeclared(path: String, row: usize) -> WyrdQueueError {
+    WyrdQueueError::Contract(BifrostError::UndeclaredField {
+        field: path,
+        row: u64::try_from(row).unwrap_or(u64::MAX),
+    })
+}
+
+/// The refusal for a missing value on a non-nullable field.
+///
+/// Row insertion raises it for a null or absent key, and Arrow batches for an
+/// omitted required column at row 0, with the same message.
+fn missing_required(path: &str, row: usize) -> WyrdQueueError {
+    WyrdQueueError::SchemaParse(format!(
+        "row {row} field `{path}`: null/absent value on a non-nullable column"
+    ))
+}
+
+/// Encode one JSON text value for a Variant field at `path` and `row`.
+///
+/// Row insertion and Arrow JSON-text columns share it, so a value is stored
+/// identically and refused with the same catalogued Variant error.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdQueueError::Contract`] with `BIFROST_UNSUPPORTED_TYPE` for a
-/// declared Variant column of any other type, the catalogued Variant error
-/// naming the field and row of the first unstorable text, and
-/// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
-/// columns.
-pub fn normalize_declared_variants(
-    declared: &[FieldSpec],
-    batch: &RecordBatch,
-) -> Result<RecordBatch, WyrdQueueError> {
-    let schema = batch.schema();
-    let mut texts = Vec::new();
-    for (index, field) in schema.fields().iter().enumerate() {
-        let is_declared_variant = declared
-            .iter()
-            .any(|spec| spec.name == *field.name() && spec.data_type == DataTypeSpec::Variant);
-        if !is_declared_variant || is_variant(field) {
-            continue;
-        }
-        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
-                field: field.name().clone(),
-                data_type: field.data_type().to_string(),
-            }));
-        }
-        let text = cast(batch.column(index), &DataType::Utf8View).map_err(arrow_failure)?;
-        texts.push((
-            index,
-            text,
-            VariantColumnBuilder::with_capacity(batch.num_rows()),
-        ));
-    }
-    if texts.is_empty() {
-        return Ok(batch.clone());
-    }
-    for row in 0..batch.num_rows() {
-        for (index, text, builder) in &mut texts {
-            let text = text.as_string_view();
-            if text.is_null(row) {
-                builder.append_null();
-                continue;
-            }
-            let encoded = EncodedVariant::from_json_text(text.value(row)).map_err(|violation| {
-                WyrdQueueError::Contract(violation.into_error(
-                    schema.field(*index).name(),
-                    u64::try_from(row).unwrap_or(u64::MAX),
-                ))
-            })?;
-            builder.append(&encoded);
-        }
-    }
-    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-    let mut columns = batch.columns().to_vec();
-    for (index, _, builder) in texts {
-        let field = &fields[index];
-        fields[index] = Arc::new(variant_field(field.name(), field.is_nullable()));
-        columns[index] = builder.finish();
-    }
-    RecordBatch::try_new(
-        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-        columns,
-    )
-    .map_err(arrow_failure)
+/// Returns the catalogued Variant error naming `path` and `row`.
+fn encode_variant(path: &str, row: usize, text: &str) -> Result<EncodedVariant, WyrdQueueError> {
+    EncodedVariant::from_json_text(text).map_err(|violation| {
+        WyrdQueueError::Contract(violation.into_error(path, u64::try_from(row).unwrap_or(u64::MAX)))
+    })
 }
 
-/// Report an Arrow failure while viewing or reassembling normalized columns.
+/// Report an Arrow failure while viewing or reassembling conformed columns.
 fn arrow_failure(error: ArrowError) -> WyrdQueueError {
-    WyrdQueueError::SchemaParse(format!("Variant normalization failed: {error}"))
+    WyrdQueueError::SchemaParse(format!("batch conformance failed: {error}"))
 }
 
 /// One value of one input row on its way into a column.
@@ -368,14 +424,9 @@ fn build_column(field: &Field, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRe
     let missing = (!field.is_nullable())
         .then(|| cells.iter().find(|cell| cell.raw.is_none() && !cell.masked))
         .flatten()
-        .map(|cell| {
-            Failure::schema(
-                cell.row,
-                format!(
-                    "row {} field `{path}`: null/absent value on a non-nullable column",
-                    cell.row
-                ),
-            )
+        .map(|cell| Failure {
+            row: cell.row,
+            error: missing_required(path, cell.row),
         });
     let built = if is_variant(field) {
         build_variant(path, cells)
@@ -502,10 +553,7 @@ fn object_of<'a>(
         let error = if path.is_empty() && is_reserved_column(key) {
             WyrdQueueError::ReservedColumn(format!("payload key `{key}` is reserved"))
         } else {
-            WyrdQueueError::Contract(BifrostError::UndeclaredField {
-                field: child_path(path, key),
-                row: u64::try_from(row).unwrap_or(u64::MAX),
-            })
+            undeclared(child_path(path, key), row)
         };
         return Err(Failure { row, error });
     }
@@ -585,13 +633,11 @@ fn build_variant(path: &str, cells: &[Cell<'_>]) -> Result<ArrayRef, Failure> {
         .iter()
         .map(|cell| {
             cell.raw
-                .map(|raw| EncodedVariant::from_json_text(raw.get()))
+                .map(|raw| encode_variant(path, cell.row, raw.get()))
                 .transpose()
-                .map_err(|violation| Failure {
+                .map_err(|error| Failure {
                     row: cell.row,
-                    error: WyrdQueueError::Contract(
-                        violation.into_error(path, u64::try_from(cell.row).unwrap_or(u64::MAX)),
-                    ),
+                    error,
                 })
         })
         .collect::<Result<VariantColumnBuilder, _>>()
@@ -1078,5 +1124,61 @@ mod batch_builder_tests {
                 .expect_err("malformed fixed-size binary input is refused before admission");
             assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE", "row {row}");
         }
+    }
+
+    /// A preflight over required `id`, optional `name`, and Variant `payload`.
+    fn preflight() -> RowPreflight {
+        RowPreflight::new(&Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            variant_field("payload", true),
+        ]))
+    }
+
+    /// One row holding each named Int64 column.
+    fn ints(columns: &[&str]) -> arrow::array::RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int64, true))
+            .collect();
+        let arrays = columns
+            .iter()
+            .map(|_| std::sync::Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef)
+            .collect();
+        arrow::array::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)
+            .expect("batch builds")
+    }
+
+    /// Columns match by name: the output follows declared order, an omitted
+    /// nullable column is all-null with its declared type, and a reserved
+    /// column passes through after the declared ones.
+    #[test]
+    fn batch_columns_match_by_name_and_omitted_nullable_columns_are_null() {
+        let conformed = preflight()
+            .prepare_batch(&ints(&["run_id", "id"]))
+            .expect("conforms");
+
+        let schema = conformed.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "name", "payload", "run_id"]);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(crate::variant::is_variant(schema.field(2)));
+        assert!(conformed.column(1).is_null(0) && conformed.column(2).is_null(0));
+    }
+
+    /// An undeclared column and an omitted required column are refused.
+    #[test]
+    fn undeclared_and_missing_required_columns_are_refused() {
+        let undeclared = preflight()
+            .prepare_batch(&ints(&["id", "extra"]))
+            .expect_err("extra is not declared");
+        assert_eq!(undeclared.code(), "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD");
+        assert!(undeclared.to_string().contains("extra"), "{undeclared}");
+
+        let missing = preflight()
+            .prepare_batch(&ints(&["name"]))
+            .expect_err("id is required");
+        assert_eq!(missing.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert!(missing.to_string().contains("id"), "{missing}");
     }
 }

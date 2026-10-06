@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -280,9 +280,15 @@ No fallible schema or value conversion remains after reservation.
 
 `Bifrost::write_batch(table, batch)` keeps its public signature. At the start
 of the async call it invokes the existing authoritative `describe(table)`
-operation, then normalizes only fields declared Variant in that returned
-logical schema before direct-send admission. A describe or normalization
-failure leaves queue, byte-budget, and direct-send state unchanged. No cache,
+operation, then conforms the batch to that returned logical schema before
+direct-send admission, matching row `insert`: user columns are matched by name
+and sent in declared order; a missing nullable column is sent as nulls; a
+missing non-nullable column is `WYRD_VALA_400_SCHEMA_PARSE`; a column the table
+does not declare is `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` naming it at row
+0; reserved correlation and managed columns pass through for the server to
+judge; and only fields declared Variant are normalized. A describe or
+conformance failure leaves queue, byte-budget, and direct-send state
+unchanged. No cache,
 overload, caller-supplied schema, or duplicated inference is added. The server
 accepts only the extension and repeats validation at its trust boundary.
 `wyrd-queue` owns direct Variant JSON/value preparation.
@@ -769,8 +775,14 @@ string; it is not parsed as JSON.
 
 `write_batch` in every SDK accepts, for a declared Variant column, either the
 Arrow Variant extension or a Utf8/LargeUtf8 column of JSON text, which the
-shared client converts to Variant before sending. The server wire contract
-accepts only the Variant extension for Variant columns.
+shared client converts to Variant before sending. As with row `insert`, a
+batch names its columns: their order does not matter, an omitted nullable
+column is written as nulls, an omitted required column is refused with
+`WYRD_VALA_400_SCHEMA_PARSE`, and a column the table does not declare is
+refused with `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD`. The shared client
+applies these rules once for every SDK. The server wire contract stays exact:
+it accepts only the Variant extension for Variant columns and every declared
+column in declared order.
 
 #### REQ-015 — No silent key loss
 
@@ -1167,6 +1179,13 @@ None.
 
 ## Revision history
 
+- **Revision 12 (2026-10-06, approved):** From TASK-002 implementation. Arrow
+  `write_batch` follows the same column rules as row `insert`: columns match by
+  name in any order, an omitted nullable column is written as nulls, an omitted
+  required column is `SCHEMA_PARSE`, and an undeclared column is
+  `UNDECLARED_FIELD`. The shared client conforms the batch in the same
+  describe-then-normalize step, so every SDK has one behavior; the server wire
+  contract is unchanged and stays exact.
 - **Revision 11 (2026-10-06, approved):** From TASK-001 review r2. JSON
   integers outside the signed/unsigned 64-bit ranges are refused with
   `NUMERIC_OUT_OF_RANGE` instead of stored as wide decimals, so every accepted

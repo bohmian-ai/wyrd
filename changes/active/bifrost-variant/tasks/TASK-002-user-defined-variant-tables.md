@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-variant
-spec_revision: 11
+spec_revision: 12
 requirements: [REQ-003, REQ-004, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-018, REQ-019, INV-002, INV-003, INV-004, INV-006, INV-007, AC-004, AC-005, AC-008]
 depends_on: [TASK-001]
 parent_task:
@@ -98,8 +98,10 @@ hierarchy or second queue.
 ### 3. Arrow normalization uses the destination schema
 
 **Behavior.** `write_batch` performs exactly one authoritative `describe(table)`
-before admission, then converts extension and Utf8/LargeUtf8 JSON only for
-declared Variant fields. Describe failure, invalid JSON, and wrong wire types
+before admission, then conforms the batch to the declared columns (match by
+name, declared order, omitted nullable columns as nulls, omitted required
+column `SCHEMA_PARSE`, undeclared column `UNDECLARED_FIELD`) and converts
+extension and Utf8/LargeUtf8 JSON only for declared Variant fields. Describe failure, invalid JSON, and wrong wire types
 leave queue, budget, and direct-send state unchanged; server input must be the
 extension. Row strings are not JSON-parsed. This proves REQ-014, REQ-019,
 INV-002, INV-007, AC-004, and AC-005.

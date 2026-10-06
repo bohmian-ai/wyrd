@@ -895,7 +895,7 @@ struct PointColumns {
     service_name: Vec<Option<String>>,
     /// Promoted `service.version` resource string.
     service_version: Vec<Option<String>>,
-    /// Promoted `deployment.environment.name` resource string.
+    /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,

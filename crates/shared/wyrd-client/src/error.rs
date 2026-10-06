@@ -196,11 +196,10 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// identical codes always produce identical [`WyrdError`] values regardless of
 /// which transport the response arrived on.
 ///
-/// A Bifrost code whose `details` carry the serialized [`BifrostError`] (the
-/// HTTP problem document and the gRPC problem header both do) is rebuilt
-/// exactly from that payload, so every catalog Bifrost variant keeps its code
-/// and fields without a per-code arm. Bodies without that payload fall back to
-/// the message-parsing arms of `bifrost_error_from_code`.
+/// A Bifrost code is rebuilt exactly from the serialized [`BifrostError`] its
+/// `details` carry — every server producer (the HTTP problem document, the
+/// gRPC problem header, and the query terminal) serializes it — so every
+/// catalog Bifrost variant keeps its code and fields without a per-code arm.
 ///
 /// Reconstruction goes through [`WyrdError::from_code`], which covers the whole
 /// catalog (every `{ message, details }` variant), so a `404`/`403`/`429`
@@ -220,9 +219,6 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
     {
         return WyrdError::Vala { error };
     }
-    if let Some(bifrost) = bifrost_error_from_code(code, &message, &details) {
-        return bifrost;
-    }
     if let Some(reconstructed) = WyrdError::from_code(code, message.clone(), details.clone()) {
         return reconstructed;
     }
@@ -233,180 +229,6 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
             "original_details": details,
         }),
     }
-}
-
-/// Reconstructs Bifrost's typed error variants from their stable wire identity.
-fn bifrost_error_from_code(
-    code: &str,
-    message: &str,
-    details: &serde_json::Value,
-) -> Option<WyrdError> {
-    let table_from_message = |prefix: &str| {
-        message
-            .strip_prefix(prefix)
-            .or_else(|| details.get("table").and_then(serde_json::Value::as_str))
-            .unwrap_or("<unknown>")
-            .to_owned()
-    };
-    let error = match code {
-        "WYRD_VALA_429_INGEST_BUSY" => BifrostError::IngestBusy {
-            table: table_from_message("ingest coordinator busy for table ")
-                .trim_end_matches(" — local buffer full")
-                .to_owned(),
-        },
-        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" => BifrostError::TableNotFound {
-            table: table_from_message("bifrost table not found: "),
-        },
-        "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
-            table: table_from_message("schema fingerprint mismatch: "),
-        },
-        "WYRD_VALA_400_SCHEMA_PARSE" => BifrostError::SchemaParse {
-            detail: message
-                .strip_prefix("schema parse failed: ")
-                .unwrap_or(message)
-                .to_owned(),
-        },
-        "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" => {
-            BifrostError::CompactionTargetMismatch {
-                table: table_from_message("compaction target mismatch for table: "),
-            }
-        }
-        "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH" => BifrostError::CompactionTypeMismatch {
-            table: table_from_message("compaction type mismatch for table: "),
-        },
-        "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET" => {
-            let (bytes, table) = message
-                .strip_prefix("invalid compaction target file size ")
-                .and_then(|rest| rest.split_once(" for table "))
-                .unwrap_or_default();
-            BifrostError::InvalidCompactionTarget {
-                table: table.to_owned(),
-                bytes: bytes.parse().unwrap_or_default(),
-            }
-        }
-        "WYRD_VALA_400_QUERY_INVALID_SQL" => BifrostError::QueryInvalidSql {
-            detail: message
-                .strip_prefix("invalid or unsupported query SQL: ")
-                .unwrap_or(message)
-                .to_owned(),
-        },
-        "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE" => BifrostError::OracleRoleUnavailable,
-        // Ingest backpressure. A caller that cannot see this code cannot tell
-        // "the pod is out of WAL space, retry when it drains" from a generic
-        // upstream failure, which is the difference between a client that waits
-        // and a client that gives up on rows the server would have taken.
-        "WYRD_VALA_507_WAL_DISK_FULL" => BifrostError::WalDiskFull,
-        "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND" => BifrostError::RunningQueryNotFound,
-        "WYRD_VALA_409_RUNNING_QUERY_CONFLICT" => BifrostError::RunningQueryConflict,
-        "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE" => {
-            BifrostError::RunningQueryControlUnavailable
-        }
-        "WYRD_VALA_500_AUDIT_UNAVAILABLE" => BifrostError::AuditUnavailable {
-            detail: message
-                .strip_prefix("audit outbox unavailable: ")
-                .unwrap_or(message)
-                .to_owned(),
-        },
-        "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
-        "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
-        "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED" => BifrostError::QueryResourcesExhausted,
-        "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
-        "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
-        // Every remaining closed query terminal. Without these a caller cannot
-        // tell a retryable timeout from a permanent authorization refusal: both
-        // arrive as an untyped upstream failure carrying only prose, and any
-        // retry policy built on that is matching on Display text.
-        "WYRD_VALA_504_QUERY_TIMEOUT" => BifrostError::QueryTimeout,
-        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE" => BifrostError::QueryVisibilityUnavailable,
-        "WYRD_VALA_500_QUERY_TENANT_INVARIANT" => BifrostError::QueryTenantInvariant,
-        "WYRD_VALA_500_QUERY_RECONCILIATION_INVARIANT" => {
-            BifrostError::QueryReconciliationInvariant
-        }
-        "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
-        "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
-        "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
-        "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
-        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,
-        "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
-        // The enforced ceiling is configured, not universal. A caller that only
-        // learns "too large" cannot resize its batch to fit; it has to guess at
-        // a limit the server never promised, so both bounds are reconstructed.
-        "WYRD_VALA_413_PAYLOAD_TOO_LARGE" => {
-            let (bytes, limit) = payload_bounds_from(message, details);
-            BifrostError::PayloadTooLarge { bytes, limit }
-        }
-        "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE" => {
-            let (value, past_bound, future_bound) = event_time_window_bounds_from_message(message);
-            BifrostError::EventTimeOutOfRange {
-                value,
-                past_bound,
-                future_bound,
-            }
-        }
-        _ => return None,
-    };
-    Some(WyrdError::Vala { error })
-}
-
-/// Reconstruct the three `EventTimeOutOfRange` fields from a wire error message.
-///
-/// The server renders this Bifrost error through the variant's `#[error(...)]`
-/// form, `"event time out of acceptance window: {value} not in [{past_bound},
-/// {future_bound}]"`, and that `Display` text is the only field source carried
-/// on **both** transports: the HTTP `problem+json` `detail` and the gRPC
-/// `Status` message. The gRPC `ErrorInfo` metadata for Bifrost errors is empty,
-/// so the structured `details` object cannot be relied on across transports —
-/// which is why the sibling single-field arms parse the message too. The three
-/// values are epoch-microsecond strings with no embedded separators, so the
-/// bracketed list splits unambiguously. On any shape mismatch every field falls
-/// back to `"<unknown>"`, mirroring the `<unknown>` fallback the single-field
-/// arms use, so reconstruction never fails the typed-variant mapping.
-fn event_time_window_bounds_from_message(message: &str) -> (String, String, String) {
-    let parsed = message
-        .strip_prefix("event time out of acceptance window: ")
-        .and_then(|rest| rest.split_once(" not in ["))
-        .and_then(|(value, bounds)| {
-            let (past_bound, future_bound) = bounds.strip_suffix(']')?.split_once(", ")?;
-            Some((
-                value.to_owned(),
-                past_bound.to_owned(),
-                future_bound.to_owned(),
-            ))
-        });
-    parsed.unwrap_or_else(|| {
-        let unknown = "<unknown>".to_owned();
-        (unknown.clone(), unknown.clone(), unknown)
-    })
-}
-
-/// Recover the measured byte count and enforced ceiling from a payload-limit
-/// failure.
-///
-/// The gRPC projection carries only the stable code and the rendered detail
-/// message, so the bounds are parsed from that message first and the structured
-/// HTTP `details.data` payload is used as the fallback. Both transports
-/// therefore reconstruct the identical typed error. Unparseable input yields
-/// zeroes rather than a panic, because a malformed upstream response must not
-/// take down the caller.
-fn payload_bounds_from(message: &str, details: &serde_json::Value) -> (usize, usize) {
-    let from_message = message
-        .strip_prefix("ingest payload too large: ")
-        .and_then(|rest| rest.split_once(" bytes exceeds the "))
-        .and_then(|(bytes, rest)| {
-            let limit = rest.strip_suffix(" byte limit")?;
-            Some((bytes.parse().ok()?, limit.parse().ok()?))
-        });
-    from_message.unwrap_or_else(|| {
-        let field = |name: &str| {
-            details
-                .get("data")
-                .and_then(|data| data.get(name))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0)
-        };
-        (field("bytes"), field("limit"))
-    })
 }
 
 #[cfg(test)]
@@ -470,163 +292,74 @@ mod tests {
         );
     }
 
-    /// Bifrost-specific codes retain their typed status instead of becoming upstream failures.
+    /// Every Bifrost problem the server renders reconstructs its exact variant.
+    ///
+    /// Each body is the server's own `as_problem_json` rendering, whose
+    /// `details` carry the serialized `BifrostError`, so the client keeps the
+    /// typed status, code, message, and fields instead of collapsing onto a
+    /// retryable-looking 502 `UpstreamFailure`.
     ///
     /// # Panics
     ///
-    /// Panics when any Bifrost problem code maps to a status or code other than
-    /// the one it carried on the wire.
+    /// Panics when any reconstructed problem drifts from the one sent.
     #[test]
-    fn bifrost_grpc_codes_keep_their_wire_status() {
-        let not_found = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
-            "detail": "bifrost table not found: vala.bifrost.missing",
-            "details": {},
-        }));
-        assert_eq!(not_found.status(), 404);
-        assert_eq!(not_found.code(), "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
-
-        let conflict = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-            "detail": "schema fingerprint mismatch: vala.bifrost.events",
-            "details": {},
-        }));
-        assert_eq!(conflict.status(), 409);
-        assert_eq!(
-            conflict.code(),
-            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
-        );
-
-        let target_conflict = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH",
-            "detail": "compaction target mismatch for table: vala.datasets.events",
-            "details": {},
-        }));
-        assert_eq!(target_conflict.status(), 409);
-        assert_eq!(
-            target_conflict.code(),
-            "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
-        );
-
-        let type_conflict = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
-            "detail": "compaction type mismatch for table: vala.datasets.events",
-            "details": {},
-        }));
-        assert_eq!(type_conflict.status(), 409);
-        assert_eq!(
-            type_conflict.code(),
-            "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH"
-        );
-        assert_eq!(
-            type_conflict.to_string(),
-            "compaction type mismatch for table: vala.datasets.events"
-        );
-
-        let schema = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_400_SCHEMA_PARSE",
-            "detail": "schema parse failed: too many leaves",
-            "details": {},
-        }));
-        assert_eq!(schema.status(), 400);
-        assert_eq!(schema.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-        assert_eq!(schema.to_string(), "schema parse failed: too many leaves");
-
-        let invalid_target = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",
-            "detail": "invalid compaction target file size 1 for table vala.datasets.events",
-            "details": {},
-        }));
-        assert_eq!(invalid_target.status(), 400);
-        assert_eq!(
-            invalid_target.to_string(),
-            "invalid compaction target file size 1 for table vala.datasets.events"
-        );
-
-        let invalid_sql = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_400_QUERY_INVALID_SQL",
-            "detail": "invalid or unsupported query SQL: parser rejected SELECT FROM",
-            "details": {},
-        }));
-        assert_eq!(invalid_sql.status(), 400);
-        assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
-
-        let admission = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
-            "detail": "query admission rejected",
-            "details": {},
-        }));
-        assert_eq!(admission.status(), 429);
-        assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
-
-        let queue_full = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_429_QUERY_QUEUE_FULL",
-            "detail": "query queue full",
-            "details": {},
-        }));
-        assert_eq!(queue_full.status(), 429);
-        assert_eq!(queue_full.code(), "WYRD_VALA_429_QUERY_QUEUE_FULL");
-
-        let oversized = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
-            "detail": "query memory request too large",
-            "details": {},
-        }));
-        assert_eq!(oversized.status(), 422);
-        assert_eq!(
-            oversized.code(),
-            "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE"
-        );
-
-        for (code, status) in [
-            ("WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE", 503),
-            ("WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND", 404),
-            ("WYRD_VALA_409_RUNNING_QUERY_CONFLICT", 409),
-            ("WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE", 503),
-            ("WYRD_VALA_500_AUDIT_UNAVAILABLE", 500),
+    fn bifrost_problems_reconstruct_their_exact_variant() {
+        let table = || "vala.datasets.events".to_owned();
+        for (sent, status) in [
+            (BifrostError::TableNotFound { table: table() }, 404),
+            (BifrostError::FingerprintMismatch { table: table() }, 409),
+            (
+                BifrostError::CompactionTargetMismatch { table: table() },
+                409,
+            ),
+            (BifrostError::CompactionTypeMismatch { table: table() }, 409),
+            (
+                BifrostError::SchemaParse {
+                    detail: "too many leaves".to_owned(),
+                },
+                400,
+            ),
+            (
+                BifrostError::InvalidCompactionTarget {
+                    table: table(),
+                    bytes: 1,
+                },
+                400,
+            ),
+            (
+                BifrostError::QueryInvalidSql {
+                    detail: "parser rejected SELECT FROM".to_owned(),
+                },
+                400,
+            ),
+            (BifrostError::QueryAdmissionRejected, 429),
+            (BifrostError::QueryQueueFull, 429),
+            (BifrostError::QueryMemoryRequestTooLarge, 422),
+            (BifrostError::OracleRoleUnavailable, 503),
+            (BifrostError::RunningQueryNotFound, 404),
+            (BifrostError::RunningQueryConflict, 409),
+            (BifrostError::RunningQueryControlUnavailable, 503),
+            (BifrostError::QueryAuditUnavailable, 503),
+            (
+                BifrostError::AuditUnavailable {
+                    detail: "outbox down".to_owned(),
+                },
+                500,
+            ),
+            (
+                BifrostError::EventTimeOutOfRange {
+                    value: "100".to_owned(),
+                    past_bound: "200".to_owned(),
+                    future_bound: "300".to_owned(),
+                },
+                400,
+            ),
         ] {
-            let error = from_problem_json(&serde_json::json!({
-                "code": code,
-                "detail": "running query lifecycle result",
-                "details": {},
-            }));
-            assert_eq!(error.code(), code);
-            assert_eq!(error.status(), status);
+            let sent = WyrdError::from(sent);
+            let received = from_problem_json(&sent.as_problem_json());
+            assert_eq!(received.status(), status, "{}", sent.code());
+            assert_eq!(received.as_problem_json(), sent.as_problem_json());
         }
-    }
-
-    /// Proves the stable `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` code
-    /// reconstructs the typed `BifrostError::EventTimeOutOfRange` variant with
-    /// its real permanent 400 status and preserved code — never the
-    /// retryable-looking 502 `UpstreamFailure` an unmapped Bifrost code would
-    /// collapse onto — and that the offending value and both window bounds are
-    /// recovered from the wire message, the only field source carried on both
-    /// the HTTP and gRPC transports.
-    #[test]
-    fn bifrost_event_time_out_of_range_reconstructs_typed_400() {
-        let err = from_problem_json(&serde_json::json!({
-            "code": "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
-            "detail": "event time out of acceptance window: 100 not in [200, 300]",
-            "details": {},
-        }));
-        assert_eq!(err.code(), "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE");
-        assert_eq!(
-            err.status(),
-            400,
-            "out-of-range is a permanent 400, not a retryable 502 UpstreamFailure"
-        );
-        let json = err.as_problem_json();
-        assert_eq!(
-            json["details"]["variant"].as_str(),
-            Some("event_time_out_of_range"),
-            "typed variant must be reconstructed, not the UpstreamFailure catch-all"
-        );
-        assert_eq!(json["details"]["data"]["value"].as_str(), Some("100"));
-        assert_eq!(json["details"]["data"]["past_bound"].as_str(), Some("200"));
-        assert_eq!(
-            json["details"]["data"]["future_bound"].as_str(),
-            Some("300")
-        );
     }
 
     #[test]
@@ -727,44 +460,33 @@ mod tests {
         use wyrd_tonic::tonic::Code;
         use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
+        use wyrd_spec::error::WyrdError;
+        use wyrd_spec::vala::error::BifrostError;
+        use wyrd_tonic::error::wyrd_error_to_status;
+
         use crate::error::{from_grpc_status, from_problem_json};
 
-        /// Capacity and poison codes reconstruct identically across both transports.
+        /// Capacity and poison problems reconstruct identically across both transports.
+        ///
+        /// Each problem is rendered by the server's own HTTP and gRPC producers,
+        /// so retryability is read from the same serialized `BifrostError`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when either transport loses the code or status, or when the
+        /// two reconstructions disagree.
         #[test]
         fn capacity_http_and_grpc_reconstruct_retryability_identically() {
-            for (code, status, grpc_code) in [
-                (
-                    "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
-                    429,
-                    Code::ResourceExhausted,
-                ),
-                (
-                    "WYRD_VALA_429_QUERY_QUEUE_FULL",
-                    429,
-                    Code::ResourceExhausted,
-                ),
-                (
-                    "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
-                    422,
-                    Code::InvalidArgument,
-                ),
-                ("WYRD_VALA_500_QUERY_EXECUTION_FAILED", 500, Code::Internal),
+            for (sent, status) in [
+                (BifrostError::QueryAdmissionRejected, 429),
+                (BifrostError::QueryQueueFull, 429),
+                (BifrostError::QueryMemoryRequestTooLarge, 422),
+                (BifrostError::QueryExecutionFailed, 500),
             ] {
-                let details = ErrorDetails::with_error_info(code, "wyrd.dev", HashMap::new());
-                let grpc = wyrd_tonic::tonic::Status::with_error_details(
-                    grpc_code,
-                    "capacity result",
-                    details,
-                );
-                let http = serde_json::json!({
-                    "code": code,
-                    "status": status,
-                    "detail": "capacity result",
-                    "details": {},
-                });
-                let from_grpc = from_grpc_status(&grpc);
-                let from_http = from_problem_json(&http);
-                assert_eq!(from_grpc.code(), code);
+                let sent = WyrdError::from(sent);
+                let from_http = from_problem_json(&sent.as_problem_json());
+                let from_grpc = from_grpc_status(&wyrd_error_to_status(sent.clone(), None));
+                assert_eq!(from_grpc.code(), sent.code());
                 assert_eq!(from_grpc.status(), status);
                 assert_eq!(from_grpc.as_problem_json(), from_http.as_problem_json());
             }
@@ -810,22 +532,13 @@ mod tests {
         /// enforced limit, detail, or remediation, or when the two disagree.
         #[test]
         fn payload_limit_reconstructs_identically_across_transports() {
-            let detail = "ingest payload too large: 41943040 bytes exceeds the 8388608 byte limit";
-            let grpc = wyrd_tonic::tonic::Status::with_error_details(
-                Code::ResourceExhausted,
-                detail,
-                ErrorDetails::with_error_info(
-                    "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-                    "wyrd.dev",
-                    HashMap::new(),
-                ),
-            );
-            let http = serde_json::json!({
-                "code": "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-                "status": 413,
-                "detail": detail,
-                "details": { "variant": "payload_too_large", "data": { "bytes": 41_943_040, "limit": 8_388_608 } },
+            let sent = WyrdError::from(BifrostError::PayloadTooLarge {
+                bytes: 41_943_040,
+                limit: 8_388_608,
             });
+            let detail = sent.to_string();
+            let grpc = wyrd_error_to_status(sent.clone(), None);
+            let http = sent.as_problem_json();
 
             let from_grpc = from_grpc_status(&grpc);
             let from_http = from_problem_json(&http);

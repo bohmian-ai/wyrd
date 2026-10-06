@@ -1294,7 +1294,9 @@ mod tests {
                         )
                     } else {
                         counts.statuses.fetch_add(1, Ordering::AcqRel);
-                        let body = "{\"code\":\"WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND\",\"detail\":\"gone\"}";
+                        let body = WyrdError::from(BifrostError::RunningQueryNotFound)
+                            .as_problem_json()
+                            .to_string();
                         format!(
                             "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()

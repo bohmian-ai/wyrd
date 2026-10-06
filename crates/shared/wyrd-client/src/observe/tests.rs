@@ -19,6 +19,7 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, FieldSpec, INPUT_CLASS_GATE_CORRELATION,
     INPUT_CLASS_KEY, PARQUET_FIELD_ID_KEY,
 };
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::eval::media::{MediaKind, MediaRef};
 use wyrd_spec::vala::ids::{SessionId, SpanId, TraceId};
 
@@ -149,7 +150,11 @@ fn ok_json(body: &str) -> String {
 
 /// One stable problem-JSON 404 for an unknown table.
 fn not_found() -> String {
-    let body = r#"{"type":"about:blank","title":"Not Found","status":404,"code":"WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND","detail":"no such table"}"#;
+    let body = WyrdError::from(BifrostError::TableNotFound {
+        table: "no.such_table".to_owned(),
+    })
+    .as_problem_json()
+    .to_string();
     format!(
         "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()

@@ -26,7 +26,6 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, StructArray};
-use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{DFSchema, ScalarValue, exec_err, plan_err};
@@ -45,7 +44,7 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, is_variant,
+    EncodedVariant, VariantColumnBuilder, VariantViolation, is_variant, mask_placeholders,
     variant_field, variant_storage_type,
 };
 
@@ -255,8 +254,8 @@ impl ScalarUDFImpl for VariantGet {
         let root = values
             .next()
             .ok_or_else(|| DataFusionError::Internal("variant_get has no root".to_owned()))?
-            .into_array(rows)
-            .and_then(mask_placeholders)?;
+            .into_array(rows)?;
+        let root = mask_placeholders(root)?;
         let elements: Vec<ColumnarValue> = values.collect();
         let literal: Option<Vec<Option<VariantPathElement<'_>>>> = elements
             .iter()
@@ -378,30 +377,6 @@ fn decode_rows(argument: &ColumnarValue, rows: usize) -> Result<VariantArray> {
     Ok(VariantArray::try_new(&mask_placeholders(
         argument.to_array(rows)?,
     )?)?)
-}
-
-/// Mark every empty-storage placeholder row of a Variant column as null.
-///
-/// A Variant nested in a null struct keeps empty child bytes in place of a
-/// value, because neither the Parquet reader nor `get_field` pushes the parent
-/// null down. The upstream decoder panics on those bytes, so every Variant
-/// argument passes through here before it is decoded.
-///
-/// # Errors
-///
-/// Returns the Arrow error raised while reassembling the masked struct.
-fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef> {
-    let Some(columns) = storage.as_struct_opt() else {
-        return Ok(storage);
-    };
-    let present = (0..storage.len())
-        .map(|row| storage.is_valid(row) && !is_placeholder(storage.as_ref(), row));
-    let (fields, children, _) = columns.clone().into_parts();
-    Ok(Arc::new(StructArray::try_new(
-        fields,
-        children,
-        Some(present.collect::<NullBuffer>()),
-    )?))
 }
 
 /// `variant_as_text(v)`: the text `->>` returns.

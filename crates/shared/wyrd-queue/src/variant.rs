@@ -23,10 +23,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BinaryViewArray, LargeBinaryArray, StructArray,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray, make_array};
 use arrow::buffer::NullBuffer;
+use arrow::compute::cast;
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use arrow_schema::extension::ExtensionType;
@@ -35,7 +34,7 @@ use parquet_variant::{
     BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
     VariantBuilderExt,
 };
-use parquet_variant_compute::VariantType;
+use parquet_variant_compute::{VariantArray, VariantType};
 use parquet_variant_json::VariantToJson;
 use serde_json::value::RawValue;
 use serde_json::{Number, Value};
@@ -255,30 +254,28 @@ pub fn variant_bytes_to_json(metadata: &[u8], value: &[u8]) -> Result<Value, Var
 
 /// Render one Arrow Variant column cell as JSON.
 ///
-/// Accepts any storage the `arrow.parquet.variant` extension allows for an
-/// unshredded value: a struct whose `metadata` and `value` children are
-/// `Binary`, `LargeBinary`, or `BinaryView`. A null cell renders as JSON null.
+/// Decodes through upstream [`VariantArray`], which accepts any storage the
+/// `arrow.parquet.variant` extension allows for an unshredded value: a struct
+/// whose `metadata` and `value` children are `Binary`, `LargeBinary`, or
+/// `BinaryView`. A null or placeholder cell renders as JSON null. The cell is
+/// decoded with upstream's shallow validation, so it must come from storage
+/// whose writers validated every value, as every Bifrost writer does.
 ///
 /// # Errors
 ///
 /// Returns [`VariantViolation::InvalidJson`] when the column is not an
-/// unshredded Variant storage struct or the cell does not decode.
+/// unshredded Variant storage struct or the cell does not render as JSON.
 pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, VariantViolation> {
-    let invalid = || VariantViolation::InvalidJson {
+    let invalid = |_| VariantViolation::InvalidJson {
         path: String::new(),
     };
-    if column.is_null(row) {
+    let cell = mask_placeholders(column.slice(row, 1)).map_err(invalid)?;
+    if cell.is_null(0) {
         return Ok(Value::Null);
     }
-    let storage = column
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(invalid)?;
-    let metadata = binary_cell(storage.column_by_name("metadata").ok_or_else(invalid)?, row)
-        .ok_or_else(invalid)?;
-    let value = binary_cell(storage.column_by_name("value").ok_or_else(invalid)?, row)
-        .ok_or_else(invalid)?;
-    variant_bytes_to_json(metadata, value)
+    VariantArray::try_new(&cell)
+        .and_then(|variants| variants.try_value(0)?.to_json_value())
+        .map_err(invalid)
 }
 
 /// Renders Arrow Variant columns as their JSON value in Arrow's JSON writer.
@@ -287,7 +284,7 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
 /// of `metadata`/`value` bytes. Installing this factory on a writer's
 /// [`EncoderOptions`] makes every field
 /// carrying the `arrow.parquet.variant` extension — top level or nested in a
-/// Struct or List — render through [`variant_cell_to_json`], so every
+/// Struct or List — render through upstream [`VariantArray`], so every
 /// row-as-JSON surface shares one rendering. Other fields keep Arrow's
 /// default encoders.
 #[derive(Debug, Default)]
@@ -296,10 +293,9 @@ pub struct VariantJsonEncoderFactory;
 impl EncoderFactory for VariantJsonEncoderFactory {
     /// Pre-render every non-null cell of a Variant field as JSON text.
     ///
-    /// Rendering is done up front because the encoder itself cannot fail. A
-    /// Variant nested in a Struct sees only its own nulls, so the slot under a
-    /// null parent row holds empty `metadata` and `value` placeholders; that
-    /// slot is never encoded and renders nothing instead of failing.
+    /// Rendering is done up front because the encoder itself cannot fail.
+    /// Placeholder slots under a null parent row are masked first, so they
+    /// render nothing instead of failing.
     ///
     /// # Errors
     ///
@@ -314,13 +310,16 @@ impl EncoderFactory for VariantJsonEncoderFactory {
         if !is_variant(field) {
             return Ok(None);
         }
-        let rendered = (0..array.len())
+        let storage = mask_placeholders(make_array(array.to_data()))?;
+        let variants = VariantArray::try_new(&storage)?;
+        let rendered = (0..storage.len())
             .map(|row| {
-                if array.is_null(row) || is_placeholder(array, row) {
+                if storage.is_null(row) {
                     return Ok(String::new());
                 }
-                variant_cell_to_json(array, row)
-                    .map(|value| value.to_string())
+                variants
+                    .try_value(row)
+                    .and_then(|value| value.to_json_string())
                     .map_err(|_| {
                         ArrowError::JsonError(format!(
                             "field {} row {row} is not a decodable Variant",
@@ -336,22 +335,43 @@ impl EncoderFactory for VariantJsonEncoderFactory {
     }
 }
 
-/// Reports whether one Variant cell is an empty-storage placeholder.
+/// Mark every empty-storage placeholder row of a Variant column as null.
 ///
 /// Every encoded Variant has at least one `metadata` and one `value` byte, so
 /// a cell whose two children are both empty carries no value at all. Such a
-/// cell appears under a null parent struct, whose null is not pushed down into
-/// the child storage, so every Variant reader treats it as SQL null.
-pub fn is_placeholder(column: &dyn Array, row: usize) -> bool {
-    let empty = |name: &str| {
-        column
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .and_then(|storage| storage.column_by_name(name))
-            .and_then(|child| binary_cell(child, row))
-            .is_some_and(<[u8]>::is_empty)
+/// cell appears under a null parent struct, whose null is neither pushed down
+/// by the Parquet reader nor by `get_field`, and the upstream decoder panics
+/// on it, so every reader masks the column here before decoding. A non-struct
+/// array is returned unchanged.
+///
+/// # Errors
+///
+/// Returns the Arrow error raised while viewing a child as bytes or
+/// reassembling the masked struct.
+pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
+    let Some(columns) = storage.as_struct_opt() else {
+        return Ok(storage);
     };
-    empty("metadata") && empty("value")
+    let bytes = |name: &str| {
+        columns
+            .column_by_name(name)
+            .map(|child| cast(child, &DataType::BinaryView))
+            .transpose()
+    };
+    let (metadata, value) = (bytes("metadata")?, bytes("value")?);
+    let empty = |child: &Option<ArrayRef>, row: usize| {
+        child
+            .as_ref()
+            .is_some_and(|child| child.as_binary_view().value(row).is_empty())
+    };
+    let present = (0..storage.len())
+        .map(|row| storage.is_valid(row) && !(empty(&metadata, row) && empty(&value, row)));
+    let (fields, children, _) = columns.clone().into_parts();
+    Ok(Arc::new(StructArray::try_new(
+        fields,
+        children,
+        Some(present.collect::<NullBuffer>()),
+    )?))
 }
 
 /// Pre-rendered JSON text of each row of one Variant column.
@@ -362,24 +382,6 @@ impl Encoder for RenderedJson {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         out.extend_from_slice(self.0[idx].as_bytes());
     }
-}
-
-/// Return one binary child cell regardless of its offset width or view form.
-fn binary_cell(array: &ArrayRef, row: usize) -> Option<&[u8]> {
-    if array.is_null(row) {
-        return None;
-    }
-    let any = array.as_any();
-    any.downcast_ref::<BinaryArray>()
-        .map(|values| values.value(row))
-        .or_else(|| {
-            any.downcast_ref::<LargeBinaryArray>()
-                .map(|values| values.value(row))
-        })
-        .or_else(|| {
-            any.downcast_ref::<BinaryViewArray>()
-                .map(|values| values.value(row))
-        })
 }
 
 /// Return the canonical unshredded Variant storage type.
@@ -795,7 +797,7 @@ fn check_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{RecordBatch, StringArray};
+    use arrow::array::{BinaryArray, RecordBatch, StringArray};
     use arrow::json::WriterBuilder;
     use arrow::json::writer::JsonArray;
     use arrow_schema::Schema;

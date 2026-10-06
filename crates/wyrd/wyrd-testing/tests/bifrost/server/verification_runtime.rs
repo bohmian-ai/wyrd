@@ -38,7 +38,7 @@ use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::tables::{AgentTracesTable, DomainTable};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use vala_sql::queries::audit_staging::{append_audit, entry_hash};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
@@ -1058,8 +1058,11 @@ async fn query_rows(
 /// `get_field` from the hot rows before the flush and the published rows
 /// after it: an absent summary's children all read SQL null, including
 /// `to_json` of its Variant, and a present summary's children read its
-/// values. The retained audit row's `entry_hash` is recomputed from the
-/// stored columns, with the decoded detail re-canonicalized, and matches.
+/// values. A second gateway call the upstream refuses is captured with no
+/// resolved model: hot and published, both its `resolved_model` children
+/// read SQL null while the resolved call's read its provider and model. The
+/// retained audit row's `entry_hash` is recomputed from the stored columns,
+/// with the decoded detail re-canonicalized, and matches.
 ///
 /// # Errors
 /// Returns server, seeding, gateway, publication, or query errors, or a
@@ -1128,12 +1131,52 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
         &journey.rows(children_sql.clone()).await?,
         &expected_children,
     )?;
+    // Gateway capture: the resolved call carries both model Structs whole,
+    // and the refused call's absent resolved model reads both children null.
+    let models_sql = format!(
+        "SELECT wyrd_request_id, requested_model['provider'], requested_model['model'], \
+         resolved_model['provider'], resolved_model['model'] FROM vala.gateway.calls \
+         WHERE wyrd_request_id IN ('{}', '{}') ORDER BY wyrd_request_id",
+        call.request_id, call.unresolved_request_id
+    );
+    let mut expected_models = vec![
+        vec![
+            json!(call.request_id),
+            json!("openai"),
+            json!("gpt-4o"),
+            json!("openai"),
+            json!("gpt-4o"),
+        ],
+        vec![
+            json!(call.unresolved_request_id),
+            json!("openai"),
+            json!("gpt-4o"),
+            Value::Null,
+            Value::Null,
+        ],
+    ];
+    expected_models.sort_by_key(|row| row[0].to_string());
+    // Capture lands after each caller has its answer, so wait for both rows.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let hot_models = loop {
+        let rows = journey.rows(models_sql.clone()).await?;
+        if rows.len() == expected_models.len() || tokio::time::Instant::now() >= deadline {
+            break rows;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    expect_eq("hot gateway model children", &hot_models, &expected_models)?;
     journey.server.flush_bifrost().await?;
     journey.server.await_audit_published(journey.tenant).await?;
     expect_eq(
         "published summary Struct children",
         &journey.rows(children_sql).await?,
         &expected_children,
+    )?;
+    expect_eq(
+        "published gateway model children",
+        &journey.rows(models_sql).await?,
+        &expected_models,
     )?;
 
     // Verification results: the two summary Structs are set exclusively.
@@ -1330,12 +1373,25 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         row: 0,
         path: String::new(),
     };
-    let out_of_range = |path: &str| BifrostError::VariantNumericOutOfRange {
+    let out_of_range = |path: &str, numeric_kind: &str| BifrostError::VariantNumericOutOfRange {
         field: "messages".to_owned(),
         row: 0,
         path: path.to_owned(),
-        numeric_kind: "decimal".to_owned(),
+        numeric_kind: numeric_kind.to_owned(),
     };
+    let field_names = (0..200)
+        .map(|index| format!("f{index:03}"))
+        .collect::<Vec<_>>();
+    let many_names = variant_metadata(
+        &field_names.iter().map(String::as_str).collect::<Vec<_>>(),
+        true,
+    )?;
+    let mut large_string = primitive(VARIANT_LONG_STRING, &1000_u32.to_le_bytes());
+    large_string.extend([b'x'; 1000]);
+    let one_shared_child = variant_object(
+        &(0..200).map(|id| (id, 0)).collect::<Vec<_>>(),
+        &large_string,
+    )?;
     let over_deep = nested_lists(VARIANT_MAX_DEPTH + 1)?;
     let deepest = nested_lists(VARIANT_MAX_DEPTH)?;
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
@@ -1428,12 +1484,83 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             invalid_messages.clone(),
         ),
         (
+            "many fields sharing one large child",
+            (messages(), raw_variant(&many_names, &one_shared_child)?),
+            invalid_messages.clone(),
+        ),
+        (
+            "one field starting inside another",
+            (
+                messages(),
+                raw_variant(
+                    &AB_METADATA,
+                    &variant_object(&[(0, 0), (1, 1)], &[0x0c, 0x00])?,
+                )?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
+            "two fields resolving to one name",
+            (
+                messages(),
+                raw_variant(
+                    &variant_metadata(&["a", "a"], false)?,
+                    &variant_object(&[(0, 0), (1, 1)], &[VARIANT_NULL, VARIANT_NULL])?,
+                )?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
+            "a Decimal4",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &primitive(VARIANT_DECIMAL4, &[0, 5, 0, 0, 0]),
+                )?,
+            ),
+            out_of_range("", "decimal"),
+        ),
+        (
+            "a Decimal8",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &primitive(VARIANT_DECIMAL8, &[0, 5, 0, 0, 0, 0, 0, 0, 0]),
+                )?,
+            ),
+            out_of_range("", "decimal"),
+        ),
+        (
+            "a NaN double",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &primitive(VARIANT_DOUBLE, &f64::NAN.to_le_bytes()),
+                )?,
+            ),
+            out_of_range("", "double"),
+        ),
+        (
+            "an infinite float",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &primitive(VARIANT_FLOAT, &f32::INFINITY.to_le_bytes()),
+                )?,
+            ),
+            out_of_range("", "double"),
+        ),
+        (
             "a fractional decimal",
             (
                 messages(),
                 raw_variant(&EMPTY_METADATA, &decimal16(12_345, 2))?,
             ),
-            out_of_range(""),
+            out_of_range("", "decimal"),
         ),
         (
             "a scale-zero decimal past u64::MAX",
@@ -1441,12 +1568,12 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
                 messages(),
                 raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX) + 1, 0))?,
             ),
-            out_of_range(""),
+            out_of_range("", "decimal"),
         ),
         (
             "a scale-zero decimal within i64",
             (messages(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
-            out_of_range(""),
+            out_of_range("", "decimal"),
         ),
         (
             "a refused decimal after an over-deep sibling",
@@ -1457,7 +1584,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
                     &variant_list(&[over_deep.clone(), decimal16(5, 0)])?,
                 )?,
             ),
-            out_of_range("/1"),
+            out_of_range("/1", "decimal"),
         ),
         (
             "an oversized malformed value reports its size",
@@ -1564,7 +1691,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
         )?;
     }
-    admission.refuse_numeric_before_depth().await?;
+    admission.refuse_json_rows().await?;
 
     let refused_spans = admission.spans_frame(&refused);
     let event_storage =
@@ -1635,7 +1762,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         .await?;
 
     // The accepted trace carries the one decimal form the exact numeric domain
-    // admits, which must read back with every digit.
+    // admits, which must read back with every digit, and a finite float.
     let accepted = admission.session("accepted");
     let sentinel = admission.trace_frame(
         &accepted,
@@ -1643,7 +1770,13 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             messages(),
             raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX), 0))?,
         ),
-        (tool_io(), valid()?),
+        (
+            tool_io(),
+            raw_variant(
+                &EMPTY_METADATA,
+                &primitive(VARIANT_FLOAT, &1.5_f32.to_le_bytes()),
+            )?,
+        ),
     )?;
     admission.accept(AGENT_TRACES, &sentinel).await?;
     admission
@@ -1667,14 +1800,15 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &vec![vec![json!(accepted), json!(1)]],
     )?;
     expect_eq(
-        "the accepted u64::MAX decimal",
+        "the accepted u64::MAX decimal and finite float",
         &admission
             .journey
             .rows(format!(
-                "SELECT messages FROM {AGENT_TRACES} WHERE dev_session_id = '{accepted}'"
+                "SELECT messages, tool_io FROM {AGENT_TRACES} \
+                 WHERE dev_session_id = '{accepted}'"
             ))
             .await?,
-        &vec![vec![json!(u64::MAX)]],
+        &vec![vec![json!(u64::MAX), json!(1.5)]],
     )?;
     expect_eq(
         "stored metric points",
@@ -1730,8 +1864,23 @@ const VARIANT_NULL: u8 = 0x00;
 /// Variant array header: four-byte offsets and a one-byte element count.
 const VARIANT_ARRAY_HEADER: u8 = 0x0f;
 
+/// Variant primitive type of a Double.
+const VARIANT_DOUBLE: u8 = 7;
+
+/// Variant primitive type of a Decimal4.
+const VARIANT_DECIMAL4: u8 = 8;
+
+/// Variant primitive type of a Decimal8.
+const VARIANT_DECIMAL8: u8 = 9;
+
 /// Variant primitive header of a Decimal16 (primitive type 10).
 const VARIANT_DECIMAL16: u8 = 10 << 2;
+
+/// Variant primitive type of a Float.
+const VARIANT_FLOAT: u8 = 14;
+
+/// Variant primitive type of a string with a four-byte length.
+const VARIANT_LONG_STRING: u8 = 16;
 
 /// A Variant primitive header naming no primitive type, so it is malformed.
 const VARIANT_MALFORMED: u8 = 31 << 2;
@@ -1798,36 +1947,78 @@ impl VariantAdmissionJourney {
         })
     }
 
-    /// Require that a JSON agent-trace row is refused for numeric range in
-    /// both key orders when its `messages` Variant also nests past the depth
-    /// limit, and when the number sits inside the over-depth container.
+    /// Require that each JSON agent-trace row is refused before any ACK with
+    /// the exact Variant error the revision-13 order selects.
     ///
-    /// Each row goes through the public facade's JSON-row path with its
-    /// integer token intact, and the refusal surfaces from the flush before
-    /// any frame is acknowledged.
+    /// Numeric range outranks depth in both key orders and inside the
+    /// over-depth container; valid JSON nested 129 and 10,000 levels deep
+    /// is too deep rather than invalid; and a `messages` value whose built
+    /// bytes already exceed the size limit reports size beside a refused
+    /// number or an over-depth sibling. Each row goes through the public
+    /// facade's JSON-row path with its integer token intact, and the refusal
+    /// surfaces from the flush before any frame is acknowledged.
     ///
     /// # Errors
     ///
     /// Returns a connect, describe, or enqueue error, or a description when
     /// a row is accepted or refused with any other error.
-    async fn refuse_numeric_before_depth(&self) -> Result<(), ServerJourneyError> {
-        let (open, close) = ("[".repeat(65), "]".repeat(65));
-        let deep = format!("{open}1{close}");
+    async fn refuse_json_rows(&self) -> Result<(), ServerJourneyError> {
+        let nested = |inner: &str, levels: usize| {
+            format!("{}{inner}{}", "[".repeat(levels), "]".repeat(levels))
+        };
+        let deep = nested("1", 65);
+        let numeric = |path: String| BifrostError::VariantNumericOutOfRange {
+            field: "messages".to_owned(),
+            row: 0,
+            path,
+            numeric_kind: "integer".to_owned(),
+        };
+        let too_deep = BifrostError::VariantTooDeep {
+            field: "messages".to_owned(),
+            row: 0,
+            path: "/0".repeat(64),
+            depth: VARIANT_MAX_DEPTH + 1,
+            limit: VARIANT_MAX_DEPTH,
+        };
+        let big = format!(
+            r#""{}""#,
+            "x".repeat(usize::try_from(VARIANT_MAX_ENCODED_BYTES)?)
+        );
+        // The exact byte count is whatever the shared owner built before
+        // refusing; the facade must surface that size error unchanged.
+        let too_large = |messages: String| -> Result<(String, BifrostError), ServerJourneyError> {
+            let error = EncodedVariant::from_json_text(&messages)
+                .err()
+                .ok_or("the oversized row encodes")?
+                .into_error("messages", 0);
+            expect_eq(
+                "the oversized row's error",
+                &error.code(),
+                &"WYRD_VALA_413_VARIANT_TOO_LARGE",
+            )?;
+            Ok((messages, error))
+        };
         let cases = [
             (
                 format!(r#"{{"a": 18446744073709551616, "b": {deep}}}"#),
-                "/a".to_owned(),
+                numeric("/a".to_owned()),
             ),
             (
                 format!(r#"{{"a": {deep}, "b": 18446744073709551616}}"#),
-                "/b".to_owned(),
+                numeric("/b".to_owned()),
             ),
             (
-                format!(r#"{{"a": {open}18446744073709551616{close}}}"#),
-                format!("/a{}", "/0".repeat(65)),
+                format!(r#"{{"a": {}}}"#, nested("18446744073709551616", 65)),
+                numeric(format!("/a{}", "/0".repeat(65))),
             ),
+            (nested("1", 129), too_deep.clone()),
+            (nested("1", 10_000), too_deep),
+            too_large(format!(
+                r#"{{"big": {big}, "other": 18446744073709551616}}"#
+            ))?,
+            too_large(format!(r#"{{"big": {big}, "other": {deep}}}"#))?,
         ];
-        for (messages, path) in cases {
+        for (messages, expected) in cases {
             let bifrost = Bifrost::connect(&self.client).await?;
             let table = bifrost.writer_table(AGENT_TRACES).await?;
             let fields = table
@@ -1854,18 +2045,9 @@ impl VariantAdmissionJourney {
                 .await
                 .map(|()| "the row was accepted".to_owned())
                 .map_err(|error| WyrdError::from(&error));
-            let what = format!("numeric range outranks depth at {path}");
+            let what = format!("JSON row refused as {}", expected.code());
             match refused {
-                Err(WyrdError::Vala { error }) => expect_eq(
-                    &what,
-                    &error,
-                    &BifrostError::VariantNumericOutOfRange {
-                        field: "messages".to_owned(),
-                        row: 0,
-                        path,
-                        numeric_kind: "integer".to_owned(),
-                    },
-                )?,
+                Err(WyrdError::Vala { error }) => expect_eq(&what, &error, &expected)?,
                 other => return Err(format!("{what}: {other:?}").into()),
             }
         }
@@ -2083,15 +2265,59 @@ fn variant_list(items: &[Vec<u8>]) -> Result<Vec<u8>, ServerJourneyError> {
 /// Returns an error when the chain outgrows a two-byte offset.
 fn shared_objects(levels: u32) -> Result<Vec<u8>, ServerJourneyError> {
     (0..levels).try_fold(vec![VARIANT_NULL], |child, _| {
-        let end = u16::try_from(child.len())?;
-        // Object header with two-byte offsets, two fields, ids 0 and 1.
-        let mut object = vec![0x06, 2, 0, 1];
-        for offset in [0, 0, end] {
-            object.extend(offset.to_le_bytes());
-        }
-        object.extend(child);
-        Ok(object)
+        variant_object(&[(0, 0), (1, 0)], &child)
     })
+}
+
+/// Variant value bytes for an object with one-byte field ids and two-byte
+/// offsets.
+///
+/// `fields` pairs each field id with its value's start offset inside
+/// `values`, which follow the offsets; the end offset is `values.len()`.
+/// Nothing is validated, so fields may share or overlap bytes.
+///
+/// # Errors
+///
+/// Returns an error when the object outgrows a one-byte count or a two-byte
+/// offset.
+fn variant_object(fields: &[(u8, u16)], values: &[u8]) -> Result<Vec<u8>, ServerJourneyError> {
+    // Object header: two-byte offsets, one-byte field ids, one-byte count.
+    let mut object = vec![0x06, u8::try_from(fields.len())?];
+    object.extend(fields.iter().map(|(id, _)| id));
+    for (_, offset) in fields {
+        object.extend(offset.to_le_bytes());
+    }
+    object.extend(u16::try_from(values.len())?.to_le_bytes());
+    object.extend_from_slice(values);
+    Ok(object)
+}
+
+/// Variant metadata naming `names` with four-byte offsets.
+///
+/// The sorted-names flag is set when `sorted` is true; nothing checks that
+/// claim, so a fixture can name one key twice.
+///
+/// # Errors
+///
+/// Returns an error when the dictionary outgrows a four-byte offset.
+fn variant_metadata(names: &[&str], sorted: bool) -> Result<Vec<u8>, ServerJourneyError> {
+    let mut metadata = vec![if sorted { 0xd1 } else { 0xc1 }];
+    metadata.extend(u32::try_from(names.len())?.to_le_bytes());
+    let mut offset = 0_u32;
+    metadata.extend(offset.to_le_bytes());
+    for name in names {
+        offset += u32::try_from(name.len())?;
+        metadata.extend(offset.to_le_bytes());
+    }
+    metadata.extend(names.concat().into_bytes());
+    Ok(metadata)
+}
+
+/// Variant value bytes for one primitive of `type_id` with `payload`.
+fn primitive(type_id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut value = vec![type_id << 2];
+    value.extend_from_slice(payload);
+    value
 }
 
 /// Variant value bytes for one Decimal16 primitive.
@@ -2209,10 +2435,13 @@ struct PublishedResults {
     item: Vec<Value>,
 }
 
-/// The captured gateway call and the JSON it sent and received.
+/// The captured gateway calls and the JSON the resolved one sent and received.
 struct CapturedCall {
     /// Request id the gateway answered with, which the captured row carries.
     request_id: String,
+    /// Request id of a second call the upstream refused, so its captured row
+    /// has no resolved model.
+    unresolved_request_id: String,
     /// Body the caller sent.
     request: Value,
     /// Body the upstream provider answered with.
@@ -2262,12 +2491,22 @@ impl TypedPayloadJourney {
     }
 
     /// Start a bound server whose gateway providers resolve to a mock
-    /// upstream that answers every chat completion.
+    /// upstream that answers every chat completion, except that one asking
+    /// for a single completion token is refused, so no model resolves it.
     ///
     /// # Errors
     /// Returns a mock URL or server start error.
     async fn start() -> Result<Self, ServerJourneyError> {
         let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({"max_completion_tokens": 1})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "refused", "type": "invalid_request_error"},
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(Self::completion()))
@@ -2556,8 +2795,28 @@ impl TypedPayloadJourney {
         {
             return Err("the call never reached the mock upstream".into());
         }
+        let refused = http
+            .post(format!("{base}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {caller}"))
+            .json(&json!({
+                "model": "openai/gpt-4o",
+                "max_completion_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await?;
+        if refused.status().is_success() {
+            return Err("the upstream refusal reached the caller as a success".into());
+        }
+        let unresolved_request_id = refused
+            .headers()
+            .get("wyrd-request-id")
+            .and_then(|value| value.to_str().ok())
+            .ok_or("the refused answer carries no request id")?
+            .to_owned();
         Ok(CapturedCall {
             request_id,
+            unresolved_request_id,
             request,
             response: Self::completion(),
         })

@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R5
 kind: remediation
-status: ready
+status: review
 spec: SPEC-bifrost-variant
 spec_revision: 13
 requirements: [REQ-003, REQ-004, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-019, INV-002, INV-007, AC-003, AC-005]

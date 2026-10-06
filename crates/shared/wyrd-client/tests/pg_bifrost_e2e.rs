@@ -8,6 +8,9 @@
 //! journeys. The timeout journey uses a delayed server WAL to prove that the
 //! public SDK retains its owned batch through ambiguous transport settlement.
 
+#[path = "pg_bifrost_e2e/variant_tables.rs"]
+mod variant_tables;
+
 mod pg_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1118,11 +1121,14 @@ mod pg_tests {
                 stored.name()
             );
             assert!(
-                described.metadata().is_empty(),
-                "`{}` sends no field identity: the stable id and sensitivity \
-                 tag are the server's own, re-derived on every stamp, so \
-                 ingress compares an incoming block by shape and never asks a \
-                 writer to restate them",
+                described
+                    .metadata()
+                    .keys()
+                    .all(|key| wyrd_queue::is_extension_key(key)),
+                "`{}` sends no field identity, only its Arrow extension type: \
+                 the stable id and sensitivity tag are the server's own, \
+                 re-derived on every stamp, so ingress compares an incoming \
+                 block by shape and never asks a writer to restate them",
                 stored.name()
             );
         }
@@ -1171,30 +1177,29 @@ mod pg_tests {
                 .is_nullable(),
             "Card correlation is optional, so describe must not demand it"
         );
-        let mut builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&dynamic)
-            .expect("the dynamic description builds a row builder");
-        builder
-            .append_json_row(
-                r#"{"id": 1, "value": "described"}"#,
-                Some(&writer_card),
-                None,
-            )
-            .expect("a described row is accepted");
-        builder
-            .append_json_row(r#"{"id": 2, "value": "uncorrelated"}"#, None, None)
-            .expect("a described row without Card correlation is accepted");
-        let ipc = builder.finish_ipc().expect("seal the described batch");
-
-        RawIngest::connect(&client)
+        let preflight = wyrd_queue::RowPreflight::from_description(&dynamic)
+            .expect("the dynamic description builds a row preflight");
+        let ingest = RawIngest::connect(&client)
             .await
-            .expect("connect the public ingest wire")
-            .insert(
-                &format!("vala.bifrost.{table_name}"),
-                uuid::Uuid::now_v7(),
-                ipc,
-            )
-            .await
-            .expect("the described batch is accepted by the real wire");
+            .expect("connect the public ingest wire");
+        for (row, card) in [
+            (r#"{"id": 1, "value": "described"}"#, Some(&writer_card)),
+            (r#"{"id": 2, "value": "uncorrelated"}"#, None),
+        ] {
+            let ipc = preflight
+                .prepare(&[row], card, None)
+                .expect("a described row is accepted")
+                .to_ipc()
+                .expect("seal the described batch");
+            ingest
+                .insert(
+                    &format!("vala.bifrost.{table_name}"),
+                    uuid::Uuid::now_v7(),
+                    ipc,
+                )
+                .await
+                .expect("the described batch is accepted by the real wire");
+        }
         srv.flush_bifrost()
             .await
             .expect("flush server-owned Scribe");

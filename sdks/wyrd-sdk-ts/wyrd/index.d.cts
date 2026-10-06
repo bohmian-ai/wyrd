@@ -874,11 +874,14 @@ export interface NativeTableConfig {
   resolvedJson?: string
 }
 
-/** Closed result of describing one table: its config or a catalog error. */
+/**
+ * Closed result of declaring or describing one table: its config or a
+ * catalog error.
+ */
 export interface NativeTableConfigResult {
-  /** Described table config when the server answered. */
+  /** The table config when it was declared or described. */
   config?: NativeTableConfig
-  /** Catalog failure when description failed. */
+  /** Catalog failure when declaration or description failed. */
   error?: NativeWyrdError
 }
 
@@ -929,15 +932,20 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * `wyrd-queue` owner every language uses, so one model declares the same
  * columns from any SDK.
  *
+ * A catalogued refusal of the declaration itself — a table name that is not
+ * `namespace.name`, a document that does not map to columns, an open-extras
+ * object, or a server-owned column — returns in the result's structured
+ * `error`, which the TypeScript wrapper raises as a `WyrdError` carrying its
+ * code, status, details, and remediation.
+ *
  * # Errors
  *
- * Returns a napi error when the table is not `namespace.name`, the document is
- * not one mappable JSON Schema, a declared column is server-owned, the
- * layout is not one physical-layout declaration, the compaction target is
- * not a non-negative integer, or the compaction type is not one known
- * hyphenated wire spelling.
+ * Returns a napi error when the text is not JSON, the layout is not one
+ * physical-layout declaration, the compaction target is not a non-negative
+ * integer, the compaction type is not one known hyphenated wire spelling,
+ * or the config cannot be projected.
  */
-export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfig
+export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
 
 /**
  * Decodes one Variant cell's `metadata`/`value` bytes into its native

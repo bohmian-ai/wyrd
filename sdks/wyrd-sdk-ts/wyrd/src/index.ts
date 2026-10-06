@@ -525,9 +525,13 @@ export class TableConfig {
    * registration naming a different type is refused with
    * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
    *
-   * @throws when the resulting document does not map to an Arrow schema,
-   * declares a column the write path already owns, the compaction target is
-   * not a non-negative integer, or the compaction type is not a known spelling.
+   * @throws {WyrdError} with the catalog code, status, details, and
+   * remediation when the table name is not `namespace.name`, the document
+   * does not map to an Arrow schema (`WYRD_VALA_400_SCHEMA_PARSE`, including a
+   * model that allows extra keys), or it declares a column the write path
+   * already owns.
+   * @throws when the compaction target is not a non-negative integer or the
+   * compaction type is not a known spelling.
    */
   static fromJsonSchema(
     table: string,
@@ -540,15 +544,14 @@ export class TableConfig {
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
         ? (schema as JsonSchemaSource).toJSONSchema()
         : schema;
-    return new TableConfig(
-      tableConfigFromJsonSchema(
-        table,
-        JSON.stringify(document),
-        layoutJson(layout),
-        compactionTargetFileSizeBytes,
-        compactionType,
-      ),
+    const declared = tableConfigFromJsonSchema(
+      table,
+      JSON.stringify(document),
+      layoutJson(layout),
+      compactionTargetFileSizeBytes,
+      compactionType,
     );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
   }
 
   /**
@@ -638,26 +641,16 @@ export interface RowSchema<T> {
 /** The Arrow extension name every Variant column carries. */
 const VARIANT_EXTENSION = "arrow.parquet.variant";
 
-/** Whether `field` is a Variant or nests one inside a Struct or List. */
-function holdsVariant(field: Field): boolean {
-  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
-    return true;
-  }
-  if (DataType.isStruct(field.type) || DataType.isList(field.type)) {
-    return (field.type.children as Field[]).some(holdsVariant);
-  }
-  return false;
-}
-
 /**
- * Replace every Variant cell inside one row value with its native value,
- * leaving every other value as Apache Arrow produced it.
+ * Project one row value onto its native JavaScript value.
  *
- * Decoding stays in the shared Rust owner: objects become plain objects,
- * arrays arrays, and an integer outside the safe range a `bigint`.
+ * A Variant cell decodes through the shared Rust owner (objects become plain
+ * objects, arrays arrays, and an integer outside the safe range a `bigint`),
+ * a Struct becomes a plain object, and a List an array, recursively. Every
+ * scalar stays as Apache Arrow produced it, so 64-bit integers are `bigint`.
  */
 function nativeValue(field: Field, value: unknown): unknown {
-  if (value === null || value === undefined || !holdsVariant(field)) {
+  if (value === null || value === undefined) {
     return value;
   }
   if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
@@ -671,9 +664,12 @@ function nativeValue(field: Field, value: unknown): unknown {
       children.map((child) => [child.name, nativeValue(child, struct[child.name])]),
     );
   }
-  return Array.from(value as Iterable<unknown>, (item) =>
-    nativeValue(children[0] as Field, item),
-  );
+  if (DataType.isList(field.type)) {
+    return Array.from(value as Iterable<unknown>, (item) =>
+      nativeValue(children[0] as Field, item),
+    );
+  }
+  return value;
 }
 
 /**
@@ -871,9 +867,10 @@ export class Bifrost {
    * The precision write door, beside {@link Bifrost.insert}: it names its
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
-   * Build the batch against {@link TableConfig.schema} from
-   * `describeTableConfig` - a canonical table compares an incoming block
-   * against its declared fields exactly, metadata included.
+   * Columns match the table's declared columns by name: an omitted nullable
+   * column is written as nulls, and a Variant column takes either the Variant
+   * extension or JSON text. A missing required column, an undeclared column,
+   * or unstorable JSON is refused before anything is sent.
    */
   async writeBatch(table: string, batch: RecordBatch): Promise<void> {
     const ipc = tableToIPC(new Table(batch), "stream");
@@ -903,8 +900,9 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout. Variant cells, top level or
-   * nested in a Struct or List, reach `rows` as their native value.
+   * nothing about the table's stored layout. Every cell reaches `rows` as its
+   * native value: a Struct is a plain object, a List an array, a Variant its
+   * decoded JSON value, and a 64-bit integer a `bigint`.
    *
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
    * partially valid result is never returned as success.
@@ -932,13 +930,12 @@ export class Bifrost {
     if (rows === undefined) {
       return result;
     }
-    const variantFields = schema.fields.filter(holdsVariant);
     return result
       .toArrow()
       .toArray()
       .map((row: { toJSON(): Record<string, unknown> }) => {
         const values = row.toJSON();
-        for (const field of variantFields) {
+        for (const field of schema.fields) {
           values[field.name] = nativeValue(field, values[field.name]);
         }
         return rows.parse(values);

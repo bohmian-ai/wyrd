@@ -5,7 +5,9 @@ use std::sync::Arc;
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_schema::extension::ExtensionType;
 use iceberg::spec::{self, NestedField, Type};
+use parquet_variant_compute::VariantType;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_queue::is_extension_key;
@@ -197,53 +199,41 @@ pub struct BuiltinTableDefinition {
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
 ///
 /// Clients prepare Variant values before sending, but a raw Arrow IPC writer
-/// can skip that, and the schema fingerprint compares storage types only.
-/// Every table validator runs this walk over its declared fields, top level
-/// and nested inside Structs and Lists: every field holding a Variant must
-/// match its declaration on the wire, where `wyrd_queue::field_to_spec` keeps
-/// the `arrow.parquet.variant` extension that storage types drop, and every
-/// present Variant value must pass [`EncodedVariant::from_bytes`]. Fields are
-/// checked in logical order first, then values row by row in input order and
-/// field order, so the first failure follows the locked precedence. A
-/// declared field the batch does not supply is left to the fingerprint check.
-/// It reads the batch only and has no side effects.
+/// can skip that, and the schema fingerprint compares storage types only, not
+/// the `arrow.parquet.variant` extension. `declared` is the trusted logical
+/// declaration — a built-in's own fields, or a dynamic table's registered
+/// Iceberg schema converted to Arrow — never the supplied schema. Every
+/// supplied field first goes through [`variant_identity_matches`], so a
+/// declared Variant without the canonical extension and Variant identity on a
+/// declared non-Variant are refused at any depth before any value is read.
+/// Then every present Variant value must pass [`EncodedVariant::from_bytes`],
+/// row by row in input order and field order, so the first failure follows
+/// the locked precedence. A declared field the batch does not supply is left
+/// to the fingerprint check. It reads the batch only and has no side effects.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::UnsupportedType`] naming the top-level field when
-/// a field holding a Variant arrives without the extension or in a storage
-/// layout other than the declared one, and the catalogued Variant error
-/// (size, encoding or canonical form, numeric range, or depth, in that
-/// order) for the first stored value that fails.
+/// Variant identity differs from the declaration at any depth, and the
+/// catalogued Variant error (size, encoding or canonical form, numeric range,
+/// or depth, in that order) for the first stored value that fails.
 pub(crate) fn validate_declared_variants(
     declared: &[Field],
     batch: &RecordBatch,
 ) -> Result<(), BifrostError> {
     let schema = batch.schema();
-    let wire = |field: &Field| {
-        wyrd_queue::field_to_spec(field)
-            .ok()
-            .map(|spec| wyrd_queue::spec_to_field(&spec, false))
-    };
     let mut variant_columns = Vec::new();
     for declared in declared {
-        if !holds_variant(declared) {
-            continue;
-        }
         let Ok(index) = schema.index_of(declared.name()) else {
             continue;
         };
         let supplied = schema.field(index);
-        let matches = matches!(
-            (wire(declared), wire(supplied)),
-            (Some(declared), Some(supplied))
-                if declared.data_type() == supplied.data_type()
-                    && is_variant(&declared) == is_variant(&supplied)
-        );
-        if !matches {
+        if !variant_identity_matches(declared, supplied) {
             return Err(unsupported_variant(declared.name(), supplied.data_type()));
         }
-        variant_columns.push((declared, Arc::clone(batch.column(index))));
+        if holds_variant(declared) {
+            variant_columns.push((declared, Arc::clone(batch.column(index))));
+        }
     }
     for index in 0..batch.num_rows() {
         let row = u64::try_from(index).unwrap_or(u64::MAX);
@@ -354,6 +344,34 @@ pub(crate) fn refuse_undeclared(declared: &[Field], schema: &Schema) -> Result<(
             row: 0,
         }),
         None => Ok(()),
+    }
+}
+
+/// Report whether `supplied` carries Variant identity exactly where `declared` does.
+///
+/// A declared Variant needs the canonical extension, with empty metadata, over
+/// the declared storage struct. Any other declared field refuses the Variant
+/// extension name in any form, so a caller cannot relabel an ordinary Struct.
+/// Struct children are matched by name and a List item by position, because
+/// a registered list item is named by Iceberg rather than by the writer. A
+/// child the declaration lacks is left to the fingerprint check.
+fn variant_identity_matches(declared: &Field, supplied: &Field) -> bool {
+    if is_variant(declared) {
+        return is_variant(supplied) && supplied.data_type() == declared.data_type();
+    }
+    if supplied.extension_type_name() == Some(VariantType::NAME) {
+        return false;
+    }
+    match (declared.data_type(), supplied.data_type()) {
+        (DataType::Struct(declared), DataType::Struct(supplied)) => supplied.iter().all(|child| {
+            declared
+                .find(child.name())
+                .is_none_or(|(_, declared)| variant_identity_matches(declared, child))
+        }),
+        (DataType::List(declared), DataType::List(supplied)) => {
+            variant_identity_matches(declared, supplied)
+        }
+        _ => true,
     }
 }
 

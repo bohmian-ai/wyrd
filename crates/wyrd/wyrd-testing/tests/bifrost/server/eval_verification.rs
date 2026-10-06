@@ -1020,20 +1020,20 @@ fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) 
     let schema = Arc::new(arrow::datatypes::Schema::new(
         vala_bifrost_redux::tables::EvalObservationsTable::arrow_fields(),
     ));
-    let mut builder = wyrd_queue::BatchBuilder::new(schema);
-    builder
-        .append_json_row(
-            &json!({
+    wyrd_queue::RowPreflight::new(&schema)
+        .prepare(
+            &[json!({
                 "record_id": record,
                 "context": { "answer": "yes" },
                 "created_at": chrono::Utc::now().to_rfc3339(),
             })
-            .to_string(),
+            .to_string()],
             Some(subject),
             None,
         )
-        .expect("the observation row matches the fixed projection");
-    builder.finish_ipc().expect("the observation frame encodes")
+        .expect("the observation row matches the fixed projection")
+        .to_ipc()
+        .expect("the observation frame encodes")
 }
 
 /// Poll until at least `count` observation-enqueue transactions are blocked,
@@ -1601,21 +1601,20 @@ fn stamped_observation(
     let schema = Arc::new(arrow::datatypes::Schema::new(
         vala_bifrost_redux::tables::EvalObservationsTable::arrow_fields(),
     ));
-    let mut builder = wyrd_queue::BatchBuilder::new(schema);
-    builder
-        .append_json_row(
-            &json!({
+    let prepared = wyrd_queue::RowPreflight::new(&schema)
+        .prepare(
+            &[json!({
                 "record_id": record,
                 "context": { "marker": record },
                 "trace_id": trace,
                 "created_at": at.to_rfc3339(),
             })
-            .to_string(),
+            .to_string()],
             Some(subject),
             None,
         )
         .expect("the observation row matches the fixed projection");
-    let rows = builder.finish().expect("the observation row builds");
+    let rows = prepared.batch();
     let mut fields: Vec<arrow::datatypes::FieldRef> = rows.schema().fields().to_vec();
     fields.push(Arc::new(arrow::datatypes::Field::new(
         wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 14
+revision: 16
 status: approved
 ---
 
@@ -294,9 +294,16 @@ No fallible schema or value conversion remains after reservation.
 
 `Bifrost::write_batch(table, batch)` keeps its public signature. At the start
 of the async call it invokes the existing authoritative `describe(table)`
-operation, then normalizes only fields declared Variant in that returned
-logical schema before direct-send admission. A describe or normalization
-failure leaves queue, byte-budget, and direct-send state unchanged. No cache,
+operation, then conforms the batch to that returned logical schema before
+direct-send admission, matching row `insert`: user columns are matched by name
+and sent in declared order with their declared nullability; a missing nullable
+column is sent as nulls; a missing non-nullable column, or a null in one, is
+`WYRD_VALA_400_SCHEMA_PARSE`; a column the table
+does not declare is `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` naming it at row
+0; reserved correlation and managed columns pass through for the server to
+judge; and only fields declared Variant are normalized. A describe or
+conformance failure leaves queue, byte-budget, and direct-send state
+unchanged. No cache,
 overload, caller-supplied schema, or duplicated inference is added. The server
 accepts only the extension and repeats validation at its trust boundary.
 `wyrd-queue` owns direct Variant JSON/value preparation.
@@ -788,8 +795,15 @@ string; it is not parsed as JSON.
 
 `write_batch` in every SDK accepts, for a declared Variant column, either the
 Arrow Variant extension or a Utf8/LargeUtf8 column of JSON text, which the
-shared client converts to Variant before sending. The server wire contract
-accepts only the Variant extension for Variant columns.
+shared client converts to Variant before sending. As with row `insert`, a
+batch names its columns: their order does not matter, an omitted nullable
+column is written as nulls, a supplied column takes its declared nullability,
+an omitted required column or a null in one is refused with
+`WYRD_VALA_400_SCHEMA_PARSE`, and a column the table does not declare is
+refused with `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD`. The shared client
+applies these rules once for every SDK. The server wire contract stays exact:
+it accepts only the Variant extension for Variant columns and every declared
+column in declared order.
 
 #### REQ-015 — No silent key loss
 
@@ -805,9 +819,13 @@ field for open data.
 Registering a table with a type Iceberg cannot store (UInt64, Date64, Time32,
 second- or millisecond-precision timestamps, a timestamp with a non-UTC zone,
 or any other type the canonical schema model does not support) is refused with
-`WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at the SDK
-before any request and again at the server. SDK documentation lists exactly
-the supported types.
+`WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at every
+SDK declaration boundary capable of representing that type before any
+request, and again at the server. Rust and Python Arrow declaration boundaries
+cover every listed Arrow type. TypeScript's JSON Schema/Zod declaration
+boundary covers only forms representable by JSON Schema and does not gain a
+`TableConfig.fromArrow` surface for this requirement. SDK documentation lists
+exactly the types its public declaration formats support.
 
 ### Query
 
@@ -1123,10 +1141,15 @@ field access and decoded into native values by the typed row terminal.
 
 #### AC-005 — Refusals
 
-In each SDK, an undeclared row key, a model allowing extra keys, and each
-unsupported type of REQ-016 are refused with their exact catalog codes, and no
-row is queued for a refused write. Invalid JSON in `parse_json` returns a
-stable query error; `try_parse_json` returns null.
+In each SDK, an undeclared row key and a model allowing extra keys are refused
+with their exact catalog codes, and no row is queued for a refused write.
+Rust and Python additionally declare and refuse every Arrow type listed in
+REQ-016 before any request. TypeScript proves declaration-time refusals for
+unsupported forms expressible through its public JSON Schema/Zod boundary; it
+is not required to synthesize Arrow declarations that boundary cannot
+represent. A `write_batch` wire-type mismatch proves REQ-014 and does not
+substitute for declaration-time REQ-016 evidence. Invalid JSON in
+`parse_json` returns a stable query error; `try_parse_json` returns null.
 
 #### AC-006 — Shredding equivalence
 
@@ -1186,6 +1209,22 @@ None.
 
 ## Revision history
 
+- **Revision 16 (2026-10-06, approved):** Resolves TASK-002 repeat-review
+  `FIND-TASK-002-6` without adding the explicitly excluded TypeScript
+  `TableConfig.fromArrow`. REQ-016 and AC-005 now require exhaustive
+  unsupported-type declaration proof only at public SDK declaration boundaries
+  capable of representing those types. Rust and Python retain the full Arrow
+  matrix; TypeScript retains JSON Schema/Zod refusals, while write-time wire
+  mismatches remain REQ-014 evidence rather than a substitute for declaration
+  evidence. No runtime behavior or supported type changes.
+- **Revision 15 (2026-10-06, approved):** From TASK-002 implementation. Arrow
+  `write_batch` follows the same column rules as row `insert`: columns match by
+  name in any order and take their declared nullability, an omitted nullable
+  column is written as nulls, an omitted required column or a null in one is
+  `SCHEMA_PARSE`, and an undeclared column is
+  `UNDECLARED_FIELD`. The shared client conforms the batch in the same
+  describe-then-normalize step, so every SDK has one behavior; the server wire
+  contract is unchanged and stays exact.
 - **Revision 14 (2026-10-06, approved):** By explicit human direction, Forge
   copies rewrite lineage through without a missing/null check, as Java and
   Spark v3 rewrites do. Bifrost writes only v3 tables whose manifest lists

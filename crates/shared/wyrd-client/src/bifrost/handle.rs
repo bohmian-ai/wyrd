@@ -174,8 +174,11 @@ impl WriterPool {
     /// [`crate::bifrost::BifrostClientError::Queue`] at the public boundary.
     ///
     /// # Errors
-    /// Returns [`WyrdQueueError::QueueFull`] (code `WYRD_CLIENT_429_QUEUE_FULL`)
-    /// when the producer's bounded channel is saturated or the pool has closed.
+    /// Returns any [`wyrd_queue::RowPreflight::prepare`] refusal before
+    /// admission (reserved or undeclared key, type mismatch, unstorable
+    /// Variant), and [`WyrdQueueError::QueueFull`] (code
+    /// `WYRD_CLIENT_429_QUEUE_FULL`) when the producer's bounded channel is
+    /// saturated or the pool has closed.
     pub(crate) fn insert(
         &self,
         table: &str,
@@ -197,8 +200,9 @@ impl WriterPool {
     /// may resubmit the whole record without duplicating a prefix.
     ///
     /// # Errors
-    /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
-    /// producer channel cannot take every row now,
+    /// Returns any [`wyrd_queue::RowPreflight::prepare`] refusal of any row
+    /// before admission, [`WyrdQueueError::QueueFull`] when the pool has
+    /// closed or the producer channel cannot take every row now,
     /// [`WyrdQueueError::Backpressure`] when the producer ceiling or byte
     /// budget cannot admit them, and [`WyrdQueueError::PayloadTooLarge`] when
     /// the record has more rows than the channel can ever hold.

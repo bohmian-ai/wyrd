@@ -30,14 +30,11 @@ use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
-use parquet_variant::{
-    BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
-    VariantBuilderExt,
-};
+use parquet_variant::{ObjectFieldBuilder, Variant, VariantBuilder, VariantBuilderExt};
 use parquet_variant_compute::{VariantArray, VariantType};
 use parquet_variant_json::VariantToJson;
+use serde_json::Value;
 use serde_json::value::RawValue;
-use serde_json::{Number, Value};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
 
@@ -124,8 +121,10 @@ pub struct EncodedVariant {
 impl EncodedVariant {
     /// Encode one JSON value under the Bifrost Variant rules.
     ///
-    /// The value is walked once into a `parquet-variant` builder; depth is
-    /// checked as each container opens, and size once the encoding finishes.
+    /// The value is re-serialized and encoded by [`Self::from_json_text`], the
+    /// one JSON walker. A `serde_json` number re-serializes to its exact
+    /// integer or shortest round-trip double text, so the stored Variant is
+    /// the same as encoding the value's own JSON text.
     ///
     /// # Errors
     ///
@@ -133,11 +132,7 @@ impl EncodedVariant {
     /// limit and [`VariantViolation::TooLarge`] when the encoding exceeds the
     /// size limit.
     pub fn from_json(value: &Value) -> Result<Self, VariantViolation> {
-        let mut builder = VariantBuilder::new();
-        let mut path = JsonPointer::default();
-        append_json(&mut builder, value, &mut path, 0)?;
-        let (metadata, value) = builder.finish();
-        Self::sized(metadata, value)
+        Self::from_json_text(&value.to_string())
     }
 
     /// Parse JSON text and encode it under the Bifrost Variant rules.
@@ -535,55 +530,6 @@ fn enter_container(depth: u32, path: &JsonPointer) -> Result<u32, VariantViolati
     Ok(depth)
 }
 
-/// Append one JSON value to any Variant builder position.
-///
-/// `depth` is the number of containers already open above this value.
-///
-/// # Errors
-///
-/// Returns [`VariantViolation::TooDeep`] for a container past the limit and
-/// [`VariantViolation::NumericOutOfRange`] for an unrepresentable number.
-fn append_json(
-    builder: &mut impl VariantBuilderExt,
-    value: &Value,
-    path: &mut JsonPointer,
-    depth: u32,
-) -> Result<(), VariantViolation> {
-    match value {
-        Value::Null => builder.append_value(Variant::Null),
-        Value::Bool(flag) => builder.append_value(*flag),
-        Value::Number(number) => builder.append_value(number_variant(number, path)?),
-        Value::String(text) => builder.append_value(text.as_str()),
-        Value::Array(items) => {
-            let depth = enter_container(depth, path)?;
-            let mut list = builder.try_new_list().map_err(|_| invalid(path))?;
-            append_items(&mut list, items, path, depth)?;
-            list.finish();
-        }
-        Value::Object(entries) => {
-            let depth = enter_container(depth, path)?;
-            let mut object = builder.try_new_object().map_err(|_| invalid(path))?;
-            for (key, child) in entries {
-                path.push_key(key);
-                if child.is_null() {
-                    // A field builder would treat null as an absent key.
-                    object.insert(key, Variant::Null);
-                } else {
-                    append_json(
-                        &mut ObjectFieldBuilder::new(key, &mut object),
-                        child,
-                        path,
-                        depth,
-                    )?;
-                }
-                path.pop();
-            }
-            object.finish();
-        }
-    }
-    Ok(())
-}
-
 /// Append one validated raw JSON value to any Variant builder position.
 ///
 /// The token's first byte selects its kind; containers are split into raw
@@ -693,53 +639,11 @@ fn out_of_range(path: &JsonPointer, numeric_kind: &'static str) -> VariantViolat
     }
 }
 
-/// Append every array item to an open list builder.
-///
-/// # Errors
-///
-/// Propagates every [`append_json`] failure.
-fn append_items<S: BuilderSpecificState>(
-    list: &mut ListBuilder<'_, S>,
-    items: &[Value],
-    path: &mut JsonPointer,
-    depth: u32,
-) -> Result<(), VariantViolation> {
-    for (index, item) in items.iter().enumerate() {
-        path.push_index(index);
-        append_json(list, item, path, depth)?;
-        path.pop();
-    }
-    Ok(())
-}
-
 /// Return an invalid-JSON violation at the current pointer.
 fn invalid(path: &JsonPointer) -> VariantViolation {
     VariantViolation::InvalidJson {
         path: path.render(),
     }
-}
-
-/// Convert one JSON number under the Bifrost numeric rules.
-///
-/// # Errors
-///
-/// Returns [`VariantViolation::NumericOutOfRange`] when the number is neither
-/// a 64-bit integer, an unsigned integer a decimal holds, nor a finite double.
-fn number_variant(
-    number: &Number,
-    path: &JsonPointer,
-) -> Result<Variant<'static, 'static>, VariantViolation> {
-    if let Some(integer) = number.as_i64() {
-        return Ok(narrow_integer(integer));
-    }
-    if let Some(unsigned) = number.as_u64() {
-        return Ok(Variant::from(unsigned));
-    }
-    number
-        .as_f64()
-        .filter(|double| double.is_finite())
-        .map(Variant::from)
-        .ok_or_else(|| out_of_range(path, "double"))
 }
 
 /// Store a signed integer at the narrowest Variant integer width.

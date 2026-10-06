@@ -144,44 +144,9 @@ impl From<&BifrostClientError> for WyrdError {
                 message: detail.clone(),
                 details: serde_json::json!({}),
             },
-            BifrostClientError::Queue(inner) => queue_catalog_error(inner),
+            BifrostClientError::Queue(inner) => inner.into(),
             BifrostClientError::Client(inner) => inner.into(),
         }
-    }
-}
-
-/// Projects one client-tier queue refusal onto its catalog variant.
-///
-/// Saturation, drain, payload, and configuration refusals keep their own `WYRD_CLIENT_*`
-/// codes so a caller can retry a full queue without parsing error text; a sink
-/// failure is already a catalog error and passes through unchanged.
-fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
-    let message = error.to_string();
-    let details = serde_json::json!({});
-    match error {
-        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
-            WyrdError::ClientQueueFull { message, details }
-        }
-        WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
-        WyrdQueueError::PayloadTooLarge => WyrdError::ClientPayloadTooLarge { message, details },
-        WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
-            message,
-            details: serde_json::json!({ "field": field, "reason": reason }),
-        },
-        WyrdQueueError::SchemaParse(detail) => WyrdError::Vala {
-            error: BifrostError::SchemaParse {
-                detail: detail.clone(),
-            },
-        },
-        WyrdQueueError::ReservedColumn(column) => WyrdError::Vala {
-            error: BifrostError::ReservedColumn {
-                column: column.clone(),
-            },
-        },
-        WyrdQueueError::Variant(error) => WyrdError::Vala {
-            error: error.clone(),
-        },
-        WyrdQueueError::Sink(inner) => inner.clone(),
     }
 }
 

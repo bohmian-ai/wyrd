@@ -89,27 +89,39 @@ impl WyrdQueueError {
     }
 }
 
-impl From<WyrdQueueError> for WyrdError {
+impl From<&WyrdQueueError> for WyrdError {
     /// Map to the stable [`WyrdError`] catalog at the surface boundary.
     ///
-    /// The queue-domain codes project onto typed `WyrdError` variants via the
-    /// shared `WyrdError::from_code` reconstruction (so the client boundary
-    /// reports the real status/code); the `Sink` variant passes its already-mapped
-    /// error straight through and the `Variant` variant lifts its catalogued
-    /// Bifrost error with its details intact.
-    fn from(err: WyrdQueueError) -> Self {
-        let err = match err {
-            WyrdQueueError::Sink(inner) => return inner,
-            WyrdQueueError::Variant(inner) => return inner.into(),
-            other => other,
-        };
-        let code = err.code();
-        let message = err.to_string();
-        WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(
-            WyrdError::Internal {
+    /// Saturation, drain, payload, and configuration refusals keep their own
+    /// `WYRD_CLIENT_*` codes so a caller can retry a full queue without parsing
+    /// error text; the serialization-domain refusals become their catalogued
+    /// Bifrost error with its details, and a sink failure is already a catalog
+    /// error and passes through unchanged.
+    fn from(error: &WyrdQueueError) -> Self {
+        let message = error.to_string();
+        let details = serde_json::json!({});
+        match error {
+            WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
+                WyrdError::ClientQueueFull { message, details }
+            }
+            WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
+            WyrdQueueError::PayloadTooLarge => {
+                WyrdError::ClientPayloadTooLarge { message, details }
+            }
+            WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
                 message,
-                details: serde_json::json!({ "original_code": code }),
+                details: serde_json::json!({ "field": field, "reason": reason }),
             },
-        )
+            WyrdQueueError::SchemaParse(detail) => BifrostError::SchemaParse {
+                detail: detail.clone(),
+            }
+            .into(),
+            WyrdQueueError::ReservedColumn(column) => BifrostError::ReservedColumn {
+                column: column.clone(),
+            }
+            .into(),
+            WyrdQueueError::Variant(error) => error.clone().into(),
+            WyrdQueueError::Sink(inner) => inner.clone(),
+        }
     }
 }

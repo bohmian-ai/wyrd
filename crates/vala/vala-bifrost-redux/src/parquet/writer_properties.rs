@@ -2,9 +2,7 @@
 
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{
-    DEFAULT_MAX_ROW_GROUP_ROW_COUNT, EnabledStatistics, WriterProperties,
-};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -30,15 +28,6 @@ const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
 
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
-
-/// Bloom-filter capacity of every Bifrost Bloom column, in distinct values.
-///
-/// Each filter is sized for the most rows a row group can hold —
-/// parquet-rs's row-group row maximum, which every Bifrost recipe keeps — so
-/// a filter is never undersized for the group it describes. Parquet folds each
-/// filter down to the distinct values the group actually holds when it writes
-/// it, so a sparse group still gets a small filter at [`BLOOM_FPP`].
-const BLOOM_NDV: u64 = DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64;
 
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
@@ -127,7 +116,15 @@ pub fn bifrost_rewrite_writer_properties(
 /// Extracted so the rewrite writer cannot drift from the ingest writer: a
 /// producer that encoded differently would make an otherwise-identical file
 /// obsolete on the next selection pass for no semantic reason.
-fn recipe_builder(bloom_columns: &[String]) -> parquet::file::properties::WriterPropertiesBuilder {
+///
+/// Bloom columns set only enablement and [`BLOOM_FPP`]; parquet-rs sizes each
+/// filter's distinct-value capacity from the writer's row-group row maximum
+/// and folds it down to the values a group actually holds when it writes it.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
+fn recipe_builder(bloom_columns: &[String]) -> WriterPropertiesBuilder {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
@@ -147,8 +144,7 @@ fn recipe_builder(bloom_columns: &[String]) -> parquet::file::properties::Writer
         let path = ColumnPath::from(column.as_str());
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
-            .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
-            .set_column_bloom_filter_max_ndv(path, BLOOM_NDV);
+            .set_column_bloom_filter_fpp(path, BLOOM_FPP);
     }
 
     builder
@@ -156,6 +152,8 @@ fn recipe_builder(bloom_columns: &[String]) -> parquet::file::properties::Writer
 
 #[cfg(test)]
 mod tests {
+    use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
+
     use super::*;
 
     /// The canonical union a traces table resolves: managed floor plus the
@@ -207,6 +205,13 @@ mod tests {
         );
     }
 
+    /// Every recipe setting resolves to its fixed value, including Bloom
+    /// filters sized natively from the row-group row maximum.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compression, sizing, encoding, statistics, or Bloom
+    /// setting drifts.
     #[test]
     fn writer_recipe_metadata_is_deterministic() {
         let bloom_columns = declared_recipe();
@@ -254,7 +259,10 @@ mod tests {
                 .bloom_filter_properties(&ColumnPath::from(column.as_str()))
                 .expect("allowlisted column has a bloom filter");
             assert!((properties_for_column.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
-            assert_eq!(properties_for_column.ndv(), BLOOM_NDV);
+            assert_eq!(
+                properties_for_column.ndv(),
+                DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64
+            );
         }
 
         for column in ["message", "payload", "value"] {

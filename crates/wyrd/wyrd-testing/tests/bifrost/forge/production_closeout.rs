@@ -213,11 +213,15 @@ impl CloseoutJourney {
     /// Panics if the real role graph cannot start or its observer is absent.
     async fn start_with_config(config: ForgeConfig) -> Self {
         let profile = GeometryProfile::selected();
-        let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
-            vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
-                .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
-                .expect("the selected staging target is a valid geometry"),
-        );
+        // The one worker drains only the journey's tables, so the tenant's audit
+        // table cannot take a slot a geometry or competing-table plan is owed.
+        let mut spec = BifrostClusterSpec::dedicated_forge_workers()
+            .with_scribe_geometry_for_test(
+                vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
+                    .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
+                    .expect("the selected staging target is a valid geometry"),
+            )
+            .without_audit_publication_for_test();
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
@@ -1379,9 +1383,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         journey.snapshot_count(&table.binding).await - published_before,
         "every snapshot the rewrite passes published carries its own operation"
     );
-    // Audited reads above keep publishing retained audit, so the coordinator
-    // can plan and start audit-log maintenance after the last drain. Ownership
-    // is therefore judged once every role has drained, when every attempt
+    // Ownership is judged once every role has drained, when every attempt
     // guard must have returned its increment.
     let telemetry = journey.cluster.telemetry().clone();
     journey.cluster.shutdown().await.expect("all roles drain");
@@ -2708,7 +2710,8 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
 #[tokio::test]
 #[ignore = "requires Postgres and two replicas"]
 async fn restart_recovers_hot_promotion_with_empty_schedule() {
-    let mut spec = BifrostClusterSpec::two_mixed();
+    // The tenant's audit table would otherwise join the recovered membership.
+    let mut spec = BifrostClusterSpec::two_mixed().without_audit_publication_for_test();
     spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
     let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
     let mut journey = LeaderJourney::start(spec, false).await;

@@ -221,11 +221,12 @@ opendal = { version = "0.57", default-features = false, features = [
 # byte ceiling. Pinned: the cache manages its own byte accounting against this
 # map's ordering, so a silent ordering or capacity change would alter eviction.
 lru = "=0.12.5"
-# =55.0.0 matches the managed iceberg-rust arrow-59.2 line. The four iceberg
+# =55.1.0 matches the managed iceberg-rust arrow-59 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
-# single native universe (no moving branch, no duplicate Arrow/Parquet package).
-datafusion = "=55.0.0"
-datafusion-proto = "=55.0.0"
+# single native universe (no moving branch, no duplicate Arrow/Parquet package);
+# `[patch.crates-io]` below pins the DataFusion crates to the Wyrd fork.
+datafusion = "=55.1.0"
+datafusion-proto = "=55.1.0"
 parquet = "59.2"
 # Arrow-rs Variant model, kernels, and JSON conversion; same release line as `parquet`.
 parquet-variant = "59.3"
@@ -249,6 +250,21 @@ iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compact
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
 datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "4cfa166d233207ee188a277a7849bee7d9dfd2de" }
+
+# One tested revision of the Wyrd DataFusion fork (v55.1.0 plus nested-field
+# access, UDF input requirements, nested statistics pruning, and the per-file
+# Parquet read planner) replaces these crates for every consumer, including the
+# iceberg, compaction, and distributed git dependencies.
+[patch.crates-io]
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "7e2951aa27ad562860b2be2cf286e8b9dc548370" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

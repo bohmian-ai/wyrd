@@ -352,10 +352,9 @@ where
     if !state.bifrost.serves_api() {
         return Ok(router);
     }
-    let bifrost = Arc::clone(&state.bifrost);
-    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost));
-    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost));
-    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost));
+    let traces = otlp::TraceOtlpGrpcService::new(state);
+    let metrics = otlp::MetricsOtlpGrpcService::new(state);
+    let logs = otlp::LogsOtlpGrpcService::new(state);
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state.bifrost.transport_admission();
     Ok(router

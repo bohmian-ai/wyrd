@@ -777,7 +777,7 @@ mod pg_tests {
         let principal_id = row.0;
         conn.commit().await.expect("principal lookup commits");
         let key = WyrdApiKey::generate(tenant);
-        let key_hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let key_hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         let created_by = insert_creator_user(fixture, tenant)
             .await
             .expect("creator user inserts");

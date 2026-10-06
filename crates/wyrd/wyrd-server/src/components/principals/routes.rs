@@ -172,9 +172,7 @@ async fn require_principal(
 /// has already established, in this same transaction, that the principal
 /// exists in the tenant — creation by inserting it, issuance through
 /// [`require_principal`] — so a credential is never written against an absent
-/// or foreign id. Argon2 hashing is handed to a blocking thread because it is deliberately
-/// expensive and would otherwise stall the request executor. Only the hash is
-/// inserted; the plaintext is returned to the caller once and never stored.
+/// or foreign id. Only the SHA-256 verifier is inserted; the plaintext is returned to the caller once and never stored.
 ///
 /// The insert joins the caller's transaction rather than committing on its
 /// own, so a later failure in the same request rolls the credential back with
@@ -188,11 +186,7 @@ async fn mint_credential(
     created_by: Uuid,
 ) -> Result<IssuedCredential, WyrdErrorResponse> {
     let plaintext = WyrdApiKey::generate(conn.data_tenant_id());
-    let raw = plaintext.secret.clone();
-    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
     let credential_id = Uuid::now_v7();
     insert_api_key(
         conn,

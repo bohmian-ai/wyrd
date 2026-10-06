@@ -4,7 +4,6 @@ use chrono::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use vala_sql::audit_outbox::AuditOutbox;
-use wyrd_auth_issue::{self, IssueError};
 use wyrd_runtime::{Permission, Principal, PrincipalId};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, SecretBearer};
@@ -62,12 +61,6 @@ pub enum IssueKeyError {
         /// Supplied card kind.
         card_kind: CardKind,
     },
-    /// Argon2 hash failed.
-    #[error("api key hash failed")]
-    Hash(#[from] IssueError),
-    /// Blocking task failed.
-    #[error("api key hash task failed")]
-    Join(#[from] tokio::task::JoinError),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -107,9 +100,7 @@ impl IssueApiKey {
         let api_key_id = Uuid::new_v4();
         let plaintext = WyrdApiKey::generate(conn.data_tenant_id());
         let prefix = plaintext.prefix.clone();
-        let raw = plaintext.secret.clone();
-        let key_hash =
-            tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw)).await??;
+        let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
         let ttl = request
             .expires_in_seconds
             .and_then(|seconds| Duration::try_seconds(i64::from(seconds)))
@@ -258,12 +249,10 @@ impl From<IssueKeyError> for WyrdError {
                     details: serde_json::json!({ "card_kind": card_kind.wire_name() }),
                 }
             }
-            IssueKeyError::Hash(_) | IssueKeyError::Join(_) | IssueKeyError::Database(_) => {
-                WyrdError::Internal {
-                    message: "failed to issue API key".to_owned(),
-                    details: serde_json::json!({}),
-                }
-            }
+            IssueKeyError::Database(_) => WyrdError::Internal {
+                message: "failed to issue API key".to_owned(),
+                details: serde_json::json!({}),
+            },
         }
     }
 }
@@ -318,14 +307,6 @@ mod tests {
         let error = principal_kind_for_card(&card_ref(CardKind::Model)).expect_err("rejected");
 
         assert!(error.to_string().contains("non-human principal"));
-    }
-
-    #[test]
-    fn hash_runs_on_blocking_pool() {
-        let source = include_str!("issue_api_key.rs");
-
-        assert!(source.contains("tokio::task::spawn_blocking"));
-        assert!(source.contains("wyrd_auth_issue::hash_api_key"));
     }
 
     fn card_ref(kind: CardKind) -> CardRef {

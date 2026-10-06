@@ -661,11 +661,12 @@ token is accepted only on the Bifrost ingest and query surfaces.
 
 OTLP is the one exception to exchange-first. A stock OpenTelemetry exporter
 carries static headers and cannot renew a token, so the OTLP/HTTP and OTLP/gRPC
-endpoints also accept the API key itself in an `x-wyrd-api-key` header. The
-server runs the same API-key grant `/auth/token` serves on **every** such
-request, before any payload is decoded, and the minted token yields the same
-principal, permissions, audit decision, limits, and tenant scope a bearer
-caller gets; a revoked key fails at its next export. `x-wyrd-access-token`
+endpoints also accept the API key itself in an `x-wyrd-api-key` header. On
+**every** such request, before any payload is decoded, the server verifies the
+key exactly as the `/auth/token` API-key grant does and resolves the principal,
+permissions, and tenant scope that grant's token would carry, without minting
+or signing one; the request then runs under the same authorization, audit,
+and limits as a bearer caller. A revoked key fails at its next export. `x-wyrd-access-token`
 remains valid on OTLP, and no other route accepts `x-wyrd-api-key`. An exporter
 is configured only with standard settings, for example
 `OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`; no SDK exporter helper exists.

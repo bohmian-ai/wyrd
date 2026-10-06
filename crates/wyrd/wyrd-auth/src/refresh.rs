@@ -24,8 +24,8 @@ use wyrd_sql::queries::auth::{
 };
 
 use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, auth_event, principal_kind_tag};
-use crate::exchange_api_key::token_hash;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantTokenIssuer};
+use wyrd_auth_issue::hash_secret;
 
 /// Refresh-token grant service.
 ///
@@ -139,7 +139,7 @@ impl RefreshTokens {
         client: OAuthClientId,
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
-        let hash = token_hash(presented.expose_secret());
+        let hash = hash_secret(presented.expose_secret());
         let Some(stored) = refresh_by_hash(conn, &hash).await? else {
             tracing::debug!("refresh token not found for presented hash");
             return Err(RefreshError::NotFound);
@@ -302,7 +302,6 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use secrecy::{ExposeSecret, SecretString};
-    use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::{IssueError, IssuingKey};
     use wyrd_auth_verify::{AccessTokenClaims, Kid, public_key_from_pem, verify_eddsa};
@@ -370,10 +369,6 @@ mod pg_tests {
             space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
-    }
-
-    fn hash_of(token: &SecretString) -> String {
-        format!("{:x}", Sha256::digest(token.expose_secret().as_bytes()))
     }
 
     fn issue_refresh_jwt(
@@ -488,7 +483,7 @@ mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
         let binding = seed_active_human_connection(&mut conn)
             .await
@@ -504,7 +499,13 @@ mod pg_tests {
             .await
             .expect("rotation succeeds");
 
-        let new_hash = hash_of(exchanged.refresh_token.as_ref().expect("refresh token"));
+        let new_hash = wyrd_auth_issue::hash_secret(
+            exchanged
+                .refresh_token
+                .as_ref()
+                .expect("refresh token")
+                .expose_secret(),
+        );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
             .expect("lookup")
@@ -534,7 +535,7 @@ mod pg_tests {
             Uuid::new_v4(),
             "user",
             user_id,
-            &hash_of(&unbound_jwt),
+            &wyrd_auth_issue::hash_secret(unbound_jwt.expose_secret()),
             Utc::now() + Duration::days(30),
         )
         .await
@@ -556,7 +557,13 @@ mod pg_tests {
         );
 
         let bound_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        seed_active_refresh(&mut conn, "user", user_id, &hash_of(&bound_jwt)).await;
+        seed_active_refresh(
+            &mut conn,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(bound_jwt.expose_secret()),
+        )
+        .await;
         sqlx::query("UPDATE wyrd.auth_human_connections SET state = 'Inactive'")
             .execute(&mut **conn.transaction())
             .await
@@ -597,7 +604,7 @@ mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
 
         let result = refresh_service(&audit)
@@ -620,11 +627,12 @@ mod pg_tests {
         assert_eq!(old_row.revoked_reason.as_deref(), Some("rotated"));
 
         // New row exists and links back via rotated_from.
-        let new_hash = hash_of(
+        let new_hash = wyrd_auth_issue::hash_secret(
             exchanged
                 .refresh_token
                 .as_ref()
-                .expect("rotation issues a refresh token"),
+                .expect("rotation issues a refresh token")
+                .expose_secret(),
         );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
@@ -683,8 +691,13 @@ mod pg_tests {
             .expect("connection seeds");
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let replayed =
-            seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
+        let replayed = seed_active_refresh(
+            &mut conn,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret()),
+        )
+        .await;
         sqlx::query(
             "UPDATE wyrd.auth_refresh_tokens
                 SET revoked_at = now(), revoked_reason = 'rotated'
@@ -763,7 +776,7 @@ mod pg_tests {
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
 
@@ -791,11 +804,12 @@ mod pg_tests {
         // The successor token from conn_a's rotation should also be revoked
         // by the family revoke triggered by reuse detection.
         let exchanged_a = result_a.unwrap();
-        let successor_hash = hash_of(
+        let successor_hash = wyrd_auth_issue::hash_secret(
             exchanged_a
                 .refresh_token
                 .as_ref()
-                .expect("rotation issues a refresh token"),
+                .expect("rotation issues a refresh token")
+                .expose_secret(),
         );
         let successor = refresh_by_hash(&mut conn_b, &successor_hash)
             .await
@@ -864,7 +878,13 @@ mod pg_tests {
         ];
         for (case, reason) in cases {
             let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-            let id = seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
+            let id = seed_active_refresh(
+                &mut conn,
+                "user",
+                user_id,
+                &wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret()),
+            )
+            .await;
             sqlx::query(
                 "UPDATE wyrd.auth_refresh_tokens
                     SET expires_at = CASE WHEN $2::text IS NULL
@@ -996,7 +1016,7 @@ mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
         let consumed = refresh_by_hash(&mut conn, &hash)
             .await
@@ -1073,7 +1093,7 @@ mod pg_tests {
         );
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
 
         let exchanged = refresh_service(&audit)
@@ -1127,7 +1147,7 @@ mod pg_tests {
         let mut setup_conn = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         let consumed_id =
             seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
@@ -1147,7 +1167,7 @@ mod pg_tests {
         let successor = rotated
             .refresh_token
             .expect("rotation issues a refresh token");
-        let successor_hash = hash_of(&successor);
+        let successor_hash = wyrd_auth_issue::hash_secret(successor.expose_secret());
 
         // The replay. The route commits this transaction for `Reused` alone.
         let mut conn_b = fixture.tenant_conn().await.expect("conn_b opens");
@@ -1253,8 +1273,13 @@ mod pg_tests {
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup, tenant).await;
         let ancestor = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let ancestor_id =
-            seed_active_refresh(&mut setup, "user", user_id, &hash_of(&ancestor)).await;
+        let ancestor_id = seed_active_refresh(
+            &mut setup,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(ancestor.expose_secret()),
+        )
+        .await;
         let current = service
             .execute(
                 &mut setup,
@@ -1306,10 +1331,13 @@ mod pg_tests {
         replaying.commit().await.expect("the route commits Reused");
 
         let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
-        let successor_row = refresh_by_hash(&mut fresh, &hash_of(&successor))
-            .await
-            .expect("lookup")
-            .expect("C exists");
+        let successor_row = refresh_by_hash(
+            &mut fresh,
+            &wyrd_auth_issue::hash_secret(successor.expose_secret()),
+        )
+        .await
+        .expect("lookup")
+        .expect("C exists");
         assert_eq!(
             successor_row.revoked_reason.as_deref(),
             Some("reuse_detected"),
@@ -1419,7 +1447,13 @@ mod pg_tests {
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup, tenant).await;
         let current = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        seed_active_refresh(&mut setup, "user", user_id, &hash_of(&current)).await;
+        seed_active_refresh(
+            &mut setup,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(current.expose_secret()),
+        )
+        .await;
         setup.commit().await.expect("setup commits");
 
         // The legitimate rotation of B, held open with C written.
@@ -1499,7 +1533,7 @@ mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
 
         let result = refresh_service(&audit)

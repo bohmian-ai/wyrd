@@ -18,6 +18,10 @@ use crate::http::error::WyrdErrorResponse;
 pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
     HeaderName::from_static("x-wyrd-access-token");
 
+/// Header a stock OTLP exporter sends its Wyrd API key in. Only the OTLP
+/// routes, HTTP and gRPC, accept it.
+pub(crate) const WYRD_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-wyrd-api-key");
+
 pub(crate) fn extract_wyrd_access_token(
     headers: &HeaderMap,
 ) -> Result<SecretString, WyrdErrorResponse> {

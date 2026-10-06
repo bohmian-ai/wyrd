@@ -19,7 +19,7 @@ use serde_json::json;
 use uuid::Uuid;
 use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
-use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
+use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::auth::{
     ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
@@ -43,8 +43,9 @@ use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
     resolve_card_ref_scope, stage_scope_mint_success_audit,
 };
-use crate::error::store_error;
-use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
+use crate::error::{auth_error_to_wyrd, store_error};
+use crate::exchange_api_key::{principal_kind_wire, role_refs};
+use wyrd_auth_issue::hash_secret;
 
 /// Absolute lifetime of a `wyrd-ui` session: its refresh token does not
 /// rotate (RFC 9700 §4.14.2 applies rotation to public clients only), so the
@@ -428,6 +429,97 @@ impl TenantTokenIssuer {
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         let tenant = conn.data_tenant_id();
+        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let expires_at = Utc::now() + self.settings.access_ttl;
+        let scope_mint = grant
+            .scope_mint_kind()
+            .zip(principal.card_ref.clone())
+            .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
+        let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
+        let access_token = self
+            .issuing_key
+            .issue_access_token(
+                grant.into_access_grant(principal, roles, permissions),
+                self.settings.access_ttl,
+            )
+            .map_err(|error| match &scope_mint {
+                Some((_, root, _)) => match issue_scope_error(error, root) {
+                    IssueErrorOrWyrd::Issue(error) => IssuanceError::Issue(error),
+                    IssueErrorOrWyrd::Wyrd(error) => IssuanceError::Wyrd(error),
+                },
+                None => IssuanceError::Issue(error),
+            })?;
+
+        // Two decisions, two records. The exchange says a grant was spent to
+        // obtain a token and which credential; the scope mint says what emit
+        // authority the Card conferred.
+        self.audit.stage(tenant, event);
+        if let Some((mint_kind, root, scope)) = scope_mint {
+            stage_scope_mint_success_audit(
+                &self.audit,
+                tenant,
+                principal_id,
+                &root,
+                &scope,
+                request_id,
+                mint_kind,
+            );
+        }
+
+        Ok(ExchangedToken {
+            access_token: SecretString::from(access_token),
+            refresh_token: None,
+            token_type: TokenType::Bearer,
+            expires_at,
+        })
+    }
+
+    /// Resolve the authority a tenant credential confers on `principal_id`,
+    /// without minting a token.
+    ///
+    /// The per-request form of [`Self::issue`]: a caller that authenticates a
+    /// durable credential on every request gets the [`VerifiedToken`] the
+    /// exchanged token would have yielded, built from the same resolution and
+    /// claim shaping, with the same owner-activity side effect. Nothing is
+    /// signed, so no token-exchange or scope-mint audit is staged; the
+    /// request's own permission checks record its decisions.
+    ///
+    /// # Errors
+    /// Every [`Self::issue`] error except an encoded-size refusal, plus
+    /// [`IssuanceError::Wyrd`] when the shaped claims do not convert into a
+    /// verified token.
+    #[tracing::instrument(level = "debug", skip(self, conn, grant), fields(principal_id = %principal_id), err)]
+    pub async fn verify(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+        grant: TenantGrant,
+    ) -> Result<VerifiedToken, IssuanceError> {
+        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let claims = self.issuing_key.access_claims(
+            grant.into_access_grant(principal, roles, permissions),
+            self.settings.access_ttl,
+        )?;
+        Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
+    }
+
+    /// Resolve the principal `grant` issues for, with its current roles and
+    /// permissions.
+    ///
+    /// Refuses a tenant that does not admit credentials and a principal that
+    /// is missing or not active, resolves a Card-bound principal's Card scope,
+    /// and records owner activity when the grant is a Card-bound machine's own
+    /// durable credential.
+    ///
+    /// # Errors
+    /// As [`Self::issue`], less the signing errors.
+    async fn resolve(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+        grant: &TenantGrant,
+    ) -> Result<(TokenPrincipalRef, Vec<RoleRef>, PermissionSet), IssuanceError> {
+        let tenant = conn.data_tenant_id();
         if !tenant_admits_credentials(conn, tenant).await? {
             return Err(IssuanceError::TenantNotAdmitting);
         }
@@ -472,48 +564,7 @@ impl TenantTokenIssuer {
         if grant.records_owner_activity() && principal.card_ref.is_some() {
             record_machine_authentication(conn, principal.id).await?;
         }
-        let expires_at = Utc::now() + self.settings.access_ttl;
-        let scope_mint = grant
-            .scope_mint_kind()
-            .zip(principal.card_ref.clone())
-            .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
-        let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
-        let access_token = self
-            .issuing_key
-            .issue_access_token(
-                grant.into_access_grant(principal, roles, permissions),
-                self.settings.access_ttl,
-            )
-            .map_err(|error| match &scope_mint {
-                Some((_, root, _)) => match issue_scope_error(error, root) {
-                    IssueErrorOrWyrd::Issue(error) => IssuanceError::Issue(error),
-                    IssueErrorOrWyrd::Wyrd(error) => IssuanceError::Wyrd(error),
-                },
-                None => IssuanceError::Issue(error),
-            })?;
-
-        // Two decisions, two records. The exchange says a grant was spent to
-        // obtain a token and which credential; the scope mint says what emit
-        // authority the Card conferred.
-        self.audit.stage(tenant, event);
-        if let Some((mint_kind, root, scope)) = scope_mint {
-            stage_scope_mint_success_audit(
-                &self.audit,
-                tenant,
-                principal_id,
-                &root,
-                &scope,
-                request_id,
-                mint_kind,
-            );
-        }
-
-        Ok(ExchangedToken {
-            access_token: SecretString::from(access_token),
-            refresh_token: None,
-            token_type: TokenType::Bearer,
-            expires_at,
-        })
+        Ok((principal, roles, permissions))
     }
 
     /// Establish or renew a human session: an access token from
@@ -571,7 +622,7 @@ impl TenantTokenIssuer {
             conn,
             Uuid::new_v4(),
             principal_id,
-            &token_hash(&refresh_token),
+            &hash_secret(&refresh_token),
             issued_at + lifetime,
             rotated_from,
             session,

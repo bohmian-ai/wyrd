@@ -12,20 +12,20 @@ use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::callback::{AuthorizationCodeExchange, LoginCompletion};
-use wyrd_auth_verify::AccessTokenClaims;
+use wyrd_auth_verify::{AccessTokenClaims, VerifiedToken};
 use wyrd_spec::auth::{
     CallbackQuery, ExchangeTokenType, IssueKeyRequest, OAuthClientId, OAuthErrorCode,
     OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::TenantConn;
 
 use crate::auth::authorize::{client_redirect, error_name};
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
     MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, stage_scope_mint_failure_audit,
 };
-use crate::auth::credential_verify::verify_presented;
 use crate::auth::exchange_api_key::{
     DelegateToken, ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd,
 };
@@ -35,7 +35,6 @@ use crate::auth::oauth::{ClientForm, GRANT_TYPES, OAuthError, OAuthForm, no_stor
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
-use crate::http::error::internal_failure;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -190,14 +189,17 @@ async fn token(
 
 /// The tenant grants of one token-endpoint request, over the server's auth
 /// configuration and the request's id.
-struct TokenGrants<'a> {
+///
+/// OTLP ingest authenticates a stock exporter's API key through the same
+/// API-key verification, so it is crate-visible.
+pub(crate) struct TokenGrants<'a> {
     /// Server state holding the auth owners and the runtime store.
-    state: &'a AppState,
+    pub(crate) state: &'a AppState,
     /// The request id every audit event of the grant carries.
-    request_id: &'a str,
+    pub(crate) request_id: &'a str,
 }
 
-impl TokenGrants<'_> {
+impl<'a> TokenGrants<'a> {
     /// Redeem an authorization code issued to `client` (RFC 6749 §4.1.3).
     ///
     /// # Errors
@@ -225,12 +227,8 @@ impl TokenGrants<'_> {
 
     /// Exchange a Wyrd API key for an access token of its own principal.
     ///
-    /// A key that does not parse names no tenant, so there is no connection
-    /// to reach and no row to verify against — and returning for free is
-    /// exactly what would make a malformed key distinguishable by clock from
-    /// a live prefix with a wrong tail. One verification against the fixed
-    /// dummy costs what the real comparison costs, and the refusal is the
-    /// same one every invalid key earns.
+    /// A key that does not parse names no tenant, so it is refused with the
+    /// same error every invalid key earns.
     ///
     /// # Errors
     /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, its
@@ -238,20 +236,8 @@ impl TokenGrants<'_> {
     /// or issuance error.
     async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
         let presented = SecretString::from(api_key.expose().to_owned());
-        let Ok(parsed) = WyrdApiKey::parse(api_key.expose()) else {
-            verify_presented(&presented, None)
-                .await
-                .map_err(|error| internal_failure("api key verification failed", &error))?;
-            return Err(api_key_invalid());
-        };
-        let issuer = self.issuer()?;
-        let mut conn = self
-            .state
-            .postgres
-            .tenant_conn(parsed.tenant_id)
-            .await
-            .map_err(store_unavailable)?;
-        let exchanged = match (ExchangeApiKey { issuer })
+        let (parsed, mut conn, exchange) = self.api_key_exchange(api_key.expose()).await?;
+        let exchanged = match exchange
             .execute(&mut conn, presented, self.request_id)
             .await
         {
@@ -270,6 +256,57 @@ impl TokenGrants<'_> {
         };
         conn.commit().await.map_err(store_unavailable)?;
         Ok(exchanged.into_exchange_response())
+    }
+
+    /// Authenticate one OTLP request by the API key its exporter sent, without
+    /// minting a token.
+    ///
+    /// The same key verification as [`Self::api_key`], committed with the
+    /// key's use record, yielding the verified principal the exchanged token
+    /// would carry. Nothing is staged on the audit outbox: like a bearer
+    /// request, the request's own authorization decisions are the audit.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, and a
+    /// store or issuance error.
+    pub(crate) async fn api_key_principal(
+        &self,
+        api_key: &SecretString,
+    ) -> Result<VerifiedToken, WyrdError> {
+        let (parsed, mut conn, exchange) = self.api_key_exchange(api_key.expose_secret()).await?;
+        let verified = match exchange.authenticate(&mut conn, api_key).await {
+            Ok(verified) => verified,
+            Err(error) => {
+                return Err(map_exchange_error_to_wyrd(&mut conn, &parsed.prefix, error).await);
+            }
+        };
+        conn.commit().await.map_err(store_unavailable)?;
+        Ok(verified)
+    }
+
+    /// Parse a presented API key and open its tenant's transaction, with the
+    /// API-key exchange bound to this server's issuer.
+    ///
+    /// A key that does not parse names no tenant, so it is refused before any
+    /// store access with the error every invalid key earns.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::ApiKeyInvalid`] for an unparseable key, the
+    /// not-configured error when no issuer is configured, and the
+    /// store-unavailable error when the transaction cannot open.
+    async fn api_key_exchange(
+        &self,
+        api_key: &str,
+    ) -> Result<(WyrdApiKey, TenantConn<'a>, ExchangeApiKey), WyrdError> {
+        let parsed = WyrdApiKey::parse(api_key).map_err(|_| api_key_invalid())?;
+        let issuer = self.issuer()?;
+        let conn = self
+            .state
+            .postgres
+            .tenant_conn(parsed.tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        Ok((parsed, conn, ExchangeApiKey { issuer }))
     }
 
     /// Run an RFC 8693 delegation: the holder of `actor_token` acts for the

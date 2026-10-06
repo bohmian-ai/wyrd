@@ -5,7 +5,6 @@
 
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use wyrd_auth_verify::{
     ActClaim, AuthError, TokenAudience, TokenPrincipalRef, TokenVerifier, VerifiedToken,
 };
@@ -21,10 +20,10 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
-use crate::credential_verify::verify_presented;
 use crate::error::auth_error_to_wyrd;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::WyrdApiKey;
+use wyrd_auth_issue::secret_matches;
 
 /// API-key exchange service.
 #[derive(Clone, Debug)]
@@ -71,12 +70,9 @@ pub enum ExchangeError {
     /// principal or an unknown key.
     #[error("tenant does not admit credentials")]
     TenantNotAdmitting,
-    /// Key exists but Argon2 hash verification failed.
+    /// Key exists but its secret does not match the stored verifier.
     #[error("api key hash mismatch")]
     HashMismatch,
-    /// Blocking task failed.
-    #[error("api key verify task failed")]
-    Join(#[from] tokio::task::JoinError),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -152,9 +148,9 @@ impl ExchangeApiKey {
     /// Exchange a Wyrd API key for a tenant access token.
     ///
     /// Verifies the key itself — format, tenant, an unexpired unrevoked row
-    /// for its prefix, and the Argon2 secret — at a fixed cost, records the
-    /// key's use, then mints through the shared issuance workflow, which
-    /// refuses an inactive tenant or principal and resolves current grants.
+    /// for its prefix, and the SHA-256 verifier — records the key's use, then
+    /// mints through the shared issuance workflow, which refuses an inactive
+    /// tenant or principal and resolves current grants.
     ///
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
@@ -180,50 +176,61 @@ impl ExchangeApiKey {
             )
             .await?)
     }
+
+    /// Authenticate one request by a Wyrd API key, without minting a token.
+    ///
+    /// The same key verification and use record as [`Self::execute`], then
+    /// [`TenantTokenIssuer::verify`]: the request runs as the principal the
+    /// exchanged token would name, with the authority it would carry. For
+    /// stock exporters that send a static key header on every request.
+    ///
+    /// # Errors
+    /// As [`Self::execute`].
+    #[tracing::instrument(level = "debug", skip(self, conn, api_key), err)]
+    pub async fn authenticate(
+        &self,
+        conn: &mut TenantConn<'_>,
+        api_key: &SecretString,
+    ) -> Result<VerifiedToken, ExchangeError> {
+        let row = verify_api_key(conn, api_key).await?;
+        touch_api_key_last_used(conn, row.api_key_id).await?;
+        Ok(self
+            .issuer
+            .verify(
+                conn,
+                row.principal_id,
+                TenantGrant::ApiKey {
+                    credential_id: row.api_key_id,
+                },
+            )
+            .await?)
+    }
 }
 
-/// Verify a presented tenant API key at a fixed cost and return its row.
+/// Verify a presented tenant API key and return its row.
 ///
 /// Shared by the API-key exchange and the tenant connection recovery-key
-/// check, so both refuse identically. Every refusal is decided first and
-/// answered last, because Argon2 is what a refusal costs: a malformed key,
-/// another tenant's key, or an unknown prefix must not return before
-/// verification runs, or a live prefix with a wrong tail would take measurably
-/// longer than any of them — enough to enumerate live prefixes by clock.
+/// check, so both refuse identically: the key must parse, name this
+/// connection's tenant, match an unexpired unrevoked row by prefix, and match
+/// that row's SHA-256 verifier in constant time.
 ///
 /// # Errors
 /// Returns [`ExchangeError::NotFound`] for a malformed key or unknown prefix,
 /// [`ExchangeError::CrossTenant`] for another tenant's key,
 /// [`ExchangeError::HashMismatch`] when the secret does not verify,
-/// [`ExchangeError::Database`] when the lookup fails, and
-/// [`ExchangeError::Join`] when the verification task fails.
-///
-/// # Panics
-/// Panics only if the refusal bookkeeping below is ever changed so that an
-/// absent credential row leaves no refusal — the invariant the `expect` names.
+/// and [`ExchangeError::Database`] when the lookup fails.
 pub(crate) async fn verify_api_key(
     conn: &mut TenantConn<'_>,
     api_key: &SecretString,
 ) -> Result<ApiKeyLookupRow, ExchangeError> {
-    let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
-        Err(_) => (None, Some(ExchangeError::NotFound)),
-        Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
-            (None, Some(ExchangeError::CrossTenant))
-        }
-        Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
-            None => (None, Some(ExchangeError::NotFound)),
-            Some(row) => (Some(row), None),
-        },
-    };
-
-    let matched = verify_presented(api_key, row.as_ref().map(|row| row.key_hash.as_str()))
-        .await
-        .map_err(ExchangeError::Join)?;
-    if let Some(refusal) = refusal {
-        return Err(refusal);
+    let parsed = WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::NotFound)?;
+    if parsed.tenant_id != conn.data_tenant_id() {
+        return Err(ExchangeError::CrossTenant);
     }
-    let row = row.expect("invariant: a refusal was recorded for every absent row");
-    if !matched {
+    let row = api_key_by_prefix(conn, &parsed.prefix)
+        .await?
+        .ok_or(ExchangeError::NotFound)?;
+    if !secret_matches(api_key.expose_secret(), &row.key_hash) {
         return Err(ExchangeError::HashMismatch);
     }
     Ok(row)
@@ -414,12 +421,6 @@ fn act_from_chain(
     })
 }
 
-/// Hash a bearer secret for storage lookup and comparison.
-#[must_use]
-pub(crate) fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
-}
-
 /// Disambiguate `ExchangeError::NotFound` by checking API-key lifecycle status.
 pub(crate) async fn resolve_not_found_reason(
     conn: &mut TenantConn<'_>,
@@ -481,12 +482,6 @@ pub async fn map_exchange_error_to_wyrd(
         // the log line: an operator still needs to know whether a key was
         // revoked or expired.
         ExchangeError::NotFound => resolve_not_found_reason(conn, prefix).await,
-        ExchangeError::Join(_) => {
-            return WyrdError::Internal {
-                message: "failed to exchange API key".to_owned(),
-                details: json!({}),
-            };
-        }
         ExchangeError::Issuance(error) => return error.into(),
         ExchangeError::Database(_) => {
             return WyrdError::AuthVerifyUnavailable {
@@ -551,7 +546,7 @@ pub(crate) mod pg_tests {
     use crate::audit::{CARD_SCOPE_MINT_OPERATION, TOKEN_EXCHANGE_OPERATION};
 
     use chrono::{Duration, Utc};
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use serde_json::Value as JsonValue;
     use sqlx::types::Json;
     use uuid::Uuid;
@@ -577,7 +572,6 @@ pub(crate) mod pg_tests {
     use wyrd_sql::TenantConn;
 
     use crate::audit::test_outbox::{assert_retrying, drain, outbox};
-    use crate::credential_verify;
     use vala_sql::audit_outbox::AuditOutbox;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
 
@@ -800,14 +794,6 @@ pub(crate) mod pg_tests {
     }
 
     #[test]
-    fn argon2_runs_on_blocking_pool() {
-        let source = include_str!("exchange_api_key.rs");
-
-        assert!(source.contains("tokio::task::spawn_blocking"));
-        assert!(source.contains("wyrd_auth_issue::verify_api_key"));
-    }
-
-    #[test]
     fn act_from_chain_roundtrip() {
         use wyrd_runtime::{
             DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
@@ -879,7 +865,7 @@ pub(crate) mod pg_tests {
     /// Seed a live API key for `principal_id` in `conn`'s open transaction and
     /// return its row id and presentable secret.
     ///
-    /// Generates a tenant-bound key, stores its Argon2 hash and prefix in
+    /// Generates a tenant-bound key, stores its SHA-256 verifier and prefix in
     /// `wyrd.auth_api_keys` with a one-day expiry, and writes nothing else; the
     /// caller commits. The row id is what a grant record and the browser
     /// session tests' key-use reads must name, so callers need it rather than a
@@ -894,7 +880,7 @@ pub(crate) mod pg_tests {
         created_by: Uuid,
     ) -> (Uuid, SecretString) {
         let key = WyrdApiKey::generate(tenant);
-        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         let api_key_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
@@ -1066,7 +1052,7 @@ pub(crate) mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
 
         let key = WyrdApiKey::generate(tenant);
-        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
@@ -1243,24 +1229,18 @@ pub(crate) mod pg_tests {
         (unadmitted_tenant, unadmitted)
     }
 
-    /// Every refusal path pays for exactly one Argon2 verification.
+    /// Every refusal renders the one invalid-key error.
     ///
-    /// The refusal-then-verify order in [`ExchangeApiKey::execute`] is what makes
-    /// the paths indistinguishable by clock: a malformed key, another tenant's
-    /// key, a tenant that no longer admits credentials, an unknown prefix, a
-    /// disabled account, a revoked or expired key, and a live prefix with the
-    /// wrong tail must all do the same work. Counting verifications is the only
-    /// way to assert that without measuring wall-clock time, which is unstable
-    /// under a shared test Postgres.
-    ///
-    /// The counter is process-global; `cargo nextest` runs each test in its own
-    /// process, so the deltas below belong to this test alone.
+    /// A malformed key, another tenant's key, a tenant that no longer admits
+    /// credentials, an unknown prefix, a disabled account, a revoked or
+    /// expired key, and a live prefix with the wrong tail are
+    /// indistinguishable to the caller, so no refusal is an oracle.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn every_invalid_api_key_costs_exactly_one_verification() {
+    async fn every_invalid_api_key_is_refused_identically() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
@@ -1309,16 +1289,10 @@ pub(crate) mod pg_tests {
             ("wrong_tail", wrong_tail.secret),
         ];
         for (label, presented) in cases {
-            let before = credential_verify::verifications_performed();
             let error = service
                 .execute(&mut conn, presented, &format!("req-{label}"))
                 .await
                 .expect_err("an invalid api key is refused");
-            assert_eq!(
-                credential_verify::verifications_performed() - before,
-                1,
-                "the {label} path did not perform exactly one verification"
-            );
             let prefix = "probe";
             assert_eq!(
                 rendered(&super::map_exchange_error_to_wyrd(&mut conn, prefix, error).await),
@@ -1335,17 +1309,11 @@ pub(crate) mod pg_tests {
             .tenant_conn_for(unadmitted_tenant)
             .await
             .expect("unadmitted tenant conn reopens");
-        let before = credential_verify::verifications_performed();
         let error = service
             .execute(&mut unadmitted_conn, unadmitted, "req-unadmitted")
             .await
             .expect_err("a tenant that does not admit credentials is refused");
         assert!(matches!(error, ExchangeError::TenantNotAdmitting));
-        assert_eq!(
-            credential_verify::verifications_performed() - before,
-            1,
-            "the unadmitted-tenant path did not perform exactly one verification"
-        );
         assert_eq!(
             rendered(
                 &super::map_exchange_error_to_wyrd(&mut unadmitted_conn, "probe", error).await
@@ -1445,8 +1413,7 @@ pub(crate) mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
 
-        // Store a hash that is not a valid Argon2 PHC string for this key.
-        // verify_api_key() returns false → HashMismatch.
+        // Store a verifier that is not this key's SHA-256 digest.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)

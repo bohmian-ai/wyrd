@@ -9,7 +9,6 @@ pub mod callback;
 pub mod card_scope;
 pub mod cli_logins;
 pub mod connections;
-pub mod credential_verify;
 pub(crate) mod error;
 pub mod exchange_api_key;
 pub mod issuance;

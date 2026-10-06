@@ -123,11 +123,7 @@ impl TenantRecovery {
             })?;
 
         let plaintext = wyrd_auth::issue_api_key::WyrdApiKey::generate(tenant_id);
-        let raw = plaintext.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
 
         insert_api_key(
             &mut conn,

@@ -46,7 +46,7 @@ wyrd-server init
 # wyrd_global_… (shown once, store it now)
 ```
 
-The credential is shown exactly once and stored only as an Argon2 verifier. It is printed to your terminal rather than emitted through the server's log pipeline, and server start creates no administrative state and prints no credential under any deployment profile.
+The credential is shown exactly once and stored only as a SHA-256 verifier. It is printed to your terminal rather than emitted through the server's log pipeline, and server start creates no administrative state and prints no credential under any deployment profile.
 
 Initialization happens at most once. The root's name is unique in the database, so a second `init` — concurrent or later — refuses rather than minting a second root. All three writes commit together, so a failure leaves the deployment uninitialized and safe to retry.
 

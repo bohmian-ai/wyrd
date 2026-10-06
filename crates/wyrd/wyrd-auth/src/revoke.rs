@@ -139,9 +139,9 @@ pub(crate) mod pg_tests {
 
     use super::revoke_principal_in_conn;
     use crate::audit::test_outbox::{drain, outbox};
-    use crate::exchange_api_key::token_hash;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::refresh::RefreshTokens;
+    use wyrd_auth_issue::hash_secret;
 
     fn make_service_card_ref(name: &str) -> CardRef {
         CardRef {
@@ -522,7 +522,7 @@ pub(crate) mod pg_tests {
             &mut setup,
             Uuid::new_v4(),
             user_id,
-            &token_hash(current.expose_secret()),
+            &hash_secret(current.expose_secret()),
             Utc::now() + Duration::days(30),
             None,
             HumanSessionBinding {
@@ -639,7 +639,7 @@ pub(crate) mod pg_tests {
             .expect("the route commits the revocation");
 
         let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
-        let successor_row = refresh_by_hash(&mut fresh, &token_hash(successor.expose_secret()))
+        let successor_row = refresh_by_hash(&mut fresh, &hash_secret(successor.expose_secret()))
             .await
             .expect("lookup")
             .expect("C exists");

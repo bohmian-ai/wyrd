@@ -14,7 +14,6 @@ use secrecy::{ExposeSecret, SecretString};
 use std::io::{Error as IoError, Result as IoResult, Write};
 use uuid::Uuid;
 use wyrd_auth::platform_credentials::{PlatformCredential, PlatformCredentialError};
-use wyrd_auth_issue::hash_api_key;
 use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_sql::queries::platform::credentials::insert_platform_credential_tx;
@@ -122,11 +121,7 @@ pub async fn initialize_platform_root(
 ) -> Result<(), InitError> {
     let principal_id = Uuid::now_v7();
     let credential = PlatformCredential::generate();
-    let raw = credential.secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw))
-        .await
-        .map_err(|error| InitError::Credential(PlatformCredentialError::Join(error)))?
-        .map_err(|error| InitError::Credential(PlatformCredentialError::Hash(error)))?;
+    let secret_hash = wyrd_auth_issue::hash_secret(credential.secret.expose_secret());
 
     let mut conn = pool.begin_platform_audited().await?;
 
@@ -237,11 +232,7 @@ pub async fn issue_platform_root_credential(
     pool: &OperatorPool,
 ) -> Result<SecretString, RecoverRootError> {
     let credential = PlatformCredential::generate();
-    let raw = credential.secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw))
-        .await
-        .map_err(|error| RecoverRootError::Credential(PlatformCredentialError::Join(error)))?
-        .map_err(|error| RecoverRootError::Credential(PlatformCredentialError::Hash(error)))?;
+    let secret_hash = wyrd_auth_issue::hash_secret(credential.secret.expose_secret());
 
     let mut conn = pool.begin_platform_audited().await?;
     let Some(principal_id) = platform_principal_id_by_name(&mut conn, PLATFORM_ROOT_NAME).await?

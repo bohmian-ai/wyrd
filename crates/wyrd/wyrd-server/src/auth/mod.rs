@@ -8,7 +8,6 @@ pub mod oauth;
 pub mod revoke;
 
 pub(crate) use wyrd_auth::card_scope;
-pub(crate) use wyrd_auth::credential_verify;
 pub use wyrd_auth::seed;
 pub(crate) use wyrd_auth::{exchange_api_key, issue_api_key, pg_resolvers, refresh, roles};
 

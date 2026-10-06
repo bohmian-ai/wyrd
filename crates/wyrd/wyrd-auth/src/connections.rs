@@ -829,8 +829,8 @@ async fn tester_authorized(
 /// and audit the recovery principal's permission decision.
 ///
 /// Reuses the API-key exchange's verification, so the key must parse, name
-/// this tenant, and match a live key row by Argon2 with every refusal still
-/// running one verification; the owning principal must then be active and
+/// this tenant, and match a live key row's SHA-256 verifier; the owning
+/// principal must then be active and
 /// hold permissions covering `identity_connections:write`.
 ///
 /// A key that resolves to an active principal reaches a real permission

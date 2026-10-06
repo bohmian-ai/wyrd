@@ -3054,11 +3054,7 @@ impl WyrdTestServer {
         let tenant_id = self.data_tenant_id();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let api_key = WyrdApiKey::generate(tenant_id);
-        let raw = api_key.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(api_key.secret.expose_secret());
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
         let principal = service_account_by_card_ref(&mut conn, "service", &binding)
@@ -3540,11 +3536,7 @@ impl WyrdTestServer {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let api_key = WyrdApiKey::generate(tenant_id);
-        let raw = api_key.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(api_key.secret.expose_secret());
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
         seed_machine_card(&mut conn, &card_ref, creator_id).await?;

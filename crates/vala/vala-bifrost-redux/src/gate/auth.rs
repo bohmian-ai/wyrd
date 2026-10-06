@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::{TokenAudience, TokenVerifier};
+use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
 use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -48,6 +48,22 @@ pub struct AuthContext {
     /// [`Self::principal`], while the chain travels with it so the operation's
     /// audit record can name who was acting for whom.
     pub delegation_chain: Vec<DelegationStep>,
+}
+
+impl AuthContext {
+    /// Build the context of one request whose caller is already verified.
+    ///
+    /// The tenant is the verified principal's own, and the request correlator
+    /// is read from `metadata` or minted, as for a bearer request.
+    #[must_use]
+    pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
+        Self {
+            tenant: verified.principal.tenant_id,
+            principal: verified.principal,
+            request_id: read_or_mint_request_id(metadata),
+            delegation_chain: verified.delegation_chain,
+        }
+    }
 }
 
 /// Read the bearer token from the `x-wyrd-access-token` metadata, stripping an
@@ -118,12 +134,7 @@ pub fn authenticate(
     let verified_token = verifier
         .verify_on(&token, &expected_tenant, TokenAudience::Bifrost)
         .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
-    Ok(AuthContext {
-        principal: verified_token.principal,
-        tenant: expected_tenant,
-        request_id: read_or_mint_request_id(metadata),
-        delegation_chain: verified_token.delegation_chain,
-    })
+    Ok(AuthContext::from_verified(verified_token, metadata))
 }
 
 /// The Gate's handle on the shared tenant token verifier.

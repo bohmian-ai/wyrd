@@ -6,9 +6,19 @@ use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use wyrd_auth_verify::TokenAudience;
+use std::sync::Arc;
 
-use crate::components::auth::token_extract::verify_authenticated_principal;
+use secrecy::SecretString;
+use wyrd_auth_verify::TokenAudience;
+use wyrd_spec::request_id::RequestId;
+
+use crate::auth::exchange_api_key::api_key_invalid;
+use crate::components::auth::AuthenticatedPrincipal;
+use crate::components::auth::routes::TokenGrants;
+use crate::components::auth::token_extract::{
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, verify_authenticated_principal,
+};
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Reject unauthenticated requests before they reach protected handlers.
@@ -41,6 +51,49 @@ pub async fn require_bifrost_authenticated(
     next: Next,
 ) -> Response {
     authenticate_on(&state, request, next, TokenAudience::Bifrost).await
+}
+
+/// Reject unauthenticated requests to the OTLP HTTP routes.
+///
+/// Identical to [`require_authenticated`], except that a request with no
+/// access token may carry its exporter's Wyrd API key in `x-wyrd-api-key`,
+/// since a stock OpenTelemetry exporter sends only static headers. The key is
+/// verified on every request through [`TokenGrants::api_key_principal`] and
+/// yields the principal its exchanged token would carry. An access token, when
+/// present, always wins.
+pub async fn require_otlp_authenticated(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.headers().contains_key(WYRD_ACCESS_TOKEN_HEADER) {
+        return authenticate_on(&state, request, next, TokenAudience::Wyrd).await;
+    }
+    let Some(presented) = request.headers().get(WYRD_API_KEY_HEADER) else {
+        return authenticate_on(&state, request, next, TokenAudience::Wyrd).await;
+    };
+    let Ok(presented) = presented.to_str() else {
+        return WyrdErrorResponse(api_key_invalid()).into_response();
+    };
+    let api_key = SecretString::from(presented.to_owned());
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::now_v7);
+    let grants = TokenGrants {
+        state: &state,
+        request_id: request_id.as_str(),
+    };
+    match grants.api_key_principal(&api_key).await {
+        Ok(verified) => {
+            request
+                .extensions_mut()
+                .insert(AuthenticatedPrincipal::from_verified(Arc::new(verified)));
+            next.run(request).await
+        }
+        Err(error) => WyrdErrorResponse(error).into_response(),
+    }
 }
 
 /// Verify the request's token for `surface`, insert the principal, and run

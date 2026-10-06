@@ -12,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
+use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::PermissionCheck;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
@@ -667,6 +668,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         metadata: &MetadataMap,
     ) -> Result<AuthContext, IngestError> {
         self.authenticate(metadata)
+    }
+
+    /// Admit one server-owned OTLP adapter request whose caller the server
+    /// already verified, before tonic codec work.
+    ///
+    /// The API-key form of [`Self::authenticate_otlp_metadata`]: the server
+    /// authenticated a stock exporter's API key, and Gate keeps its readiness
+    /// authority and builds the same [`AuthContext`] a bearer would yield.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ingress-closed refusal when the Gate is closed or its
+    /// Scribe is not ready.
+    pub fn admit_otlp_verified(
+        &self,
+        verified: VerifiedToken,
+        metadata: &MetadataMap,
+    ) -> Result<AuthContext, IngestError> {
+        self.ensure_open()?;
+        Ok(AuthContext::from_verified(verified, metadata))
     }
 
     /// Mount the Gate on the shared tonic router.

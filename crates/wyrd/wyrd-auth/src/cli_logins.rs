@@ -40,10 +40,10 @@ use wyrd_sql::row_types::auth::HumanSessionBinding;
 use crate::audit::{auth_event, auth_failure_code, principal_event, principal_kind_tag};
 use crate::connections::HumanConnections;
 use crate::error::store_error;
-use crate::exchange_api_key::token_hash;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::login_unavailable;
 use crate::refresh::tenant_from_refresh_jwt;
+use wyrd_auth_issue::hash_secret;
 
 /// Operation for a device-code token request that issued, or was refused, a
 /// login's credential.
@@ -414,7 +414,7 @@ impl CliLogins {
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let Some(row) = refresh_by_hash(&mut conn, &token_hash(refresh_token.expose()))
+        let Some(row) = refresh_by_hash(&mut conn, &hash_secret(refresh_token.expose()))
             .await
             .map_err(store_error)?
         else {
@@ -569,9 +569,9 @@ mod pg_tests {
     use crate::audit::test_outbox::{assert_retrying, drain, outbox};
     use crate::callback::{AuthorizationCodeExchange, LoginCompletion};
     use crate::connections::HumanConnections;
-    use crate::exchange_api_key::token_hash;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use vala_sql::audit_outbox::AuditOutbox;
+    use wyrd_auth_issue::hash_secret;
 
     /// A CLI login owner over `fixture` whose tenant's Active connection
     /// points at `provider`, a mock discovery document, staging its audit on
@@ -1174,7 +1174,7 @@ mod pg_tests {
                 &mut conn,
                 id,
                 user,
-                &token_hash(&jwt),
+                &hash_secret(&jwt),
                 Utc::now() + Duration::days(1),
                 rotated_from.map(|index: usize| ids[index]),
                 HumanSessionBinding {
@@ -1253,7 +1253,7 @@ mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let mut revoked = Vec::new();
         for jwt in &tokens {
-            let row = refresh_by_hash(&mut conn, &token_hash(jwt))
+            let row = refresh_by_hash(&mut conn, &hash_secret(jwt))
                 .await
                 .expect("lookup")
                 .expect("row exists");

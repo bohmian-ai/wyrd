@@ -63,7 +63,7 @@ pub struct ServiceAccountPrincipalRow {
 pub struct ApiKeyLookupRow {
     /// API key id.
     pub api_key_id: Uuid,
-    /// Stored Argon2 PHC string.
+    /// Stored SHA-256 hex verifier.
     pub key_hash: String,
     /// Service account id.
     pub principal_id: Uuid,
@@ -300,7 +300,7 @@ pub async fn tenant_admin_principal_id(
 
 /// Insert a hashed credential row for a tenant-scope principal.
 ///
-/// Stores only the Argon2 verifier and non-secret lookup metadata; the
+/// Stores only the SHA-256 verifier and non-secret lookup metadata; the
 /// plaintext is returned once by the issuing caller and never persisted.
 /// `lifetime` is optional: an administrative credential issued during tenant
 /// provisioning or recovery has no natural lifetime, while a workload key

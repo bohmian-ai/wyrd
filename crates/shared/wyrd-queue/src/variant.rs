@@ -31,7 +31,9 @@ use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
-use parquet_variant::{ObjectFieldBuilder, Variant, VariantBuilder, VariantBuilderExt};
+use parquet_variant::{
+    ObjectFieldBuilder, Variant, VariantBuilder, VariantBuilderExt, VariantMetadata,
+};
 use parquet_variant_compute::{VariantArray, VariantType};
 use parquet_variant_json::VariantToJson;
 use serde_json::Value;
@@ -107,10 +109,53 @@ impl VariantViolation {
     }
 }
 
+/// The first violation of each class found while checking one value.
+///
+/// Both input walkers record what they find here instead of returning at the
+/// first problem, then [`Self::finish`] picks the public error in the locked
+/// order, so where a problem sits in the value never changes which error is
+/// reported. Size is checked before any walk and is never recorded.
+#[derive(Debug, Default)]
+struct VariantViolations {
+    /// First malformed input, which outranks every other class.
+    malformed: Option<VariantViolation>,
+    /// First number outside the exact numeric domain.
+    numeric: Option<VariantViolation>,
+    /// First container past [`VARIANT_MAX_DEPTH`].
+    depth: Option<VariantViolation>,
+}
+
+impl VariantViolations {
+    /// Keep `violation` unless one of its class was already found.
+    fn record(&mut self, violation: VariantViolation) {
+        let slot = match violation {
+            VariantViolation::NumericOutOfRange { .. } => &mut self.numeric,
+            VariantViolation::TooDeep { .. } => &mut self.depth,
+            VariantViolation::InvalidJson { .. } | VariantViolation::TooLarge { .. } => {
+                &mut self.malformed
+            }
+        };
+        slot.get_or_insert(violation);
+    }
+
+    /// Select the public error: malformed, then numeric range, then depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns the highest-priority recorded violation, if any.
+    fn finish(self) -> Result<(), VariantViolation> {
+        match self.malformed.or(self.numeric).or(self.depth) {
+            Some(violation) => Err(violation),
+            None => Ok(()),
+        }
+    }
+}
+
 /// One canonical encoded Variant value: its metadata and value bytes.
 ///
-/// Construction always enforces the Bifrost limits, so holding an
-/// `EncodedVariant` means the value is storable.
+/// Construction always enforces the Bifrost limits, the exact numeric domain,
+/// and full encoding validity, so holding an `EncodedVariant` means the value
+/// is storable and renders exactly in every terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedVariant {
     /// Variant metadata bytes (the field-name dictionary).
@@ -155,44 +200,46 @@ impl EncodedVariant {
         let mut path = JsonPointer::default();
         let raw: &RawValue = serde_json::from_str(text).map_err(|_| invalid(&path))?;
         let mut builder = VariantBuilder::new();
-        let mut too_deep = None;
-        append_raw(&mut builder, raw, &mut path, 0, &mut too_deep)?;
-        if let Some(violation) = too_deep {
-            return Err(violation);
-        }
+        let mut found = VariantViolations::default();
+        append_raw(&mut builder, raw, &mut path, 0, &mut found);
+        found.finish()?;
         let (metadata, value) = builder.finish();
         Self::sized(metadata, value)
     }
 
     /// Accept already-encoded Variant bytes after full validation.
     ///
-    /// Size is checked first. Depth is checked next, before upstream full
-    /// validation, because [`Variant::try_new`] recurses once per nesting
-    /// level and a compact hostile value can nest far deeper than any stack
-    /// allows while staying under the size limit. The depth walk uses
-    /// upstream's shallow accessors and stops at the first container past
-    /// [`VARIANT_MAX_DEPTH`], so it never recurses deeper than the limit;
-    /// those accessors panic on malformed bytes, which is contained here and
-    /// reported as invalid. Upstream full validation then remains the one
-    /// encoding authority.
+    /// Size is checked first. Then [`scan_encoded`] visits every node of the
+    /// size-bounded value with an explicit stack, recording malformed
+    /// encoding, numbers outside the exact domain, and the first container
+    /// past [`VARIANT_MAX_DEPTH`]. Upstream's recursive [`Variant::try_new`]
+    /// recurses once per nesting level, and a compact hostile value can nest
+    /// far deeper than any stack allows, so it runs only when no depth
+    /// violation was found; it remains the encoding authority for every
+    /// accepted value. The shallow accessors the scan uses panic on malformed
+    /// bytes, which is contained here and reported as invalid. The recorded
+    /// violations then select one error, malformed first.
     ///
     /// # Errors
     ///
-    /// Returns [`VariantViolation::TooLarge`], [`VariantViolation::TooDeep`],
-    /// or [`VariantViolation::InvalidJson`] for bytes that are not a valid
-    /// Variant.
+    /// Returns [`VariantViolation::TooLarge`] past the size limit, then
+    /// [`VariantViolation::InvalidJson`] for bytes that are not a valid
+    /// Variant, [`VariantViolation::NumericOutOfRange`] for a number outside
+    /// the exact domain, and [`VariantViolation::TooDeep`] for a container
+    /// past the depth limit.
     pub fn from_bytes(metadata: &[u8], value: &[u8]) -> Result<Self, VariantViolation> {
         let encoded = Self::sized(metadata.to_vec(), value.to_vec())?;
         let root = JsonPointer::default();
-        std::panic::catch_unwind(|| {
-            check_depth(
-                &Variant::new(metadata, value),
-                &mut JsonPointer::default(),
-                0,
-            )
-        })
-        .unwrap_or_else(|_| Err(invalid(&root)))?;
-        Variant::try_new(metadata, value).map_err(|_| invalid(&root))?;
+        let mut found =
+            std::panic::catch_unwind(|| scan_encoded(metadata, value)).unwrap_or_else(|_| {
+                let mut found = VariantViolations::default();
+                found.record(invalid(&root));
+                found
+            });
+        if found.depth.is_none() && Variant::try_new(metadata, value).is_err() {
+            found.record(invalid(&root));
+        }
+        found.finish()?;
         Ok(encoded)
     }
 
@@ -559,7 +606,20 @@ struct JsonPointer {
 impl JsonPointer {
     /// Descend into one object key, escaping `~` and `/`.
     fn push_key(&mut self, key: &str) {
-        self.tokens.push(key.replace('~', "~0").replace('/', "~1"));
+        self.tokens.push(Self::escape(key));
+    }
+
+    /// Return the reference token of one object key, escaping `~` and `/`.
+    fn escape(key: &str) -> String {
+        key.replace('~', "~0").replace('/', "~1")
+    }
+
+    /// Return to the ancestor `depth` tokens below the root.
+    ///
+    /// The explicit-stack walks record each pending value's parent depth and
+    /// truncate to it, since they cannot pop in step with recursion.
+    fn truncate(&mut self, depth: usize) {
+        self.tokens.truncate(depth);
     }
 
     /// Descend into one array index.
@@ -582,20 +642,20 @@ impl JsonPointer {
     }
 }
 
-/// Fail when opening a container at `depth` would pass the limit.
+/// Open a container below `depth` others, recording it when past the limit.
 ///
-/// # Errors
-///
-/// Returns [`VariantViolation::TooDeep`] naming the container's pointer.
-fn enter_container(depth: u32, path: &JsonPointer) -> Result<u32, VariantViolation> {
+/// Returns the container's own depth, counting the root container as one,
+/// and whether it is within [`VARIANT_MAX_DEPTH`].
+fn enter_container(depth: u32, path: &JsonPointer, found: &mut VariantViolations) -> (u32, bool) {
     let depth = depth + 1;
-    if depth > VARIANT_MAX_DEPTH {
-        return Err(VariantViolation::TooDeep {
+    let within = depth <= VARIANT_MAX_DEPTH;
+    if !within {
+        found.record(VariantViolation::TooDeep {
             path: path.render(),
             depth,
         });
     }
-    Ok(depth)
+    (depth, within)
 }
 
 /// Append one validated raw JSON value to any Variant builder position.
@@ -605,34 +665,28 @@ fn enter_container(depth: u32, path: &JsonPointer) -> Result<u32, VariantViolati
 /// with their original text. `depth` is the number of containers already
 /// open above this value.
 ///
-/// Numeric range outranks depth, so a container past the depth limit does
-/// not end the walk: the first such refusal is kept in `too_deep`, the
-/// container is skipped unbuilt, and the walk goes on through its siblings so
-/// an out-of-range number anywhere within the limit still wins, whatever the
-/// object key order. Nothing deeper than the limit is ever visited.
-///
-/// # Errors
-///
-/// Returns [`VariantViolation::NumericOutOfRange`] for an unrepresentable
-/// number and [`VariantViolation::InvalidJson`] when a builder refuses a
-/// container.
+/// Every violation is recorded in `found` rather than returned, so the walk
+/// always covers the whole value and [`VariantViolations::finish`] alone
+/// picks the error. A refused number is built as a placeholder null. A
+/// container past the depth limit is not built: [`scan_numbers`] searches it
+/// without recursion, so an out-of-range number below the limit still
+/// outranks depth. Recursion therefore never passes the limit.
 fn append_raw(
     builder: &mut impl VariantBuilderExt,
     raw: &RawValue,
     path: &mut JsonPointer,
     depth: u32,
-    too_deep: &mut Option<VariantViolation>,
-) -> Result<(), VariantViolation> {
+    found: &mut VariantViolations,
+) {
     let text = raw.get();
     let first = text.as_bytes().first();
     let depth = if matches!(first, Some(b'{' | b'[')) {
-        match enter_container(depth, path) {
-            Ok(depth) => depth,
-            Err(violation) => {
-                too_deep.get_or_insert(violation);
-                return Ok(());
-            }
+        let (depth, within) = enter_container(depth, path, found);
+        if !within {
+            scan_numbers(raw, path, found);
+            return;
         }
+        depth
     } else {
         depth
     };
@@ -641,9 +695,12 @@ fn append_raw(
             // A map keeps the final occurrence of a repeated key.
             // ponytail: each level re-scans its subtree, so cost is bounded by
             // depth (64) times size; a streaming visitor if parse_json profiles hot.
-            let entries: BTreeMap<String, &RawValue> =
-                serde_json::from_str(text).map_err(|_| invalid(path))?;
-            let mut object = builder.try_new_object().map_err(|_| invalid(path))?;
+            let Ok(entries) = serde_json::from_str::<BTreeMap<String, &RawValue>>(text) else {
+                return found.record(invalid(path));
+            };
+            let Ok(mut object) = builder.try_new_object() else {
+                return found.record(invalid(path));
+            };
             for (key, child) in entries {
                 path.push_key(&key);
                 if child.get() == "null" {
@@ -655,33 +712,95 @@ fn append_raw(
                         child,
                         path,
                         depth,
-                        too_deep,
-                    )?;
+                        found,
+                    );
                 }
                 path.pop();
             }
             object.finish();
         }
         Some(b'[') => {
-            let items: Vec<&RawValue> = serde_json::from_str(text).map_err(|_| invalid(path))?;
-            let mut list = builder.try_new_list().map_err(|_| invalid(path))?;
+            let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) else {
+                return found.record(invalid(path));
+            };
+            let Ok(mut list) = builder.try_new_list() else {
+                return found.record(invalid(path));
+            };
             for (index, item) in items.into_iter().enumerate() {
                 path.push_index(index);
-                append_raw(&mut list, item, path, depth, too_deep)?;
+                append_raw(&mut list, item, path, depth, found);
                 path.pop();
             }
             list.finish();
         }
-        Some(b'"') => {
-            let string: String = serde_json::from_str(text).map_err(|_| invalid(path))?;
-            builder.append_value(string.as_str());
-        }
+        Some(b'"') => match serde_json::from_str::<String>(text) {
+            Ok(string) => builder.append_value(string.as_str()),
+            Err(_) => found.record(invalid(path)),
+        },
         Some(b't') => builder.append_value(true),
         Some(b'f') => builder.append_value(false),
         Some(b'n') => builder.append_value(Variant::Null),
-        _ => builder.append_value(raw_number_variant(text, path)?),
+        _ => match raw_number_variant(text, path) {
+            Ok(number) => builder.append_value(number),
+            Err(violation) => {
+                found.record(violation);
+                builder.append_value(Variant::Null);
+            }
+        },
     }
-    Ok(())
+}
+
+/// Record the first out-of-range number inside a JSON container past the
+/// depth limit, without building it.
+///
+/// The subtree is walked with an explicit stack in the same order as
+/// [`append_raw`] — object keys sorted with the final occurrence of a repeated
+/// key kept, then list items — so the reported pointer is the one the normal
+/// walk would name. Nothing is searched once a numeric violation is known,
+/// since only the first one is reported. `path` is restored on return.
+fn scan_numbers(raw: &RawValue, path: &mut JsonPointer, found: &mut VariantViolations) {
+    let base = path.tokens.len();
+    // Each pending value carries its parent's pointer depth and its token.
+    let mut pending: Vec<(usize, Option<String>, &RawValue)> = vec![(base, None, raw)];
+    while found.numeric.is_none() {
+        let Some((parent, token, raw)) = pending.pop() else {
+            break;
+        };
+        path.truncate(parent);
+        if let Some(token) = token {
+            path.tokens.push(token);
+        }
+        let text = raw.get();
+        let here = path.tokens.len();
+        let start = pending.len();
+        match text.as_bytes().first() {
+            Some(b'{') => match serde_json::from_str::<BTreeMap<String, &RawValue>>(text) {
+                Ok(entries) => pending.extend(
+                    entries
+                        .into_iter()
+                        .map(|(key, child)| (here, Some(JsonPointer::escape(&key)), child)),
+                ),
+                Err(_) => found.record(invalid(path)),
+            },
+            Some(b'[') => match serde_json::from_str::<Vec<&RawValue>>(text) {
+                Ok(items) => pending.extend(
+                    items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, item)| (here, Some(index.to_string()), item)),
+                ),
+                Err(_) => found.record(invalid(path)),
+            },
+            Some(b'"' | b't' | b'f' | b'n') => {}
+            _ => {
+                if let Err(violation) = raw_number_variant(text, path) {
+                    found.record(violation);
+                }
+            }
+        }
+        pending[start..].reverse();
+    }
+    path.truncate(base);
 }
 
 /// Convert one JSON number token under the Bifrost numeric rules.
@@ -749,45 +868,78 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
     }
 }
 
-/// Walk a shallowly decoded Variant and fail past the depth limit.
+/// Visit every node of raw Variant bytes and record what is wrong with them.
 ///
-/// Children are reached through upstream's shallow, constant-time accessors,
-/// so the walk does no recursive validation of its own and recurses at most
-/// [`VARIANT_MAX_DEPTH`] + 1 levels before refusing.
-///
-/// # Errors
-///
-/// Returns [`VariantViolation::TooDeep`] for a container past the limit.
+/// Metadata is fully validated first. Nodes are then reached through
+/// upstream's shallow, constant-time accessors from an explicit stack, so a
+/// hostile depth costs heap, not call stack, and the whole size-bounded value
+/// is covered. Together the shallow node checks, the object field-name order
+/// check, and the metadata check are the conditions upstream full validation
+/// applies. The first container past [`VARIANT_MAX_DEPTH`] is recorded and the
+/// walk continues below it, and a Decimal16 outside the exact numeric domain is recorded at
+/// its pointer: only the scale-zero form of `i64::MAX + 1..=u64::MAX`, the
+/// encoding of a JSON integer in that range, is accepted.
 ///
 /// # Panics
 ///
-/// Panics when a child's bytes are malformed; [`EncodedVariant::from_bytes`]
+/// Panics when a node's bytes are malformed; [`EncodedVariant::from_bytes`]
 /// contains it.
-fn check_depth(
-    variant: &Variant<'_, '_>,
-    path: &mut JsonPointer,
-    depth: u32,
-) -> Result<(), VariantViolation> {
-    match variant {
-        Variant::Object(object) => {
-            let depth = enter_container(depth, path)?;
-            for (key, child) in object.iter() {
-                path.push_key(key);
-                check_depth(&child, path, depth)?;
-                path.pop();
-            }
+fn scan_encoded(metadata: &[u8], value: &[u8]) -> VariantViolations {
+    let mut found = VariantViolations::default();
+    let mut path = JsonPointer::default();
+    let Ok(metadata) = VariantMetadata::try_new(metadata) else {
+        found.record(invalid(&path));
+        return found;
+    };
+    let exact_unsigned = i128::from(i64::MAX) + 1..=i128::from(u64::MAX);
+    // Each pending node carries its parent's pointer depth, its token, and
+    // the number of containers open above it.
+    let mut pending = vec![(0, None, 0, Variant::new_with_metadata(metadata, value))];
+    while let Some((parent, token, depth, node)) = pending.pop() {
+        path.truncate(parent);
+        if let Some(token) = token {
+            path.tokens.push(token);
         }
-        Variant::List(list) => {
-            let depth = enter_container(depth, path)?;
-            for (index, child) in list.iter().enumerate() {
-                path.push_index(index);
-                check_depth(&child, path, depth)?;
-                path.pop();
+        let here = path.tokens.len();
+        let start = pending.len();
+        match node {
+            Variant::Object(object) => {
+                let (depth, _) = enter_container(depth, &path, &mut found);
+                let sorted = object.metadata.is_sorted();
+                let mut previous: Option<&str> = None;
+                for (name, child) in object.iter() {
+                    if previous.is_some_and(|previous| {
+                        if sorted {
+                            name <= previous
+                        } else {
+                            name < previous
+                        }
+                    }) {
+                        found.record(invalid(&path));
+                    }
+                    previous = Some(name);
+                    pending.push((here, Some(JsonPointer::escape(name)), depth, child));
+                }
             }
+            Variant::List(list) => {
+                let (depth, _) = enter_container(depth, &path, &mut found);
+                for (index, child) in list.iter().enumerate() {
+                    pending.push((here, Some(index.to_string()), depth, child));
+                }
+            }
+            Variant::Decimal16(decimal)
+                if decimal.scale() != 0 || !exact_unsigned.contains(&decimal.integer()) =>
+            {
+                found.record(out_of_range(&path, "decimal"));
+            }
+            _ => {}
         }
-        _ => {}
+        pending[start..].reverse();
+        if found.malformed.is_some() {
+            break;
+        }
     }
-    Ok(())
+    found
 }
 
 /// Contract tests for Variant encoding, validation, and JSON rendering.
@@ -911,14 +1063,27 @@ mod tests {
         }
     }
 
-    /// Numeric range outranks depth whatever the object key order.
+    /// Numeric range outranks depth whatever the object key order, and also
+    /// when the number sits inside the container past the limit.
     ///
     /// # Panics
     ///
-    /// Panics when either key order reports depth, or depth alone stops
-    /// reporting depth.
+    /// Panics when either key order or the nested number reports depth, or
+    /// depth alone stops reporting depth.
     #[test]
     fn numeric_range_outranks_depth_in_any_key_order() {
+        let nested = format!(
+            r#"{{"a": {}18446744073709551616{}}}"#,
+            "[".repeat(65),
+            "]".repeat(65)
+        );
+        assert_eq!(
+            EncodedVariant::from_json_text(&nested),
+            Err(VariantViolation::NumericOutOfRange {
+                path: format!("/a{}", "/0".repeat(65)),
+                numeric_kind: "integer",
+            })
+        );
         let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
         for (numeric, nested) in [("a", "b"), ("b", "a")] {
             assert_eq!(
@@ -948,22 +1113,117 @@ mod tests {
     /// bytes are accepted.
     #[test]
     fn raw_depth_is_bounded_before_full_validation() {
-        let mut value = vec![0x00_u8];
-        for _ in 0..20_000 {
-            let mut list = vec![0x0f, 1];
-            list.extend(0_u32.to_le_bytes());
-            list.extend(u32::try_from(value.len()).expect("fits").to_le_bytes());
-            list.extend(value);
-            value = list;
-        }
         assert!(matches!(
-            EncodedVariant::from_bytes(&[0x01, 0x00, 0x00], &value),
+            EncodedVariant::from_bytes(EMPTY_METADATA, &nest(vec![0x00], 20_000)),
             Err(VariantViolation::TooDeep { depth: 65, .. })
         ));
         assert_eq!(
             EncodedVariant::from_bytes(&[0xff], &[0x0f, 1, 0xff]),
             Err(VariantViolation::InvalidJson {
                 path: String::new()
+            })
+        );
+    }
+
+    /// Variant metadata with an empty field-name dictionary.
+    const EMPTY_METADATA: &[u8] = &[0x01, 0x00, 0x00];
+
+    /// Encode a raw Variant list of `items` with four-byte offsets.
+    fn list(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut list = vec![0x0f, u8::try_from(items.len()).expect("short list")];
+        let mut offset = 0_u32;
+        list.extend(offset.to_le_bytes());
+        for item in items {
+            offset += u32::try_from(item.len()).expect("fits");
+            list.extend(offset.to_le_bytes());
+        }
+        list.extend(items.concat());
+        list
+    }
+
+    /// Wrap raw Variant `value` in `levels` single-item lists.
+    fn nest(value: Vec<u8>, levels: usize) -> Vec<u8> {
+        (0..levels).fold(value, |value, _| list(&[value]))
+    }
+
+    /// Malformed encoding outranks depth wherever it sits in the value.
+    ///
+    /// The malformed node is placed below a container past the limit, and
+    /// beside an over-depth sibling in both orders; each must be refused as
+    /// invalid rather than too deep.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any placement reports depth or is accepted.
+    #[test]
+    fn raw_malformed_outranks_depth_in_any_position() {
+        // A primitive header naming no primitive type.
+        let malformed = vec![0x7c_u8];
+        let deep = nest(vec![0x00], 70);
+        for value in [
+            nest(malformed.clone(), 70),
+            list(&[deep.clone(), malformed.clone()]),
+            list(&[malformed, deep]),
+        ] {
+            assert_eq!(
+                EncodedVariant::from_bytes(EMPTY_METADATA, &value),
+                Err(VariantViolation::InvalidJson {
+                    path: String::new()
+                })
+            );
+        }
+    }
+
+    /// Raw Decimal16 values are accepted only as the exact JSON integers
+    /// above `i64::MAX`, and a refused one outranks depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decimal outside the domain is accepted, a refusal loses
+    /// its pointer, or `u64::MAX` stops rendering with every digit.
+    #[test]
+    fn raw_decimals_outside_the_exact_domain_are_refused() {
+        let encode = |integer: i128, scale: u8| {
+            let decimal =
+                parquet_variant::VariantDecimal16::try_new(integer, scale).expect("decimal");
+            let mut builder = VariantBuilder::new();
+            let mut object = builder.new_object();
+            let mut list = object.new_list("n");
+            list.append_value(decimal);
+            list.finish();
+            object.finish();
+            builder.finish()
+        };
+        for (integer, scale) in [
+            (12_345, 2),
+            (i128::from(u64::MAX) + 1, 0),
+            (5, 0),
+            (-i128::from(u64::MAX), 0),
+        ] {
+            let (metadata, value) = encode(integer, scale);
+            assert_eq!(
+                EncodedVariant::from_bytes(&metadata, &value),
+                Err(VariantViolation::NumericOutOfRange {
+                    path: "/n/0".to_owned(),
+                    numeric_kind: "decimal",
+                }),
+                "{integer} scale {scale}"
+            );
+        }
+        let (metadata, value) = encode(i128::from(u64::MAX), 0);
+        let accepted = EncodedVariant::from_bytes(&metadata, &value).expect("u64::MAX is exact");
+        assert_eq!(
+            variant_bytes_to_json(accepted.metadata(), accepted.value()).expect("renders"),
+            json!({"n": [u64::MAX]})
+        );
+
+        let (metadata, decimal) = encode(5, 0);
+        let value = list(&[nest(vec![0x00], 70), decimal]);
+        assert_eq!(
+            EncodedVariant::from_bytes(&metadata, &value),
+            Err(VariantViolation::NumericOutOfRange {
+                path: "/1/n/0".to_owned(),
+                numeric_kind: "decimal",
             })
         );
     }

@@ -31,7 +31,9 @@ collection repeats a key, the final occurrence is stored.
 JSON input converts an integer in the signed 64-bit range to an integer, an
 integer above that but within the unsigned 64-bit range to a scale-zero
 decimal, and a non-integer number to a double, so every accepted integer reads
-back exactly. Send a wider integer as a string. A value is refused before acknowledgement with a stable code:
+back exactly. Send a wider integer or an exact fractional decimal as a
+string. A raw Variant decimal is accepted only in that same scale-zero
+unsigned range. A value is refused before acknowledgement with a stable code:
 
 | Condition | Code |
 |---|---|
@@ -39,7 +41,7 @@ back exactly. Send a wider integer as a string. A value is refused before acknow
 | Encoded metadata plus value over 8,388,608 bytes | `WYRD_VALA_413_VARIANT_TOO_LARGE` |
 | Invalid JSON or Variant encoding | `WYRD_VALA_400_VARIANT_INVALID_JSON` |
 | Nesting deeper than 64 containers | `WYRD_VALA_400_VARIANT_TOO_DEEP` |
-| Integer outside the signed and unsigned 64-bit ranges | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
+| Integer outside the signed and unsigned 64-bit ranges, or any other decimal | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
 
 Query a Variant with these operators and functions:
 
@@ -212,7 +214,8 @@ null.
 
 `positive_buckets` and `negative_buckets` carry nullable `offset` (`Int32`)
 and `bucket_counts` (`List<Int64>`); both read SQL null when the collection is
-absent. Each `quantile_values` element carries
+absent, and a collection with only some fields set is refused. Each
+`quantile_values` element carries
 `quantile` and `value`. Each `exemplars` element carries `time_unix_nano`,
 nullable `int_value` and `double_value`, Variant `filtered_attributes`, and
 nullable `trace_id` and `span_id`. `resource_entity_refs` is as on
@@ -321,7 +324,8 @@ A scored Drift result sets only `drift_report`: `method` (`Utf8`), `features`
 result sets only `eval_summary`: `total_tasks`, `passed_tasks`, and
 `failed_tasks` (`Int32`), `pass_rate` (`Float64`), and `duration_ms`
 (`Int64`). Every field inside either Struct is nullable and reads SQL null
-when its Struct is absent. A completed Drift execution that could not score
+when its Struct is absent; a write that sets some fields of a present Struct
+but not others is refused. A completed Drift execution that could not score
 valid input sets neither. There is no `details` column.
 
 ## vala.drift.result_features

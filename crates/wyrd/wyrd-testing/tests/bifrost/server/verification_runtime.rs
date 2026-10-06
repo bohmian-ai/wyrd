@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, Float64Array, ListArray,
-    StringArray, StructArray, TimestampMicrosecondArray,
+    Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    ListArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -1264,17 +1264,25 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
-/// past the size limit. Precedence is pinned: an oversized value that is also
+/// past the size limit. Malformed bytes below an over-deep container or
+/// beside an over-deep sibling in either order are refused as invalid, and a
+/// Decimal16 outside the exact numeric domain — fractional, past `u64::MAX`,
+/// or a scale-zero value within `i64` — is refused for numeric range, also
+/// beside an over-deep sibling. A `vala.metrics.points` frame whose absent
+/// bucket set keeps a child value is refused as a partial Struct.
+/// Precedence is pinned: an oversized value that is also
 /// malformed reports its size, a wrong marker on one field outranks invalid
 /// bytes in another, and an undeclared column or a non-Variant type change
 /// outranks each of invalid, over-deep, and oversized Variant bytes. A JSON
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
-/// is refused for numeric range in both key orders before any ACK.
+/// is refused for numeric range in both key orders, and also when the integer
+/// sits inside the over-deep branch, before any ACK.
 /// `vala.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
 /// A non-Variant type change stays a fingerprint mismatch. Afterward the same
-/// server accepts the two valid sentinel frames and only they are readable,
-/// so no refused frame persisted a row.
+/// server accepts the valid sentinel frames and only they are readable, so no
+/// refused frame persisted a row; the accepted trace's scale-zero `u64::MAX`
+/// decimal reads back with every digit.
 ///
 /// # Errors
 ///
@@ -1322,6 +1330,13 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         row: 0,
         path: String::new(),
     };
+    let out_of_range = |path: &str| BifrostError::VariantNumericOutOfRange {
+        field: "messages".to_owned(),
+        row: 0,
+        path: path.to_owned(),
+        numeric_kind: "decimal".to_owned(),
+    };
+    let over_deep = nested_lists(VARIANT_MAX_DEPTH + 1)?;
     let deepest = nested_lists(VARIANT_MAX_DEPTH)?;
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
         .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
@@ -1349,7 +1364,11 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             (foreign_metadata("messages"), valid()?),
             unsupported("messages"),
         ),
-        ("invalid bytes", (messages(), invalid()?), invalid_messages),
+        (
+            "invalid bytes",
+            (messages(), invalid()?),
+            invalid_messages.clone(),
+        ),
         (
             "one container past the depth limit",
             (
@@ -1365,6 +1384,72 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
                 raw_variant(&EMPTY_METADATA, &nested_lists(20_000)?)?,
             ),
             too_deep.clone(),
+        ),
+        (
+            "malformed bytes below a container past the depth limit",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &(0..VARIANT_MAX_DEPTH + 5)
+                        .try_fold(vec![VARIANT_MALFORMED], |value, _| variant_list(&[value]))?,
+                )?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
+            "malformed bytes after an over-deep sibling",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &variant_list(&[over_deep.clone(), vec![VARIANT_MALFORMED]])?,
+                )?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
+            "malformed bytes before an over-deep sibling",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &variant_list(&[vec![VARIANT_MALFORMED], over_deep.clone()])?,
+                )?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
+            "a fractional decimal",
+            (
+                messages(),
+                raw_variant(&EMPTY_METADATA, &decimal16(12_345, 2))?,
+            ),
+            out_of_range(""),
+        ),
+        (
+            "a scale-zero decimal past u64::MAX",
+            (
+                messages(),
+                raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX) + 1, 0))?,
+            ),
+            out_of_range(""),
+        ),
+        (
+            "a scale-zero decimal within i64",
+            (messages(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
+            out_of_range(""),
+        ),
+        (
+            "a refused decimal after an over-deep sibling",
+            (
+                messages(),
+                raw_variant(
+                    &EMPTY_METADATA,
+                    &variant_list(&[over_deep.clone(), decimal16(5, 0)])?,
+                )?,
+            ),
+            out_of_range("/1"),
         ),
         (
             "an oversized malformed value reports its size",
@@ -1528,12 +1613,36 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         )
         .await?;
 
+    admission
+        .refuse(
+            "a null bucket set whose offset child is still set",
+            POINTS,
+            &admission.points_frame(&refused, true)?,
+            &BifrostError::SchemaParse {
+                detail: "row 0: positive_buckets.offset must be null exactly when \
+                         positive_buckets is null"
+                    .to_owned(),
+            },
+        )
+        .await?;
+
+    // The accepted trace carries the one decimal form the exact numeric domain
+    // admits, which must read back with every digit.
     let accepted = admission.session("accepted");
-    let sentinel =
-        admission.trace_frame(&accepted, (messages(), valid()?), (tool_io(), valid()?))?;
+    let sentinel = admission.trace_frame(
+        &accepted,
+        (
+            messages(),
+            raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX), 0))?,
+        ),
+        (tool_io(), valid()?),
+    )?;
     admission.accept(AGENT_TRACES, &sentinel).await?;
     admission
         .accept(SPANS, &admission.spans_frame(&accepted))
+        .await?;
+    admission
+        .accept(POINTS, &admission.points_frame(&accepted, false)?)
         .await?;
     admission.journey.server.flush_bifrost().await?;
 
@@ -1550,6 +1659,27 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &vec![vec![json!(accepted), json!(1)]],
     )?;
     expect_eq(
+        "the accepted u64::MAX decimal",
+        &admission
+            .journey
+            .rows(format!(
+                "SELECT messages FROM {AGENT_TRACES} WHERE dev_session_id = '{accepted}'"
+            ))
+            .await?,
+        &vec![vec![json!(u64::MAX)]],
+    )?;
+    expect_eq(
+        "stored metric points",
+        &admission
+            .journey
+            .rows(format!(
+                "SELECT scope_name, count(*) FROM {POINTS} \
+                 WHERE scope_name LIKE '%{suffix}' GROUP BY scope_name"
+            ))
+            .await?,
+        &vec![vec![json!(accepted), json!(3)]],
+    )?;
+    expect_eq(
         "stored spans",
         &admission
             .journey
@@ -1564,6 +1694,9 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     admission.journey.server.shutdown().await?;
     Ok(())
 }
+
+/// The shared verdict table the typed-payload journey publishes to.
+const RESULTS: &str = "vala.verification.results";
 
 /// The non-signal built-in the Variant admission journey writes.
 const AGENT_TRACES: &str = "vala.dev.agent_traces";
@@ -1586,6 +1719,15 @@ const VARIANT_NULL: u8 = 0x00;
 /// Variant array header: four-byte offsets and a one-byte element count.
 const VARIANT_ARRAY_HEADER: u8 = 0x0f;
 
+/// Variant primitive header of a Decimal16 (primitive type 10).
+const VARIANT_DECIMAL16: u8 = 10 << 2;
+
+/// A Variant primitive header naming no primitive type, so it is malformed.
+const VARIANT_MALFORMED: u8 = 31 << 2;
+
+/// The canonical metric points ledger the journey writes raw frames to.
+const POINTS: &str = "vala.metrics.points";
+
 /// One bound server and an admin ingest door that sends raw Arrow IPC frames.
 struct VariantAdmissionJourney {
     /// Server, tenant, and published-row reader.
@@ -1596,6 +1738,8 @@ struct VariantAdmissionJourney {
     client: wyrd_client::WyrdClient,
     /// The described `vala.traces.spans` user schema.
     spans: SchemaRef,
+    /// The described `vala.metrics.points` user schema.
+    points: SchemaRef,
     /// Suffix that scopes this run's sessions and span scopes.
     run: String,
 }
@@ -1609,7 +1753,11 @@ impl VariantAdmissionJourney {
     /// Returns a start, bootstrap, provisioning, client, or describe error.
     async fn start() -> Result<Self, ServerJourneyError> {
         let journey = TypedPayloadJourney::start().await?;
-        for (namespace, name) in [("dev", "agent_traces"), ("traces", "spans")] {
+        for (namespace, name) in [
+            ("dev", "agent_traces"),
+            ("traces", "spans"),
+            ("metrics", "points"),
+        ] {
             journey
                 .server
                 .ensure_builtin_table_for_test(journey.tenant, namespace, name)
@@ -1628,18 +1776,20 @@ impl VariantAdmissionJourney {
             journey.server.grpc_url().as_deref(),
         )?;
         let spans = Arc::clone(TableConfig::describe(&client, SPANS).await?.user_schema());
+        let points = Arc::clone(TableConfig::describe(&client, POINTS).await?.user_schema());
         Ok(Self {
             ingest: RawIngest::connect(&client).await?,
             client,
             journey,
             spans,
+            points,
             run: uuid::Uuid::now_v7().simple().to_string(),
         })
     }
 
     /// Require that a JSON agent-trace row is refused for numeric range in
     /// both key orders when its `messages` Variant also nests past the depth
-    /// limit.
+    /// limit, and when the number sits inside the over-depth container.
     ///
     /// Each row goes through the public facade's JSON-row path with its
     /// integer token intact, and the refusal surfaces from the flush before
@@ -1650,8 +1800,23 @@ impl VariantAdmissionJourney {
     /// Returns a connect, describe, or enqueue error, or a description when
     /// a row is accepted or refused with any other error.
     async fn refuse_numeric_before_depth(&self) -> Result<(), ServerJourneyError> {
-        let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
-        for (numeric, nested) in [("a", "b"), ("b", "a")] {
+        let (open, close) = ("[".repeat(65), "]".repeat(65));
+        let deep = format!("{open}1{close}");
+        let cases = [
+            (
+                format!(r#"{{"a": 18446744073709551616, "b": {deep}}}"#),
+                "/a".to_owned(),
+            ),
+            (
+                format!(r#"{{"a": {deep}, "b": 18446744073709551616}}"#),
+                "/b".to_owned(),
+            ),
+            (
+                format!(r#"{{"a": {open}18446744073709551616{close}}}"#),
+                format!("/a{}", "/0".repeat(65)),
+            ),
+        ];
+        for (messages, path) in cases {
             let bifrost = Bifrost::connect(&self.client).await?;
             let table = bifrost.writer_table(AGENT_TRACES).await?;
             let fields = table
@@ -1660,9 +1825,7 @@ impl VariantAdmissionJourney {
                 .iter()
                 .map(|field| {
                     let value = match field.data_type() {
-                        _ if field.name() == "messages" => {
-                            format!(r#"{{"{numeric}": 18446744073709551616, "{nested}": {deep}}}"#)
-                        }
+                        _ if field.name() == "messages" => messages.clone(),
                         _ if field.is_nullable() => "null".to_owned(),
                         DataType::Timestamp(..) => format!("\"{}\"", Utc::now().to_rfc3339()),
                         _ => format!("\"{}\"", self.session("refused")),
@@ -1680,7 +1843,7 @@ impl VariantAdmissionJourney {
                 .await
                 .map(|()| "the row was accepted".to_owned())
                 .map_err(|error| WyrdError::from(&error));
-            let what = format!("numeric range outranks depth with numeric key {numeric}");
+            let what = format!("numeric range outranks depth at {path}");
             match refused {
                 Err(WyrdError::Vala { error }) => expect_eq(
                     &what,
@@ -1688,7 +1851,7 @@ impl VariantAdmissionJourney {
                     &BifrostError::VariantNumericOutOfRange {
                         field: "messages".to_owned(),
                         row: 0,
-                        path: format!("/{numeric}"),
+                        path,
                         numeric_kind: "integer".to_owned(),
                     },
                 )?,
@@ -1757,6 +1920,37 @@ impl VariantAdmissionJourney {
             scope,
             Utc::now().timestamp_nanos_opt().unwrap_or(0),
         )
+    }
+
+    /// The canonical three-point fixture under scope `scope`.
+    ///
+    /// With `partial`, the first point's absent `positive_buckets` keeps a
+    /// set `offset` child, a value no metric point can represent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bucket column is not the declared Struct or
+    /// the rebuilt batch does not assemble.
+    fn points_frame(&self, scope: &str, partial: bool) -> Result<RecordBatch, ServerJourneyError> {
+        let points = canonical_signals::points(
+            &self.points,
+            scope,
+            Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        );
+        if !partial {
+            return Ok(points);
+        }
+        let index = points.schema().index_of("positive_buckets")?;
+        let (fields, mut children, nulls) = points
+            .column(index)
+            .as_struct_opt()
+            .ok_or("positive_buckets is a Struct")?
+            .clone()
+            .into_parts();
+        children[0] = Arc::new(Int32Array::from(vec![0; points.num_rows()]));
+        let mut columns = points.columns().to_vec();
+        columns[index] = Arc::new(StructArray::try_new(fields, children, nulls)?);
+        Ok(RecordBatch::try_new(points.schema(), columns)?)
     }
 
     /// Send `batch` as one raw IPC frame and return the refusal it earns.
@@ -1835,22 +2029,42 @@ fn raw_variant(metadata: &[u8], value: &[u8]) -> Result<ArrayRef, ServerJourneyE
 
 /// Variant value bytes for `depth` single-element lists around a null.
 ///
-/// Each list uses four-byte offsets, so the encoding stays valid at any
-/// depth the journey needs.
-///
 /// # Errors
 ///
 /// Returns an error when the encoding outgrows a four-byte offset.
 fn nested_lists(depth: u32) -> Result<Vec<u8>, ServerJourneyError> {
-    let mut value = vec![VARIANT_NULL];
-    for _ in 0..depth {
-        let mut list = vec![VARIANT_ARRAY_HEADER, 1];
-        list.extend(0_u32.to_le_bytes());
-        list.extend(u32::try_from(value.len())?.to_le_bytes());
-        list.extend(value);
-        value = list;
+    (0..depth).try_fold(vec![VARIANT_NULL], |value, _| variant_list(&[value]))
+}
+
+/// Variant value bytes for a list of the already-encoded `items`.
+///
+/// The list uses four-byte offsets, so the encoding stays valid at any depth
+/// the journey needs. The items are not validated, which lets a list carry a
+/// malformed element.
+///
+/// # Errors
+///
+/// Returns an error when the list outgrows a one-byte count or a four-byte
+/// offset.
+fn variant_list(items: &[Vec<u8>]) -> Result<Vec<u8>, ServerJourneyError> {
+    let mut list = vec![VARIANT_ARRAY_HEADER, u8::try_from(items.len())?];
+    let mut offset = 0_u32;
+    list.extend(offset.to_le_bytes());
+    for item in items {
+        offset = offset
+            .checked_add(u32::try_from(item.len())?)
+            .ok_or("the list outgrows a four-byte offset")?;
+        list.extend(offset.to_le_bytes());
     }
-    Ok(value)
+    list.extend(items.concat());
+    Ok(list)
+}
+
+/// Variant value bytes for one Decimal16 primitive.
+fn decimal16(integer: i128, scale: u8) -> Vec<u8> {
+    let mut value = vec![VARIANT_DECIMAL16, scale];
+    value.extend(integer.to_le_bytes());
+    value
 }
 
 /// Replace the `attributes` Variant of every `events` element in `spans`.
@@ -2042,6 +2256,9 @@ impl TypedPayloadJourney {
     /// Publish a scored Drift, an unscored Drift, and an Eval result through
     /// the production payload builder as the tenant SYSTEM writer.
     ///
+    /// Before the Eval result is written, a partial copy of its summary is
+    /// refused by the same writer.
+    ///
     /// # Errors
     /// Returns a seeding, minting, payload, or write error.
     async fn publish_results(&self) -> Result<PublishedResults, ServerJourneyError> {
@@ -2157,6 +2374,9 @@ impl TypedPayloadJourney {
             )
             .build(report)?;
             for batch in payload.batches() {
+                if batch.table == RESULTS && matches!(report, VerifierReport::Eval { .. }) {
+                    Self::refuse_partial_summary(&bifrost, &batch.batch).await?;
+                }
                 bifrost.write_batch(&batch.table, &batch.batch).await?;
             }
             published.push(result);
@@ -2172,6 +2392,41 @@ impl TypedPayloadJourney {
             eval_summary,
             item: vec![actual, expected],
         })
+    }
+
+    /// Require that a copy of the Eval `results` batch whose present
+    /// `eval_summary` lacks `total_tasks` is refused before any ACK.
+    ///
+    /// The caller writes the intact batch afterward, and the journey's hot and
+    /// published reads then find only intact rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the summary is not the declared Struct, the copy
+    /// does not assemble, or the write is acked or refused with another error.
+    async fn refuse_partial_summary(
+        bifrost: &Bifrost,
+        results: &RecordBatch,
+    ) -> Result<(), ServerJourneyError> {
+        let index = results.schema().index_of("eval_summary")?;
+        let (fields, mut children, nulls) = results
+            .column(index)
+            .as_struct_opt()
+            .ok_or("eval_summary is a Struct")?
+            .clone()
+            .into_parts();
+        children[0] = arrow::array::new_null_array(children[0].data_type(), results.num_rows());
+        let mut columns = results.columns().to_vec();
+        columns[index] = Arc::new(StructArray::try_new(fields, children, nulls)?);
+        let partial = RecordBatch::try_new(results.schema(), columns)?;
+        match bifrost.write_batch(RESULTS, &partial).await {
+            Ok(()) => Err("a partial eval_summary was acked".into()),
+            Err(error) => expect_eq(
+                "a partial eval_summary",
+                &WyrdError::from(&error).code(),
+                &"WYRD_VALA_400_SCHEMA_PARSE",
+            ),
+        }
     }
 
     /// Configure a provider and a request-and-response payload capture

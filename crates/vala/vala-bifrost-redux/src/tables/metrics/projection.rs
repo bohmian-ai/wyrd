@@ -31,7 +31,6 @@ use super::points::{
     POSITIVE_BUCKET_FIELDS, QUANTILE_VALUE_ELEMENT,
 };
 use crate::otlp_contract::MetricsOutcome;
-use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
     OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, attributes_variant,
@@ -41,6 +40,7 @@ use crate::tables::signal::{
     trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
     variant_column,
 };
+use crate::tables::{TableError, refuse_partial_structs};
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::BifrostError;
 
@@ -285,8 +285,8 @@ pub fn canonical_metric_schema() -> Arc<Schema> {
 ///
 /// Returns the refusal of [`validate_canonical_user_batch`], and
 /// [`BifrostError::SchemaParse`] when `metric_type` is unknown, a column
-/// outside the declared kind is populated, or a numeric point carries both or
-/// neither value alternative.
+/// outside the declared kind is populated, a numeric point carries both or
+/// neither value alternative, or a bucket set is only partly present.
 pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, BifrostError> {
     let schema_parse = |detail| BifrostError::SchemaParse { detail };
     let batch = validate_canonical_user_batch(METRIC_FIELDS, batch)?;
@@ -331,6 +331,7 @@ pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, Bifros
             }
         }
     }
+    refuse_partial_structs(&batch, &["positive_buckets", "negative_buckets"])?;
     Ok(batch)
 }
 

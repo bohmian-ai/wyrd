@@ -2,4 +2,4 @@
 
 pub mod calls;
 
-pub use calls::{CallsTable, REQUEST_PAYLOAD, RESPONSE_PAYLOAD};
+pub use calls::{CallsTable, REQUEST_PAYLOAD, RESOLVED_MODEL, RESPONSE_PAYLOAD};

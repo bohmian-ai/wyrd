@@ -42,7 +42,7 @@ impl ResultsTable {
     /// `features` is a Variant because feature names are open. Every child is
     /// nullable so a Parquet read keeps the null an absent report gives each
     /// child: a required leaf would read back padded values, which `get_field`
-    /// exposes. Producers still write every child of a present report.
+    /// exposes. The table validator refuses a partly present report.
     #[must_use]
     pub fn drift_report_fields() -> Fields {
         Fields::from(vec![
@@ -79,6 +79,8 @@ impl DomainTable for ResultsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// The implementation-specific summary columns gated behind the elevated payload permission.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
+    /// A report or summary is written whole or not at all.
+    const WHOLE_STRUCTS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {

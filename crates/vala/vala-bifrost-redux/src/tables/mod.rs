@@ -262,13 +262,14 @@ pub(crate) fn validate_declared_variants(
 /// differently nullable column, or a non-Variant storage type — is returned
 /// unwalked, so the later schema fingerprint refuses it before any Variant
 /// value is read. Only a block whose names, order, nullability, and storage
-/// types all match goes through [`validate_declared_variants`]. The batch is
-/// returned unchanged.
+/// types all match goes through [`validate_declared_variants`] and then
+/// [`refuse_partial_structs`] over the table's [`DomainTable::WHOLE_STRUCTS`].
+/// The batch is returned unchanged.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::UndeclaredField`] for an undeclared column and the
-/// refusal of [`validate_declared_variants`].
+/// refusals of [`validate_declared_variants`] and [`refuse_partial_structs`].
 fn validate_predeclared<T: DomainTable + ?Sized>(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
@@ -287,8 +288,50 @@ fn validate_predeclared<T: DomainTable + ?Sized>(
             });
     if shaped {
         validate_declared_variants(&declared, batch)?;
+        refuse_partial_structs(batch, T::WHOLE_STRUCTS)?;
     }
     Ok(batch.clone())
+}
+
+/// Refuse a row in which a nullable Struct is only partly present.
+///
+/// A nullable built-in Struct's children are physically nullable so a Parquet
+/// read keeps an absent parent's children null, yet the domain value it stores
+/// is wholly present or wholly absent. So in each named Struct column every
+/// child must be valid exactly where the parent is. Callers run this after the
+/// schema check, so a named column that is missing or not a Struct is left to
+/// the schema refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] naming the first row, column, and
+/// child whose validity differs from its parent's.
+pub(crate) fn refuse_partial_structs(
+    batch: &RecordBatch,
+    columns: &[&str],
+) -> Result<(), BifrostError> {
+    for &name in columns {
+        let Some(parent) = batch.column_by_name(name).and_then(|c| c.as_struct_opt()) else {
+            continue;
+        };
+        for row in 0..parent.len() {
+            let present = parent.is_valid(row);
+            if let Some((child, _)) = parent
+                .fields()
+                .iter()
+                .zip(parent.columns())
+                .find(|(_, values)| values.is_valid(row) != present)
+            {
+                return Err(BifrostError::SchemaParse {
+                    detail: format!(
+                        "row {row}: {name}.{} must be null exactly when {name} is null",
+                        child.name()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuse the first supplied column a built-in does not declare.
@@ -434,6 +477,12 @@ pub trait DomainTable: Send + Sync + 'static {
     /// ledger and value-level rules; a pre-declared table keeps the Variant
     /// contract over its declared Arrow fields.
     const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
+
+    /// Nullable Struct columns whose value is wholly present or wholly absent.
+    ///
+    /// The pre-declared validator refuses a row that sets only some children
+    /// of one of these columns; see [`refuse_partial_structs`].
+    const WHOLE_STRUCTS: &'static [&'static str] = &[];
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1093,11 +1142,15 @@ pub fn builtin_fqns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BinaryArray, Int64Array, StructArray};
+    use arrow::array::{
+        ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, make_array, new_null_array,
+    };
+    use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use verification::{EVAL_SUMMARY, ResultsTable};
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
@@ -2470,6 +2523,142 @@ mod tests {
             baseline,
             "a duplicated reserved field drifts the canonical physical identity"
         );
+    }
+
+    /// A nullable Struct is admitted only wholly present or wholly absent.
+    ///
+    /// The helper is driven through all four parent/child validity states,
+    /// then the Results and Calls validators are shown to refuse a partial
+    /// value in their declared Struct columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete or absent value is refused, or a partial value
+    /// reaches a table's durable path.
+    #[test]
+    fn partial_nullable_structs_are_refused() {
+        let children = Fields::from(vec![utf8("provider", true), utf8("model", true)]);
+        let model = |parent: Vec<bool>, child: Vec<Option<&str>>| {
+            let child = Arc::new(StringArray::from(child)) as ArrayRef;
+            let column = StructArray::new(
+                children.clone(),
+                vec![Arc::clone(&child), child],
+                Some(NullBuffer::from(parent)),
+            );
+            RecordBatch::try_from_iter([("m", Arc::new(column) as ArrayRef)]).expect("batch")
+        };
+        refuse_partial_structs(&model(vec![true, false], vec![Some("a"), None]), &["m"])
+            .expect("complete-present and null-absent rows are admitted");
+        for (parent, child) in [(true, None), (false, Some("a"))] {
+            let refusal = refuse_partial_structs(&model(vec![parent], vec![child]), &["m"])
+                .expect_err("a partial value is refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{parent} {child:?}"
+            );
+        }
+
+        // One declared row: nullable columns null, required ones filled.
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let refuses_partial = |namespace: &str, name: &str, column: &str, partial: ArrayRef| {
+            let definition = builtin_table(namespace, name).expect("built-in");
+            let fields = (definition.arrow_fields)();
+            let columns = fields
+                .iter()
+                .map(|field| match field.name() == column {
+                    true => Arc::clone(&partial),
+                    false if field.is_nullable() => new_null_array(field.data_type(), 1),
+                    false => match field.data_type() {
+                        DataType::Struct(nested) => Arc::new(StructArray::new(
+                            nested.clone(),
+                            nested.iter().map(|f| filled(f.data_type())).collect(),
+                            None,
+                        )) as ArrayRef,
+                        data_type => filled(data_type),
+                    },
+                })
+                .collect();
+            let batch =
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("declared row");
+            let refusal = (definition.canonical_validator)(&batch)
+                .expect_err("a partial Struct is refused before durable work");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{namespace}.{name}"
+            );
+        };
+        let summary = ResultsTable::eval_summary_fields();
+        let mut values: Vec<ArrayRef> = summary.iter().map(|f| filled(f.data_type())).collect();
+        values[0] = new_null_array(&DataType::Int32, 1);
+        refuses_partial(
+            "verification",
+            "results",
+            EVAL_SUMMARY,
+            Arc::new(StructArray::new(summary, values, None)),
+        );
+        refuses_partial(
+            "gateway",
+            "calls",
+            gateway::RESOLVED_MODEL,
+            Arc::new(model(vec![true], vec![None]).column(0).as_struct().clone()),
+        );
+    }
+
+    /// The metric points validator refuses a partly present bucket set.
+    ///
+    /// A projected point with no buckets gets its `offset` child set while the
+    /// collection stays null; the validator must refuse it before durable work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture stops projecting, its first point gains buckets,
+    /// or the partial bucket set is admitted.
+    #[test]
+    fn partial_metric_buckets_are_refused() {
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
+        let points = crate::tables::signal::without_correlation_columns(&points)
+            .expect("the correlation columns split off cleanly");
+        let buckets = points
+            .column_by_name("positive_buckets")
+            .expect("bucket column")
+            .as_struct();
+        assert!(
+            buckets.is_null(0),
+            "the fixture's first point has no buckets"
+        );
+        let (bucket_fields, mut bucket_children, nulls) = buckets.clone().into_parts();
+        bucket_children[0] = filled(bucket_fields[0].data_type());
+        let bucket_children = bucket_children
+            .into_iter()
+            .map(|child| make_array(child.to_data().slice(0, 1)))
+            .collect();
+        let partial: ArrayRef = Arc::new(StructArray::new(
+            bucket_fields,
+            bucket_children,
+            nulls.map(|nulls| nulls.slice(0, 1)),
+        ));
+        let points = points.slice(0, 1);
+        let mut columns = points.columns().to_vec();
+        let index = points
+            .schema()
+            .index_of("positive_buckets")
+            .expect("bucket index");
+        columns[index] = partial;
+        let partial_points = RecordBatch::try_new(points.schema(), columns).expect("points");
+        let refusal = crate::tables::metrics::validate_metric_points(&partial_points)
+            .expect_err("a partial bucket set is refused");
+        assert_eq!(refusal.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
     /// Pins the revision-10 Variant contract and every built-in Variant/Struct layout.

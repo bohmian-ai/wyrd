@@ -34,7 +34,8 @@ pub static POSITIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false
 ///
 /// Both children are nullable because the collection itself is: a required
 /// Parquet leaf under a null Struct reads back padded values, which a field
-/// query such as `positive_buckets['offset']` would expose.
+/// query such as `positive_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
     F::payload("offset", T::Int32, true),
     F::payload(
@@ -51,7 +52,8 @@ pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false
 ///
 /// Both children are nullable because the collection itself is: a required
 /// Parquet leaf under a null Struct reads back padded values, which a field
-/// query such as `negative_buckets['offset']` would expose.
+/// query such as `negative_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static NEGATIVE_BUCKET_FIELDS: [F; 2] = [
     F::payload("offset", T::Int32, true),
     F::payload(

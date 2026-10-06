@@ -1,9 +1,9 @@
 ---
 id: TASK-001-R4
 kind: remediation
-status: ready
+status: complete
 spec: SPEC-bifrost-variant
-spec_revision: 11
+spec_revision: 12
 requirements: [REQ-003, REQ-004, REQ-009, REQ-018, REQ-019, INV-002, INV-007, AC-003, AC-005]
 depends_on: []
 parent_task: TASK-001
@@ -14,7 +14,9 @@ remediates: [FIND-TASK-001-14, FIND-TASK-001-15, FIND-TASK-001-16, FIND-TASK-001
 
 ## Authority and immutable review subject
 
-- Approved specification: `changes/active/bifrost-variant/spec.md`, revision 11
+- Approved specification: `changes/active/bifrost-variant/spec.md`, revision 12
+  (this packet was written against revision 11; the human decision recorded
+  below made revision 12 operative before completion)
 - Original task: `changes/active/bifrost-variant/tasks/TASK-001-variant-storage-and-query.md`
 - Reviewed base: `80b33286e7dcaab8ed04d06b63eb0ca329b0c2a2`
 - Reviewed candidate: `a6429060fb011aafa4335f2f736c70adab231739`
@@ -252,6 +254,9 @@ this remediation.
   top-level `native_preflight_rejects_nonnullable_nulls` stays red.
 
 ### Diagnosis — published Struct children of an absent summary read non-null
+
+> Superseded history: this diagnosis was made under revision 11's non-null
+> children. Revision 12 (resolution below) is the operative outcome.
 
 - **Symptom:** after the Gate fix, V2 passes "hot summary Struct children" but
   the published read (after `flush_bifrost`) returns `method: ""`,

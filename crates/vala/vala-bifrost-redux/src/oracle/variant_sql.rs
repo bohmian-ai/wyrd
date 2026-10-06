@@ -869,15 +869,31 @@ mod tests {
     }
 
     /// `parse_json` reports numeric range before depth whatever the object
-    /// key order.
+    /// key order, and when the number sits inside the over-depth container.
     ///
     /// # Panics
     ///
-    /// Panics when either key order reports depth or the details differ.
+    /// Panics when either key order or the nested number reports depth, or
+    /// the details differ.
     #[tokio::test]
     async fn parse_json_numeric_range_outranks_depth_in_any_key_order() {
         let context = session(&[None]);
-        let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
+        let (open, close) = ("[".repeat(65), "]".repeat(65));
+        assert_eq!(
+            refusal(
+                &context,
+                &format!(r#"SELECT parse_json('{{"a": {open}18446744073709551616{close}}}')"#),
+            )
+            .await,
+            BifrostError::VariantNumericOutOfRange {
+                field: "parse_json".to_owned(),
+                row: 0,
+                path: format!("/a{}", "/0".repeat(65)),
+                numeric_kind: "integer".to_owned(),
+            },
+            "a number below the depth limit"
+        );
+        let deep = format!("{open}1{close}");
         for (numeric, nested) in [("a", "b"), ("b", "a")] {
             assert_eq!(
                 refusal(

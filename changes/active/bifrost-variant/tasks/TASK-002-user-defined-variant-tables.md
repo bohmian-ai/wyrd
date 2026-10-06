@@ -202,9 +202,15 @@ it is not a Bifrost data or Iceberg migration.
 1. `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=schema::schema_tests::open_nested_and_unsupported_schemas_map_exactly)'`
 2. `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=producer::tests::prepared_rows_reject_atomically_before_reservation)'`
 3. `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=bifrost::facade::tests::variant_batch_describes_before_admission)'`
-4. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all -E "test(=pg_tests::variant_tables_round_trip_and_refuse_atomically)"'`
-5. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py::test_variant_tables_round_trip_and_refuse_atomically'`
-6. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/bifrost-write.test.ts -t "variant tables round trip and refuse atomically"'`
+4. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-client --features test-support --test pg_bifrost_e2e -P journey --run-ignored=all -E "test(/^variant_tables::pg_tests::/)"'`
+5. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/bifrost/test_variant_tables.py'`
+6. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/variant-tables.test.ts'`
+
+Scenario 4's single `variant_tables_round_trip_and_refuse_atomically` journey
+per SDK is split into one focused, user-shaped file per SDK
+(`pg_bifrost_e2e/variant_tables.rs`, `test_variant_tables.py`,
+`variant-tables.test.ts`) with the same eight cases each; commands 4–6 run
+those files.
 7. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:setup && cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip'`
 8. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run ts:build && mise run ts:build:testing && cd sdks/wyrd-sdk-ts/wyrd && mise exec -- pnpm exec vitest run tests/integration/oracle-query.test.ts -t "canonical signal Arrow write and SQL read round-trip"'`
 9. `mise run py:typecheck`
@@ -235,3 +241,29 @@ schema acquisition are fixed above; only local symbol placement remains.
 - `AGENTS.md`
 - `architecture/{agent-rules,wyrd-design,wyrd-doctrine,bifrost-design}.md`
 - `architecture/references/domain/arrow-analytical-interop.md`
+
+## Implementation evidence — 2026-10-06
+
+| Criterion | Implementation | Verification | Result |
+| --- | --- | --- | --- |
+| REQ-012 declarations map exactly; client and server refuse unsupported forms | `wyrd-queue` `schema.rs` shared decision table; server register validation | Cmd 1; Rust `unsupported_type_is_refused_by_sdk_and_server` (SDK + raw server, no table created); Python `test_unsupported_type_is_refused`; TS `refuses open extras beside fixed fields` | pass |
+| Rows fully prepared before one reservation; failures leave queue state unchanged | `RowPreflight::prepare -> PreparedRows`; producer accepts only `PreparedRows` | Cmd 2; Rust/Python/TS undeclared-field cases read back zero rows | pass |
+| `write_batch` describes once, then conforms by the same rules as `insert` (revision 12) | `RowPreflight::prepare_batch`, sharing the `undeclared`, `missing_required`, and `encode_variant` helpers with `prepare`; facade calls it after `describe` | Cmd 3; `wyrd-queue` batch conformance unit tests (57/57); Arrow JSON-text cases in all three SDKs | pass |
+| Server accepts only the extension and repeats checks; struct-masked nulls in required children are accepted | `scribe/fixed_ipc.rs`, `scribe/material_plan.rs` masked-null handling | `masked_required_struct_child_null_roundtrips`; `vala-bifrost-redux` lib 347/347 | pass |
+| Rust, Python, TypeScript journeys round-trip native and Arrow values and refuse atomically | Focused files per SDK; TS typed rows project Struct to objects and List to arrays (`nativeValue`) | Cmds 4–6: Rust 8/8 (full `pg_bifrost_e2e` 26/26), Python 8/8, TS 8/8 | pass |
+| Canonical-signal Arrow journeys write Variant columns as JSON text; OTLP detour removed | Python `test_bifrost_query.py`, TS `oracle-query.test.ts` build batches from the described schema | Cmds 7–8 (Python file 9/9, TS file 9/9) | pass |
+| Contracts, stubs, typing, format, lints | — | Cmds 9–12; `mise run fmt`, `lints`, `py:format`, `py:lints`, `ts:test:unit` (38/38), `py:test:unit` (539) | pass |
+
+Open findings:
+
+- DataFusion 55 `get_field` returns a Struct's child column without the
+  parent's nulls, so `point['x']` on a row whose `point` is null reads the
+  child's placeholder (`0`) instead of `null`. Whole-Struct reads are correct.
+  The fix belongs in the Oracle SQL surface (`oracle/variant_sql.rs`), which
+  already installs Wyrd's functions; it needs an owner decision.
+- TypeScript `TableConfig.fromJsonSchema` refusals carry the message but no
+  stable `code` (pre-existing for every construction-time TS error). Rust and
+  Python carry the code.
+- Nested Variant fields inside List/Struct columns (e.g. span `events[].attributes`)
+  cannot be written from Arrow JSON text; revision 12 conforms top-level
+  declared Variant columns only. The OTLP path still covers them.

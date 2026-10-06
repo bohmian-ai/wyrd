@@ -1,4 +1,5 @@
 from wyrd import Agent, FinishReason, Prompt, WyrdError
+from wyrd.agent import CallbackContext, Role
 
 
 def test_before_model_callback_fires_with_ambient_mock() -> None:
@@ -15,7 +16,32 @@ def test_before_model_callback_fires_with_ambient_mock() -> None:
 
     assert "hello" in run.output
     assert calls
-    assert calls[0]["ctx"]["agent_id"] == agent.id
+    assert calls[0]["ctx"].agent_id == agent.id
+
+
+def test_callback_context_is_typed() -> None:
+    seen: list[CallbackContext] = []
+
+    def before_model(ctx, request):
+        seen.append(ctx)
+        return None
+
+    agent = Agent(
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
+        before_model_callback=before_model,
+    )
+    agent.run("hello")
+
+    ctx = seen[0]
+    assert isinstance(ctx, CallbackContext)
+    assert ctx.agent_id == agent.id
+    assert ctx.session_id is None
+    assert ctx.iteration == 0
+    assert len(ctx.conversation) == len(ctx.conversation.turns) >= 1
+    user_turns = [turn for turn in ctx.conversation.turns if turn.role == Role.User]
+    assert user_turns
+    assert user_turns[-1].content == "hello"
+    assert user_turns[-1].to_dict()["type"] == "user"
 
 
 def test_after_model_replace_with_changes_output() -> None:

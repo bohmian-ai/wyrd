@@ -6,8 +6,8 @@ from types import TracebackType
 from typing import Any, Literal
 
 from ..bifrost import Bifrost, Correlation
+from ..cards import CardRef
 from ..eval import MediaRef
-from .cards import CardRef
 
 #### end of imports ####
 

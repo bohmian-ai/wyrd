@@ -333,6 +333,21 @@ impl ModelCard {
         })
     }
 
+    /// Load a native holder from a saved Card directory or a Card file.
+    ///
+    /// A directory is read through the `card.json` that [`ModelCard`] `save`
+    /// writes; any other path is read as one JSON or YAML Card envelope. The
+    /// envelope then passes through [`ModelCard::from_card`], so kind, version,
+    /// and `ModelSpec` validation stay in one place. No model bytes are read.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the file cannot be read or parsed, and
+    /// a `ModelCard` validation error when the envelope is not a valid Model
+    /// Card.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, WyrdError> {
+        Self::from_card(crate::local::read_card(path)?)
+    }
+
     /// Hydrate the holder's built-in or caller-supplied Python interface.
     #[cfg(feature = "python")]
     pub fn hydrate_interface(
@@ -765,6 +780,35 @@ impl ModelCard {
     ) -> CardPyResult<Self> {
         let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
         card.hydrate_interface(py, interface)?;
+        Ok(card)
+    }
+
+    /// Load a saved `ModelCard` directory or a Model Card YAML or JSON file.
+    ///
+    /// A directory written by `save` loads the envelope from its `card.json`
+    /// and then loads the saved model through the hydrated interface, so the
+    /// returned holder's `model` is ready. A Card file loads the envelope and
+    /// interface only. Python subclass-backed cards pass
+    /// `interface=YourInterface` exactly as for `model_validate_json`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the Card file cannot be read or
+    /// parsed, a `ModelCard` validation error when the envelope is invalid or
+    /// the interface cannot be rebuilt, and the interface's error when loading
+    /// saved model artifacts fails.
+    #[staticmethod]
+    #[pyo3(name = "from_path", signature = (path, interface=None, load_kwargs=None))]
+    pub fn from_path_py(
+        py: Python<'_>,
+        path: PathBuf,
+        interface: Option<&Bound<'_, PyAny>>,
+        load_kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<Self> {
+        let mut card = Self::from_path(&path)?;
+        card.hydrate_interface(py, interface)?;
+        if path.is_dir() {
+            card.load(py, Some(path), load_kwargs)?;
+        }
         Ok(card)
     }
 

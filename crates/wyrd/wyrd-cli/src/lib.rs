@@ -1,10 +1,11 @@
-//! Library surface of the `wyrd` CLI for in-process test drivers.
+//! Library surface of the `wyrd` CLI.
 //!
-//! The CLI ships as a binary (`src/main.rs`); this thin facade re-exports the
-//! command modules the binary already owns so integration tests can drive the
-//! real argument-parsing, request-building, and response-handling code paths
-//! in process — exactly what an operator runs — instead of re-implementing the
-//! admin wire calls.
+//! The CLI ships as a binary (`src/main.rs`) that renders the command
+//! functions this library owns. [`commands`] exposes those functions in
+//! process, returning the typed value the binary prints with `--format json`
+//! and a shared-catalog error instead of an exit code; every SDK projects
+//! them. The remaining modules let integration tests drive the real
+//! argument-parsing, request-building, and response-handling code paths.
 
 /// `wyrd auth` tenant identity commands: API keys, OIDC login, refresh, trusted issuers, and workload bindings.
 pub mod auth;
@@ -18,9 +19,6 @@ pub mod load;
 mod operator_connection;
 mod platform;
 mod principal;
-#[cfg(feature = "python")]
-/// Optional PyO3 adapter for the shared numeric CLI entrypoint.
-pub mod python;
 pub mod query;
 pub mod registration;
 mod workflow;
@@ -28,6 +26,22 @@ mod workflow;
 use clap::{Parser, error::ErrorKind};
 
 pub use cli::{Cli, Command};
+
+/// In-process CLI commands: the same implementation the `wyrd` executable
+/// renders, returning the typed value it prints with `--format json` and a
+/// [`wyrd_spec::error::WyrdError`] instead of an exit code.
+///
+/// Networked commands read their credential from the ambient chain
+/// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+/// `credentials.toml`), never from an argument; `server` re-points only the
+/// endpoint.
+pub mod commands {
+    pub use crate::auth::issue_key::issue_key;
+    pub use crate::card::{LoadOutput, PlanCard, PlanReport, SelectorArgs, apply, get, load, plan};
+    pub use crate::gateway::{
+        delete_provider_credential, put_provider_credential, revoke_provider_credential,
+    };
+}
 
 // Re-export the public loader API
 pub use load::{

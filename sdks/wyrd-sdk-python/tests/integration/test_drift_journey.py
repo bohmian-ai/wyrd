@@ -2,31 +2,26 @@
 
 Registers Pandas, Polars, and Arrow baseline Data Cards, each saved as Parquet,
 fits a PSI Verifier from each and an SPC Verifier from the Polars baseline, and
-reads every baseline's Card status until it is ready. A Service bound to the
-SPC Verifier with one Operator emits Drift observations through ``WyrdState``;
-direct runs of every Verifier then score the window server-side and persist
-their results, SPC X-bar/S evidence, and feature rows without an Operator
-dispatch. A manual run of the Service's binding and its due scheduled
-occurrence each fail on SPC signals and dispatch its Operator. Once the SPC
-Verifier's stored fit is retired to a pre-revision format, a new run is refused
-with ``baseline_legacy`` while its earlier result stays readable. Negative flows
-cover an Arrow IPC baseline refused as non-Parquet, an SPC profile carrying the
-retired ``weco_rule`` field, and a caller without ``evals:run``. A second journey proves each method's edge
-semantics on isolated subjects: an empty tenant, a baseline-like window, SPC
-subgroups until a partial one, a sparse window, unrelated and incomplete
-records, per-row Custom averaging with window bounds, and a text-valued metric.
+reads every baseline's Card status until it is ready. A Service binds all four
+Verifiers, and only its SPC binding names an HTTP Operator delivered to a local
+receiver. As its own principal the Service emits Drift observations through
+``WyrdState`` and judges the same rows directly with each Verifier through
+``run.observe.verify``. Each binding's due scheduled occurrence then fails,
+persisting its result, SPC X-bar/S evidence, and feature rows, and the SPC
+binding delivers its Operator. Negative flows cover an Arrow IPC baseline
+refused as non-Parquet, an SPC profile carrying the retired ``weco_rule``
+field, and a caller without ``evals:run``.
 
-A third journey registers one Service whose Model carries PSI, SPC, and Custom
+A second journey registers one Service whose Model carries PSI, SPC, and Custom
 Drift bindings and whose Agent carries a deterministic and a local LLM-judge
 Eval binding. As its own Card-bound principal the Service emits typed and
 mapping Drift and Eval observations through one ``state.run()`` that switches
 between the Model and Agent views; Scribe acknowledges them, each Eval
-observation runs both Eval bindings, and manual binding runs score each Drift
-method. The failed PSI binding run delivers its HTTP Operator to a local
-receiver, read back as ``delivered`` through Run GET, and a direct PSI run
-persists null owner and binding identity. Mapping, dataclass, and Pydantic
-payloads persist identical tall Drift rows, and registering a retired
-``kind: Drift`` or ``kind: Eval`` Card is refused.
+observation runs both Eval bindings, and each due Drift binding scores its
+method. The failed PSI binding delivers its HTTP Operator to a local receiver,
+and the Model view judges the same rows directly with the PSI Verifier.
+Mapping, dataclass, and Pydantic payloads persist identical tall Drift rows,
+and registering a retired ``kind: Drift`` or ``kind: Eval`` Card is refused.
 """
 
 from __future__ import annotations
@@ -42,7 +37,6 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -57,11 +51,10 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.data import ArrowInterface, DataCard, PandasInterface, PolarsInterface
 from wyrd.model import ModelInterface
-from wyrd.observe import Run
+from wyrd.observe import Judgment, Run
 from wyrd.prompt import Prompt
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
-from wyrd.verification import Verification
 
 WAIT_SECONDS = 90
 ROWS = 100
@@ -89,27 +82,23 @@ def verifier_yaml(name: str, baseline: CardRef, method: str) -> str:
     )
 
 
-SERVICE = """apiVersion: wyrd/v1
-kind: Service
-metadata:
-  name: py-drift-service
-  version: 1.0.0
-  space: default
-spec:
-  verified_by:
-    - verifier:
-        kind: Verifier
-        name: py-drift-spc
-        version: 1.0.0
-        space: default
-      runs_on:
-        kind: schedule
-        cron: "0 0 * * *"
-      on_failure:
-        - kind: http
-          method: post
-          url: https://hooks.example.test/py-drift
-"""
+def service_yaml(hook: str) -> str:
+    """Build a Service whose root binds every baseline's Verifier on a daily schedule.
+
+    Only the SPC binding names an Operator: an HTTP POST to ``hook``.
+    """
+    bindings = "".join(
+        f"    - verifier: {{kind: Verifier, name: {name}, version: 1.0.0, space: default}}\n"
+        '      runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+        for name in ("py-drift-pandas", "py-drift-polars", "py-drift-arrow")
+    )
+    return (
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: py-drift-service\n"
+        f"  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n{bindings}"
+        "    - verifier: {kind: Verifier, name: py-drift-spc, version: 1.0.0, space: default}\n"
+        '      runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+        f"      on_failure:\n        - {{kind: http, method: post, url: '{hook}'}}\n"
+    )
 
 
 def download(server: WyrdTestServer, credential: str, kind: str, uid: str, bundle: Path) -> dict:
@@ -162,63 +151,55 @@ def wait_ready(server: WyrdTestServer, credential: str, verifier: CardRef, root:
         time.sleep(0.2)
 
 
-def settle(verification: Verification, run_id: str) -> dict:
-    """Poll run ``run_id`` until it leaves the queue and return its status."""
-    deadline = time.monotonic() + WAIT_SECONDS
-    while (run := verification.get_run(run_id))["status"] in {"pending", "running", "retrying"}:
-        assert time.monotonic() < deadline, f"run never settled: {run}"
-        time.sleep(0.1)
-    return run
+def client_environment(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Clear every ambient credential that would outrank an API key, and any saved login.
 
-
-def scheduled_run(server: WyrdTestServer, binding_id: str) -> str:
-    """Make ``binding_id`` due and return the one run its occurrence schedules.
-
-    Dueness is PostgreSQL's decision, so the test harness places the schedule
-    cursor at statement time and the verification runtime schedules the
-    occurrence; the daily window ``[midnight UTC, now)`` holds this journey's
-    observations.
+    ``observe.verify`` resolves its client from the environment on first use
+    when Bifrost is not started. The entered ``WyrdTestServer`` publishes
+    ``WYRD_SERVER_URL`` and owns ``WYRD_API_KEY``, restoring both on exit.
     """
-    earlier = set(server.verification_runs())
-    server.make_binding_due(binding_id)
-    deadline = time.monotonic() + WAIT_SECONDS
-    while not (runs := [run for run in server.verification_runs() if run not in earlier]):
-        assert time.monotonic() < deadline, "the due binding never scheduled a run"
-        time.sleep(0.1)
-    (run,) = runs
-    return run
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(root / "config"))
+    for name in ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
 
 
-def complete(
-    verification: Verification,
-    verifier: CardRef,
-    subject: CardRef,
-    window: tuple[datetime, datetime] | None = None,
-) -> str:
-    """Run ``verifier`` directly over ``subject`` and return its result.
+def verify_as(bundle: Path, credential: str, verifier: str, input: object) -> Judgment:
+    """Judge ``input`` with bound ``verifier`` from ``bundle``'s root Run view as ``credential``.
 
-    ``window`` is the ``[start, end)`` range; omitted, it spans an hour either side of now.
+    Sets the harness-owned ``WYRD_API_KEY`` (see ``client_environment``); a
+    fresh ``WyrdState`` resolves its client from it on this first judgment.
     """
-    now = datetime.now(UTC)
-    start, end = window or (now - timedelta(hours=1), now + timedelta(hours=1))
-    run_id = verification.start_run(
-        {
-            "target": {
-                "kind": "verifier",
-                "verifier_uid": str(verifier.uid),
-                "subject_card_uid": str(subject.uid),
-            },
-            "input": {
-                "kind": "drift_window",
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-        }
-    )
-    run = settle(verification, run_id)
-    assert run["status"] == "completed", run
-    assert run["dispatches"] == [], "a direct run never dispatches"
-    return run["result_id"]
+    os.environ["WYRD_API_KEY"] = credential
+    return WyrdState.from_path(bundle).run().observe.verify(verifier, input)
+
+
+def await_rows(server: WyrdTestServer, query: Bifrost, sql: str, count: int) -> list[dict]:
+    """Flush Scribe and rerun ``sql`` until it returns ``count`` rows, and return them.
+
+    A result table the tenant has not written yet reads as no rows.
+    """
+    deadline = time.monotonic() + WAIT_SECONDS
+    while True:
+        server.flush_bifrost()
+        try:
+            found = query.sql(sql).to_arrow().to_pylist()
+        except WyrdError as error:
+            assert error.code == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND", error
+            found = []
+        if len(found) >= count:
+            assert len(found) == count, found
+            return found
+        assert time.monotonic() < deadline, f"only {len(found)} of {count} rows: {found}"
+        time.sleep(0.2)
+
+
+def await_hooks(received: list[tuple[str, dict]], count: int) -> None:
+    """Wait until the local receiver holds ``count`` Operator deliveries to ``/hook``."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while len(hooks := [path for path, _ in received if path == "/hook"]) < count:
+        assert time.monotonic() < deadline, f"only {len(hooks)} of {count} Operator deliveries"
+        time.sleep(0.1)
+    assert len(hooks) == count, received
 
 
 def assert_spc_evidence(details: str, subgroups: int, x_bar_signals: int) -> None:
@@ -256,9 +237,14 @@ def register_baselines(cards: Cards) -> dict[str, CardRef]:
 
 
 @pytest.mark.integration
-def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> None:
+def test_parquet_baselines_fit_and_score_drift_server_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Pandas, Polars, and Arrow baselines fit, and each Verifier scores server-side."""
-    with WyrdTestServer(verification_runtime=True) as server:
+    with (
+        local_upstream() as (upstream, received),
+        WyrdTestServer(verification_runtime=True) as server,
+    ):
         admin = server.bootstrap_service(["admin"], name="py-drift-admin")
         cards = Cards(server_url=server.base_url, credential=admin)
         baselines = register_baselines(cards)
@@ -275,113 +261,58 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
         for verifier in verifiers.values():
             wait_ready(server, admin, verifier, tmp_path / "status")
 
-        (tmp_path / "service.yaml").write_text(SERVICE, encoding="utf-8")
+        (tmp_path / "service.yaml").write_text(service_yaml(f"{upstream}/hook"), encoding="utf-8")
         service = cards.register_from_path(str(tmp_path / "service.yaml")).root
         credential = server.credential_registered_service(
             f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
         )
         bundle = tmp_path / "service"
-        (binding_id,) = download(server, admin, "Service", str(service.uid), bundle)[
-            "verification"
-        ]["binding_ids"]
+        binding_ids = download(server, admin, "Service", str(service.uid), bundle)["verification"][
+            "binding_ids"
+        ]
+        assert len(binding_ids) == 4, binding_ids
         state = WyrdState.from_path(bundle)
         state.start_bifrost(server_url=server.base_url, credential=credential)
         run = state.run()
-        for row in range(120):
-            run.observe.drift({"latency": 150.0 + row})
-        state.shutdown()
-        server.flush_bifrost()
-
-        verification = Verification(server_url=server.base_url, credential=credential)
-        query = Bifrost(server_url=server.base_url, credential=admin)
-        results = {}
+        shifted = [{"latency": 150.0 + row} for row in range(120)]
+        for row in shifted:
+            run.observe.drift(row)
         for name, verifier in verifiers.items():
-            result_id = results[name] = complete(verification, verifier, service)
-            server.flush_bifrost()
-            (result,) = (
-                query.sql(
-                    "SELECT execution_status, verdict, subject_card_uid, binding_id, details "
-                    f"FROM vala.verification.results WHERE result_id = '{result_id}'"
-                )
-                .to_arrow()
-                .to_pylist()
-            )
-            assert (result["execution_status"], result["verdict"]) == ("completed", "failed"), name
-            assert result["subject_card_uid"] == str(service.uid)
-            assert result["binding_id"] is None
-            features = (
-                query.sql(
-                    "SELECT f.feature, f.verdict FROM vala.drift.result_features f "
-                    "JOIN vala.verification.results r ON f.result_id = r.result_id "
-                    f"WHERE r.result_id = '{result_id}'"
-                )
-                .to_arrow()
-                .to_pylist()
-            )
-            assert features == [{"feature": "latency", "verdict": "drift"}], name
+            judgment = run.observe.verify(name, shifted)
+            assert judgment.verdict == "failed", (name, judgment.summary)
+            assert (str(judgment.verifier.uid), str(judgment.subject.uid)) == (
+                str(verifier.uid),
+                str(service.uid),
+            ), name
+            features = judgment.detail["drift"]["features"]
+            assert {feature: report["verdict"] for feature, report in features.items()} == {
+                "latency": "drift"
+            }, name
             if name == "py-drift-spc":
-                assert_spc_evidence(result["details"], 24, 24)
+                assert_spc_evidence(json.dumps(judgment.detail["drift"]), 24, 24)
+        state.shutdown()
 
-        now = datetime.now(UTC)
-        binding_run = verification.start_run(
-            {
-                "target": {"kind": "binding", "binding_id": binding_id},
-                "input": {
-                    "kind": "drift_window",
-                    "start": (now - timedelta(hours=1)).isoformat(),
-                    "end": (now + timedelta(hours=1)).isoformat(),
-                },
-            }
+        for binding_id in binding_ids:
+            server.make_binding_due(binding_id)
+        query = Bifrost(server_url=server.base_url, credential=admin)
+        scheduled = await_rows(
+            server,
+            query,
+            "SELECT r.execution_status, r.verdict, r.binding_id, r.subject_card_uid, r.details, "
+            "f.feature, f.method, f.verdict AS feature_verdict "
+            "FROM vala.verification.results r JOIN vala.drift.result_features f "
+            "ON r.result_id = f.result_id "
+            f"WHERE r.owner_card_uid = '{service.uid}' ORDER BY f.method",
+            4,
         )
-        for run_id in (binding_run, scheduled_run(server, binding_id)):
-            run = settle(verification, run_id)
-            assert run["status"] == "completed", run
-            assert len(run["dispatches"]) == 1, "a failed binding result dispatches its Operator"
-            server.flush_bifrost()
-            (bound,) = (
-                query.sql(
-                    "SELECT verdict, binding_id, details FROM vala.verification.results "
-                    f"WHERE result_id = '{run['result_id']}'"
-                )
-                .to_arrow()
-                .to_pylist()
-            )
-            assert (bound["verdict"], bound["binding_id"]) == ("failed", binding_id), bound
-            assert_spc_evidence(bound["details"], 24, 24)
-
-        spc = verifiers["py-drift-spc"]
-        server.retire_fitted_format(str(spc.uid))
-        now = datetime.now(UTC)
-        refused = settle(
-            verification,
-            verification.start_run(
-                {
-                    "target": {
-                        "kind": "verifier",
-                        "verifier_uid": str(spc.uid),
-                        "subject_card_uid": str(service.uid),
-                    },
-                    "input": {
-                        "kind": "drift_window",
-                        "start": (now - timedelta(hours=1)).isoformat(),
-                        "end": (now + timedelta(hours=1)).isoformat(),
-                    },
-                }
-            ),
-        )
-        assert refused["status"] == "errored", refused
-        assert refused["error"]["code"] == "baseline_legacy", refused
-        assert refused["result_id"] is None, "a refused legacy run is never scored"
-        (historical,) = (
-            query.sql(
-                "SELECT verdict, details FROM vala.verification.results "
-                f"WHERE result_id = '{results['py-drift-spc']}'"
-            )
-            .to_arrow()
-            .to_pylist()
-        )
-        assert historical["verdict"] == "failed", historical
-        assert_spc_evidence(historical["details"], 24, 24)
+        assert sorted(result["binding_id"] for result in scheduled) == sorted(binding_ids)
+        assert [result["method"] for result in scheduled] == ["Psi", "Psi", "Psi", "Spc"]
+        for result in scheduled:
+            assert (result["execution_status"], result["verdict"]) == ("completed", "failed")
+            assert result["subject_card_uid"] == str(service.uid), result
+            assert (result["feature"], result["feature_verdict"]) == ("latency", "drift"), result
+        assert_spc_evidence(scheduled[-1]["details"], 24, 24)
+        await_hooks(received, 1)
 
         ipc = DataCard(
             ArrowInterface(data=pa.table({"latency": LATENCY}), format="ipc"),
@@ -409,248 +340,26 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             cards.register_from_path(str(retired))
         assert "weco_rule" in str(legacy.value.details), legacy.value.details
 
-        reader = Verification(
-            server_url=server.base_url,
-            credential=server.bootstrap_service(["reader"], name="py-drift-reader"),
-        )
+        client_environment(monkeypatch, tmp_path)
+        reader = server.bootstrap_service(["reader"], name="py-drift-reader")
         with pytest.raises(WyrdError) as denied:
-            reader.start_run(
-                {
-                    "target": {
-                        "kind": "verifier",
-                        "verifier_uid": str(verifiers["py-drift-pandas"].uid),
-                        "subject_card_uid": str(service.uid),
-                    },
-                    "input": {
-                        "kind": "drift_window",
-                        "start": "2026-09-17T00:00:00Z",
-                        "end": "2026-09-17T01:00:00Z",
-                    },
-                }
-            )
+            verify_as(bundle, reader, "py-drift-pandas", shifted)
         assert denied.value.status == 403
 
 
-EDGE_VERIFIERS = {
-    "py-edge-psi": (
-        "      method: Psi\n      signal:\n        kind: Distribution\n"
-        "        baseline_ref:\n          kind: Data\n          name: py-edge-data\n"
-        "          version: 1.0.0\n          space: default\n"
-        "        features: [latency, tier]\n      condition:\n        kind: Statistical\n"
-        "      profile:\n        kind: Psi\n"
-        "        binning_strategy:\n          kind: EqualWidth\n          n_bins: 10\n"
-        "        categorical_features: [tier]\n"
-        "        threshold:\n          kind: Fixed\n          value: 0.25\n"
-    ),
-    "py-edge-spc": (
-        "      method: Spc\n      signal:\n        kind: Distribution\n"
-        "        baseline_ref:\n          kind: Data\n          name: py-edge-data\n"
-        "          version: 1.0.0\n          space: default\n"
-        "        features: [latency]\n      condition:\n        kind: Statistical\n"
-        "      profile:\n        kind: Spc\n        sample_size: 5\n"
-    ),
-    "py-edge-custom": (
-        "      method: Custom\n      signal:\n        kind: Metric\n        name: score\n"
-        "      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n"
-        "        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n"
-    ),
-}
-
-
-def register_edge_verifier(cards: Cards, root: Path, name: str) -> CardRef:
-    """Register one method-edge Drift Verifier from ``EDGE_VERIFIERS``."""
-    path = root / f"{name}.yaml"
-    path.write_text(
-        f"apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n"
-        "  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n"
-        f"    spec:\n{EDGE_VERIFIERS[name]}",
-        encoding="utf-8",
-    )
-    return cards.register_from_path(str(path)).root
-
-
-def subject(cards: Cards, root: Path, name: str) -> CardRef:
-    """Register an unbound Service named ``name`` as a Drift subject."""
-    path = root / f"{name}.yaml"
-    path.write_text(
-        f"apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n"
-        "  version: 1.0.0\n  space: default\nspec: {}\n",
-        encoding="utf-8",
-    )
-    return cards.register_from_path(str(path)).root
+# The Custom Drift method block: the per-row mean of ``score`` against 1.0, alerting past 0.5.
+CUSTOM_DRIFT = (
+    "      method: Custom\n      signal:\n        kind: Metric\n        name: score\n"
+    "      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n"
+    "        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n"
+)
 
 
 def subject_credential(server: WyrdTestServer, service: CardRef) -> str:
-    """Issue the subject Service's own key, whose Card scope covers its manual runs."""
+    """Issue the subject Service's own key, whose Card scope covers judging it."""
     return server.credential_registered_service(
         f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
     )
-
-
-def emit_rows(
-    server: WyrdTestServer, admin: str, service: CardRef, bundle: Path, rows: list[dict]
-) -> None:
-    """Emit ``rows`` as Drift observations of ``service`` through one ``WyrdState`` lifetime.
-
-    Each lifetime is one client batch; the batch is drained and flushed before returning.
-    """
-    download(server, admin, "Service", str(service.uid), bundle)
-    state = WyrdState.from_path(bundle)
-    state.start_bifrost(server_url=server.base_url, credential=subject_credential(server, service))
-    run = state.run()
-    for row in rows:
-        run.observe.drift(row)
-    state.shutdown()
-    server.flush_bifrost()
-
-
-def read_result(server: WyrdTestServer, query: Bifrost, result_id: str) -> tuple[dict, list]:
-    """Flush Scribe, then read one result and its ``(feature, method, verdict)`` rows.
-
-    A tenant that has never scored a report has no feature table yet, which reads
-    as no feature rows.
-    """
-    server.flush_bifrost()
-    (result,) = (
-        query.sql(
-            "SELECT execution_status, verdict, details "
-            f"FROM vala.verification.results WHERE result_id = '{result_id}'"
-        )
-        .to_arrow()
-        .to_pylist()
-    )
-    try:
-        rows = (
-            query.sql(
-                "SELECT f.feature, f.method, f.verdict FROM vala.drift.result_features f "
-                "JOIN vala.verification.results r ON f.result_id = r.result_id "
-                f"WHERE r.result_id = '{result_id}' ORDER BY f.feature"
-            )
-            .to_arrow()
-            .to_pylist()
-        )
-    except WyrdError as error:
-        assert error.code == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND", error
-        rows = []
-    return result, [(row["feature"], row["method"], row["verdict"]) for row in rows]
-
-
-def assert_unscored(outcome: tuple[dict, list]) -> None:
-    """Assert a result completed inconclusive before scoring: null details, no features."""
-    result, features = outcome
-    assert (result["execution_status"], result["verdict"]) == ("completed", "inconclusive"), result
-    assert result["details"] is None, result
-    assert features == [], features
-
-
-@pytest.mark.integration
-def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
-    """Each Drift method's edge semantics hold through the production runtime.
-
-    Before the tenant's first Drift write a Custom run completes inconclusive with
-    no details, features, or dispatch. Separate subjects then isolate each case: a
-    baseline-like window passes PSI and Custom (a mean at the threshold is no
-    drift); two in-control subgroups pass SPC with zero-signal evidence until a
-    trailing partial subgroup leaves it unscored; three rows are too few for
-    PSI and leave SPC a partial, unscored subgroup; records without a PSI feature are ignored while
-    one omitting a feature leaves PSI unscored; Custom averages per row, not per
-    batch, and the window bounds exclude a batch; a text-valued metric is
-    inconclusive.
-    """
-    with WyrdTestServer(verification_runtime=True) as server:
-        admin = server.bootstrap_service(["admin"], name="py-drift-edges-admin")
-        cards = Cards(server_url=server.base_url, credential=admin)
-        query = Bifrost(server_url=server.base_url, credential=admin)
-        now = datetime.now(UTC)
-        start, end = now - timedelta(hours=1), now + timedelta(hours=1)
-
-        def run(
-            verifier: CardRef, service: CardRef, window: tuple[datetime, datetime] = (start, end)
-        ) -> tuple[dict, list]:
-            verification = Verification(
-                server_url=server.base_url, credential=subject_credential(server, service)
-            )
-            return read_result(server, query, complete(verification, verifier, service, window))
-
-        custom = register_edge_verifier(cards, tmp_path, "py-edge-custom")
-        steady = subject(cards, tmp_path, "py-edge-steady")
-        assert_unscored(run(custom, steady))
-
-        tier = ["gold" if row % 2 == 0 else "silver" for row in range(ROWS)]
-        baseline = DataCard(
-            PolarsInterface(data=pl.DataFrame({"latency": LATENCY, "tier": tier})),
-            space="default",
-            name="py-edge-data",
-            version="1.0.0",
-        )
-        cards.data.register(baseline)
-        psi = register_edge_verifier(cards, tmp_path, "py-edge-psi")
-        spc = register_edge_verifier(cards, tmp_path, "py-edge-spc")
-        for verifier in (psi, spc):
-            wait_ready(server, admin, verifier, tmp_path / "status")
-
-        bundles = tmp_path / "bundles"
-        baseline_like = [
-            {
-                "latency": float((row * 37) % ROWS),
-                "tier": tier[row],
-                "score": 1.0 if row % 2 == 0 else 2.0,
-            }
-            for row in range(ROWS)
-        ]
-        emit_rows(server, admin, steady, bundles / "steady", baseline_like)
-        result, features = run(psi, steady)
-        assert result["verdict"] == "passed", result
-        assert features == [("latency", "Psi", "no_drift"), ("tier", "Psi", "no_drift")]
-        result, features = run(custom, steady)
-        assert result["verdict"] == "passed", "a mean at the threshold is no drift"
-        assert features == [("score", "Custom", "no_drift")]
-
-        def latencies(values: list[float]) -> list[dict]:
-            return [{"latency": value, "tier": "gold", "score": 1.0} for value in values]
-
-        calm = subject(cards, tmp_path, "py-edge-calm")
-        emit_rows(
-            server, admin, calm, bundles / "calm", latencies([48.0, 49.0, 50.0, 51.0, 52.0] * 2)
-        )
-        result, features = run(spc, calm)
-        assert result["verdict"] == "passed", result
-        assert features == [("latency", "Spc", "no_drift")]
-        assert_spc_evidence(result["details"], 2, 0)
-        emit_rows(server, admin, calm, bundles / "calm-partial", latencies([50.0, 50.0]))
-        assert_unscored(run(spc, calm))
-
-        sparse = subject(cards, tmp_path, "py-edge-sparse")
-        emit_rows(server, admin, sparse, bundles / "sparse", baseline_like[:3])
-        assert_unscored(run(psi, sparse))
-        assert_unscored(run(spc, sparse))
-
-        gappy = subject(cards, tmp_path, "py-edge-gappy")
-        emit_rows(server, admin, gappy, bundles / "gappy", baseline_like)
-        emit_rows(server, admin, gappy, bundles / "gappy-unrelated", [{"score": 9.0}] * 5)
-        result, _ = run(psi, gappy)
-        assert result["verdict"] == "passed", "records without a PSI feature do not enter PSI"
-        emit_rows(server, admin, gappy, bundles / "gappy-omitted", [{"latency": 50.0}])
-        assert_unscored(run(psi, gappy))
-
-        weighted = subject(cards, tmp_path, "py-edge-weighted")
-
-        def scores(values: list[float]) -> list[dict]:
-            return [{"latency": 50.0, "tier": "gold", "score": value} for value in values]
-
-        emit_rows(server, admin, weighted, bundles / "weighted-a", scores([1.0]))
-        split = datetime.now(UTC)
-        emit_rows(server, admin, weighted, bundles / "weighted-b", scores([2.0, 2.0, 2.0]))
-        result, _ = run(custom, weighted)
-        assert result["verdict"] == "failed", "rows average 1.75; batches would average 1.5"
-        result, _ = run(custom, weighted, (start, split))
-        assert result["verdict"] == "passed", "the window end excludes the second batch"
-        result, _ = run(custom, weighted, (split, end))
-        assert result["verdict"] == "failed", "the window start excludes the first batch"
-
-        text = subject(cards, tmp_path, "py-edge-text")
-        emit_rows(server, admin, text, bundles / "text", [{"score": "high"}] * 3)
-        assert_unscored(run(custom, text))
 
 
 MODEL_ARTIFACT = b"py-bound-model-artifact"
@@ -819,7 +528,7 @@ def write_bound_graph(root: Path, baseline: CardRef, hook: str) -> Path:
         "custom.yaml": (
             "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: py-bound-custom\n"
             "  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n"
-            f"    spec:\n{EDGE_VERIFIERS['py-edge-custom']}"
+            f"    spec:\n{CUSTOM_DRIFT}"
         ),
         "eval-assert.yaml": eval_verifier(
             "py-bound-assert",
@@ -855,47 +564,6 @@ def write_bound_graph(root: Path, baseline: CardRef, hook: str) -> Path:
     for name, body in files.items():
         (root / name).write_text(body, encoding="utf-8")
     return root / "service.yaml"
-
-
-def await_binding_ready(verification: Verification, binding_id: str) -> dict:
-    """Poll one binding until its Verifier is ready to run, and return it."""
-    deadline = time.monotonic() + WAIT_SECONDS
-    while (binding := verification.get_binding(binding_id))["readiness"] != "ready":
-        assert time.monotonic() < deadline, f"binding never became ready: {binding}"
-        time.sleep(0.2)
-    return binding
-
-
-def await_new_runs(server: WyrdTestServer, earlier: set[str], count: int) -> list[str]:
-    """Poll until ``count`` verification runs exist beyond ``earlier``, and return them."""
-    deadline = time.monotonic() + WAIT_SECONDS
-    while len(runs := [run for run in server.verification_runs() if run not in earlier]) < count:
-        assert time.monotonic() < deadline, f"only {len(runs)} of {count} runs were created"
-        time.sleep(0.1)
-    assert len(runs) == count, runs
-    return runs
-
-
-def await_dispatches(verification: Verification, run_id: str) -> dict:
-    """Poll a settled run until every Operator dispatch leaves the queue."""
-    deadline = time.monotonic() + WAIT_SECONDS
-    while True:
-        run = verification.get_run(run_id)
-        statuses = {dispatch["status"] for dispatch in run["dispatches"]}
-        if not statuses & {"pending", "running", "retrying"}:
-            return run
-        assert time.monotonic() < deadline, f"a dispatch never settled: {run}"
-        time.sleep(0.1)
-
-
-def manual_window() -> dict[str, str]:
-    """A Drift window spanning an hour either side of now."""
-    now = datetime.now(UTC)
-    return {
-        "kind": "drift_window",
-        "start": (now - timedelta(hours=1)).isoformat(),
-        "end": (now + timedelta(hours=1)).isoformat(),
-    }
 
 
 def rows_of(query: Bifrost, sql: str) -> list[dict]:
@@ -977,68 +645,30 @@ def assert_payload_forms_agree(query: Bifrost, run_ids: list[str]) -> None:
     assert persisted == [canonical] * 3, persisted
 
 
-def assert_eval_runs(
-    server: WyrdTestServer,
-    verification: Verification,
-    query: Bifrost,
-    earlier: set[str],
-    tasks: dict[str, str],
-    agent_uid: str,
-) -> None:
-    """Settle the four observation-created Eval runs and read their joined results.
+def assert_eval_runs(server: WyrdTestServer, query: Bifrost, agent_uid: str) -> set[str]:
+    """Read the four observation-created Eval results and return their binding ids.
 
     Each acknowledged record activates both Eval bindings; every run passes
-    its gate, dispatches nothing, and persists one item row per task joined to
-    its summary on ``result_id`` (Oracle scopes both sides to the caller's
-    data tenant, which is not a queryable column). ``tasks`` maps each Eval
-    binding id to its one task id.
+    its gate and persists one item row per task joined to its summary on
+    ``result_id`` (Oracle scopes both sides to the caller's data tenant, which
+    is not a queryable column). Each binding runs its own one task.
     """
-    runs = await_new_runs(server, earlier, 4)
-    observed = []
-    for run_id in runs:
-        settled = settle(verification, run_id)
-        assert settled["status"] == "completed", settled
-        assert settled["dispatches"] == [], "a passing gate dispatches nothing"
-        assert settled["requested_by_principal_id"] is None, settled
-        server.flush_bifrost()
-        (joined,) = rows_of(
-            query,
-            "SELECT r.verdict, r.binding_id, r.subject_card_uid, i.task_id, i.outcome_kind "
-            "FROM vala.verification.results r JOIN vala.eval.result_items i "
-            "ON r.result_id = i.result_id "
-            f"WHERE r.result_id = '{settled['result_id']}'",
-        )
-        assert (joined["verdict"], joined["subject_card_uid"]) == ("passed", agent_uid), joined
-        assert joined["task_id"] == tasks[joined["binding_id"]], joined
-        observed.append(joined["binding_id"])
-    assert sorted(observed) == sorted(list(tasks) * 2), "each record runs both Eval bindings"
-
-
-def assert_direct_run_unbound(
-    verification: Verification, query: Bifrost, server: WyrdTestServer, psi: str, model: str
-) -> None:
-    """A direct PSI run persists null owner and binding on its summary and features."""
-    result_id = complete(
-        verification,
-        CardRef(kind="Verifier", name="py-bound-psi", version="1.0.0", space="default", uid=psi),
-        CardRef(kind="Model", name="py-bound-model", version="1.0.0", space="default", uid=model),
-    )
-    server.flush_bifrost()
-    (unbound,) = rows_of(
+    joined = await_rows(
+        server,
         query,
-        "SELECT r.owner_card_uid, r.binding_id, f.owner_card_uid AS feature_owner, "
-        "f.binding_id AS feature_binding, f.verdict FROM vala.verification.results r "
-        "JOIN vala.drift.result_features f "
-        "ON r.result_id = f.result_id "
-        f"WHERE r.result_id = '{result_id}'",
+        "SELECT r.verdict, r.binding_id, r.subject_card_uid, i.task_id "
+        "FROM vala.verification.results r JOIN vala.eval.result_items i "
+        "ON r.result_id = i.result_id "
+        f"WHERE r.subject_card_uid = '{agent_uid}'",
+        4,
     )
-    assert unbound == {
-        "owner_card_uid": None,
-        "binding_id": None,
-        "feature_owner": None,
-        "feature_binding": None,
-        "verdict": "drift",
-    }, unbound
+    assert {(row["verdict"], row["subject_card_uid"]) for row in joined} == {("passed", agent_uid)}
+    tasks = {(row["binding_id"], row["task_id"]) for row in joined}
+    assert sorted(task for _, task in tasks) == ["answer", "judge"], joined
+    assert sorted(row["task_id"] for row in joined) == ["answer", "answer", "judge", "judge"], (
+        "each record runs both Eval bindings"
+    )
+    return {binding for binding, _ in tasks}
 
 
 def assert_retired_kinds_refused(cards: Cards, root: Path) -> None:
@@ -1080,48 +710,36 @@ def test_service_bindings_verify_drift_and_eval_through_an_http_operator(tmp_pat
             )
         ).root
         graph = write_bound_graph(tmp_path, baseline, f"{upstream}/hook")
-        model_ref = cards.register_from_path(str(tmp_path / "model.yaml")).root
+        cards.register_from_path(str(tmp_path / "model.yaml"))
         receipt = cards.register_from_path(str(graph))
         service = receipt.root
-        uids = {outcome.card_ref.name: str(outcome.card_ref.uid) for outcome in receipt.outcomes}
-        uids["py-bound-model"] = str(model_ref.uid)
+        refs = {outcome.card_ref.name: outcome.card_ref for outcome in receipt.outcomes}
+        for name in ("py-bound-psi", "py-bound-spc"):
+            wait_ready(server, admin, refs[name], tmp_path / "status")
         credential = server.credential_registered_service(
             f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
         )
-        verification = Verification(server_url=server.base_url, credential=credential)
         bundle = tmp_path / "bundle"
         binding_ids = download(server, admin, "Service", str(service.uid), bundle)["verification"][
             "binding_ids"
         ]
-        by_verifier = {uid: name for name, uid in uids.items()}
-        bindings = {
-            by_verifier[binding["verifier_uid"]]: binding
-            for binding in (await_binding_ready(verification, b) for b in binding_ids)
-        }
-        assert sorted(bindings) == [
-            "py-bound-assert",
-            "py-bound-custom",
-            "py-bound-judge-eval",
-            "py-bound-psi",
-            "py-bound-spc",
-        ], bindings
-        model_uid, agent_uid = uids["py-bound-model"], uids["py-bound-agent"]
-        assert {
-            binding["subject_card_uid"]
-            for name, binding in bindings.items()
-            if name in {"py-bound-psi", "py-bound-spc", "py-bound-custom"}
-        } == {model_uid}
+        assert len(binding_ids) == 5, binding_ids
 
         state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})
         state.start_bifrost(server_url=server.base_url, credential=credential)
+        model_uid, agent_uid = str(state.card_ref("model").uid), str(state.card_ref("agent").uid)
         run, model, agent = emit_invocation(state)
         assert model.run_id == agent.run_id == run.run_id
-        assert (model.card_ref.split("#", 1)[1], agent.card_ref.split("#", 1)[1]) == (
+        assert (model.alias, agent.alias) == ("model", "agent")
+        direct = model.observe.verify(
+            "py-bound-psi", [{"latency": 150.0 + row} for row in range(DRIFT_ROWS)]
+        )
+        assert direct.verdict == "failed", direct.summary
+        assert (str(direct.verifier.uid), str(direct.subject.uid)) == (
+            str(refs["py-bound-psi"].uid),
             model_uid,
-            agent_uid,
         )
         form_runs = emit_payload_forms(state)
-        earlier = set(server.verification_runs())
         state.shutdown()
         server.flush_bifrost()
 
@@ -1134,43 +752,32 @@ def test_service_bindings_verify_drift_and_eval_through_an_http_operator(tmp_pat
         )
         assert drift == [{"n": 2 * DRIFT_ROWS, "low": model_uid, "high": model_uid}], drift
 
-        tasks = {
-            bindings["py-bound-assert"]["binding_id"]: "answer",
-            bindings["py-bound-judge-eval"]["binding_id"]: "judge",
-        }
-        assert_eval_runs(server, verification, query, earlier, tasks, agent_uid)
+        eval_bindings = assert_eval_runs(server, query, agent_uid)
+        assert len(eval_bindings) == 2 and eval_bindings < set(binding_ids), eval_bindings
         judged = [path for path, _ in received if path == "/v1/chat/completions"]
         assert len(judged) == 2, "the judge binding called the local provider once per record"
 
-        for name in ("py-bound-psi", "py-bound-spc", "py-bound-custom"):
-            binding_id = bindings[name]["binding_id"]
-            run_id = verification.start_run(
-                {"target": {"kind": "binding", "binding_id": binding_id}, "input": manual_window()}
-            )
-            settled = settle(verification, run_id)
-            assert settled["status"] == "completed", settled
-            assert settled["requested_by_principal_id"] is not None, settled
-            server.flush_bifrost()
-            (result,) = rows_of(
-                query,
-                "SELECT verdict, owner_card_uid, binding_id, subject_card_uid, details "
-                f"FROM vala.verification.results WHERE result_id = '{settled['result_id']}'",
-            )
-            assert result["verdict"] == "failed", (name, result)
-            assert (result["owner_card_uid"], result["binding_id"]) == (
-                str(service.uid),
-                binding_id,
-            ), result
+        drift_bindings = sorted(set(binding_ids) - eval_bindings)
+        for binding_id in drift_bindings:
+            server.make_binding_due(binding_id)
+        listed = ", ".join(f"'{binding_id}'" for binding_id in drift_bindings)
+        results = await_rows(
+            server,
+            query,
+            "SELECT r.verdict, r.owner_card_uid, r.binding_id, r.subject_card_uid, r.details, "
+            "f.method FROM vala.verification.results r JOIN vala.drift.result_features f "
+            f"ON r.result_id = f.result_id WHERE r.binding_id IN ({listed})",
+            3,
+        )
+        by_method = {result["method"]: result for result in results}
+        assert sorted(by_method) == ["Custom", "Psi", "Spc"], results
+        assert sorted(result["binding_id"] for result in results) == drift_bindings
+        for result in results:
+            assert result["verdict"] == "failed", result
+            assert result["owner_card_uid"] == str(service.uid), result
             assert result["subject_card_uid"] == model_uid, result
-            if name == "py-bound-psi":
-                delivered = await_dispatches(verification, run_id)
-                assert [d["status"] for d in delivered["dispatches"]] == ["delivered"], delivered
-                assert [path for path, _ in received].count("/hook") == 1, received
-                assert_psi_bins(result["details"], DRIFT_ROWS)
-            else:
-                assert settled["dispatches"] == [], "a binding without an Operator dispatches none"
-            if name == "py-bound-spc":
-                assert_spc_evidence(result["details"], DRIFT_ROWS // 5, DRIFT_ROWS // 5)
+        assert_psi_bins(by_method["Psi"]["details"], DRIFT_ROWS)
+        assert_spc_evidence(by_method["Spc"]["details"], DRIFT_ROWS // 5, DRIFT_ROWS // 5)
+        await_hooks(received, 1)
 
-        assert_direct_run_unbound(verification, query, server, uids["py-bound-psi"], model_uid)
         assert_retired_kinds_refused(cards, tmp_path)

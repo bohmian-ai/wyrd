@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from uuid import UUID, uuid4
 
-import blake3
 import numpy as np
 import pandas as pd
 import pytest
@@ -162,31 +161,21 @@ def assert_all_artifacts_are_confined_to_bundle(state: WyrdState, bundle: Path) 
         assert artifact.local_path.is_relative_to(bundle.resolve())
 
 
-def trusted_artifact_hashes(bundle: Path) -> dict[str, str]:
-    """Return canonical artifact inventory hashes for executable Model aliases."""
+def registered_artifact_hashes(cards: Cards, bundle: Path) -> dict[str, str]:
+    """Read each executable Model alias's trusted hash from its registered Card."""
     manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
     trusted: dict[str, str] = {}
     for card in manifest["cards"]:
-        if card["card_ref"]["kind"] != "Model":
+        ref = card["card_ref"]
+        if ref["kind"] != "Model":
             continue
-        artifacts = [
-            {
-                "relative_path": artifact["relative_path"],
-                "sha256": artifact["sha256"],
-                "size_bytes": artifact["size_bytes"],
-                "content_type": artifact.get("content_type"),
-            }
-            for artifact in card["artifacts"]
-        ]
-        artifacts.sort(key=lambda artifact: artifact["relative_path"])
-        canonical = json.dumps(
-            artifacts,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
+        registered = cards.get(
+            CardRef(ref["kind"], ref["name"], ref["version"], space=ref["space"], uid=ref["uid"])
+        )
+        artifact_hash = registered["metadata"].get("artifact_hash")
+        assert artifact_hash, "a registered Model Card carries its artifact hash"
         for alias in card["aliases"]:
-            trusted[alias] = blake3.blake3(canonical).hexdigest()
+            trusted[alias] = artifact_hash
     return trusted
 
 
@@ -198,8 +187,8 @@ def register_service(cards: Cards, service_path: Path) -> CardRef:
 
 def download_fixture(
     tmp_path: Path, *, metadata_only: bool = False
-) -> tuple[Path, CardRef, dict[str, object]]:
-    """Register the fixture with a real server and download its CLI bundle before shutdown."""
+) -> tuple[Path, CardRef, dict[str, object], dict[str, str]]:
+    """Register the fixture, download its CLI bundle, and read its trusted hashes."""
     service_path = copy_typed_state_service(tmp_path)
     bundle = tmp_path / "wyrd-state"
     with WyrdTestServer(mutate_env=False) as server:
@@ -209,7 +198,8 @@ def download_fixture(
             server,
             *exact_get_arguments(service_ref, bundle, metadata_only=metadata_only),
         )
-    return bundle, service_ref, result
+        trusted = {} if metadata_only else registered_artifact_hashes(cards, bundle)
+    return bundle, service_ref, result, trusted
 
 
 @pytest.mark.integration
@@ -217,11 +207,11 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Hydrate the complete CLI bundle into usable offline Python objects."""
-    bundle, service_ref, result = download_fixture(tmp_path)
+    bundle, service_ref, result, trusted = download_fixture(tmp_path)
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
     state = WyrdState.from_path(
         bundle,
-        trusted_artifact_hashes=trusted_artifact_hashes(bundle),
+        trusted_artifact_hashes=trusted,
     )
     assert result["mode"] == "complete"
     assert result["card_count"] == 10
@@ -265,7 +255,7 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
 @pytest.mark.integration
 def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> None:
     """Reject a bundle produced by the public metadata-only CLI mode."""
-    bundle, _, _ = download_fixture(tmp_path, metadata_only=True)
+    bundle, _, _, _ = download_fixture(tmp_path, metadata_only=True)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
@@ -297,7 +287,7 @@ def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> Non
 @pytest.mark.integration
 def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> None:
     """Reject downloaded artifact bytes that no longer match inventory."""
-    bundle, _, _ = download_fixture(tmp_path)
+    bundle, _, _, trusted = download_fixture(tmp_path)
     artifact = next(
         path
         for path in bundle.rglob("*")
@@ -307,7 +297,7 @@ def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> Non
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(
             bundle,
-            trusted_artifact_hashes=trusted_artifact_hashes(bundle),
+            trusted_artifact_hashes=trusted,
         )
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
     assert caught.value.details["path"]
@@ -316,10 +306,10 @@ def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> Non
 @pytest.mark.integration
 def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Path) -> None:
     """Keep distinct same-kind Cards distinct at runtime."""
-    bundle, _, _ = download_fixture(tmp_path)
+    bundle, _, _, trusted = download_fixture(tmp_path)
     state = WyrdState.from_path(
         bundle,
-        trusted_artifact_hashes=trusted_artifact_hashes(bundle),
+        trusted_artifact_hashes=trusted,
     )
     assert state.model("model_primary") is not state.model("model_shadow")
 
@@ -327,7 +317,7 @@ def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Pat
 @pytest.mark.integration
 def test_missing_model_trust_returns_recoverable_runtime_error(tmp_path: Path) -> None:
     """Reject executable built-in Model hydration without external trust."""
-    bundle, _, _ = download_fixture(tmp_path)
+    bundle, _, _, _ = download_fixture(tmp_path)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
@@ -339,22 +329,22 @@ def test_missing_model_trust_returns_recoverable_runtime_error(tmp_path: Path) -
 @pytest.mark.integration
 def test_missing_relationship_projection_is_rejected_offline(tmp_path: Path) -> None:
     """Reject a complete bundle whose projected relationship file is absent."""
-    bundle, _, _ = download_fixture(tmp_path)
+    bundle, _, _, trusted = download_fixture(tmp_path)
     manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
     relationship_path = bundle / manifest["cards"][0]["relationships_path"]
     relationship_path.unlink()
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(
             bundle,
-            trusted_artifact_hashes=trusted_artifact_hashes(bundle),
+            trusted_artifact_hashes=trusted,
         )
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
     assert caught.value.details["path"]
 
 
-def served_binding_ids(bundle: Path) -> list[str]:
+def served_binding_ids(bundle: Path, trusted: dict[str, str]) -> list[str]:
     """Read the root Service's served binding identities from a hydrated bundle."""
-    state = WyrdState.from_path(bundle, trusted_artifact_hashes=trusted_artifact_hashes(bundle))
+    state = WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
     status = state.card("root").status
     assert status is not None, "a binding owner serves status"
     return status["verification"]["binding_ids"]
@@ -369,11 +359,12 @@ def test_bound_service_serves_stable_uuid7_binding_ids(tmp_path: Path) -> None:
         service_ref = register_service(cards, service_path)
         first = tmp_path / "first"
         run_cli(server, *exact_get_arguments(service_ref, first))
+        trusted = registered_artifact_hashes(cards, first)
         reapplied = cards.register_from_path(str(service_path / "typed-service.yaml")).root
         assert reapplied.uid == service_ref.uid
         second = tmp_path / "second"
         run_cli(server, *exact_get_arguments(service_ref, second))
-    binding_ids = served_binding_ids(first)
+    binding_ids = served_binding_ids(first, trusted)
     assert len(binding_ids) == 2, "one binding per bound component occurrence"
     assert all(UUID(binding_id).version == 7 for binding_id in binding_ids)
-    assert served_binding_ids(second) == binding_ids
+    assert served_binding_ids(second, trusted) == binding_ids

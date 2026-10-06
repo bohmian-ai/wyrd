@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wyrd import Agent, AgentCard, FinishReason, Prompt, PromptReference, RunConfig, tool
+import pytest
+from wyrd import Agent, AgentCard, FinishReason, Prompt, PromptReference, RunConfig, WyrdError, tool
+from wyrd.agent import MockProvider
 
 
 @tool(name="t", description="echoes text")
@@ -47,20 +49,17 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
 
     card = agent.to_card()
 
-    assert card["apiVersion"] == "wyrd/v1"
-    assert card["kind"] == "Agent"
-    assert card["metadata"]["name"] == "planner"
-    assert card["metadata"]["version"] == "0.3.0"
-    assert card["spec"]["prompt"] is not None
+    assert isinstance(card, AgentCard)
+    assert card.name == "planner"
+    assert card.version == "0.3.0"
+    assert card.prompt is not None
+    assert card.model_dump()["kind"] == "Agent"
 
     agent.save(path)
     loaded = Agent.from_yaml(path)
     loaded_card = loaded.to_card()
 
-    assert loaded_card["apiVersion"] == card["apiVersion"]
-    assert loaded_card["kind"] == card["kind"]
-    assert loaded_card["metadata"] == card["metadata"]
-    assert loaded_card["spec"] == card["spec"]
+    assert loaded_card.model_dump() == card.model_dump()
 
 
 def test_agent_card_json_round_trip() -> None:
@@ -99,6 +98,30 @@ def test_agent_card_preserves_unresolved_registered_prompt_reference() -> None:
     assert restored.prompt_ref.card_ref.version == "0.3.0"
 
 
+def test_mock_provider_returns_canned_responses_in_order_then_echoes() -> None:
+    mock = MockProvider(["first answer"])
+    mock.push("second answer")
+    agent = Agent(
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
+        mock_provider=mock,
+    )
+
+    assert mock.remaining == 2
+    assert agent.run("q1").output == "first answer"
+    assert agent.run("q2").output == "second answer"
+    assert mock.remaining == 0
+    assert "q3" in agent.run("q3").output
+
+
+def test_mock_provider_rejects_provider_base_url() -> None:
+    with pytest.raises(WyrdError):
+        Agent(
+            prompt=Prompt(["hello"], "mock-model", provider="mock"),
+            mock_provider=MockProvider(),
+            provider_base_url="http://localhost:1",
+        )
+
+
 def test_journey_delegate_via_agent_delegate_tool() -> None:
     child = Agent(
         prompt=Prompt(["child"], "mock-model", provider="mock"),
@@ -119,11 +142,11 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
         return None
 
     def before_model(ctx, request):
-        calls.append(("before_model", ctx["agent_id"]))
+        calls.append(("before_model", ctx.agent_id))
         return None
 
     def after_model(ctx, response):
-        calls.append(("after_model", ctx["agent_id"]))
+        calls.append(("after_model", ctx.agent_id))
         return None
 
     def after_agent(ctx, run):

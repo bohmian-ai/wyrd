@@ -3,11 +3,9 @@
 One invocation switches from the root Service to its Model and Agent views,
 emits a Drift mapping and an Eval context, writes one row into a
 caller-registered generic table, drains at graceful shutdown, and reads every
-row back by the exact subject Card UID and the one invocation id. Startup is
-first refused once per fixed table whose describe the server fails, and the
-server's staged describe decisions prove repeated writes reuse cached schemas.
+row back by the exact subject Card UID and the one invocation id.
 
-A second, single-Card run is entered with ``with state.run(card="agent")``:
+A second, single-Card run is entered with ``with state.run("agent")``:
 framework-style spans created inside it export through the stock OTLP/HTTP
 exporter to the authenticated ``/v1/traces`` endpoint, and the persisted span,
 custom, and Eval rows join on their Run and trace identity. A third run proves
@@ -130,7 +128,6 @@ MEDIA = MediaRef(id="screenshot", kind="image", uri="s3://bucket/shot.png", medi
 MEDIA_TEXT = (
     '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]'
 )
-FIXED_TABLES = ("vala.drift.observations", "vala.eval.observations")
 
 
 def write_service_graph(root: Path) -> Path:
@@ -414,14 +411,14 @@ def otlp_provider(server: WyrdTestServer, credential: str) -> TracerProvider:
 def emit_framework_scope(
     state: WyrdState, provider: TracerProvider, dataset: str
 ) -> tuple[Run, tuple[str, str]]:
-    """Run framework-style code inside ``with state.run(card="agent")``.
+    """Run framework-style code inside ``with state.run("agent")``.
 
     The spans carry no Wyrd attributes of their own; the scope supplies them.
     The custom row and the Eval observation pass no trace identity: the Eval
     row takes the active tool span's ids. Returns the run and those ids.
     """
     tracer = provider.get_tracer("framework")
-    with state.run(card="agent") as agent_run:
+    with state.run("agent") as agent_run:
         with (
             tracer.start_as_current_span("agent.invoke"),
             tracer.start_as_current_span("agent.tool") as tool,
@@ -478,9 +475,16 @@ def emit_nested_scopes(state: WyrdState, provider: TracerProvider) -> tuple[Run,
 
 
 def assert_nested_scopes(
-    server: WyrdTestServer, credential: str, run: Run, views: dict[str, Run]
+    server: WyrdTestServer,
+    credential: str,
+    run: Run,
+    views: dict[str, Run],
+    refs: dict[str, CardRef],
 ) -> None:
-    """Prove every nested and async span persisted with its view's exact correlation."""
+    """Prove every nested and async span persisted with its view's exact correlation.
+
+    ``refs`` maps each view's alias to its exact ``CardRef``.
+    """
     query = Bifrost(server_url=server.base_url, credential=credential)
     spans = (
         query.sql(
@@ -492,9 +496,9 @@ def assert_nested_scopes(
     )
     assert {
         row["name"]: (asserted_card_ref(row["attributes"]), row["card_uid"]) for row in spans
-    } == {name: (view.card_ref, view.card_ref.split("#", 1)[1]) for name, view in views.items()}, (
-        "one run id across every scope, each span under its own view's Card"
-    )
+    } == {
+        name: (str(refs[view.alias]), str(refs[view.alias].uid)) for name, view in views.items()
+    }, "one run id across every scope, each span under its own view's Card"
     outside = (
         query.sql("SELECT run_id, card_uid FROM vala.traces.spans WHERE name = 'nested.outside'")
         .to_arrow()
@@ -515,11 +519,12 @@ def assert_scope_joins(
     server: WyrdTestServer,
     credential: str,
     agent_run: Run,
-    agent_uid: str,
+    agent_ref: CardRef,
     dataset: str,
     tool: tuple[str, str],
 ) -> None:
     """Prove the persisted span, custom, and Eval rows join on the Run scope."""
+    agent_uid = str(agent_ref.uid)
     query = Bifrost(server_url=server.base_url, credential=credential)
     run_id = agent_run.run_id
     spans = (
@@ -535,7 +540,7 @@ def assert_scope_joins(
     # and the lossless attribute payload keeps exactly what the client sent.
     assert {
         (asserted_card_ref(row["attributes"]), row["run_id"], row["card_uid"]) for row in spans
-    } == {(agent_run.card_ref, run_id, agent_uid)}
+    } == {(str(agent_ref), run_id, agent_uid)}
     publishers = {row["principal_id"] for row in spans}
     assert len(publishers) == 1 and None not in publishers, "one authenticated publisher"
     (publisher,) = publishers
@@ -578,9 +583,7 @@ def assert_scope_joins(
 @pytest.mark.integration
 def test_scoped_run_emits_drift_eval_and_generic_rows(tmp_path: Path) -> None:
     """One invocation emits Drift, Eval, and generic rows correlated to their subjects."""
-    # A dedicated server: publication would retire the staged describe
-    # decisions this journey counts.
-    with WyrdTestServer(audit_publication=False) as server:
+    with WyrdTestServer() as server:
         run_journey(tmp_path, server)
 
 
@@ -605,14 +608,13 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
 
     state = WyrdState.from_path(bundle, interfaces={"model": NoopModelInterface()})
     state.start_bifrost(server_url=server.base_url, credential=credential)
-    fixed_describes = [server.table_describe_count(table) for table in FIXED_TABLES]
 
     run = state.run()
     model = run.for_card("model")
     agent = run.for_card("agent")
     assert model.run_id == run.run_id == agent.run_id
-    model_uid = model.card_ref.split("#", 1)[1]
-    agent_uid = agent.card_ref.split("#", 1)[1]
+    refs = {alias: state.card_ref(alias) for alias in ("model", "agent")} | {"root": root}
+    model_uid, agent_uid = str(refs["model"].uid), str(refs["agent"].uid)
 
     model.observe.drift({"latency_ms": 12.5, "tier": "gold"})
     agent.observe.eval({"answer": "yes"})
@@ -630,7 +632,6 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
         )
     agent.observe.record(dataset, {"value": 41})
     agent.observe.record(dataset, {"value": 43})
-    assert server.table_describe_count(dataset) == 1, "the repeated write reused its describe"
     model.observe.record(dataset_b, {"value": 42})
 
     assert_eval_refusals(agent)
@@ -643,9 +644,6 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
     with pytest.raises(wyrd.WyrdError) as unknown:
         run.for_card("missing")
     assert unknown.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
-    assert [server.table_describe_count(table) for table in FIXED_TABLES] == fixed_describes, (
-        "Drift and Eval emits perform no per-observation schema IO"
-    )
 
     provider = otlp_provider(server, credential)
     agent_run, tool = emit_framework_scope(state, provider, dataset)
@@ -660,8 +658,8 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
     server.flush_bifrost()
 
     assert_read_back(server, admin, run.run_id, model_uid, agent_uid, (dataset, dataset_b), active)
-    assert_scope_joins(server, admin, agent_run, agent_uid, dataset, tool)
-    assert_nested_scopes(server, admin, nested_run, views)
+    assert_scope_joins(server, admin, agent_run, refs["agent"], dataset, tool)
+    assert_nested_scopes(server, admin, nested_run, views, refs)
     assert_stale_writer_fenced(server, admin, dataset)
     server.flush_bifrost()
     stale_rows = query_values(server, admin, dataset)

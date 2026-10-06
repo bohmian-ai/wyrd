@@ -168,6 +168,23 @@ impl PyAgentCard {
         Ok(serde_json::to_string(&self.inner.to_envelope()?)?)
     }
 
+    /// Project a local, possibly unregistered Agent Card envelope.
+    ///
+    /// `Agent.to_card()` routes here: an Agent that was never registered has
+    /// no UID, so this path skips the persisted-UID requirement that
+    /// `model_validate_json` enforces. Envelope validation still runs.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the JSON is not a valid Agent Card envelope.
+    #[staticmethod]
+    #[pyo3(name = "_from_draft_json")]
+    pub fn from_draft_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
+        Self::from_native(
+            py,
+            AgentCard::from_envelope(serde_json::from_str(json_string)?)?,
+        )
+    }
+
     /// Hydrate an Agent Card from a complete JSON envelope.
     #[staticmethod]
     #[pyo3(name = "model_validate_json")]

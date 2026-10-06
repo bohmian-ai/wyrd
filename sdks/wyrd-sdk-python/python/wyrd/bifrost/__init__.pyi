@@ -1,7 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 from collections.abc import AsyncIterator, Iterator, Sequence
-from typing import Any, Protocol, TypedDict, TypeVar, overload
+from typing import Any, Literal, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
@@ -108,6 +108,41 @@ class CancelRunningQueryResult(TypedDict):
     request_id: str
     cancellation_started: bool
 
+class QueryTerminal:
+    """The validated terminal frame one query stream closed with.
+
+    Closed wire enums read back as their snake_case wire names.
+    """
+
+    @property
+    def outcome(self) -> Literal["success", "degraded", "failed"]:
+        """Stream outcome."""
+        ...
+    @property
+    def query_class(self) -> Literal["interactive", "analytical"]:
+        """Path Oracle ran the query on."""
+        ...
+    @property
+    def row_count(self) -> int:
+        """Rows already emitted in batch frames."""
+        ...
+    @property
+    def warnings(self) -> list[Literal["live_tail_unavailable", "stale_cut_replanned"]]:
+        """Closed warnings the server attached."""
+        ...
+    @property
+    def source_completion(self) -> dict[str, str]:
+        """Completion outcome per source tier present in the cut."""
+        ...
+    @property
+    def error_code(self) -> str | None:
+        """Stable failure code for a failed terminal, otherwise ``None``."""
+        ...
+    @property
+    def error_detail(self) -> str | None:
+        """Scrubbed failure diagnostic for a failed terminal, when sent."""
+        ...
+
 class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
     """Asynchronously yields Arrow batches from one Oracle query."""
 
@@ -118,7 +153,7 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
         """Return the server lifecycle request ID before completion."""
         ...
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Return terminal metadata after validated completion."""
         ...
     async def aclose(self) -> None:
@@ -200,7 +235,7 @@ class QueryResult:
     def to_pandas(self) -> Any: ...
     def to_bytes(self) -> bytes: ...
     @property
-    def terminal(self) -> dict[str, Any]:
+    def terminal(self) -> QueryTerminal:
         """The validated terminal frame the server closed the stream with."""
         ...
     def __len__(self) -> int: ...
@@ -223,7 +258,7 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
         """The server lifecycle request ID, available before completion."""
         ...
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Terminal metadata, present only after validated completion."""
         ...
     def close(self) -> None:
@@ -337,6 +372,7 @@ __all__ = [
     "PhysicalLayout",
     "QueryParam",
     "QueryResult",
+    "QueryTerminal",
     "ResolvedTable",
     "RowModel",
     "RunningQuery",

@@ -1015,6 +1015,30 @@ impl Prompt {
         self.inner.media_variables.clone()
     }
 
+    /// Return the declared structured-output JSON Schema, or `None` for text.
+    ///
+    /// The schema is read from the prompt's provider-neutral response type,
+    /// so it is the same object for every provider request shape.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the schema cannot be converted to Python.
+    #[getter]
+    pub fn response_schema(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
+        match &self.inner.response_type {
+            skald_spec::ResponseType::Text => Ok(None),
+            skald_spec::ResponseType::JsonSchema { schema, .. } => py_value(py, schema).map(Some),
+        }
+    }
+
+    /// Return the declared structured-output schema name, or `None` for text.
+    #[getter]
+    pub fn response_schema_name(&self) -> Option<&str> {
+        match &self.inner.response_type {
+            skald_spec::ResponseType::Text => None,
+            skald_spec::ResponseType::JsonSchema { name, .. } => Some(name),
+        }
+    }
+
     /// Set declared render variables.
     #[setter]
     pub fn set_variables(&mut self, variables: Vec<String>) {

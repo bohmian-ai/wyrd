@@ -8,6 +8,7 @@ import polars as pl
 import pyarrow as pa
 import pytest
 import torch
+from wyrd.data import Dim
 from wyrd.model import ModelSignature, SampleInput
 
 
@@ -15,10 +16,10 @@ def _output() -> np.ndarray:
     return np.array([0.1, 0.2], dtype=np.float32)
 
 
-def _dynamic_batch_shape(width: int | None = None) -> list[dict]:
-    shape = [{"kind": "Dynamic", "value": "batch"}]
+def _dynamic_batch_shape(width: int | None = None) -> list[Dim]:
+    shape = [Dim.dynamic("batch")]
     if width is not None:
-        shape.append({"kind": "Fixed", "value": width})
+        shape.append(Dim.fixed(width))
     return shape
 
 

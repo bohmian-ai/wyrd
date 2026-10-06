@@ -1,6 +1,6 @@
 import importlib
 
-from wyrd import Agent, Prompt
+from wyrd import Agent, AgentCard, Prompt
 
 
 def test_agent_is_native_pyclass_without_python_wrapper() -> None:
@@ -24,7 +24,7 @@ def test_old_agent_inner_classes_are_not_importable() -> None:
         assert not hasattr(module, name)
 
 
-def test_agent_to_card_returns_mapping() -> None:
+def test_agent_to_card_returns_typed_agent_card() -> None:
     agent = Agent(
         prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
         name="planner-agent",
@@ -33,5 +33,5 @@ def test_agent_to_card_returns_mapping() -> None:
 
     card = agent.to_card()
 
-    assert isinstance(card, dict)
-    assert card["kind"] == "Agent"
+    assert isinstance(card, AgentCard)
+    assert card.name == "planner-agent"

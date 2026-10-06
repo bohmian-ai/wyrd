@@ -1735,6 +1735,30 @@ impl PyCards {
             .map(PyRegistrationReceipt::from)
             .map_err(WyrdPyError::from)
     }
+
+    /// Fetch one registered Card envelope by exact reference.
+    ///
+    /// The shared Rust `Cards::get` reads and validates the typed envelope
+    /// while the GIL is released; the result crosses the boundary as the
+    /// JSON mapping the generated `wyrd.cards.RegisteredCard` types describe,
+    /// with `spec` and `status` discriminated by `kind`. No artifact bytes are
+    /// downloaded.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef` carrying its space and version.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the reference lacks its space, the Card is
+    /// absent, the server request fails, or the envelope cannot be converted
+    /// to Python values.
+    #[pyo3(signature = (card_ref))]
+    fn get(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<Py<PyAny>> {
+        let selector = CardSelector::exact(card_ref.0.clone());
+        let card = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.inner.get(selector)))
+            .map_err(WyrdPyError::from)?;
+        json_to_py(py, &serde_json::to_value(&card)?)
+    }
 }
 
 /// Typed operations for registered `DataCard` objects.

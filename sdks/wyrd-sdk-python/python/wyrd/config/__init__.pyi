@@ -8,8 +8,31 @@ from ..cards import CardKind
 
 #### end of imports ####
 
+class ConfigDefaults:
+    """Workspace `[defaults]` merged into every Card's metadata."""
+
+    @property
+    def space(self) -> str | None:
+        """Default `metadata.space`, or `None` when unset."""
+        ...
+
+    @property
+    def labels(self) -> dict[str, str]:
+        """Default labels merged per key into `metadata.labels`."""
+        ...
+
+    @property
+    def annotations(self) -> dict[str, str]:
+        """Default annotations merged per key into `metadata.annotations`."""
+        ...
+
 class WyrdConfig:
     """Workspace configuration loaded from `wyrd.toml`."""
+
+    @property
+    def defaults(self) -> ConfigDefaults:
+        """The workspace `[defaults]` table."""
+        ...
 
     @classmethod
     def load(cls, path: Path | None = None) -> WyrdConfig:
@@ -35,4 +58,4 @@ class WyrdConfig:
 
     def __repr__(self) -> str: ...
 
-__all__ = ["WyrdConfig"]
+__all__ = ["ConfigDefaults", "WyrdConfig"]

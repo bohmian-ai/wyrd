@@ -13,6 +13,7 @@ PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "bifrost.pyi": PACKAGE_DIR / "bifrost" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
+    "cli.pyi": PACKAGE_DIR / "cli" / "__init__.pyi",
     "client.pyi": PACKAGE_DIR / "client" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
@@ -24,7 +25,6 @@ PUBLIC_MODULE_STUBS = {
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
     "state.pyi": PACKAGE_DIR / "state" / "__init__.pyi",
     "testing.pyi": PACKAGE_DIR / "testing" / "__init__.pyi",
-    "verification.pyi": PACKAGE_DIR / "verification" / "__init__.pyi",
 }
 
 ROOT_STUB_FILES = ["header.pyi", "error.pyi"]
@@ -110,9 +110,16 @@ def rewrite_public_imports(filename: str, content: str) -> str:
                 "from .._wyrd import JsonDict, PathLike, WyrdError"
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
+            "from .cards import AgentCard": "from ..cards import AgentCard",
+        },
+        "cli.pyi": {
+            "from .gateway import ProviderCredentialView": (
+                "from ..gateway import ProviderCredentialView"
+            ),
         },
         "observe.pyi": {
             "from .bifrost import Bifrost": "from ..bifrost import Bifrost",
+            "from .cards import CardRef": "from ..cards import CardRef",
             "from .eval import MediaRef": "from ..eval import MediaRef",
         },
         "data.pyi": {

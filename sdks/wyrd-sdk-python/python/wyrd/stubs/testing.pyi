@@ -3,6 +3,11 @@ import os
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
 
+    Journeys steer the server through exactly three test controls, each backed
+    by the production code path: ``flush_bifrost``, ``wait_for_baseline``, and
+    ``make_binding_due``. The remaining members start, address, or credential
+    the server.
+
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
     embedded Postgres fixture. Use as a context manager; ``bootstrap_service``
     is only valid inside the ``with`` block.
@@ -92,10 +97,25 @@ class WyrdTestServer:
         """
         ...
 
-    def make_binding_due(self, binding_id: str) -> None: ...
-    def verification_runs(self) -> list[str]: ...
-    def retire_fitted_format(self, verifier_uid: str) -> None: ...
-    def table_describe_count(self, fqn: str) -> int: ...
+    def wait_for_baseline(self, verifier: str, timeout: float) -> None:
+        """Return once Drift Verifier ``verifier``'s fitted baseline is ready.
+
+        ``verifier`` is the Verifier Card UID and ``timeout`` is in seconds.
+        Raises ``WyrdError`` with ``WYRD_VERIFICATION_409_BASELINE_NOT_READY``
+        when ``timeout`` elapses first; its ``details["baseline"]`` is the last
+        observed baseline status, the same value ``card.status.verification``
+        serves.
+        """
+        ...
+
+    def make_binding_due(self, binding_id: str) -> None:
+        """Make binding ``binding_id``'s schedule due now.
+
+        The server's own scheduler then claims, runs, and settles the
+        occurrence.
+        """
+        ...
+
     def scoped_api_key(self, role: str, permissions: list[str | dict[str, object]]) -> str:
         """Seed ``role`` with exactly ``permissions`` and return a service API key.
 

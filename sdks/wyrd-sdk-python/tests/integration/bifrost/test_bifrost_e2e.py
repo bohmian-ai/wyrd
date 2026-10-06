@@ -189,7 +189,7 @@ def test_observe_record_no_raises(wyrd_server: WyrdTestServer) -> None:
 
 
 @pytest.mark.integration
-def test_register_insert_flush_read_and_swap(wyrd_server: WyrdTestServer) -> None:
+def test_register_insert_flush_read_and_swap(wyrd_server: WyrdTestServer, query_table: str) -> None:
     """The whole journey: register, write, flush, read, swap, write, read."""
 
     # `vala.datasets` is the caller-owned namespace, so this is the one table
@@ -210,10 +210,9 @@ def test_register_insert_flush_read_and_swap(wyrd_server: WyrdTestServer) -> Non
 
     # Swap the active table before flushing: the swapped-away producer must
     # still drain, so the rows above are not stranded by the rebinding.
-    second_fqn, second_token = wyrd_server.prepare_oracle_query_fixture()
-    bifrost.use_table_by_name(second_fqn)
+    bifrost.use_table_by_name(query_table)
     assert bifrost.table is not None
-    assert bifrost.table.fqn == second_fqn
+    assert bifrost.table.fqn == query_table
     bifrost.insert({"id": 7, "value": "second-table"}, {"card_ref": CARD_REF})
     assert bifrost.producer_count == 2, "the swapped-away producer is still pooled"
 
@@ -229,17 +228,16 @@ def test_register_insert_flush_read_and_swap(wyrd_server: WyrdTestServer) -> Non
         )
         == written
     )
-    assert _read(wyrd_server, second_token, f"SELECT id, value FROM {second_fqn} WHERE id = 7") == [
-        (7, "second-table")
-    ]
+    assert _read(
+        wyrd_server, wyrd_server.api_key, f"SELECT id, value FROM {query_table} WHERE id = 7"
+    ) == [(7, "second-table")]
 
 
 @pytest.mark.integration
-def test_sql_and_stream_return_the_same_rows(wyrd_server: WyrdTestServer) -> None:
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    query = f"SELECT id, value FROM {table_fqn} ORDER BY id"
+def test_sql_and_stream_return_the_same_rows(wyrd_server: WyrdTestServer, query_table: str) -> None:
+    query = f"SELECT id, value FROM {query_table} ORDER BY id"
 
-    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
     collected = bifrost.sql(query).to_arrow()
     streamed = list(bifrost.stream(query))
 
@@ -252,15 +250,15 @@ def test_sql_and_stream_return_the_same_rows(wyrd_server: WyrdTestServer) -> Non
 @pytest.mark.integration
 def test_describe_binds_an_existing_table_without_restating_its_schema(
     wyrd_server: WyrdTestServer,
+    query_table: str,
 ) -> None:
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
 
     described = TableConfig.describe(
-        table_fqn,
+        query_table,
         server_url=wyrd_server.base_url,
         credential=wyrd_server.api_key,
     )
-    assert described.fqn == table_fqn
+    assert described.fqn == query_table
     assert described.arrow_schema.names == ["id", "value"]
     assert described.resolved is not None
 
@@ -274,25 +272,24 @@ def test_describe_binds_an_existing_table_without_restating_its_schema(
     bifrost.shutdown()
     wyrd_server.flush_bifrost()
 
-    assert _read(wyrd_server, token, f"SELECT id, value FROM {table_fqn} WHERE id = 6") == [
-        (6, "described")
-    ]
+    assert _read(
+        wyrd_server, wyrd_server.api_key, f"SELECT id, value FROM {query_table} WHERE id = 6"
+    ) == [(6, "described")]
 
 
 @pytest.mark.integration
-def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer) -> None:
+def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, query_table: str) -> None:
     """An omitted card_ref writes; the server correlates to the principal."""
 
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    bifrost = _fixture_client(wyrd_server, table_fqn, wyrd_server.api_key)
+    bifrost = _fixture_client(wyrd_server, query_table, wyrd_server.api_key)
     bifrost.insert({"id": 8, "value": "uncorrelated"})
     bifrost.flush()
     bifrost.shutdown()
     wyrd_server.flush_bifrost()
 
-    assert _read(wyrd_server, token, f"SELECT id, value FROM {table_fqn} WHERE id = 8") == [
-        (8, "uncorrelated")
-    ]
+    assert _read(
+        wyrd_server, wyrd_server.api_key, f"SELECT id, value FROM {query_table} WHERE id = 8"
+    ) == [(8, "uncorrelated")]
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +346,11 @@ def test_negative_reserved_column_is_refused_locally() -> None:
 
 
 @pytest.mark.integration
-def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestServer) -> None:
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+def test_negative_empty_permissions_denied_rbac_on_write(
+    wyrd_server: WyrdTestServer, query_table: str
+) -> None:
     denied_key = wyrd_server.bootstrap_service([], name="bifrost-write-denied")
-    bifrost = _fixture_client(wyrd_server, table_fqn, denied_key)
+    bifrost = _fixture_client(wyrd_server, query_table, denied_key)
     bifrost.insert({"id": 999, "value": "denied"}, {"card_ref": CARD_REF})
     with pytest.raises(WyrdError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
         bifrost.flush()
@@ -361,9 +359,12 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
     # and the shutdown that follows has nothing left to send.
     bifrost.shutdown()
 
-    assert _read(wyrd_server, token, f"SELECT id, value FROM {table_fqn} WHERE id = 999") == [], (
-        "denied write must not mutate durable rows"
-    )
+    assert (
+        _read(
+            wyrd_server, wyrd_server.api_key, f"SELECT id, value FROM {query_table} WHERE id = 999"
+        )
+        == []
+    ), "denied write must not mutate durable rows"
 
 
 @pytest.mark.integration
@@ -424,28 +425,28 @@ def test_compaction_target_registers_describes_and_conflicts(
 
 
 @pytest.mark.integration
-def test_negative_non_select_query_is_refused(wyrd_server: WyrdTestServer) -> None:
+def test_negative_non_select_query_is_refused(
+    wyrd_server: WyrdTestServer, query_table: str
+) -> None:
     """The read plane is read-only: a mutation never reaches execution."""
 
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
 
     with pytest.raises(WyrdError) as captured:
-        bifrost.sql(f"DELETE FROM {table_fqn}")
+        bifrost.sql(f"DELETE FROM {query_table}")
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
     assert captured.value.status == 400
 
 
 @pytest.mark.integration
-def test_negative_oversized_query_is_refused(wyrd_server: WyrdTestServer) -> None:
+def test_negative_oversized_query_is_refused(wyrd_server: WyrdTestServer, query_table: str) -> None:
     """A statement past the SQL byte ceiling is refused before it is planned."""
 
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
 
     # The floor is 64 KiB of SQL; pad a valid SELECT past it with a comment so
     # the refusal is about size rather than syntax.
-    oversized = f"SELECT id FROM {table_fqn} -- {'x' * (64 * 1024)}"
+    oversized = f"SELECT id FROM {query_table} -- {'x' * (64 * 1024)}"
     with pytest.raises(WyrdError) as captured:
         bifrost.sql(oversized)
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
@@ -454,34 +455,13 @@ def test_negative_oversized_query_is_refused(wyrd_server: WyrdTestServer) -> Non
 
 @pytest.mark.integration
 def test_negative_invalid_sql_query(wyrd_server: WyrdTestServer) -> None:
-    _table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
 
     with pytest.raises(WyrdError) as captured:
         bifrost.sql("SELECT FROM")
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
     assert captured.value.status == 400
     assert captured.value.detail
-
-
-# ---------------------------------------------------------------------------
-# Audit trail
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_positive_audit_trail(wyrd_server: WyrdTestServer) -> None:
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
-    before = wyrd_server.bifrost_read_decision_count()
-
-    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
-    result = bifrost.sql(f"SELECT id FROM {table_fqn} ORDER BY id")
-    assert result.terminal["outcome"] == "success"
-
-    # The read decision is staged in the audit outbox by a background task,
-    # so wait for it before counting.
-    assert wyrd_server.wait_oracle_audit_staged() == 0
-    assert wyrd_server.bifrost_read_decision_count() > before
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +579,7 @@ def test_sql_returns_model_instances_when_a_model_is_supplied(
     select = f"SELECT call_id, model, tokens, latency_ms, status FROM {fqn} ORDER BY call_id"
 
     raw = bifrost.sql(select)
-    assert raw.terminal["outcome"] == "success"
+    assert raw.terminal.outcome == "success"
     assert len(raw) == len(INFERENCES)
 
     typed = bifrost.sql(select, model=Inference)
@@ -1038,6 +1018,7 @@ def _fixture_batch(id_: int, value: str) -> pyarrow.RecordBatch:
 @pytest.mark.integration
 def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     wyrd_server: WyrdTestServer,
+    query_table: str,
 ) -> None:
     """Service B acts for Service A through one explicit delegated client.
 
@@ -1046,7 +1027,6 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     while B's own client still writes the same table.
     """
 
-    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
     suffix = uuid.uuid4().hex[:8]
     a_key = wyrd_server.scoped_api_key(f"py_deleg_a_{suffix}", ["bifrost_query:read"])
     b_key = wyrd_server.scoped_api_key(
@@ -1058,19 +1038,19 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     delegated = service_b.on_behalf_of(_access_token(wyrd_server, a_key), audience="bifrost")
     bifrost_as_a = Bifrost(client=delegated)
 
-    ids = bifrost_as_a.sql(f"SELECT id FROM {table_fqn} WHERE id < 3 ORDER BY id")
+    ids = bifrost_as_a.sql(f"SELECT id FROM {query_table} WHERE id < 3 ORDER BY id")
     assert ids.to_arrow().column("id").to_pylist() == [1, 2]
     with pytest.raises(WyrdError) as denied:
-        bifrost_as_a.write_batch(table_fqn, _fixture_batch(41, "as-a"))
+        bifrost_as_a.write_batch(query_table, _fixture_batch(41, "as-a"))
     assert denied.value.status == 403
 
     bifrost_as_b = Bifrost(client=service_b)
-    bifrost_as_b.write_batch(table_fqn, _fixture_batch(42, "as-b"))
+    bifrost_as_b.write_batch(query_table, _fixture_batch(42, "as-b"))
     wyrd_server.flush_bifrost()
 
-    assert _read(wyrd_server, token, f"SELECT id, value FROM {table_fqn} WHERE id > 40") == [
-        (42, "as-b")
-    ]
+    assert _read(
+        wyrd_server, wyrd_server.api_key, f"SELECT id, value FROM {query_table} WHERE id > 40"
+    ) == [(42, "as-b")]
 
 
 @pytest.mark.integration

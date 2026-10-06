@@ -310,6 +310,59 @@ impl WyrdCliError {
     }
 }
 
+/// Projects a CLI failure onto the shared catalog for in-process callers.
+///
+/// The in-process command functions surface in Rust, Python, and TypeScript,
+/// where only the shared [`wyrd_spec::error::WyrdError`] catalog crosses the
+/// boundary. Server failures pass through unchanged; client-assembly failures
+/// land on their `WYRD_CLIENT_*` equivalents; local loader failures keep their
+/// diagnostics as structured details; argument and input failures become
+/// request validation; and the remaining local faults become internal errors.
+/// The executable keeps rendering the CLI's own codes.
+impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
+    fn from(error: WyrdCliError) -> Self {
+        use wyrd_spec::error::WyrdError;
+        let message = error.to_string();
+        let details = serde_json::json!({});
+        match error {
+            WyrdCliError::Server { source } => source,
+            WyrdCliError::NoCredentials
+            | WyrdCliError::NoPlatformCredential
+            | WyrdCliError::NoRefreshToken => WyrdError::ClientNoCredentials { message, details },
+            WyrdCliError::ClientConfig { .. } => {
+                WyrdError::ClientConfigInvalid { message, details }
+            }
+            WyrdCliError::ClientTransport { .. } => {
+                WyrdError::ClientTransportDown { message, details }
+            }
+            WyrdCliError::CardLoad(error) => WyrdError::LoaderInvalidEnvelope {
+                message,
+                details: serde_json::json!({ "diagnostics": error.diagnostics }),
+            },
+            WyrdCliError::InvalidArgument { field, .. } => WyrdError::Validation {
+                message,
+                details: serde_json::json!({ "field": field }),
+            },
+            WyrdCliError::QueryConfig { .. }
+            | WyrdCliError::RegistryRefUnsupported
+            | WyrdCliError::JudgeMockRequired
+            | WyrdCliError::CardExtensionUnsupported { .. }
+            | WyrdCliError::NotEvalCard
+            | WyrdCliError::RecordsParse { .. }
+            | WyrdCliError::Parse { .. }
+            | WyrdCliError::EvalSpecInvalid { .. }
+            | WyrdCliError::DeleteSelectorRequiresExact => {
+                WyrdError::Validation { message, details }
+            }
+            WyrdCliError::Query { .. }
+            | WyrdCliError::Io { .. }
+            | WyrdCliError::EvalEngine { .. }
+            | WyrdCliError::Orchestrator { .. }
+            | WyrdCliError::Output { .. } => WyrdError::Internal { message, details },
+        }
+    }
+}
+
 /// Error crossing the binary boundary from either local CLI work or Oracle query SDK work.
 #[derive(Debug)]
 pub enum CliBoundaryError {

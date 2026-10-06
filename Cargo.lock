@@ -5637,6 +5637,8 @@ dependencies = [
  "napi-sys",
  "nohash-hasher",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -11294,7 +11296,6 @@ dependencies = [
  "clap",
  "indicatif",
  "predicates",
- "pyo3",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -11655,7 +11656,9 @@ dependencies = [
  "uuid",
  "wiremock",
  "workspace-hack",
+ "wyrd-cli",
  "wyrd-client",
+ "wyrd-spec",
  "wyrd-testing",
  "wyrd-tonic",
 ]
@@ -11673,6 +11676,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wyrd-cli",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-semver",
@@ -11688,6 +11692,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "secrecy",
+ "serde_json",
  "url",
  "vala-bifrost-redux",
  "wyrd-runtime",

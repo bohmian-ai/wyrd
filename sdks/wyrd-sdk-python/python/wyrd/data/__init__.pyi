@@ -3,12 +3,40 @@
 #### begin imports ####
 
 from collections.abc import Mapping, Sequence
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef, DataLoadArgs, JsonValue
 
 #### end of imports ####
+
+class Dim:
+    """One tensor dimension: a fixed length or a named dynamic axis."""
+
+    @staticmethod
+    def fixed(length: int) -> Dim:
+        """Declare a dimension with a fixed length."""
+        ...
+
+    @staticmethod
+    def dynamic(name: str | None = ...) -> Dim:
+        """Declare a variable-length dimension, optionally named (e.g. `batch`)."""
+        ...
+
+    @property
+    def kind(self) -> Literal["Fixed", "Dynamic"]:
+        """Whether this dimension is fixed or dynamic."""
+        ...
+
+    @property
+    def length(self) -> int | None:
+        """The fixed length, or `None` for a dynamic dimension."""
+        ...
+
+    @property
+    def name(self) -> str | None:
+        """The dynamic axis name, or `None` when fixed or unnamed."""
+        ...
 
 class FieldSpec:
     """One column or tensor field in a DataCard schema.
@@ -21,8 +49,8 @@ class FieldSpec:
 
     name: str
     dtype: str
-    shape: list[dict[str, Any]]
-    dims: list[dict[str, Any]]
+    shape: list[Dim]
+    dims: list[Dim]
     nullable: bool
     extra: dict[str, str]
 
@@ -30,7 +58,7 @@ class FieldSpec:
         self,
         name: str,
         dtype: str,
-        shape: Sequence[Mapping[str, Any]] | None = ...,
+        shape: Sequence[Dim] | Sequence[Mapping[str, Any]] | None = ...,
         nullable: bool = ...,
         extra: StringMap | None = ...,
     ) -> None:
@@ -40,8 +68,9 @@ class FieldSpec:
             name (str): Column or field name stored in the Wyrd spec.
             dtype (str): Normalized dtype label, for example `int64` or
                 `string`.
-            shape (Sequence[Mapping[str, Any]] | None): Optional serialized
-                dimensions for tensor-like data.
+            shape (Sequence[Dim] | Sequence[Mapping[str, Any]] | None):
+                Optional dimensions for tensor-like data, as `Dim` values or
+                their serialized form.
             nullable (bool): Whether the field may contain null values.
             extra (StringMap | None): Small string metadata copied into the
                 field spec.
@@ -243,6 +272,8 @@ class DataInterface:
 class PandasInterface(DataInterface):
     """Data interface for pandas DataFrames saved as parquet."""
 
+    compression: str
+
     def __init__(self, *, data: Any = ..., compression: str = ...) -> None:
         """Create a pandas interface.
 
@@ -256,6 +287,8 @@ class PandasInterface(DataInterface):
 
 class PolarsInterface(DataInterface):
     """Data interface for polars DataFrames saved as parquet."""
+
+    compression: str
 
     def __init__(self, *, data: Any = ..., compression: str = ...) -> None:
         """Create a polars interface.
@@ -271,6 +304,8 @@ class PolarsInterface(DataInterface):
 class ArrowInterface(DataInterface):
     """Data interface for PyArrow tables saved as parquet or IPC."""
 
+    format: str
+
     def __init__(self, *, data: Any = ..., format: str = ...) -> None:
         """Create an Arrow interface.
 
@@ -282,6 +317,9 @@ class ArrowInterface(DataInterface):
 
 class ParquetInterface(DataInterface):
     """Data interface for parquet paths or table-like parquet sources."""
+
+    compression: str
+    row_group_size: int | None
 
     def __init__(
         self,
@@ -302,6 +340,10 @@ class ParquetInterface(DataInterface):
 
 class NumpyInterface(DataInterface):
     """Data interface for NumPy arrays saved as `.npy` or `.npz`."""
+
+    dtype: str | None
+    shape: list[int] | None
+    format: str
 
     def __init__(
         self,
@@ -326,6 +368,8 @@ class NumpyInterface(DataInterface):
 class TorchInterface(DataInterface):
     """Data interface for Torch tensors or mappings of tensors."""
 
+    save_format: str
+
     def __init__(self, *, data: Any = ..., save_format: str = ...) -> None:
         """Create a Torch interface.
 
@@ -338,6 +382,9 @@ class TorchInterface(DataInterface):
 
 class SqlInterface(DataInterface):
     """Data interface for SQL query bundles."""
+
+    dialect: str
+    connection_hint: str | None
 
     def __init__(
         self,
@@ -360,6 +407,9 @@ class SqlInterface(DataInterface):
 class JsonlInterface(DataInterface):
     """Data interface for JSON Lines rows or JSONL files."""
 
+    compression: str
+    lines_per_file: int | None
+
     def __init__(
         self,
         *,
@@ -381,6 +431,9 @@ class JsonlInterface(DataInterface):
 
 class ImageInterface(DataInterface):
     """Data interface for image manifests."""
+
+    format: str
+    color_mode: str
 
     def __init__(
         self,
@@ -407,6 +460,8 @@ class ImageInterface(DataInterface):
 class TextInterface(DataInterface):
     """Data interface for text manifests."""
 
+    encoding: str
+
     def __init__(
         self,
         *,
@@ -427,6 +482,11 @@ class TextInterface(DataInterface):
 
 class HuggingfaceInterface(DataInterface):
     """Data interface for local Hugging Face datasets or pinned dataset pointers."""
+
+    dataset_id: str
+    revision: str | None
+    split: str | None
+    config: str | None
 
     def __init__(
         self,
@@ -538,6 +598,34 @@ class DataCard:
     schema: DataSchema
     stats: DataStats
 
+    @property
+    def splits(self) -> dict[str, Split]:
+        """Named split strategies recorded on the DataCard spec."""
+        ...
+
+    @property
+    def target_columns(self) -> list[str]:
+        """Supervised target column names recorded on the DataCard spec."""
+        ...
+
+    @staticmethod
+    def from_path(
+        path: PathLike,
+        interface: DataInterface | type[DataInterface] | CardRefLike | None = ...,
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> DataCard:
+        """Load a DataCard from a saved Card directory or a Card YAML/JSON file.
+
+        A directory is read through the `card.json` that `save` wrote, and its
+        data is loaded through the interface. A file is parsed as one Card
+        envelope; no data is loaded.
+
+        Raises:
+            WyrdError: If the file cannot be read, is not a Data Card envelope,
+                or interface loading fails.
+        """
+        ...
+
     @overload
     def __init__(
         self,
@@ -549,6 +637,8 @@ class DataCard:
         labels: StringMap | None = ...,
         annotations: StringMap | None = ...,
         metadata: DataCardMetadata | None = ...,
+        splits: Mapping[str, Split] | None = ...,
+        target_columns: Sequence[str] | None = ...,
     ) -> None:
         """Create a DataCard from an explicit data interface.
 
@@ -584,6 +674,8 @@ class DataCard:
         labels: StringMap | None = ...,
         annotations: StringMap | None = ...,
         metadata: DataCardMetadata | None = ...,
+        splits: Mapping[str, Split] | None = ...,
+        target_columns: Sequence[str] | None = ...,
     ) -> None:
         """Create a DataCard from a local path or SQL query mapping.
 
@@ -619,6 +711,8 @@ class DataCard:
         labels: StringMap | None = ...,
         annotations: StringMap | None = ...,
         metadata: DataCardMetadata | None = ...,
+        splits: Mapping[str, Split] | None = ...,
+        target_columns: Sequence[str] | None = ...,
     ) -> None:
         """Create a DataCard from an existing Artifact card reference.
 
@@ -636,6 +730,10 @@ class DataCard:
                 into the card metadata.
             metadata (DataCardMetadata | None): Existing holder metadata to
                 seed before artifact reference attachment.
+            splits (Mapping[str, Split] | None): Named split strategies
+                recorded on the DataCard spec.
+            target_columns (Sequence[str] | None): Supervised target column
+                names; each must exist in the schema when one is known.
 
         Raises:
             WyrdError: If the CardRef kind is not Artifact or holder metadata
@@ -654,6 +752,8 @@ class DataCard:
         labels: StringMap | None = ...,
         annotations: StringMap | None = ...,
         metadata: DataCardMetadata | None = ...,
+        splits: Mapping[str, Split] | None = ...,
+        target_columns: Sequence[str] | None = ...,
     ) -> None:
         """Create a DataCard by inferring the interface from runtime data.
 
@@ -786,6 +886,7 @@ __all__ = [
     "DataInterface",
     "DataSchema",
     "DataStats",
+    "Dim",
     "FieldSpec",
     "HuggingfaceInterface",
     "ImageInterface",

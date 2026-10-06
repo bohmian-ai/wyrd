@@ -7,7 +7,11 @@ from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 from .._wyrd.agent import (
     Agent,
     AgentRun,
+    CallbackContext,
+    Conversation,
+    ConversationTurn,
     FinishReason,
+    MockProvider,
     Role,
     RunConfig,
     SessionTurn,
@@ -73,7 +77,11 @@ class NoSession:
 __all__ = [
     "Agent",
     "AgentRun",
+    "CallbackContext",
+    "Conversation",
+    "ConversationTurn",
     "FinishReason",
+    "MockProvider",
     "NoSession",
     "Role",
     "RunConfig",

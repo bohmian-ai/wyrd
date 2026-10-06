@@ -854,6 +854,19 @@ class Prompt:
         OpenAISettings | OpenAIResponsesSettings | AnthropicSettings | GeminiSettings | None
     )
 
+    @property
+    def response_schema(self) -> JsonDict | None:
+        """The declared structured-output JSON Schema, whatever the provider body shape.
+
+        `None` when the prompt declares no JSON-schema response format.
+        """
+        ...
+
+    @property
+    def response_schema_name(self) -> str | None:
+        """The declared structured-output schema name, when one was given."""
+        ...
+
     def __init__(
         self,
         messages: Any,

@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
+from .cards import AgentCard
 from .error import WyrdError
 from .header import JsonDict, PathLike
 from .prompt import Prompt, ProviderResponse
@@ -194,6 +195,90 @@ if True:
             """Return the final provider response as a typed wrapper, if the run reached one."""
             ...
 
+class ConversationTurn:
+    """One read-only turn of an Agent conversation."""
+
+    @property
+    def role(self) -> Role:
+        """Role that produced the turn."""
+        ...
+
+    @property
+    def content(self) -> str | None:
+        """Text of a system or user turn; `None` for assistant and tool turns."""
+        ...
+
+    @property
+    def call_id(self) -> str | None:
+        """Provider tool call id of a tool result turn, otherwise `None`."""
+        ...
+
+    def to_dict(self) -> JsonDict:
+        """Return the turn as its JSON-compatible wire mapping."""
+        ...
+
+class Conversation:
+    """Read-only conversation snapshot."""
+
+    @property
+    def turns(self) -> list[ConversationTurn]:
+        """Turns in insertion order."""
+        ...
+
+    def __len__(self) -> int: ...
+
+class CallbackContext:
+    """Read-only context passed as `ctx` to every Agent callback."""
+
+    @property
+    def agent_id(self) -> str:
+        """Stable runtime id of the Agent whose callback is firing."""
+        ...
+
+    @property
+    def session_id(self) -> str | None:
+        """Session id of the current run, or `None` without a session."""
+        ...
+
+    @property
+    def iteration(self) -> int:
+        """Zero-based model/tool loop iteration."""
+        ...
+
+    @property
+    def conversation(self) -> Conversation:
+        """Conversation snapshot at this callback fire point."""
+        ...
+
+class MockProvider:
+    """Offline, deterministic `mock` provider with caller-set canned responses.
+
+    Pass it to `Agent(mock_provider=...)` for prompts declaring
+    `provider="mock"`. Each model call returns the next canned response in
+    order; once the queue is empty the provider echoes the last user message.
+    No network or credentials are used. One provider shared by several Agents
+    is consumed across all of their runs.
+
+    ```python
+    mock = MockProvider(["first answer", "second answer"])
+    agent = Agent(prompt=Prompt(messages="hi", model="m", provider="mock"), mock_provider=mock)
+    assert agent.run("hi").output == "first answer"
+    ```
+    """
+
+    def __init__(self, responses: Sequence[str] | None = ...) -> None:
+        """Create a mock provider returning `responses` in order, then echoing."""
+        ...
+
+    def push(self, text: str) -> None:
+        """Queue one more canned assistant response."""
+        ...
+
+    @property
+    def remaining(self) -> int:
+        """Number of canned responses still queued."""
+        ...
+
 class Agent:
     """Declarative and runnable Wyrd Agent."""
 
@@ -219,6 +304,7 @@ class Agent:
         provider_base_url: str | None = ...,
         provider_api_key: str | None = ...,
         output_type: type | None = ...,
+        mock_provider: MockProvider | None = ...,
     ) -> None:
         """Create an Agent.
 
@@ -248,6 +334,9 @@ class Agent:
                 Must be callable and accept keyword arguments matching the structured output
                 fields (typically a pydantic.BaseModel subclass). Does NOT inject a
                 response_format schema — use Prompt(output=...) for schema enforcement.
+            mock_provider (MockProvider | None): Run `provider="mock"` prompts offline
+                against this provider instead of the process default registry. Cannot be
+                combined with `provider_base_url`.
         """
         ...
 
@@ -315,8 +404,8 @@ class Agent:
         """Return this Agent Card as YAML text."""
         ...
 
-    def to_card(self) -> JsonDict:
-        """Return this Agent Card as a JSON-compatible mapping."""
+    def to_card(self) -> AgentCard:
+        """Return this Agent as a typed, unregistered `AgentCard` envelope."""
         ...
 
     def model_dump_json(self) -> str:
@@ -742,7 +831,11 @@ class Workflow:
 __all__ = [
     "Agent",
     "AgentRun",
+    "CallbackContext",
+    "Conversation",
+    "ConversationTurn",
     "FinishReason",
+    "MockProvider",
     "NoSession",
     "Role",
     "RunConfig",

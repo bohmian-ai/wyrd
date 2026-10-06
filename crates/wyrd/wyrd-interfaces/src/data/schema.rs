@@ -99,20 +99,16 @@ impl PyFieldSpec {
         self.inner.dtype.clone()
     }
 
+    /// Return the field shape as typed dimensions.
     #[getter]
-    fn shape(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.inner.shape)?,
-        )?)
+    fn shape(&self) -> Vec<PyDim> {
+        py_dims(&self.inner.shape)
     }
 
+    /// Return the field shape as typed dimensions; alias of `shape`.
     #[getter]
-    fn dims(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.inner.shape)?,
-        )?)
+    fn dims(&self) -> Vec<PyDim> {
+        py_dims(&self.inner.shape)
     }
 
     #[getter]
@@ -128,6 +124,84 @@ impl PyFieldSpec {
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
+}
+
+/// Python-facing projection of one Wyrd shape [`Dim`].
+///
+/// Shapes read back as typed dimensions (`Dim.fixed(3)`,
+/// `Dim.dynamic("batch")`) instead of serialized `{"kind", "value"}` maps, and
+/// `FieldSpec(shape=[...])` accepts them directly. Shape invariants such as
+/// positive fixed lengths stay with the owning spec validator.
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "wyrd.data", name = "Dim", frozen, eq, skip_from_py_object)
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PyDim {
+    inner: wyrd_spec::card::field::Dim,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyDim {
+    /// Declare a fixed, known dimension length.
+    #[staticmethod]
+    fn fixed(length: i64) -> Self {
+        Self {
+            inner: Dim::Fixed(length),
+        }
+    }
+
+    /// Declare a dynamic dimension, optionally named such as `"batch"`.
+    #[staticmethod]
+    #[pyo3(signature = (name=None))]
+    fn dynamic(name: Option<String>) -> Self {
+        Self {
+            inner: Dim::Dynamic(name),
+        }
+    }
+
+    /// Return `"Fixed"` or `"Dynamic"`.
+    #[getter]
+    const fn kind(&self) -> &'static str {
+        match self.inner {
+            Dim::Fixed(_) => "Fixed",
+            Dim::Dynamic(_) => "Dynamic",
+        }
+    }
+
+    /// Return the fixed length, or `None` for a dynamic dimension.
+    #[getter]
+    const fn length(&self) -> Option<i64> {
+        match self.inner {
+            Dim::Fixed(length) => Some(length),
+            Dim::Dynamic(_) => None,
+        }
+    }
+
+    /// Return the dynamic dimension name, or `None` when fixed or unnamed.
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        match &self.inner {
+            Dim::Fixed(_) => None,
+            Dim::Dynamic(name) => name.as_deref(),
+        }
+    }
+
+    /// Return a constructor-shaped representation.
+    fn __repr__(&self) -> String {
+        match &self.inner {
+            Dim::Fixed(length) => format!("Dim.fixed({length})"),
+            Dim::Dynamic(Some(name)) => format!("Dim.dynamic({name:?})"),
+            Dim::Dynamic(None) => "Dim.dynamic()".to_owned(),
+        }
+    }
+}
+
+/// Project a native shape into typed Python dimensions.
+#[cfg(feature = "python")]
+fn py_dims(shape: &[Dim]) -> Vec<PyDim> {
+    shape.iter().cloned().map(|inner| PyDim { inner }).collect()
 }
 
 /// Python-facing wrapper for a Wyrd `DataSchema`.
@@ -225,6 +299,7 @@ impl PyDataSchema {
 /// Register data schema wrapper classes on a Python module.
 #[cfg(feature = "python")]
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyDim>()?;
     module.add_class::<PyFieldSpec>()?;
     module.add_class::<PyDataSchema>()?;
     Ok(())
@@ -269,6 +344,13 @@ fn parse_dims(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<Dim>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Vec::new());
     };
+    let items = value.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if !items.is_empty() && items.iter().all(PyAnyMethods::is_instance_of::<PyDim>) {
+        return items
+            .iter()
+            .map(|item| Ok(item.cast::<PyDim>()?.get().inner.clone()))
+            .collect();
+    }
     dims_from_json(pyobject_to_json(value)?)
 }
 

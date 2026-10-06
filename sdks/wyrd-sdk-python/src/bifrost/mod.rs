@@ -14,6 +14,7 @@
 
 use serde_json::Result as JsonResult;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::sync::Mutex;
@@ -31,7 +32,9 @@ use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire, QueryParam};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
+};
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -101,14 +104,6 @@ fn query_params(params: Option<Vec<Bound<'_, PyAny>>>) -> WyrdPyResult<Vec<Query
         })
         .collect()
 }
-
-/// Sentinel the native poll uses to distinguish a missing terminal from a
-/// terminal that failed to serialize.
-///
-/// Both arrive as the same `Err(String)` from the terminal projection, so the
-/// poll compares against this marker to raise the stable incomplete-stream
-/// code instead of an internal error.
-const MISSING_TERMINAL: &str = "query stream ended before its required terminal frame";
 
 /// Builds one boundary internal failure for a broken local invariant.
 ///
@@ -280,8 +275,8 @@ impl PyTableConfig {
 /// Python-facing collected query result.
 ///
 /// Holds the decoded Rust batches; [`PyQueryResult::to_ipc`] encodes them once
-/// so Python builds its own Arrow table, and the terminal is handed over as
-/// JSON so the wire contract stays the only terminal shape.
+/// so Python builds its own Arrow table, and the terminal is projected as a
+/// typed [`PyQueryTerminal`] over the wire frame.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
 pub struct PyQueryResult {
     /// The native result every projection reads.
@@ -299,21 +294,127 @@ impl PyQueryResult {
         self.inner.to_ipc().map_err(client_error)
     }
 
-    /// The validated terminal frame, serialized.
-    ///
-    /// # Errors
-    ///
-    /// Raises `WyrdError` when the terminal cannot be serialized.
+    /// The validated terminal frame the server closed the stream with.
     #[getter]
-    fn terminal_json(&self) -> WyrdPyResult<String> {
-        serde_json::to_string(self.inner.terminal()).map_err(|error| {
-            boundary_internal(format!("query terminal is not serializable: {error}"))
-        })
+    fn terminal(&self) -> PyQueryTerminal {
+        PyQueryTerminal(self.inner.terminal().clone())
     }
 
     /// Total decoded rows across every batch.
     fn __len__(&self) -> usize {
         self.inner.num_rows()
+    }
+}
+
+/// Python-facing typed view of one validated query terminal frame.
+///
+/// Closed wire enums read back as their snake_case wire names, so Python sees
+/// the same vocabulary the HTTP and gRPC contracts publish without decoding
+/// JSON. The frame is immutable once validated by the native stream.
+#[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryTerminal", frozen)]
+pub struct PyQueryTerminal(QueryTerminalFrame);
+
+/// Returns the serde wire name of one closed unit-variant wire enum.
+///
+/// # Errors
+///
+/// Raises `WyrdError` when the value does not serialize to a JSON string,
+/// which a closed `rename_all = "snake_case"` enum never does.
+fn wire_name(value: &impl serde::Serialize) -> WyrdPyResult<String> {
+    match serde_json::to_value(value) {
+        Ok(Value::String(name)) => Ok(name),
+        _ => Err(boundary_internal("query terminal enum has no wire name")),
+    }
+}
+
+#[pymethods]
+impl PyQueryTerminal {
+    /// Stream outcome: `success`, `degraded`, or `failed`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the outcome has no wire name.
+    #[getter]
+    fn outcome(&self) -> WyrdPyResult<String> {
+        wire_name(&self.0.outcome)
+    }
+
+    /// Path Oracle ran the query on: `interactive` or `analytical`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the class has no wire name.
+    #[getter]
+    fn query_class(&self) -> WyrdPyResult<String> {
+        wire_name(&self.0.query_class)
+    }
+
+    /// Rows already emitted in batch frames.
+    #[getter]
+    fn row_count(&self) -> u64 {
+        self.0.row_count
+    }
+
+    /// Closed warnings the server attached, as wire names.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when a warning has no wire name.
+    #[getter]
+    fn warnings(&self) -> WyrdPyResult<Vec<String>> {
+        self.0.warnings.iter().map(wire_name).collect()
+    }
+
+    /// Completion outcome per source tier present in the cut.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when a source or outcome has no wire name.
+    #[getter]
+    fn source_completion(&self) -> WyrdPyResult<BTreeMap<String, String>> {
+        self.0
+            .source_completion
+            .iter()
+            .map(|entry| Ok((wire_name(&entry.source)?, wire_name(&entry.outcome)?)))
+            .collect()
+    }
+
+    /// Stable failure code for a failed terminal, otherwise `None`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the code has no wire name.
+    #[getter]
+    fn error_code(&self) -> WyrdPyResult<Option<String>> {
+        self.0
+            .error
+            .as_ref()
+            .map(|error| wire_name(&error.code))
+            .transpose()
+    }
+
+    /// Scrubbed failure diagnostic for a failed terminal, when the server sent one.
+    #[getter]
+    fn error_detail(&self) -> Option<&str> {
+        self.0
+            .error
+            .as_ref()
+            .and_then(|error| error.detail.as_ref())
+            .map(wyrd_spec::vala::api::QueryErrorDetail::as_str)
+    }
+
+    /// Compact debugging representation naming outcome, class, and rows.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an enum has no wire name.
+    fn __repr__(&self) -> WyrdPyResult<String> {
+        Ok(format!(
+            "QueryTerminal(outcome={:?}, query_class={:?}, row_count={})",
+            self.outcome()?,
+            self.query_class()?,
+            self.0.row_count
+        ))
     }
 }
 
@@ -556,7 +657,7 @@ impl Bifrost {
             consumer: Mutex::new(()),
             stream: Mutex::new(Some(Box::new(stream))),
             poll_abort: Mutex::new(PollAbortState::new()),
-            terminal_json: Mutex::new(None),
+            terminal: Mutex::new(None),
         })
     }
 
@@ -766,8 +867,8 @@ pub struct PyBifrostQueryStream {
     stream: Mutex<Option<Box<QueryResultStream>>>,
     /// Short-held state for aborting the currently pending native poll.
     poll_abort: Mutex<PollAbortState>,
-    /// Serialized terminal retained after the Rust stream is released.
-    terminal_json: Mutex<Option<String>>,
+    /// Validated terminal retained after the Rust stream is released.
+    terminal: Mutex<Option<QueryTerminalFrame>>,
 }
 
 /// Abort state for exactly one serialized native query poll.
@@ -814,8 +915,8 @@ impl PollAbortState {
 enum NativePollOutcome {
     /// One Arrow batch encoded successfully.
     Batch(Vec<u8>),
-    /// The stream completed with serialized terminal metadata.
-    Complete(String),
+    /// The stream completed with its validated terminal.
+    Complete(QueryTerminalFrame),
     /// The stream was already closed before polling began.
     Closed,
     /// Explicit close aborted the pending network poll.
@@ -824,22 +925,22 @@ enum NativePollOutcome {
     QueryError {
         /// Structured SDK error projected after native ownership is released.
         error: BifrostClientError,
-        /// Optional serialized terminal retained before projecting the error.
-        terminal: Option<String>,
+        /// Optional terminal retained before projecting the error.
+        terminal: Option<QueryTerminalFrame>,
     },
     /// Local serialization or Arrow encoding failed.
     ProjectionError(String),
 }
 
 impl PyBifrostQueryStream {
-    /// Retains one serialized terminal so `terminal_json` can return it after the poll.
+    /// Retains one terminal so `terminal` can return it after the poll.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when the terminal lock is poisoned.
-    fn retain_terminal(&self, terminal: String) -> WyrdPyResult<()> {
+    fn retain_terminal(&self, terminal: QueryTerminalFrame) -> WyrdPyResult<()> {
         *self
-            .terminal_json
+            .terminal
             .lock()
             .map_err(|_| boundary_internal("terminal lock poisoned"))? = Some(terminal);
         Ok(())
@@ -888,18 +989,9 @@ impl PyBifrostQueryStream {
                                 NativePollOutcome::Aborted
                             }
                             Ok(Err(error)) => {
-                                let terminal = stream
-                                    .terminal()
-                                    .map(serde_json::to_string)
-                                    .transpose()
-                                    .map_err(|error| error.to_string());
+                                let terminal = stream.terminal().cloned();
                                 drop(stream_slot.take());
-                                match terminal {
-                                    Ok(terminal) => {
-                                        NativePollOutcome::QueryError { error, terminal }
-                                    }
-                                    Err(error) => NativePollOutcome::ProjectionError(error),
-                                }
+                                NativePollOutcome::QueryError { error, terminal }
                             }
                             Ok(Ok(Some(batch))) => match encode_batch(&batch) {
                                 Ok(batch) => NativePollOutcome::Batch(batch),
@@ -909,24 +1001,14 @@ impl PyBifrostQueryStream {
                                 }
                             },
                             Ok(Ok(None)) => {
-                                let terminal = stream
-                                    .terminal()
-                                    .map(serde_json::to_string)
-                                    .transpose()
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|terminal| {
-                                        terminal.ok_or_else(|| MISSING_TERMINAL.to_owned())
-                                    });
+                                let terminal = stream.terminal().cloned();
                                 drop(stream_slot.take());
                                 match terminal {
-                                    Ok(terminal) => NativePollOutcome::Complete(terminal),
-                                    Err(error) if error == MISSING_TERMINAL => {
-                                        NativePollOutcome::QueryError {
-                                            error: BifrostClientError::IncompleteQueryStream,
-                                            terminal: None,
-                                        }
-                                    }
-                                    Err(error) => NativePollOutcome::ProjectionError(error),
+                                    Some(terminal) => NativePollOutcome::Complete(terminal),
+                                    None => NativePollOutcome::QueryError {
+                                        error: BifrostClientError::IncompleteQueryStream,
+                                        terminal: None,
+                                    },
                                 }
                             }
                         }
@@ -963,16 +1045,16 @@ impl PyBifrostQueryStream {
         })
     }
 
-    /// Returns serialized terminal metadata after validated completion.
+    /// Returns the typed terminal after validated completion, else `None`.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when internal synchronization was poisoned.
     #[getter]
-    fn terminal_json(&self) -> WyrdPyResult<Option<String>> {
-        self.terminal_json
+    fn terminal(&self) -> WyrdPyResult<Option<PyQueryTerminal>> {
+        self.terminal
             .lock()
-            .map(|terminal| terminal.clone())
+            .map(|terminal| terminal.clone().map(PyQueryTerminal))
             .map_err(|_| boundary_internal("terminal lock poisoned"))
     }
 
@@ -1054,6 +1136,7 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Bifrost>()?;
     module.add_class::<PyTableConfig>()?;
     module.add_class::<PyQueryResult>()?;
+    module.add_class::<PyQueryTerminal>()?;
     module.add_class::<PyBifrostQueryStream>()?;
     Ok(())
 }

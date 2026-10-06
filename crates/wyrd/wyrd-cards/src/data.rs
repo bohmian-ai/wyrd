@@ -8,9 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
+use wyrd_spec::card::data::validate::{check_split_rule_columns, check_target_columns_in_schema};
 use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
-    SqlLogic,
+    SplitStrategy, SqlLogic,
 };
 use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
@@ -36,6 +37,7 @@ use {
     wyrd_interfaces::data::io::save_data,
     wyrd_interfaces::data::io::sql_logic_from_data,
     wyrd_interfaces::data::schema::PyDataSchema,
+    wyrd_interfaces::data::split::PySplit,
     wyrd_interfaces::data::stats::PyDataStats,
     wyrd_interfaces::error::WyrdPyError,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
@@ -218,6 +220,39 @@ impl DataCard {
     }
 }
 
+impl DataCardMetadata {
+    /// Declare split strategies and target columns for supervised workflows.
+    ///
+    /// Each split is stored under its own label, so the map key and the
+    /// serialized label cannot drift. When the schema is populated, split
+    /// predicates and target columns are checked against it with the same
+    /// `DataSpec` rules registration applies, so an unknown column is refused
+    /// at authoring time instead of at registration.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when a split predicate names
+    /// a column missing from the schema, and
+    /// `WYRD_DATA_400_TARGET_COLUMN_UNKNOWN` when a target column is missing.
+    pub fn declare_supervision(
+        &mut self,
+        splits: impl IntoIterator<Item = (SplitName, SplitStrategy)>,
+        target_columns: Vec<ColumnName>,
+    ) -> Result<(), WyrdError> {
+        self.splits = splits
+            .into_iter()
+            .map(|(label, strategy)| (label.clone(), DataSplit { label, strategy }))
+            .collect();
+        self.target_columns = target_columns;
+        if self.schema.columns.is_empty() {
+            return Ok(());
+        }
+        let spec = data_spec_from_metadata(self, self.interface.clone());
+        check_split_rule_columns(&spec)?;
+        check_target_columns_in_schema(&spec)?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "python")]
 #[pymethods]
 impl DataCardMetadata {
@@ -312,6 +347,20 @@ impl DataCard {
         })
     }
 
+    /// Load a native holder from a saved Card directory or a Card file.
+    ///
+    /// A directory is read through the `card.json` that [`DataCard`] `save`
+    /// writes; any other path is read as one JSON or YAML Card envelope. The
+    /// envelope then passes through [`DataCard::from_card`], so kind, version,
+    /// and `DataSpec` validation stay in one place. No data bytes are read.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the file cannot be read or parsed, and
+    /// a `DataCard` validation error when the envelope is not a valid Data Card.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, WyrdError> {
+        Self::from_card(crate::local::read_card(path)?)
+    }
+
     /// Hydrate the holder's built-in or caller-supplied Python interface.
     #[cfg(feature = "python")]
     pub fn hydrate_interface(
@@ -370,12 +419,15 @@ impl DataCard {
     /// * `labels` - Optional queryable labels.
     /// * `annotations` - Optional free-form annotations.
     /// * `metadata` - Optional holder metadata to seed before inference.
+    /// * `splits` - Optional split strategies keyed by split label.
+    /// * `target_columns` - Optional target column names.
     ///
     /// # Errors
     /// Returns a Wyrd error when input classification, interface metadata
-    /// conversion, or schema inference fails.
+    /// conversion, or schema inference fails, or when a split label, split
+    /// column, or target column is invalid or missing from the schema.
     #[new]
-    #[pyo3(signature = (data, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    #[pyo3(signature = (data, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, splits=None, target_columns=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the DataCard() Python constructor"
@@ -389,6 +441,8 @@ impl DataCard {
         labels: Option<BTreeMap<String, String>>,
         annotations: Option<BTreeMap<String, String>>,
         metadata: Option<DataCardMetadata>,
+        splits: Option<BTreeMap<String, PyRef<'_, PySplit>>>,
+        target_columns: Option<Vec<String>>,
     ) -> CardPyResult<Self> {
         let py = data.py();
         let mut metadata = metadata.unwrap_or_default();
@@ -402,6 +456,19 @@ impl DataCard {
         }
         if let Some(card_ref) = card_ref {
             metadata.card_refs.push(card_ref);
+        }
+        if splits.is_some() || target_columns.is_some() {
+            let splits = splits
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(label, split)| Ok((split_name(&label)?, split.inner().clone())))
+                .collect::<CardPyResult<Vec<_>>>()?;
+            let target_columns = target_columns
+                .unwrap_or_default()
+                .iter()
+                .map(|name| column_name(name))
+                .collect::<CardPyResult<Vec<_>>>()?;
+            metadata.declare_supervision(splits, target_columns)?;
         }
 
         let mut resolved_space = space.map(str::to_owned);
@@ -598,6 +665,26 @@ impl DataCard {
         PyDataStats::from(self.metadata.stats.clone())
     }
 
+    /// Return declared split strategies keyed by split label.
+    #[getter]
+    pub fn splits(&self) -> BTreeMap<String, PySplit> {
+        self.metadata
+            .splits
+            .iter()
+            .map(|(label, split)| (label.to_string(), PySplit::from(split.strategy.clone())))
+            .collect()
+    }
+
+    /// Return declared target column names.
+    #[getter]
+    pub fn target_columns(&self) -> Vec<String> {
+        self.metadata
+            .target_columns
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     /// Replace `DataCard` holder metadata.
     #[setter]
     pub fn set_metadata(&mut self, value: DataCardMetadata) {
@@ -727,6 +814,35 @@ impl DataCard {
     ) -> CardPyResult<Self> {
         let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
         card.hydrate_interface(py, interface)?;
+        Ok(card)
+    }
+
+    /// Load a saved `DataCard` directory or a Data Card YAML or JSON file.
+    ///
+    /// A directory written by `save` loads the envelope from its `card.json`
+    /// and then loads the saved data through the hydrated interface, so the
+    /// returned holder's `data` is ready. A Card file loads the envelope and
+    /// interface only. Python subclass-backed cards pass
+    /// `interface=YourInterface` exactly as for `model_validate_json`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the Card file cannot be read or
+    /// parsed, a `DataCard` validation error when the envelope is invalid or
+    /// the interface cannot be rebuilt, and the interface's error when loading
+    /// saved data fails.
+    #[staticmethod]
+    #[pyo3(name = "from_path", signature = (path, interface=None, load_kwargs=None))]
+    pub fn from_path_py(
+        py: Python<'_>,
+        path: PathBuf,
+        interface: Option<&Bound<'_, PyAny>>,
+        load_kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<Self> {
+        let mut card = Self::from_path(&path)?;
+        card.hydrate_interface(py, interface)?;
+        if path.is_dir() {
+            card.load(py, Some(path), load_kwargs)?;
+        }
         Ok(card)
     }
 
@@ -918,6 +1034,28 @@ fn annotations_to_strings(values: &Annotations) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Parse a caller-supplied split label into its identifier newtype.
+#[cfg(feature = "python")]
+fn split_name(label: &str) -> CardPyResult<SplitName> {
+    SplitName::new(label).map_err(|error| {
+        WyrdPyError::validation_with_details(
+            "invalid DataCard split label",
+            json!({ "field": "splits", "value": label, "reason": error.to_string() }),
+        )
+    })
+}
+
+/// Parse a caller-supplied target column into its identifier newtype.
+#[cfg(feature = "python")]
+fn column_name(name: &str) -> CardPyResult<ColumnName> {
+    ColumnName::new(name).map_err(|error| {
+        WyrdPyError::validation_with_details(
+            "invalid DataCard target column",
+            json!({ "field": "target_columns", "value": name, "reason": error.to_string() }),
+        )
+    })
+}
+
 #[cfg(feature = "python")]
 fn metadata_error(error: MetadataError) -> WyrdPyError {
     WyrdPyError::validation_with_details(
@@ -1056,6 +1194,58 @@ mod tests {
             serialized.contains(r#""annotations":{"acme.com/source":"warehouse.customer_churn"}"#)
         );
         assert!(!serialized.contains(r#""tags""#));
+    }
+
+    /// A saved Card directory and a Card YAML file load the same envelope
+    /// through `DataCard::from_path`, and a missing file keeps its loader code.
+    #[test]
+    fn from_path_reads_saved_directory_and_card_file() {
+        let root =
+            std::env::temp_dir().join(format!("wyrd_data_card_from_path_{}", wyrd_utils::uuid7()));
+        let saved = root.join("saved");
+        std::fs::create_dir_all(&saved).expect("temp Card directory is writable");
+        let yaml = r#"
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: prod
+  name: churn-train
+  version: "1.0.0"
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
+spec:
+  interface:
+    kind: Sql
+    meta:
+      dialect: duckdb
+  schema:
+    columns: []
+  target_columns: [churn]
+  sql:
+    queries:
+      main: select 1
+  stats:
+    byte_count: 1
+    sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+"#;
+        let card_file = root.join("churn-train.yaml");
+        std::fs::write(&card_file, yaml).expect("temp Card file is writable");
+        let from_file = DataCard::from_path(&card_file).expect("Card YAML file loads");
+        let envelope = from_file.to_card().expect("loaded identity is valid");
+        std::fs::write(
+            saved.join("card.json"),
+            serde_json::to_vec(&envelope).expect("envelope serializes"),
+        )
+        .expect("saved card.json is writable");
+
+        let from_dir = DataCard::from_path(&saved).expect("saved Card directory loads");
+        let missing = DataCard::from_path(&root.join("missing.yaml"));
+        std::fs::remove_dir_all(&root).expect("temp Card root is removable");
+
+        assert_eq!(from_file.name, "churn-train");
+        assert_eq!(from_file.metadata.target_columns[0].as_str(), "churn");
+        assert_eq!(from_dir.uid, from_file.uid);
+        assert_eq!(from_dir.metadata, from_file.metadata);
+        assert!(matches!(missing, Err(error) if error.code() == "WYRD_LOADER_400_IO"));
     }
 
     #[test]

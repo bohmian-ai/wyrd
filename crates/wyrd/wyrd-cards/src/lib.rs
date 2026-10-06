@@ -12,6 +12,7 @@ pub mod card_ref;
 /// DataCard implementation module.
 pub mod data;
 mod identity;
+mod local;
 /// ModelCard implementation module.
 pub mod model;
 /// PromptCard implementation module.

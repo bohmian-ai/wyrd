@@ -93,8 +93,7 @@ def _huggingface_model():
 
 def _round_trip(card: ModelCard, path: Path, expected_kind: str, *, interface=None) -> ModelCard:
     card.save(path)
-    restored = ModelCard.model_validate_json((path / "card.json").read_text(), interface=interface)
-    restored.load(path)
+    restored = ModelCard.from_path(path, interface=interface)
 
     assert restored.interface.kind == expected_kind
     assert restored.interface.has_model is True
@@ -386,3 +385,27 @@ def test_sample_input_round_trips_through_modelcard(tmp_path: Path) -> None:
     assert restored_sample is not None
     assert restored_sample.kind_token == "dict"
     assert restored_sample.to_dict()["kind"] == "Dict"
+
+
+def test_model_from_path_reads_card_yaml_file_without_loading_model(tmp_path: Path) -> None:
+    path = tmp_path / "sklearn-yaml"
+    saved = ModelCard(
+        _sklearn_model(), name="churn", metadata=model_metadata("binary_classification")
+    )
+    saved.save(path)
+    yaml_file = tmp_path / "card.yaml"
+    yaml_file.write_text((path / "card.json").read_text(encoding="utf-8"), encoding="utf-8")
+
+    card = ModelCard.from_path(yaml_file)
+
+    assert card.uid == saved.uid
+    assert card.name == "churn"
+    assert card.interface.kind == "Sklearn"
+    assert card.interface.has_model is False
+
+
+def test_model_from_path_missing_file_raises_loader_error(tmp_path: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        ModelCard.from_path(tmp_path / "absent.yaml")
+
+    assert error.value.code == "WYRD_LOADER_400_IO"

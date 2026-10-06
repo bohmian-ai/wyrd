@@ -14,9 +14,6 @@ description = "Wyrd command-line interface."
 name = "wyrd_cli"
 path = "src/lib.rs"
 
-[features]
-python = ["dep:pyo3"]
-
 [[bin]]
 name = "wyrd"
 path = "src/main.rs"
@@ -32,7 +29,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
-pyo3 = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

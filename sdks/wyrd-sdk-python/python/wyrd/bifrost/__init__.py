@@ -12,6 +12,8 @@ import pyarrow
 from .. import _wyrd as _native
 from ..client import WyrdClient
 
+QueryTerminal = _native.bifrost.QueryTerminal
+
 _Row = TypeVar("_Row", bound="RowModel")
 
 QueryParam = None | bool | int | float | str
@@ -39,7 +41,7 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
 
     def __init__(self, native_stream: Any) -> None:
         self._native = native_stream
-        self._terminal: dict[str, Any] | None = None
+        self._terminal: QueryTerminal | None = None
         self._done = False
 
     def __aiter__(self) -> BifrostQueryStream:
@@ -74,21 +76,12 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
                 pass
             raise
         if payload is None:
-            terminal_json = self._native.terminal_json
-            if terminal_json is None:
-                self._done = True
+            terminal = self._native.terminal
+            self._done = True
+            if terminal is None:
                 self._native.raise_incomplete_error()
                 raise AssertionError("native incomplete projection must raise")
-            try:
-                self._terminal = json.loads(terminal_json)
-            except Exception:
-                self._done = True
-                try:
-                    await asyncio.to_thread(self._native.close)
-                except Exception:
-                    pass
-                raise
-            self._done = True
+            self._terminal = terminal
             raise StopAsyncIteration
         try:
             return pyarrow.ipc.open_stream(payload).read_next_batch()
@@ -107,7 +100,7 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
         return self._native.request_id
 
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Return terminal metadata only after validated completion."""
 
         return self._terminal
@@ -332,10 +325,10 @@ class QueryResult:
         return bytes(self._native.to_ipc())
 
     @property
-    def terminal(self) -> dict[str, Any]:
+    def terminal(self) -> QueryTerminal:
         """The validated terminal frame the server closed the stream with."""
 
-        return json.loads(self._native.terminal_json)
+        return self._native.terminal
 
     def __len__(self) -> int:
         """Total rows across every batch."""
@@ -352,7 +345,7 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
 
     def __init__(self, native_stream: Any) -> None:
         self._native = native_stream
-        self._terminal: dict[str, Any] | None = None
+        self._terminal: QueryTerminal | None = None
         self._done = False
 
     def __iter__(self) -> BifrostBatchIterator:
@@ -369,11 +362,11 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
             raise
         if payload is None:
             self._done = True
-            terminal_json = self._native.terminal_json
-            if terminal_json is None:
+            terminal = self._native.terminal
+            if terminal is None:
                 self._native.raise_incomplete_error()
                 raise AssertionError("native incomplete projection must raise")
-            self._terminal = json.loads(terminal_json)
+            self._terminal = terminal
             raise StopIteration
         try:
             return pyarrow.ipc.open_stream(payload).read_next_batch()
@@ -389,7 +382,7 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
         return str(self._native.request_id)
 
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Terminal metadata, present only after validated completion."""
 
         return self._terminal
@@ -872,6 +865,7 @@ __all__ = [
     "PhysicalLayout",
     "QueryParam",
     "QueryResult",
+    "QueryTerminal",
     "ResolvedTable",
     "RowModel",
     "RunningQuery",

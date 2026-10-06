@@ -64,9 +64,9 @@ def test_python_session_recent_can_return_dicts() -> None:
 
     agent.run("hello", session_id="s1")
 
-    conversation = seen_contexts[0]["conversation"]["turns"]
-    assert conversation[0] == {"type": "system", "content": "seed"}
-    assert conversation[1] == {"type": "user", "content": "prior"}
+    turns = seen_contexts[0].conversation.turns
+    assert (turns[0].role, turns[0].content) == (Role.System, "seed")
+    assert (turns[1].role, turns[1].content) == (Role.User, "prior")
 
 
 def test_invalid_session_object_is_rejected() -> None:

@@ -856,6 +856,24 @@ class ModelCard:
         """
         ...
 
+    @staticmethod
+    def from_path(
+        path: PathLike,
+        interface: ModelInterface | type[ModelInterface] | None = ...,
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> ModelCard:
+        """Load a ModelCard from a saved Card directory or a Card YAML/JSON file.
+
+        A directory is read through the `card.json` that `save` wrote, and its
+        model is loaded through the interface. A file is parsed as one Card
+        envelope; no model is loaded.
+
+        Raises:
+            WyrdError: If the file cannot be read, is not a Model Card
+                envelope, or interface loading fails.
+        """
+        ...
+
 __all__ = [
     "CatboostInterface",
     "HuggingfaceInterface",

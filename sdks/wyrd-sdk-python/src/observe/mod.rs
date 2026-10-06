@@ -462,7 +462,7 @@ impl PyJudgment {
     fn counts(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
-            &serde_json::to_value(&self.inner.counts)?,
+            &serde_json::to_value(self.inner.counts)?,
         )?)
     }
 

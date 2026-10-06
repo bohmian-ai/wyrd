@@ -142,7 +142,11 @@ pub fn parse_sql_dialect(value: &str) -> WyrdPyResult<String> {
     Ok(trimmed.to_string())
 }
 
-fn normalize_option(value: &str) -> String {
+/// Canonical lowercase, underscore-separated form of an option token.
+///
+/// Parsers match on this form, and constructors store it so an option reads
+/// back identically before and after a save/load round trip.
+pub(super) fn normalize_option(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
 }
 

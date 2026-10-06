@@ -12,8 +12,9 @@ def test_load_round_trip(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
     cfg_file.write_text('[defaults]\nspace = "prod"\n[defaults.labels]\nteam = "churn-ml"\n')
     cfg = WyrdConfig.load(cfg_file)
-    assert "WyrdConfig" in repr(cfg)
-    assert "space='prod'" in repr(cfg)
+    assert cfg.defaults.space == "prod"
+    assert cfg.defaults.labels["team"] == "churn-ml"
+    assert cfg.defaults.annotations == {}
 
 
 def test_load_explicit_missing_raises_typed(tmp_path: Path) -> None:

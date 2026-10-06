@@ -12,8 +12,15 @@ description = "First-class Rust Wyrd SDK: a thin projection of wyrd-client."
 name = "wyrd_sdk"
 path = "src/lib.rs"
 
+[features]
+# In-process `wyrd` CLI commands (`wyrd_sdk::cli`), the same implementation
+# the executable renders.
+cli = ["dep:wyrd-cli"]
+
 [dependencies]
+wyrd-cli = { workspace = true, optional = true }
 wyrd-client = { workspace = true }
+wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

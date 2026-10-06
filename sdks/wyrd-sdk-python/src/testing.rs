@@ -21,7 +21,6 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
-use wyrd_testing::server::BifrostQueryResourceSnapshot;
 use wyrd_testing::{Bootstrap, WyrdTestServer as TestServer, WyrdTestServerError};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
@@ -381,27 +380,6 @@ impl WyrdTestServer {
         machine_key(bootstrap, "expected a machine bootstrap")
     }
 
-    /// Materialize one canonical built-in table for the fixture tenant.
-    ///
-    /// A canonical signal table is created on first use. An OTLP export
-    /// provisions it on ingest, but a journey that writes it through the public
-    /// Arrow batch door must ask for it first.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd Python error when the context manager is inactive, no
-    /// built-in owns `namespace.name`, or the catalog cannot materialize it.
-    fn ensure_builtin_table(&self, namespace: &str, name: &str) -> WyrdPyResult<()> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.ensure_builtin_table_for_test(
-                server.data_tenant_id(),
-                namespace,
-                name,
-            ))
-            .map_err(py_error)
-    }
-
     /// Mint an API key for a principal holding exactly `permissions`.
     ///
     /// Each permission is either a `resource:action` string, which grants every
@@ -480,25 +458,6 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
-    /// Creates a real sealed Oracle fixture and returns its table and access
-    /// token.
-    ///
-    /// Delegates to the harness's Oracle query fixture, which ingests through
-    /// the public gRPC transport, flushes Scribe unless `fused`, and exchanges
-    /// a fresh admin key through the real auth route.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd Python error when the context manager is inactive or table
-    /// registration, ingest, flush, token exchange, or Arrow encoding fails.
-    #[pyo3(signature = (fused = false))]
-    fn prepare_oracle_query_fixture(&self, fused: bool) -> WyrdPyResult<(String, String)> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.prepare_oracle_query_fixture(fused))
-            .map_err(WyrdPyError::from)
-    }
-
     /// Provision a second tenant so a journey can prove cross-tenant isolation.
     ///
     /// The tenant is seeded through the same operator path the Rust harness
@@ -567,191 +526,37 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
-    /// Bring a binding's schedule cursor to database time.
+    /// Bring a binding's schedule cursor to database time, so the
+    /// verification runtime schedules its next occurrence now.
     ///
     /// # Errors
-    /// Raises a harness error for an invalid binding or failed fixture update.
+    /// Raises a harness error for an invalid binding ID, and a Wyrd Python
+    /// error when the context manager is inactive or the update fails.
     fn make_binding_due(&self, binding_id: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
         let binding = binding_id.parse().map_err(harness_error)?;
         wyrd_runtime::runtime()
-            .block_on(async {
-                server
-                    .verification_fixture()
-                    .await?
-                    .make_binding_due(binding)
-                    .await
-            })
-            .map_err(harness_error)
-    }
-
-    /// Return every verification run ID for the fixture tenant.
-    ///
-    /// # Errors
-    /// Raises a harness error if the run query fails.
-    fn verification_runs(&self) -> WyrdPyResult<Vec<String>> {
-        let server = self.started()?;
-        let runs = wyrd_runtime::runtime()
-            .block_on(async { server.verification_fixture().await?.runs().await })
-            .map_err(harness_error)?;
-        Ok(runs.iter().map(ToString::to_string).collect())
-    }
-
-    /// Remove the fitted format from a ready Drift baseline for compatibility tests.
-    ///
-    /// # Errors
-    /// Raises a harness error for an invalid Verifier UID or failed update.
-    fn retire_fitted_format(&self, verifier_uid: &str) -> WyrdPyResult<()> {
-        let server = self.started()?;
-        let verifier = verifier_uid.parse().map_err(harness_error)?;
-        wyrd_runtime::runtime()
-            .block_on(async {
-                server
-                    .verification_fixture()
-                    .await?
-                    .retire_fitted_format(&verifier)
-                    .await
-            })
-            .map_err(harness_error)
-    }
-
-    /// Truncate the next query after its schema frame in the real server.
-    ///
-    /// # Errors
-    ///
-    /// Raises the harness error when the context manager is inactive.
-    fn fail_next_query_after_schema(&self) -> WyrdPyResult<()> {
-        self.started()?.fail_next_query_after_schema();
-        Ok(())
-    }
-
-    /// Truncate the next query after its first batch frame in the real server.
-    ///
-    /// # Errors
-    ///
-    /// Raises the harness error when the context manager is inactive.
-    fn fail_next_query_after_batch(&self) -> WyrdPyResult<()> {
-        self.started()?.fail_next_query_after_batch();
-        Ok(())
-    }
-
-    /// Stall the next query after its schema for deterministic cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Raises the harness error when the context manager is inactive.
-    fn stall_next_query_after_schema(&self) -> WyrdPyResult<()> {
-        self.started()?.stall_next_query_after_schema();
-        Ok(())
-    }
-
-    /// Wait until the real response body reaches its notification-backed stall.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd Python error when no stall is scheduled or the configured
-    /// server drain deadline expires.
-    fn wait_query_schema_stall(&self, py: Python<'_>) -> WyrdPyResult<String> {
-        let server = self.started()?;
-        py.detach(|| wyrd_runtime::runtime().block_on(server.wait_query_schema_stall()))
+            .block_on(server.make_binding_due(binding))
             .map_err(py_error)
     }
 
-    /// Return exact admission, memory, peer-slot, and tail-fence counts.
+    /// Wait until Drift Verifier `verifier`'s fitted baseline is ready.
+    ///
+    /// `verifier` is the Verifier Card UID and `timeout` is in seconds. The
+    /// GIL is released while the harness polls the baseline status a Card read
+    /// serves.
     ///
     /// # Errors
-    ///
-    /// Raises a Wyrd Python error when production-shaped resource owners cannot
-    /// provide an exact snapshot.
-    fn bifrost_query_resource_snapshot(
-        &self,
-        query_id: &str,
-    ) -> WyrdPyResult<BTreeMap<String, u64>> {
-        let snapshot = self
-            .started()?
-            .bifrost_query_resource_snapshot(query_id)
-            .map_err(py_error)?;
-        Ok(snapshot_to_map(snapshot))
-    }
-
-    /// Wait until all exact query resources equal the supplied baseline.
-    ///
-    /// # Errors
-    ///
-    /// Raises the harness error for a malformed baseline and a Wyrd Python
-    /// error when notification-backed release exceeds `shutdown.drain_ms`.
-    fn wait_bifrost_query_resources_released(
-        &self,
-        py: Python<'_>,
-        query_id: &str,
-        baseline: BTreeMap<String, u64>,
-    ) -> WyrdPyResult<BTreeMap<String, u64>> {
+    /// Raises a harness error for an invalid UID or a negative or non-finite
+    /// `timeout`, `WYRD_VERIFICATION_409_BASELINE_NOT_READY` carrying the last
+    /// observed baseline state when `timeout` elapses first, and a Wyrd Python
+    /// error when the context manager is inactive or the status read fails.
+    fn wait_for_baseline(&self, py: Python<'_>, verifier: &str, timeout: f64) -> WyrdPyResult<()> {
         let server = self.started()?;
-        let baseline = snapshot_from_map(&baseline)?;
-        let snapshot = py
-            .detach(|| {
-                wyrd_runtime::runtime()
-                    .block_on(server.wait_bifrost_query_resources_released(query_id, baseline))
-            })
-            .map_err(py_error)?;
-        Ok(snapshot_to_map(snapshot))
-    }
-
-    /// Mint an authenticated token lacking `bifrost_query:read`.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd error when the context manager is inactive or token
-    /// issuance fails.
-    fn query_denied_token(&self) -> WyrdPyResult<String> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.query_denied_token())
+        let verifier = verifier.parse().map_err(harness_error)?;
+        let timeout = Duration::try_from_secs_f64(timeout).map_err(harness_error)?;
+        py.detach(|| wyrd_runtime::runtime().block_on(server.wait_for_baseline(&verifier, timeout)))
             .map_err(py_error)
-    }
-
-    /// Return the server-observed describe count for a fixture table.
-    ///
-    /// # Errors
-    /// Raises a harness error when the audit query fails.
-    fn table_describe_count(&self, fqn: &str) -> WyrdPyResult<i64> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.table_describe_count(fqn))
-            .map_err(py_error)
-    }
-
-    /// Return the fixture tenant's durable Oracle read-decision count.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd error when the context manager is inactive or the audit
-    /// query fails.
-    fn bifrost_read_decision_count(&self) -> WyrdPyResult<i64> {
-        let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.bifrost_read_decision_count())
-            .map_err(py_error)
-    }
-
-    /// Wait until no Oracle audit outbox commit is still in flight.
-    ///
-    /// Returns the residual pending count, which is `0` once every read
-    /// decision is staged. A journey asserting on read-decision staging calls
-    /// this first because Oracle stages decisions from a background task.
-    ///
-    /// # Errors
-    ///
-    /// Raises a Wyrd error when the context manager is inactive or this server
-    /// does not host an Oracle role.
-    #[pyo3(signature = (budget_ms=5000))]
-    fn wait_oracle_audit_staged(&self, py: Python<'_>, budget_ms: u64) -> WyrdPyResult<u64> {
-        let server = self.started()?;
-        py.detach(|| {
-            wyrd_runtime::runtime()
-                .block_on(server.wait_oracle_audit_staged(Duration::from_millis(budget_ms)))
-        })
-        .map_err(py_error)
     }
 
     /// Stage, test, and activate the identity lane's Keycloak sign-in for the
@@ -881,36 +686,6 @@ fn machine_key(bootstrap: Bootstrap, unexpected: &str) -> WyrdPyResult<String> {
         Bootstrap::Machine { api_key, .. } => Ok(api_key.expose_secret().to_owned()),
         Bootstrap::User { .. } => Err(harness_error(unexpected)),
     }
-}
-
-/// Projects one exact Rust resource snapshot into a Python dictionary.
-fn snapshot_to_map(snapshot: BifrostQueryResourceSnapshot) -> BTreeMap<String, u64> {
-    BTreeMap::from([
-        ("admission_slots".to_owned(), snapshot.admission_slots),
-        ("memory_bytes".to_owned(), snapshot.memory_bytes),
-        ("peer_slots".to_owned(), snapshot.peer_slots),
-    ])
-}
-
-/// Parses one Python baseline dictionary into exact Rust resource counts.
-///
-/// # Errors
-///
-/// Raises `WYRD_TESTING_500_HARNESS_START` when a required counter is absent.
-fn snapshot_from_map(
-    baseline: &BTreeMap<String, u64>,
-) -> WyrdPyResult<BifrostQueryResourceSnapshot> {
-    let value = |name: &str| {
-        baseline
-            .get(name)
-            .copied()
-            .ok_or_else(|| harness_error(format!("query resource baseline is missing {name}")))
-    };
-    Ok(BifrostQueryResourceSnapshot {
-        admission_slots: value("admission_slots")?,
-        memory_bytes: value("memory_bytes")?,
-        peer_slots: value("peer_slots")?,
-    })
 }
 
 /// Projects one harness failure onto the shared Wyrd boundary adapter.

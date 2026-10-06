@@ -20,7 +20,6 @@ doctest = false
 # Python feature activate only when the extension is built.
 python = [
     "dep:pyo3",
-    "wyrd-cli/python",
     "skald-agent/python",
     "skald-workflow/python",
     "skald-tool/python",

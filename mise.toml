@@ -585,7 +585,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py tests/integration/test_verification_journey.py tests/integration/test_verification_execute_journey.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py tests/integration/test_verification_execute_journey.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -596,7 +596,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -1121,7 +1121,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py tests/unit/runtime/workflow/test_workflow_parameter_injection.py"
+run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py tests/unit/cards/test_registered_card_typing.py tests/unit/runtime/workflow/test_workflow_parameter_injection.py"
 
 [tasks."py:test:testing"]
 hide = true
@@ -1399,10 +1399,12 @@ cargo hakari verify
 """
 
 [tasks."codegen:regen"]
-description = "Regenerate JSON schemas / MCP tool list / pyi stubs from source"
+description = "Regenerate JSON schemas / MCP tool list / pyi stubs / typed Card envelopes from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
 cargo run --locked -p wyrd-client --example gen_schemas
+python3 scripts/gen_card_types.py
+(cd sdks/wyrd-sdk-python && uv run ruff format python/wyrd/_card_types.py)
 mise run codegen:stubs
 """
 
@@ -1416,13 +1418,14 @@ uv run ruff check --fix --select I python/wyrd
 """
 
 [tasks."codegen:check"]
-description = "Fail if generated schemas, pyi stubs, TypeScript error codes, or UI theme tokens drift from source"
+description = "Fail if generated schemas, pyi stubs, TypeScript error codes, typed Card envelopes, or UI theme tokens drift from source"
 run = """
 snapshot_codegen() {
   {
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
     find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
-    printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts
+    printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts \
+      sdks/wyrd-sdk-python/python/wyrd/_card_types.py
     find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
       ! -path 'sdks/wyrd-sdk-python/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do

@@ -5,6 +5,39 @@
 from collections.abc import Mapping
 from typing import Protocol, TypeAlias, overload
 
+from .._card_types import (
+    AgentSpec,
+    DataSpec,
+    DriftBaselineState,
+    DriftBaselineStatus,
+    ModelSpec,
+    OperatorSpec,
+    PromptSpec,
+    RegisteredAgentCard,
+    RegisteredCard,
+    RegisteredDataCard,
+    RegisteredModelCard,
+    RegisteredOperatorCard,
+    RegisteredPromptCard,
+    RegisteredServiceCard,
+    RegisteredTriggerCard,
+    RegisteredUntypedCard,
+    RegisteredVerifierCard,
+    ServiceSpec,
+    TriggerSpec,
+    TypedCardKind,
+    VerificationStatus,
+    VerifierSpec,
+)
+from .._card_types import (
+    Metadata as CardMetadata,
+)
+from .._card_types import (
+    Relationships as CardRelationships,
+)
+from .._card_types import (
+    Status as CardStatus,
+)
 from ..agent import Workflow
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
@@ -345,6 +378,35 @@ class Cards:
         Raises:
             WyrdError: If the bundle is invalid, its artifacts cannot be read,
                 or registration does not complete.
+        """
+        ...
+
+    def get(self, card_ref: CardRef) -> RegisteredCard:
+        """Fetch one registered Card envelope by exact reference.
+
+        The envelope is a JSON mapping discriminated by `kind`: `spec` and
+        `status` are typed for Data, Model, Prompt, Agent, Verifier, Service,
+        Trigger, and Operator Cards, including a Drift Verifier's
+        `status["verification"]["baseline"]` state. Other kinds return
+        `RegisteredUntypedCard`, whose `spec` is a plain mapping. No artifact
+        bytes are downloaded.
+
+        Args:
+            card_ref: Exact reference carrying its space and version.
+
+        Returns:
+            The registered envelope with server-derived relationships and
+            status.
+
+        Raises:
+            WyrdError: If the Card is absent or the server request fails.
+
+        Example:
+            ```python
+            card = cards.get(CardRef("Verifier", "churn-drift", "1.0.0", space="ml"))
+            if card["kind"] == "Verifier":
+                baseline = (card.get("status") or {}).get("verification") or {}
+            ```
         """
         ...
 
@@ -905,4 +967,29 @@ __all__ = [
     "RegistrationOutcome",
     "RegistrationReceipt",
     "WorkflowCards",
+    "AgentSpec",
+    "CardMetadata",
+    "CardRelationships",
+    "CardStatus",
+    "DataSpec",
+    "DriftBaselineState",
+    "DriftBaselineStatus",
+    "ModelSpec",
+    "OperatorSpec",
+    "PromptSpec",
+    "RegisteredAgentCard",
+    "RegisteredCard",
+    "RegisteredDataCard",
+    "RegisteredModelCard",
+    "RegisteredOperatorCard",
+    "RegisteredPromptCard",
+    "RegisteredServiceCard",
+    "RegisteredTriggerCard",
+    "RegisteredUntypedCard",
+    "RegisteredVerifierCard",
+    "ServiceSpec",
+    "TriggerSpec",
+    "TypedCardKind",
+    "VerificationStatus",
+    "VerifierSpec",
 ]

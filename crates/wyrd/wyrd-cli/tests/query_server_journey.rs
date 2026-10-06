@@ -36,6 +36,7 @@ async fn typed_query_error(
     let http = HttpTransport::new(&config.http, Arc::clone(&auth))?;
     let client = WyrdClient::from_parts(auth, http, config.grpc);
     let request = BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: None,
     };

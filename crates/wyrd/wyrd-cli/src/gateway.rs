@@ -16,6 +16,8 @@ use serde_json::Error as JsonError;
 use serde_json::error::Category;
 use wyrd_client::Gateway;
 use wyrd_client::gateway_credential::CredentialWriter;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite};
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
 
 use crate::error::{CliBoundaryError, WyrdCliError};
@@ -197,6 +199,62 @@ impl GatewayCommand {
         }?;
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Build the provider-credential writer, optionally re-pointed at `server`.
+///
+/// # Errors
+/// Returns the client-assembly errors documented on
+/// [`crate::client::from_global`].
+fn credential_writer(server: Option<&str>) -> Result<CredentialWriter, WyrdCliError> {
+    crate::client::from_global(server).map(CredentialWriter::new)
+}
+
+/// Create or rotate one provider credential and return its redacted view.
+///
+/// The in-process form of `wyrd gateway credential put`; the view is exactly
+/// what the command prints. `write` may carry a provider key; it goes only to
+/// the server, and the answer never echoes it. The client comes from the
+/// ambient credential chain, which `server` re-points.
+///
+/// # Errors
+/// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
+/// server's stable permission, invalid-configuration, conflict, or
+/// availability error.
+pub async fn put_provider_credential(
+    write: &ProviderCredentialWrite,
+    server: Option<&str>,
+) -> Result<ProviderCredentialView, WyrdError> {
+    credential_writer(server)?.put_credential(write).await
+}
+
+/// Terminally revoke one provider credential and return its redacted view.
+///
+/// The in-process form of `wyrd gateway credential revoke`; repeating is
+/// harmless.
+///
+/// # Errors
+/// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
+/// server's permission, not-found, or availability error.
+pub async fn revoke_provider_credential(
+    name: &ProviderCredentialName,
+    server: Option<&str>,
+) -> Result<ProviderCredentialView, WyrdError> {
+    credential_writer(server)?.revoke_credential(name).await
+}
+
+/// Delete one unreferenced provider credential; an absent name succeeds.
+///
+/// The in-process form of `wyrd gateway credential delete`.
+///
+/// # Errors
+/// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
+/// server's permission, conflict, or availability error.
+pub async fn delete_provider_credential(
+    name: &ProviderCredentialName,
+    server: Option<&str>,
+) -> Result<(), WyrdError> {
+    credential_writer(server)?.delete_credential(name).await
 }
 
 /// Reads and decodes one typed JSON request document from `path`, or from

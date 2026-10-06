@@ -57,7 +57,10 @@ fn decode_failure(error: &JsonError) -> String {
 /// Returns `WYRD_SPEC_400_VALIDATION` naming `field` when the value is not
 /// JSON-compatible or does not match the contract's serde shape. Neither the
 /// message nor the details repeat any part of the rejected value.
-fn decode<T: DeserializeOwned>(field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(
+    field: &str,
+    value: &Bound<'_, PyAny>,
+) -> WyrdPyResult<T> {
     let json = pyobject_to_json(value)
         .map_err(|_| invalid_argument(field, "expected a JSON-compatible Python value"))?;
     serde_json::from_value(json).map_err(|error| invalid_argument(field, &decode_failure(&error)))
@@ -87,7 +90,7 @@ impl PyGateway {
     ///
     /// Returns the server's stable `WyrdError` from `call`, or an internal
     /// error when the typed response cannot be projected to Python.
-    fn run<T, F>(py: Python<'_>, call: F) -> WyrdPyResult<Py<PyAny>>
+    pub(crate) fn run<T, F>(py: Python<'_>, call: F) -> WyrdPyResult<Py<PyAny>>
     where
         T: Serialize + Send,
         F: Future<Output = Result<T, WyrdError>> + Send,
@@ -102,7 +105,7 @@ impl PyGateway {
     /// # Errors
     ///
     /// Returns `WYRD_SPEC_400_VALIDATION` when `name` is not a valid token.
-    fn credential_name(name: &str) -> WyrdPyResult<ProviderCredentialName> {
+    pub(crate) fn credential_name(name: &str) -> WyrdPyResult<ProviderCredentialName> {
         ProviderCredentialName::new(name)
             .map_err(|_| invalid_argument("name", "expected a provider credential name"))
     }

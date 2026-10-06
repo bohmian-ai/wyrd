@@ -29,6 +29,17 @@ pub(crate) enum ChainResult<T> {
 }
 
 /// Snapshot passed to every agent callback.
+///
+/// Python callbacks receive this as a typed `CallbackContext`.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "wyrd.agent",
+        name = "CallbackContext",
+        frozen,
+        skip_from_py_object
+    )
+)]
 #[derive(Clone)]
 pub struct AgentContext {
     /// Stable agent id.

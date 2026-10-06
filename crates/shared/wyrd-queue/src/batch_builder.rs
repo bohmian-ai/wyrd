@@ -64,8 +64,10 @@ pub struct RowPreflight {
 
 /// A fully converted row input, ready for one reservation and one hand-over.
 ///
-/// Holding a `PreparedRows` means every row passed every check; nothing about
-/// it can fail after the producer reserves its charge.
+/// Holding a `PreparedRows` means every row passed every schema and value
+/// check and its exact charge is known, so admission reserves once without
+/// converting anything. Hand-over, sealing, framing, and sink settlement
+/// remain fallible and report their own errors.
 #[derive(Debug)]
 pub struct PreparedRows {
     /// The converted rows over [`RowPreflight::output_schema`].

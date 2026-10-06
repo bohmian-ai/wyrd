@@ -2706,8 +2706,8 @@ mod pg_tests {
         /// `events[1]['attributes'] ->> 'gen_ai.finish_reason'`: a Variant
         /// nested inside a Struct.
         finish_reason: String,
-        /// A parsed JSON literal holding an integer beyond 2^53, which must
-        /// read back exactly.
+        /// A parsed JSON literal holding an integer beyond 2^53 and
+        /// `u64::MAX`, which must both read back exactly.
         parsed: serde_json::Value,
         /// `try_parse_json` over invalid JSON: null rather than an error.
         lenient: Option<serde_json::Value>,
@@ -2774,7 +2774,7 @@ mod pg_tests {
                         attributes, \
                         events[1]['name'] AS event_name, \
                         events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
-                        parse_json('{{\"n\": 9007199254740993, \"a\": [1, \"x\", null]}}') AS parsed, \
+                        parse_json('{{\"n\": 9007199254740993, \"u\": 18446744073709551615, \"a\": [1, \"x\", null]}}') AS parsed, \
                         try_parse_json('{{bad') AS lenient \
                  {parent}"
             ))
@@ -2792,7 +2792,11 @@ mod pg_tests {
                 }),
                 event_name: fixture::EVENT_NAME.to_owned(),
                 finish_reason: "stop".to_owned(),
-                parsed: serde_json::json!({"n": 9_007_199_254_740_993_i64, "a": [1, "x", null]}),
+                parsed: serde_json::json!({
+                    "n": 9_007_199_254_740_993_i64,
+                    "u": u64::MAX,
+                    "a": [1, "x", null],
+                }),
                 lenient: None,
             }]
         );

@@ -722,8 +722,8 @@ mod pg_tests {
     /// The canonical span fixture stores Variant attribute collections and
     /// Struct events. Through `bifrost.query` an agent reads `->>` text, `->`
     /// and whole Variant cells as JSON values, a Struct child by exact field
-    /// access, a Variant nested in a Struct, and a parsed integer beyond 2^53
-    /// exactly; invalid JSON in `parse_json` is the stable Variant error and
+    /// access, a Variant nested in a Struct, and parsed integers beyond 2^53
+    /// and at `u64::MAX` exactly; invalid JSON in `parse_json` is the stable Variant error and
     /// `try_parse_json` is null.
     ///
     /// # Errors
@@ -762,7 +762,7 @@ mod pg_tests {
                          attributes -> 'absent' AS absent, attributes, \
                          events[1]['name'] AS event_name, \
                          events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
-                         parse_json('{{\"n\": 9007199254740993}}') AS parsed, \
+                         parse_json('{{\"n\": 9007199254740993, \"u\": 18446744073709551615}}') AS parsed, \
                          try_parse_json('{{bad') AS lenient {parent}"
                     ),
                     "max_rows": 10,
@@ -780,7 +780,7 @@ mod pg_tests {
                 },
                 fixture::EVENT_NAME,
                 "stop",
-                {"n": 9_007_199_254_740_993_i64},
+                {"n": 9_007_199_254_740_993_i64, "u": u64::MAX},
                 null,
             ]]),
             "Variant cells render as their JSON values and Struct access stays exact"

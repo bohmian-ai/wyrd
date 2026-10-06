@@ -523,7 +523,8 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
         "attributes -> 'absent' AS absent, attributes, "
         "events[1]['name'] AS event_name, "
         "events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, "
-        """parse_json('{"n": 9007199254740993, "a": [1, "x", null]}') AS parsed, """
+        """parse_json('{"n": 9007199254740993, "u": 18446744073709551615, "a": [1, "x", null]}') """
+        "AS parsed, "
         f"try_parse_json('{{bad') AS lenient {where}",
         Row,
     )
@@ -540,7 +541,7 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
             },
             "event_name": EVENT_NAME,
             "finish_reason": "stop",
-            "parsed": {"n": 9007199254740993, "a": [1, "x", None]},
+            "parsed": {"n": 9007199254740993, "u": 2**64 - 1, "a": [1, "x", None]},
             "lenient": None,
         }
     ]

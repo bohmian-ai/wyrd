@@ -513,7 +513,7 @@ describe("Variant query journey", () => {
           `attributes -> 'absent' AS absent, attributes, ` +
           `events[1]['name'] AS event_name, ` +
           `events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, ` +
-          `parse_json('{"n": 9007199254740993, "a": [1, "x", null]}') AS parsed, ` +
+          `parse_json('{"n": 9007199254740993, "u": 18446744073709551615, "a": [1, "x", null]}') AS parsed, ` +
           `try_parse_json('{bad') AS lenient ${where}`,
         { parse: (row) => ({ ...(row as Record<string, unknown>) }) },
       );
@@ -529,7 +529,7 @@ describe("Variant query journey", () => {
           },
           event_name: EVENT_NAME,
           finish_reason: "stop",
-          parsed: { n: 9007199254740993n, a: [1, "x", null] },
+          parsed: { n: 9007199254740993n, u: 2n ** 64n - 1n, a: [1, "x", null] },
           lenient: null,
         },
       ]);

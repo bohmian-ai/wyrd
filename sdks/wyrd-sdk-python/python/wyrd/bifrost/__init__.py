@@ -854,8 +854,9 @@ class DataTypeSpecVariants(TypedDict, total=False):
     """The parameterized `DataTypeSpec` forms, tagged by their variant name.
 
     A scalar type is the bare variant name as a string; everything below carries
-    parameters, so it arrives as a single-key object. `List` and `Struct` hold
-    full field declarations, which is what makes the type recursive.
+    parameters, so it arrives as a single-key object. `List`, `Struct`, and
+    `Map` hold full field declarations, which is what makes the type recursive.
+    `Map` carries its non-nullable `key` and its `value` declarations.
     """
 
     FixedSizeBinary: dict[str, int]
@@ -865,6 +866,7 @@ class DataTypeSpecVariants(TypedDict, total=False):
     Decimal128: dict[str, int]
     List: FieldSpec
     Struct: list[FieldSpec]
+    Map: dict[str, FieldSpec]
 
 
 DataTypeSpec = str | DataTypeSpecVariants

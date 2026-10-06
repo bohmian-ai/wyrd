@@ -19,6 +19,12 @@ use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, Tim
 use crate::error::WyrdQueueError;
 use crate::variant::{is_variant, variant_storage_type};
 
+/// Name of a Map's Arrow entries struct.
+///
+/// It is the name Iceberg's Arrow projection gives a `map`, so a hot batch and
+/// a published read of the same column carry the same Arrow type.
+const MAP_ENTRIES_FIELD: &str = "key_value";
+
 /// Walk a JSON-Schema object (a Pydantic `model_json_schema()`, Zod
 /// `z.toJSONSchema()`, or `schemars` output) into the wire `Vec<FieldSpec>`.
 ///
@@ -366,6 +372,11 @@ fn check_supported_type(path: &str, data_type: &DataTypeSpec) -> Result<(), Wyrd
                 check_supported_type(&format!("{path}.{}", child.name), &child.data_type)
             });
         }
+        DataTypeSpec::Map { key, value } if !key.nullable => {
+            check_supported_type(&format!("{path}.{}", key.name), &key.data_type)?;
+            return check_supported_type(&format!("{path}.{}", value.name), &value.data_type);
+        }
+        DataTypeSpec::Map { .. } => false,
         _ => true,
     };
     if supported {
@@ -388,8 +399,10 @@ fn check_supported_type(path: &str, data_type: &DataTypeSpec) -> Result<(), Wyrd
 /// rather than identity metadata.
 ///
 /// # Errors
-/// Returns [`WyrdQueueError::SchemaParse`] when the field, or any nested
-/// child, has an Arrow type outside the register-accepted wire set.
+/// Returns [`WyrdQueueError::Contract`] carrying
+/// [`BifrostError::UnsupportedType`] when the field, or any nested child, has
+/// an Arrow type with no wire form (for example Union, Duration, Interval, or
+/// Float16), naming that field by its dotted path.
 pub fn field_to_spec(field: &Field) -> Result<FieldSpec, WyrdQueueError> {
     let variant = is_variant(field);
     Ok(FieldSpec {
@@ -397,7 +410,20 @@ pub fn field_to_spec(field: &Field) -> Result<FieldSpec, WyrdQueueError> {
         data_type: if variant {
             DataTypeSpec::Variant
         } else {
-            dtspec_from_arrow(field.data_type())?
+            dtspec_from_arrow(field.data_type()).map_err(|error| match error {
+                WyrdQueueError::Contract(BifrostError::UnsupportedType {
+                    field: inner,
+                    data_type,
+                }) => WyrdQueueError::Contract(BifrostError::UnsupportedType {
+                    field: if inner.is_empty() {
+                        field.name().clone()
+                    } else {
+                        format!("{}.{inner}", field.name())
+                    },
+                    data_type,
+                }),
+                other => other,
+            })?
         },
         nullable: field.is_nullable(),
         metadata: field
@@ -452,9 +478,14 @@ pub fn is_extension_key(key: &str) -> bool {
 
 /// Map one Arrow type onto its wire form, recursing through nested fields.
 ///
+/// A Map is read from its entries struct's two children, whichever name the
+/// producer gave that struct; [`MAP_ENTRIES_FIELD`] is restored on the way
+/// back to Arrow.
+///
 /// # Errors
-/// Returns [`WyrdQueueError::SchemaParse`] for a type outside the
-/// register-accepted wire set.
+/// Returns [`WyrdQueueError::Contract`] carrying
+/// [`BifrostError::UnsupportedType`] for a type with no wire form, with the
+/// field path left for [`field_to_spec`] to fill in.
 fn dtspec_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdQueueError> {
     Ok(match dt {
         DataType::Boolean => DataTypeSpec::Bool,
@@ -496,11 +527,25 @@ fn dtspec_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdQueueError> {
                 .map(|f| field_to_spec(f))
                 .collect::<Result<_, _>>()?,
         ),
-        other => {
-            return Err(WyrdQueueError::SchemaParse(format!(
-                "Arrow type {other} is not representable on the wire"
-            )));
-        }
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(pair) if pair.len() == 2 => DataTypeSpec::Map {
+                key: Box::new(field_to_spec(&pair[0])?),
+                value: Box::new(field_to_spec(&pair[1])?),
+            },
+            _ => return Err(unrepresentable(dt)),
+        },
+        _ => return Err(unrepresentable(dt)),
+    })
+}
+
+/// Refuse an Arrow type that has no wire form.
+///
+/// The field path is left empty; each enclosing [`field_to_spec`] prefixes
+/// its own name, so the caller receives the full dotted path.
+fn unrepresentable(data_type: &DataType) -> WyrdQueueError {
+    WyrdQueueError::Contract(BifrostError::UnsupportedType {
+        field: String::new(),
+        data_type: data_type.to_string(),
     })
 }
 
@@ -562,6 +607,17 @@ fn data_type_to_arrow(spec: &DataTypeSpec, carry_metadata: bool) -> DataType {
                 .map(|field| spec_to_field(field, carry_metadata))
                 .collect::<Vec<_>>(),
         )),
+        DataTypeSpec::Map { key, value } => DataType::Map(
+            Arc::new(Field::new(
+                MAP_ENTRIES_FIELD,
+                DataType::Struct(Fields::from(vec![
+                    spec_to_field(key, carry_metadata),
+                    spec_to_field(value, carry_metadata),
+                ])),
+                false,
+            )),
+            false,
+        ),
         // The unshredded `arrow.parquet.variant` storage; the extension marker
         // is stamped on the enclosing field by `spec_to_field`.
         DataTypeSpec::Variant => variant_storage_type(),
@@ -579,6 +635,7 @@ mod schema_tests {
     };
     use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
     use serde_json::json;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
     fn field<'a>(specs: &'a [FieldSpec], name: &str) -> &'a FieldSpec {
@@ -881,11 +938,13 @@ mod schema_tests {
     }
 
     /// An Arrow type outside the wire set is refused, never coerced, even
-    /// when it is nested.
+    /// when it is nested, with the stable unsupported-type error naming its
+    /// dotted path.
     ///
     /// # Panics
     ///
-    /// Panics when an unrepresentable type maps to a declaration.
+    /// Panics when an unrepresentable type maps to a declaration or the
+    /// refusal names the wrong field or type.
     #[test]
     fn arrow_schema_refuses_unrepresentable_types() {
         let nested = DataType::Struct(Fields::from(vec![Field::new(
@@ -894,10 +953,108 @@ mod schema_tests {
             true,
         )]));
         let schema = Schema::new(vec![Field::new("outer", nested, true)]);
-        assert!(matches!(
-            arrow_schema_to_fieldspec(&schema),
-            Err(WyrdQueueError::SchemaParse(_))
-        ));
+        let Err(WyrdQueueError::Contract(BifrostError::UnsupportedType { field, data_type })) =
+            arrow_schema_to_fieldspec(&schema)
+        else {
+            panic!("a nested Float16 is refused as an unsupported type");
+        };
+        assert_eq!(
+            (field.as_str(), data_type.as_str()),
+            ("outer.half", "Float16")
+        );
+    }
+
+    /// A Map declaration round-trips through Arrow, and an Arrow map whose
+    /// producer named the entries struct differently maps to the same
+    /// declaration and back to Iceberg's `key_value` entries name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Map declaration or its Arrow form differs.
+    #[test]
+    fn map_declarations_round_trip_through_arrow() {
+        let declared = vec![make_field(
+            "attrs",
+            DataTypeSpec::Map {
+                key: Box::new(make_field("key", DataTypeSpec::Utf8, false)),
+                value: Box::new(make_field("value", DataTypeSpec::Int64, true)),
+            },
+            true,
+        )];
+        let arrow = fieldspec_to_arrow(&declared).expect("projects");
+        let DataType::Map(entries, sorted) = arrow.field(0).data_type() else {
+            panic!("a Map declaration projects to an Arrow map");
+        };
+        assert_eq!((entries.name().as_str(), sorted), ("key_value", &false));
+        assert_eq!(
+            arrow_schema_to_fieldspec(&arrow).expect("maps back"),
+            declared
+        );
+
+        let foreign = Schema::new(vec![Field::new_map(
+            "attrs",
+            "entries",
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+            false,
+            true,
+        )]);
+        let normalized = arrow_schema_to_fieldspec(&foreign).expect("a foreign map maps");
+        assert_eq!(normalized, declared);
+        assert_eq!(fieldspec_to_arrow(&normalized).expect("projects"), arrow);
+    }
+
+    /// Register refuses a Map with a nullable key or an unstorable key or
+    /// value, naming the refused field by its dotted path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an unstorable Map is accepted or the refusal names the
+    /// wrong field.
+    #[test]
+    fn unstorable_maps_are_refused_by_path() {
+        use crate::schema::check_supported;
+
+        let map = |key: FieldSpec, value: FieldSpec| {
+            vec![make_field(
+                "m",
+                DataTypeSpec::Map {
+                    key: Box::new(key),
+                    value: Box::new(value),
+                },
+                true,
+            )]
+        };
+        let refused_field = |fields: &[FieldSpec]| match check_supported(fields) {
+            Err(WyrdQueueError::Contract(BifrostError::UnsupportedType { field, .. })) => field,
+            other => panic!("expected an unsupported-type refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refused_field(&map(
+                make_field("key", DataTypeSpec::Utf8, true),
+                make_field("value", DataTypeSpec::Int64, true),
+            )),
+            "m"
+        );
+        assert_eq!(
+            refused_field(&map(
+                make_field("key", DataTypeSpec::Utf8, false),
+                make_field("value", DataTypeSpec::UInt64, true),
+            )),
+            "m.value"
+        );
+        assert_eq!(
+            refused_field(&map(
+                make_field("key", DataTypeSpec::Date64, false),
+                make_field("value", DataTypeSpec::Int64, true),
+            )),
+            "m.key"
+        );
+        check_supported(&map(
+            make_field("key", DataTypeSpec::Utf8, false),
+            make_field("value", DataTypeSpec::Variant, true),
+        ))
+        .expect("a non-null scalar key with a Variant value is storable");
     }
 
     // ── fieldspec_to_arrow round-trip tests ───────────────────────────────────────

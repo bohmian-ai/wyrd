@@ -13,9 +13,9 @@ use std::sync::Arc;
 use arrow::array::{Array, AsArray};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::cast;
@@ -390,6 +390,7 @@ fn build_column(field: &Field, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRe
                 })
             }
             DataType::List(element) => build_list(element, path, cells),
+            DataType::Map(entries, sorted) => build_map(entries, *sorted, path, cells),
             data_type => build_scalar(data_type, path, cells),
         }
     };
@@ -569,6 +570,40 @@ fn build_list(element: &FieldRef, path: &str, cells: &[Cell<'_>]) -> Result<Arra
             OffsetBuffer::from_lengths(lengths),
             values,
             nulls,
+        ),
+    )
+}
+
+/// Build one Map column from JSON arrays of `{"key": .., "value": ..}` entries.
+///
+/// A Map has a List's layout over its non-null entries struct, so the entries
+/// are built exactly as a list of those structs — which refuses a non-array
+/// value, a non-object entry, an undeclared entry key, and a null key through
+/// the shared paths — and the assembled list is reinterpreted as the Map.
+///
+/// # Errors
+///
+/// Returns the earliest-row refusal of [`build_list`] over the entries.
+///
+/// # Panics
+///
+/// Panics if the total entry count overflows the 32-bit Map offsets.
+fn build_map(
+    entries: &FieldRef,
+    sorted: bool,
+    path: &str,
+    cells: &[Cell<'_>],
+) -> Result<ArrayRef, Failure> {
+    let list = build_list(entries, path, cells)?;
+    let (_, offsets, values, nulls) = list.as_list::<i32>().clone().into_parts();
+    assembled(
+        cells,
+        MapArray::try_new(
+            Arc::clone(entries),
+            offsets,
+            values.as_struct().clone(),
+            nulls,
+            sorted,
         ),
     )
 }
@@ -994,6 +1029,65 @@ mod batch_builder_tests {
         let error = prepare(&schema, &[r#"{"point": {"x": 1, "y": 2}}"#]).expect_err("refused");
         assert_eq!(error.code(), "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD");
         assert!(error.to_string().contains("point.y"), "{error}");
+    }
+
+    /// Map values written as `{"key", "value"}` entry arrays keep their
+    /// entries, null values, null maps, and empty maps; a null key, an object
+    /// in place of the entry array, and an undeclared entry key are refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Map cell differs or a malformed value is accepted.
+    #[test]
+    fn map_values_keep_entries_and_nulls() {
+        let schema = Schema::new(vec![Field::new_map(
+            "attrs",
+            "key_value",
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+            false,
+            true,
+        )]);
+        let prepared = prepare(
+            &schema,
+            &[
+                r#"{"attrs": [{"key": "a", "value": 1}, {"key": "b", "value": null}]}"#,
+                r#"{"attrs": null}"#,
+                r#"{"attrs": []}"#,
+            ],
+        )
+        .expect("map rows prepare");
+        let attrs = prepared.batch().column(0).as_map();
+        assert!(attrs.is_valid(0) && attrs.is_null(1) && attrs.is_valid(2));
+        assert_eq!(attrs.value_length(0), 2);
+        assert_eq!(attrs.value_length(2), 0);
+        let entries = attrs.value(0);
+        let keys = entries.column(0).as_string::<i32>();
+        let values = entries.column(1).as_primitive::<Int64Type>();
+        assert_eq!((keys.value(0), keys.value(1)), ("a", "b"));
+        assert!(values.value(0) == 1 && values.is_null(1));
+
+        for (row, code, path) in [
+            (
+                r#"{"attrs": [{"key": null, "value": 1}]}"#,
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "attrs.key",
+            ),
+            (
+                r#"{"attrs": {"a": 1}}"#,
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "attrs",
+            ),
+            (
+                r#"{"attrs": [{"key": "a", "value": 1, "extra": 2}]}"#,
+                "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD",
+                "attrs.extra",
+            ),
+        ] {
+            let error = prepare(&schema, &[row]).expect_err("malformed map is refused");
+            assert_eq!(error.code(), code, "row {row}");
+            assert!(error.to_string().contains(path), "{error}");
+        }
     }
 
     /// The prepared batch round-trips through Arrow IPC.

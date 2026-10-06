@@ -270,6 +270,19 @@ pub enum DataTypeSpec {
     /// Nested struct of named fields.
     #[cfg_attr(feature = "server", schema(no_recursion))]
     Struct(Vec<FieldSpec>),
+    /// Unordered key/value entries, the Iceberg `map` type.
+    ///
+    /// Key and value are full [`FieldSpec`]s for the same reason as
+    /// [`Self::List`]'s element: each keeps its name, nullability, metadata,
+    /// and stable field id. The key must be non-nullable; register refuses a
+    /// nullable key with `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
+    Map {
+        /// Declaration of every entry's key.
+        key: Box<FieldSpec>,
+        /// Declaration of every entry's value.
+        value: Box<FieldSpec>,
+    },
     /// Self-describing semi-structured value stored in the Parquet/Iceberg
     /// Variant encoding.
     ///

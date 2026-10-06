@@ -50,8 +50,9 @@ export interface BifrostQueryRequest {
 
 /**
  * One column's logical type: a scalar variant name, or a single-key object for
- * a parameterized form. `List` and `Struct` carry full field declarations,
- * which is what makes the contract recursive.
+ * a parameterized form. `List`, `Struct`, and `Map` carry full field
+ * declarations, which is what makes the contract recursive. `Map` carries its
+ * non-nullable `key` and its `value` declarations.
  */
 export type DataTypeSpec =
   | string
@@ -61,7 +62,8 @@ export type DataTypeSpec =
   | { readonly Time64: Readonly<Record<string, string>> }
   | { readonly Decimal128: Readonly<Record<string, number>> }
   | { readonly List: FieldDescription }
-  | { readonly Struct: readonly FieldDescription[] };
+  | { readonly Struct: readonly FieldDescription[] }
+  | { readonly Map: { readonly key: FieldDescription; readonly value: FieldDescription } };
 
 /**
  * One column declaration in a table description, exactly as stored.

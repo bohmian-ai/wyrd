@@ -79,10 +79,10 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_ref`, or `run_id` name, `WYRD_VALA_400_SCHEMA_PARSE`
-    /// when a column's Arrow type is not representable on the wire, and
+    /// `wyrd_*`, `card_ref`, or `run_id` name, and
     /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
-    /// Bifrost cannot store it — before any request is sent.
+    /// a column's Arrow type has no wire form or Bifrost cannot store it —
+    /// before any request is sent.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;

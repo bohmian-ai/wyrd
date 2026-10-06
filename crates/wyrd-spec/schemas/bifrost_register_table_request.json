@@ -380,6 +380,41 @@
           "additionalProperties": false
         },
         {
+          "description": "Unordered key/value entries, the Iceberg `map` type.\n\nKey and value are full [`FieldSpec`]s for the same reason as [`Self::List`]'s element: each keeps its name, nullability, metadata, and stable field id. The key must be non-nullable; register refuses a nullable key with `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`.",
+          "type": "object",
+          "required": [
+            "Map"
+          ],
+          "properties": {
+            "Map": {
+              "type": "object",
+              "required": [
+                "key",
+                "value"
+              ],
+              "properties": {
+                "key": {
+                  "description": "Declaration of every entry's key.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/FieldSpec"
+                    }
+                  ]
+                },
+                "value": {
+                  "description": "Declaration of every entry's value.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/FieldSpec"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Self-describing semi-structured value stored in the Parquet/Iceberg Variant encoding.\n\nOn the Arrow wire it is the canonical `arrow.parquet.variant` extension type over a `metadata`/`value` binary struct. Each value keeps its own type: integers stay integers, objects keep missing keys distinct from null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and [`VARIANT_MAX_ENCODED_BYTES`].",
           "type": "string",
           "enum": [

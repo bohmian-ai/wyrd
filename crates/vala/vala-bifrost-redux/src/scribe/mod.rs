@@ -1851,6 +1851,7 @@ impl Scribe for ScribeImpl {
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::InvalidFrame
+                    | ScribeError::ContractViolation(_)
                     | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }

@@ -16,6 +16,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use wyrd_queue::variant::{variant_cell_to_json, variant_field, variant_storage_type};
+    use wyrd_spec::vala::BifrostError;
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{
         AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
@@ -399,11 +400,18 @@ mod tests {
                 .collect(),
         )
         .expect("the malformed batch still assembles");
-        let refusal = validate_canonical_user_batch(LOG_FIELDS, &malformed)
+        let refusal = crate::tables::builtin_table("logs", "records")
+            .expect("the logs built-in is registered")
+            .validate_variants(&malformed)
             .expect_err("invalid attribute Variant bytes are rejected");
-        assert!(
-            refusal.starts_with("WYRD_VALA_400_VARIANT_INVALID"),
-            "the refusal leads with the catalogued code: {refusal}"
+        assert_eq!(
+            refusal,
+            BifrostError::VariantInvalidJson {
+                field: "attributes".to_owned(),
+                row: 0,
+                path: String::new(),
+            },
+            "the refusal is the catalogued Variant error"
         );
 
         let declared_body = LOG_FIELDS

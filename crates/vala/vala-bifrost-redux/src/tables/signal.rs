@@ -11,7 +11,7 @@
 //! typed accumulators that turn projected rows into Arrow arrays.
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
     Int64Array, ListArray, StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
@@ -891,17 +891,16 @@ pub fn f64_column(values: Vec<f64>) -> ArrayRef {
 /// neither supplies nor can be wrong about either.
 ///
 /// Checks run in the locked write order: an undeclared column first, then
-/// each declared field's presence and type, then every Variant value — top
-/// level or nested in a list or struct — row by row and, within a row, in
-/// ledger order. A Variant value is fully validated, size first, then
-/// encoding, then depth, exactly as the writer-side encoder enforces them.
+/// each declared field's presence and type. Variant values are not walked
+/// here: Scribe validates every built-in's Variant values once, through
+/// [`crate::tables::BuiltinTableDefinition::validate_variants`], before this
+/// validator runs, so the catalogued Variant error reaches the caller intact.
 ///
 /// # Errors
 ///
 /// Returns a stable reason when a column is undeclared, a declared field is
-/// missing, an identity or type check fails, or a Variant value cannot be
-/// stored. An undeclared column and a Variant value carry their catalogued
-/// error code at the start of the reason.
+/// missing, or an identity or type check fails. An undeclared column carries
+/// its catalogued error code at the start of the reason.
 pub fn validate_canonical_user_batch(
     declared: &[CanonicalField],
     batch: &RecordBatch,
@@ -932,18 +931,6 @@ pub fn validate_canonical_user_batch(
             .map_err(|_| format!("canonical batch is missing column {}", field.name))?;
         validate_field_identity(field, schema.field(index))?;
         supplied.push(Arc::clone(batch.column(index)));
-    }
-
-    let variant_columns: Vec<_> = declared
-        .iter()
-        .zip(&supplied)
-        .filter(|(field, _)| holds_variant(&field.ty))
-        .collect();
-    for row in 0..batch.num_rows() {
-        let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
-        for (field, column) in &variant_columns {
-            validate_variant_values(field, field.name, column.as_ref(), row, ordinal)?;
-        }
     }
 
     let columns = declared
@@ -1007,82 +994,6 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
         ));
     }
     Ok(())
-}
-
-/// Report whether a declared type is or contains a Variant.
-fn holds_variant(ty: &T) -> bool {
-    matches!(ty, T::Variant) || ty.children().iter().any(|child| holds_variant(&child.ty))
-}
-
-/// Validate every Variant value one input row holds under one declaration.
-///
-/// `index` is the position of the value inside `column`; a list descends into
-/// the element range the value owns and a struct into each child at the same
-/// position, so nested Variants are checked with their own row. `label` is the
-/// top-level column the refusal names and `row` is the input row.
-///
-/// # Errors
-///
-/// Returns the catalogued Variant refusal for the first value that cannot be
-/// stored, or a stable reason when a value's storage is not the declared
-/// layout.
-fn validate_variant_values(
-    declared: &CanonicalField,
-    label: &str,
-    column: &dyn Array,
-    index: usize,
-    row: u64,
-) -> Result<(), String> {
-    if column.is_null(index) {
-        return Ok(());
-    }
-    let malformed = || format!("canonical field {label} does not hold its declared layout");
-    match declared.ty {
-        T::Variant => {
-            let storage = column
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(malformed)?;
-            let child = |name: &str| {
-                storage
-                    .column_by_name(name)
-                    .and_then(|bytes| bytes.as_any().downcast_ref::<BinaryArray>())
-                    .map(|bytes| bytes.value(index))
-            };
-            let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
-                return Err(malformed());
-            };
-            EncodedVariant::from_bytes(metadata, value)
-                .map(drop)
-                .map_err(|violation| refusal(&violation.into_error(label, row)))
-        }
-        T::List(element) => {
-            let list = column
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(malformed)?;
-            let offsets = list.value_offsets();
-            let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
-            let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
-            (start..end).try_for_each(|item| {
-                validate_variant_values(element, label, list.values().as_ref(), item, row)
-            })
-        }
-        T::Struct(children) => {
-            let nested = column
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(malformed)?;
-            children
-                .iter()
-                .zip(nested.columns())
-                .filter(|(child, _)| holds_variant(&child.ty))
-                .try_for_each(|(child, values)| {
-                    validate_variant_values(child, label, values.as_ref(), index, row)
-                })
-        }
-        _ => Ok(()),
-    }
 }
 
 /// The one signed-scope fixture the three signal correlation tests share.

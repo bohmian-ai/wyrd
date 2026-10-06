@@ -103,6 +103,10 @@ pub enum IngestError {
     /// Arrow IPC decode failed.
     #[error("ingest arrow decode failed: {0}")]
     Decode(String),
+    /// A schema-valid batch broke a catalogued rule of the table's declared
+    /// contract; the catalogued error is the public identity.
+    #[error("ingest contract violation: {0}")]
+    ContractViolation(BifrostError),
     /// A caller-supplied `wyrd_event_time` value falls outside the server
     /// acceptance window evaluated against per-batch receipt time.
     ///
@@ -184,9 +188,10 @@ impl IngestError {
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_) | Self::Decode(_) | Self::EventTimeOutOfRange { .. } => {
-                "validation"
-            }
+            Self::RequestValidation(_)
+            | Self::Decode(_)
+            | Self::ContractViolation(_)
+            | Self::EventTimeOutOfRange { .. } => "validation",
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
@@ -218,6 +223,7 @@ impl IngestError {
             }
             .into(),
             Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
+            Self::ContractViolation(error) => error.clone().into(),
             Self::RequestValidation(detail) | Self::Decode(detail) => {
                 BifrostError::OtlpRequestMalformed {
                     table: fallback_table(),
@@ -312,6 +318,9 @@ impl IngestError {
             crate::contracts::ScribeError::TableNotFound { table } => Self::TableNotFound { table },
             crate::contracts::ScribeError::InvalidFrame => {
                 Self::Decode("ingest frame validation failed".to_owned())
+            }
+            crate::contracts::ScribeError::ContractViolation(error) => {
+                Self::ContractViolation(error)
             }
             crate::contracts::ScribeError::EventTimeOutOfRange {
                 value_micros,

@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
+use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
 use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use wyrd_queue::variant::EncodedVariant;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
@@ -187,6 +190,157 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
+}
+
+impl BuiltinTableDefinition {
+    /// Repeat the Variant contract over one supplied batch at the trust boundary.
+    ///
+    /// Clients prepare Variant values before sending, but a raw Arrow IPC
+    /// writer can skip that, and the schema fingerprint compares storage
+    /// types only. This pass walks the table's declared fields once, top level
+    /// and nested inside Structs and Lists: every declared Variant must carry
+    /// the `arrow.parquet.variant` extension, and every present Variant value
+    /// must pass [`EncodedVariant::from_bytes`]. Fields are checked in logical
+    /// order first, then values row by row in input order and field order, so
+    /// the first failure follows the locked precedence. A declared field the
+    /// batch does not supply is left to the fingerprint check that precedes
+    /// this one. It reads the batch only and has no side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::UnsupportedType`] naming the top-level field
+    /// when a declared Variant arrives without the extension or in a storage
+    /// layout other than the declared one, and the catalogued Variant error
+    /// (size, encoding, or depth) for the first stored value that fails.
+    pub(crate) fn validate_variants(&self, batch: &RecordBatch) -> Result<(), BifrostError> {
+        let schema = batch.schema();
+        let mut variant_columns = Vec::new();
+        for declared in (self.arrow_fields)() {
+            if !holds_variant(&declared) {
+                continue;
+            }
+            let Ok(index) = schema.index_of(declared.name()) else {
+                continue;
+            };
+            let supplied = schema.field(index);
+            if !variant_identity_matches(&declared, supplied) {
+                return Err(unsupported_variant(declared.name(), supplied.data_type()));
+            }
+            variant_columns.push((declared, Arc::clone(batch.column(index))));
+        }
+        for index in 0..batch.num_rows() {
+            let row = u64::try_from(index).unwrap_or(u64::MAX);
+            for (declared, column) in &variant_columns {
+                validate_variant_values(declared, declared.name(), column.as_ref(), index, row)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Report whether a declared field is or nests a Variant.
+fn holds_variant(field: &Field) -> bool {
+    fields::is_variant(field)
+        || match field.data_type() {
+            DataType::Struct(children) => children.iter().any(|child| holds_variant(child)),
+            DataType::List(element) => holds_variant(element),
+            _ => false,
+        }
+}
+
+/// Report whether every Variant a declaration holds is supplied as a Variant.
+///
+/// The storage types already matched the fingerprint, so only the extension
+/// marker remains to compare, at the same position in the nesting.
+fn variant_identity_matches(declared: &Field, supplied: &Field) -> bool {
+    if fields::is_variant(declared) {
+        return fields::is_variant(supplied);
+    }
+    match (declared.data_type(), supplied.data_type()) {
+        (DataType::Struct(declared), DataType::Struct(supplied)) => {
+            declared.len() == supplied.len()
+                && declared
+                    .iter()
+                    .zip(supplied.iter())
+                    .all(|(declared, supplied)| variant_identity_matches(declared, supplied))
+        }
+        (DataType::List(declared), DataType::List(supplied)) => {
+            variant_identity_matches(declared, supplied)
+        }
+        _ => true,
+    }
+}
+
+/// The refusal for a declared Variant supplied in another wire type.
+fn unsupported_variant(field: &str, data_type: &DataType) -> BifrostError {
+    BifrostError::UnsupportedType {
+        field: field.to_owned(),
+        data_type: data_type.to_string(),
+    }
+}
+
+/// Validate every Variant value one input row holds under one declaration.
+///
+/// `index` is the position of the value inside `column`: a list descends into
+/// the element range the value owns and a struct into each child at the same
+/// position, so a nested Variant is checked with its own input row. A null at
+/// any level holds no value, which also skips the empty placeholder a Variant
+/// child keeps under a null parent. `label` is the top-level field a refusal
+/// names and `row` the input row.
+///
+/// # Errors
+///
+/// Returns the catalogued Variant error for the first value that cannot be
+/// stored, and [`BifrostError::UnsupportedType`] when a value's storage is not
+/// the declared layout.
+fn validate_variant_values(
+    declared: &Field,
+    label: &str,
+    column: &dyn Array,
+    index: usize,
+    row: u64,
+) -> Result<(), BifrostError> {
+    if column.is_null(index) {
+        return Ok(());
+    }
+    let malformed = || unsupported_variant(label, column.data_type());
+    if fields::is_variant(declared) {
+        let storage = column.as_struct_opt().ok_or_else(malformed)?;
+        let child = |name: &str| {
+            storage
+                .column_by_name(name)
+                .and_then(|bytes| bytes.as_binary_opt::<i32>())
+                .map(|bytes| bytes.value(index))
+        };
+        let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
+            return Err(malformed());
+        };
+        return EncodedVariant::from_bytes(metadata, value)
+            .map(drop)
+            .map_err(|violation| violation.into_error(label, row));
+    }
+    match declared.data_type() {
+        DataType::Struct(children) => {
+            let nested = column.as_struct_opt().ok_or_else(malformed)?;
+            children
+                .iter()
+                .zip(nested.columns())
+                .filter(|(child, _)| holds_variant(child))
+                .try_for_each(|(child, values)| {
+                    validate_variant_values(child, label, values.as_ref(), index, row)
+                })
+        }
+        DataType::List(element) => {
+            let list = column.as_list_opt::<i32>().ok_or_else(malformed)?;
+            let offsets = list.value_offsets();
+            let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
+            let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
+            (start..end).try_for_each(|item| {
+                    validate_variant_values(element, label, list.values().as_ref(), item, row)
+                })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A table definition implemented by the canonical registry.
@@ -2012,13 +2166,15 @@ mod tests {
             .collect()
     }
 
-    /// The registry dispatches one canonical value validator per signal table.
+    /// The registry dispatches one canonical value validator per signal table,
+    /// and each signal definition refuses invalid Variant bytes with the
+    /// catalogued error through the shared Variant pass.
     ///
     /// # Panics
     ///
-    /// Panics when a canonical built-in carries no validator, when a validator
-    /// admits a schema-valid but value-invalid batch, or when a pre-declared
-    /// built-in claims a canonical validator it cannot own.
+    /// Panics when a canonical built-in carries no validator, when invalid
+    /// Variant bytes or a foreign metric kind column are admitted, or when a
+    /// pre-declared built-in claims a canonical validator it cannot own.
     #[test]
     fn builtin_registry_dispatches_canonical_value_validation() {
         use arrow::array::{Array, BinaryArray, Int64Array, StructArray};
@@ -2075,9 +2231,12 @@ mod tests {
                     .collect(),
             )
             .expect("the corrupted batch still assembles");
-            let refusal = validate(&corrupted).expect_err("invalid Variant bytes are refused");
-            assert!(
-                refusal.starts_with("WYRD_VALA_400_VARIANT_INVALID_JSON"),
+            let refusal = definition
+                .validate_variants(&corrupted)
+                .expect_err("invalid Variant bytes are refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
                 "{namespace}.{name} refuses invalid Variant bytes with the catalogued code"
             );
         }

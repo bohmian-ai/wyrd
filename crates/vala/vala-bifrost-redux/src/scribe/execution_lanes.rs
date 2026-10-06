@@ -525,8 +525,11 @@ pub(crate) struct DecodeContext<'a> {
 ///
 /// Returns a stable Scribe refusal for a duplicated column name, reserved
 /// columns, fingerprint mismatch, card-scope failure, invalid event
-/// time, or managed column construction failure, and a fingerprint mismatch
-/// when a stamped field has no registered counterpart.
+/// time, or managed column construction failure, a fingerprint mismatch
+/// when a stamped field has no registered counterpart, and
+/// [`ScribeError::ContractViolation`] carrying the catalogued error when a
+/// built-in's declared Variant arrives without its extension or holds a value
+/// that cannot be stored.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -560,11 +563,13 @@ fn decode_rows(
             table: "resolved ingress table".to_owned(),
         });
     }
-    if let Some(definition) = context
-        .definition
-        .filter(|definition| definition.canonical_validator.is_some())
-    {
-        enforce_canonical_source_contract(rows, definition)?;
+    if let Some(definition) = context.definition {
+        definition
+            .validate_variants(rows)
+            .map_err(ScribeError::ContractViolation)?;
+        if definition.canonical_validator.is_some() {
+            enforce_canonical_source_contract(rows, definition)?;
+        }
     }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;

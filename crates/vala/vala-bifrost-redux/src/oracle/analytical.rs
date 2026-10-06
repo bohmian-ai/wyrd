@@ -1104,6 +1104,10 @@ impl GraphLease {
             outcome = ?outcome,
             "Oracle analytical follower is settling a graph"
         );
+        // Stop admitting before the live attempts are read. A request that
+        // resolved this lease earlier is then refused by the supervisor, or
+        // its attempt was already inserted and is joined below.
+        self.supervisor.begin_draining(self.graph)?;
         if outcome != AnalyticalAttemptOutcome::Success {
             self.cancel.cancel();
         }
@@ -5195,7 +5199,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a failed cleanup releases a graph or is reported as clean.
+    /// Panics when a failed cleanup releases a graph or is reported as clean,
+    /// or when a lease resolved before settlement admits an attempt after it.
     async fn follower_retains_a_graph_whose_children_never_drain() {
         // A graph whose envelope keeps a live nested child cannot drain. The
         // follower must report that as a failure and keep everything it owns.
@@ -5214,11 +5219,30 @@ mod tests {
         stuck
             .try_grow(1024)
             .expect("the admitted envelope funds one nested child");
+        // A request that resolved the lease before settlement began, as an
+        // in-flight SetPlan does, still holds it once the graph is draining.
+        let in_flight = fixture
+            .ingress
+            .published(fixture.graph)
+            .expect("the live graph is published");
         fixture
             .ingress
             .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
             .await
             .expect_err("a graph whose children never drain cannot be settled");
+        assert!(
+            matches!(
+                in_flight.admit_attempt(stray_attempt_key(fixture.graph)),
+                Err(BifrostError::QueryExecutionFailed)
+            ),
+            "a lease whose graph began settling admits no attempt"
+        );
+        assert_eq!(
+            in_flight.live_attempts().expect("attempts are readable"),
+            0,
+            "the refused admission left no attempt behind"
+        );
+        drop(in_flight);
         let retained = fixture.ingress.live().expect("ownership is readable");
         assert_eq!(retained.graphs, 1, "the undrained graph is still owned");
         assert_eq!(

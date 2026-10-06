@@ -2720,12 +2720,13 @@ mod pg_tests {
     /// and typed `sql_as`. The raw result keeps the Variant extension, the
     /// typed result decodes every Variant into native JSON, Struct access
     /// stays exact, and invalid JSON in `parse_json` is the stable Variant
-    /// error while `try_parse_json` is null.
+    /// error, before the first batch or after a delivered one, while
+    /// `try_parse_json` is null.
     ///
     /// # Panics
     ///
     /// Panics when the fixture is refused, a value reads back differently, or
-    /// the invalid-JSON query does not fail with its catalog code.
+    /// an early or late failure does not carry its catalog problem.
     #[tokio::test]
     async fn builtin_variant_and_struct_payloads_are_queryable() {
         let srv = WyrdTestServer::start_bound()
@@ -2806,6 +2807,67 @@ mod pg_tests {
             .await
             .expect_err("invalid JSON in parse_json is a query error");
         assert_eq!(sdk_code(&invalid), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+
+        // A failure after a delivered batch keeps the pre-stream problem: the
+        // one published object streams 8192-row batches in id order, so rows
+        // from id 8192 fail only in the second batch. An unrelated late cast
+        // failure stays generic, and neither result is returned partially.
+        let late_fqn = owned_fqn("variant_late");
+        let late_table = Bifrost::connect_with_table(&client, table(&late_fqn))
+            .await
+            .expect("late-failure writer connects");
+        late_table
+            .register()
+            .await
+            .expect("register the late-failure table");
+        let ids: Vec<i64> = (0..10_000).collect();
+        let late_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.clone())),
+                Arc::new(arrow::array::StringArray::from(vec!["batch"; ids.len()])),
+            ],
+        )
+        .expect("late-failure batch");
+        late_table
+            .write_batch(&late_fqn, &late_batch)
+            .await
+            .expect("the late-failure batch is accepted");
+        srv.flush_bifrost()
+            .await
+            .expect("publish the late-failure rows");
+        let BifrostClientError::Transport(early) = invalid else {
+            panic!("invalid JSON in one row is refused before the stream opens");
+        };
+        for (sql, expected) in [
+            (
+                format!(
+                    "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
+                     FROM {late_fqn}"
+                ),
+                early.problem(),
+            ),
+            (
+                format!(
+                    "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
+                     FROM {late_fqn}"
+                ),
+                wyrd_spec::error::WyrdError::from(
+                    wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+                )
+                .problem(),
+            ),
+        ] {
+            let late = bifrost
+                .sql(&sql)
+                .await
+                .expect_err("a late failure refuses the whole result");
+            let terminal = late
+                .terminal()
+                .expect("the failure arrives on the terminal");
+            assert_eq!(terminal.row_count, 8192, "one valid batch preceded it");
+            assert_eq!(wyrd_spec::error::WyrdError::from(&late).problem(), expected);
+        }
 
         srv.shutdown().await.expect("server shutdown");
     }

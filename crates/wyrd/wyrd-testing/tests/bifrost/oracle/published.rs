@@ -27,6 +27,7 @@ use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::{BifrostMetricKind, BifrostTelemetryDelta};
 use wyrd_testing::bifrost::{
@@ -1095,7 +1096,8 @@ const ROW_VARIANT: &str = "parse_json('{\"k\":\"' || filter_key || \
 /// the Interactive leader session and through an Analytical graph whose stages
 /// round-trip the distributed plan to both followers, so each session decodes
 /// and executes the Variant UDFs itself. Invalid `parse_json` text is the
-/// stable Variant error on both paths while `try_parse_json` is null, and a
+/// stable Variant error on both paths, before the first batch or after a
+/// delivered one, while `try_parse_json` is null, and a
 /// Variant read of a sensitive gateway payload is refused before any remote
 /// work. Plan shape (`variant_get` for Variant, `get_field` for Struct) is the
 /// shared installer's contract, pinned by
@@ -1206,7 +1208,15 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
         return Err(format!("the Analytical Variant matrix returned {rows:?}").into());
     }
 
-    // Invalid text is the stable Variant error whichever session meets it.
+    // Invalid text is the stable Variant error whichever session meets it,
+    // before any batch or after a valid one: the late terminal carries the
+    // same catalog problem, and the whole result is refused.
+    let invalid_json = wyrd_spec::error::WyrdError::from(BifrostError::VariantInvalidJson {
+        field: "parse_json".to_owned(),
+        row: 0,
+        path: String::new(),
+    })
+    .problem();
     for (case, sql) in [
         (
             "Interactive invalid JSON",
@@ -1222,16 +1232,17 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     ] {
         match run_rows(&client, &sql).await {
             Err(error) => {
-                let code = error
+                let problem = error
                     .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
-                    .map(sdk_code);
-                if code != Some("WYRD_VALA_400_VARIANT_INVALID_JSON") {
-                    return Err(format!("{case} failed as {code:?}: {error}").into());
+                    .map(|error| wyrd_spec::error::WyrdError::from(error).problem());
+                if problem.as_ref() != Some(&invalid_json) {
+                    return Err(format!("{case} failed as {problem:?}: {error}").into());
                 }
             }
             Ok(rows) => return Err(format!("{case} settled {rows:?}").into()),
         }
     }
+    prove_late_failures(&cluster, &client, &suffix, &invalid_json).await?;
 
     // A caller without gateway payload authority is refused at the logical
     // plan, before any peer or provider work.
@@ -1270,6 +1281,93 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     }
 
     cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Proves a failure after a delivered batch keeps its catalog problem.
+///
+/// One object read in id order streams 8192-row batches through the
+/// Interactive leader, so rows from id 8192 fail in the second batch. Two
+/// objects read through a bounded sort run as an Analytical graph whose
+/// coordinator merges ten sorted batches before projecting them, so rows from
+/// id 36864 fail only in the last batch. Each late Variant failure must match
+/// the pre-stream problem exactly, an unrelated late cast failure must stay
+/// the generic execution failure, and every collected result is refused
+/// rather than returned partially.
+///
+/// # Errors
+///
+/// Returns the first case that settled, ran on the wrong path, failed before
+/// a batch was delivered, or carried a different problem.
+async fn prove_late_failures(
+    cluster: &PeerCluster,
+    client: &WyrdClient,
+    suffix: &impl std::fmt::Display,
+    invalid_json: &wyrd_spec::error::WyrdProblem,
+) -> Result<(), JourneyError> {
+    let interactive = format!("variant_late_one_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &interactive).await?;
+    cluster
+        .ingest_rows(PEER_SCRIBE, &interactive, 0, 10_000, 3)
+        .await?;
+    let analytical = format!("variant_late_two_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &analytical).await?;
+    for _ in 0..2 {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &analytical, 0, 40_960, 3)
+            .await?;
+    }
+    cluster.refresh_snapshots().await?;
+    let generic = wyrd_spec::error::WyrdError::from(BifrostError::QueryExecutionFailed).problem();
+    let sorted =
+        format!("(SELECT id FROM vala.bifrost.{analytical} ORDER BY id LIMIT 81920) AS sorted");
+    for (case, path, sql, expected) in [
+        (
+            "Interactive late invalid JSON",
+            QueryClass::Interactive,
+            format!(
+                "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
+                 FROM vala.bifrost.{interactive}"
+            ),
+            invalid_json,
+        ),
+        (
+            "Analytical late invalid JSON",
+            QueryClass::Analytical,
+            format!(
+                "SELECT id, parse_json(CASE WHEN id < 36864 THEN '1' ELSE '{{bad' END) AS v \
+                 FROM {sorted}"
+            ),
+            invalid_json,
+        ),
+        (
+            "Interactive late cast failure",
+            QueryClass::Interactive,
+            format!(
+                "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
+                 FROM vala.bifrost.{interactive}"
+            ),
+            &generic,
+        ),
+    ] {
+        let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+            Err(error) => error,
+            Ok(result) => {
+                return Err(format!("{case} returned {} rows", result.num_rows()).into());
+            }
+        };
+        let terminal = error
+            .terminal()
+            .ok_or_else(|| format!("{case} failed before the stream opened: {error}"))?;
+        expect_path(case, terminal.query_class, path)?;
+        if terminal.row_count == 0 {
+            return Err(format!("{case} failed before a batch was delivered").into());
+        }
+        let problem = wyrd_spec::error::WyrdError::from(&error).problem();
+        if &problem != expected {
+            return Err(format!("{case} failed as {problem:?}").into());
+        }
+    }
     Ok(())
 }
 

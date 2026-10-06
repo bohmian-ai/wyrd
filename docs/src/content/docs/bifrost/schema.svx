@@ -210,8 +210,9 @@ null.
 | `deployment_environment` | `Utf8` nullable | Resource `deployment.environment.name`, else `deployment.environment` |
 | + system columns | | |
 
-`positive_buckets` and `negative_buckets` carry `offset` (`Int32`) and
-`bucket_counts` (`List<Int64>`). Each `quantile_values` element carries
+`positive_buckets` and `negative_buckets` carry nullable `offset` (`Int32`)
+and `bucket_counts` (`List<Int64>`); both read SQL null when the collection is
+absent. Each `quantile_values` element carries
 `quantile` and `value`. Each `exemplars` element carries `time_unix_nano`,
 nullable `int_value` and `double_value`, Variant `filtered_attributes`, and
 nullable `trace_id` and `span_id`. `resource_entity_refs` is as on
@@ -319,8 +320,9 @@ A scored Drift result sets only `drift_report`: `method` (`Utf8`), `features`
 (`Variant`, keyed by feature name), and `verdict` (`Utf8`). A scored Eval
 result sets only `eval_summary`: `total_tasks`, `passed_tasks`, and
 `failed_tasks` (`Int32`), `pass_rate` (`Float64`), and `duration_ms`
-(`Int64`). A completed Drift execution that could not score valid input sets
-neither. There is no `details` column.
+(`Int64`). Every field inside either Struct is nullable and reads SQL null
+when its Struct is absent. A completed Drift execution that could not score
+valid input sets neither. There is no `details` column.
 
 ## vala.drift.result_features
 

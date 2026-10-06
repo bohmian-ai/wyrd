@@ -294,10 +294,23 @@ are OPTIONAL Parquet columns whose nulls survive the read and `get_field`
 returns SQL null with no read layer. TASK-001 now binds revision 12. The
 Scribe masked-null allowance adopts TASK-002 commit `535367c94`'s
 `fixed_ipc.rs` and `material_plan.rs` verbatim (same base blobs), so one
-implementation exists across the stack. Out of this spec's scope and left
-for its owner (`bifrost-canonical-otel-signals`): `vala.gateway.calls.resolved_model`
-and `vala.metrics.points.positive_buckets`/`negative_buckets` are nullable
-Structs over non-null children with the same published-read leak.
+implementation exists across the stack.
+
+The same leak existed in two built-ins outside this spec. By human direction
+(2026-10-06) they get the same fix on this branch:
+- `vala.metrics.points.positive_buckets`/`negative_buckets`: `offset` and
+  `bucket_counts` are nullable and the projection writes nulls instead of a
+  `0` offset and an empty list. The V4 metrics journey
+  `metrics_export::pg_tests::metric_variant_fields_and_promotions_are_queryable`
+  now reads every bucket field of a published gauge as SQL null. It fails
+  with the old declarations ("a published gauge's bucket fields read SQL null,
+  not a padded value") and passes with the fix.
+- `vala.gateway.calls.resolved_model`: `CallsTable::model_ref_type` children
+  are nullable; Arrow's JSON decoder already nulls them under an absent model.
+  `components::gateway::capture::tests::unresolved_call_nulls_resolved_model_children`
+  proves the row. It stays unit-level: no journey drives an unresolved gateway
+  call, and the Parquet behavior is the mechanism V2 proves on published rows.
+- `docs/src/content/docs/bifrost/schema.svx` states the nullable fields.
 
 ### Acceptance
 
@@ -346,3 +359,20 @@ than a new iterative walker.
 | `fixed_ipc::has_unmasked_null` | `visit_nodes`, Arrow `NullBuffer` API | adopted verbatim from TASK-002 `535367c94` so the stack has one implementation |
 | `verification_runtime` `EXTENSION_METADATA_KEY`, `refuse_numeric_before_depth` | file's `EXTENSION_NAME_KEY`; `arrow` facade (does not re-export `arrow_schema::extension`) | follows the file's existing constant; the method drives the SDK JSON-row write path the raw-IPC helpers cannot |
 | tests `numeric_range_outranks_depth_in_any_key_order`, `raw_depth_is_bounded_before_full_validation`, `variant_extension_requires_empty_metadata`, `parse_json_numeric_range_outranks_depth_in_any_key_order`, `masked_required_struct_child_null_roundtrips` | existing module tests | one per new behavior |
+
+### Diagnosis — Python `test_negative_empty_permissions_denied_rbac_on_write`
+
+- **Symptom:** `pytest.raises(WyrdError, match="WYRD_PERMISSION_403_DENIED_RBAC")`
+  failed; the raised message was `principal <id> lacks bifrost_record:write`.
+- **Evidence:** the queue trace logs `code="WYRD_PERMISSION_403_DENIED_RBAC"`;
+  `wyrd-queue/src/error.rs:130` and `wyrd-client/src/bifrost/query.rs:149`
+  pass the catalog error through; `wyrd-utils/src/py.rs:402-403` builds the
+  exception from the problem `detail` and sets `code` as an attribute.
+- **Cause:** the assertion matched message text, contrary to the documented
+  contract in `python/wyrd/_wyrd.pyi` ("Branch on `code`, not on the message
+  text"); it predates the move to `WyrdError`.
+- **Fix site:** the test now asserts `denied.value.code`, like its siblings.
+  No other test regex-matches a catalog code. Diagnostician `diag-r4-rbac`
+  (read-only) reached the same cause and fix site.
+- **Proof:** `tests/integration/bifrost/test_bifrost_e2e.py` 31/31;
+  `py:format`, `py:lints` pass.

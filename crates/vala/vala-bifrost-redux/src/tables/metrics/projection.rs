@@ -36,10 +36,10 @@ use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
     OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, attributes_variant,
     bool_column, bool_opt_column, checked_i64, entity_refs_column, f64_column, f64_opt_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
-    i64_opt_column, internal, list_column, nested_fields, projected_signal_schema, span_id_bytes,
-    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
-    validate_canonical_user_batch, variant_column,
+    fixed_binary_opt_column, fixed_row_bytes, i32_opt_column, i64_column, i64_opt_column, internal,
+    list_column, nested_fields, projected_signal_schema, span_id_bytes, struct_column,
+    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
+    variant_column,
 };
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::BifrostError;
@@ -862,11 +862,11 @@ struct PointColumns {
     exponential_zero_count: Vec<Option<i64>>,
     exponential_zero_threshold: Vec<Option<f64>>,
     positive_valid: Vec<bool>,
-    positive_offset: Vec<i32>,
+    positive_offset: Vec<Option<i32>>,
     positive_count_lengths: Vec<Option<usize>>,
     positive_counts: Vec<i64>,
     negative_valid: Vec<bool>,
-    negative_offset: Vec<i32>,
+    negative_offset: Vec<Option<i32>>,
     negative_count_lengths: Vec<Option<usize>>,
     negative_counts: Vec<i64>,
     summary_count: Vec<Option<i64>>,
@@ -1208,25 +1208,25 @@ struct NestedColumns {
 
 /// Stage one optional exponential bucket collection into its flat storage.
 ///
-/// An absent collection still contributes a placeholder offset and an empty
-/// count run so the struct column stays row-aligned; its validity bit, not its
-/// children, expresses the absence.
+/// An absent collection contributes a null offset and a null count list so the
+/// struct column stays row-aligned and a field query on either child reads SQL
+/// null rather than a placeholder.
 fn push_buckets(
     buckets: Option<BucketRow>,
     valid: &mut Vec<bool>,
-    offsets: &mut Vec<i32>,
+    offsets: &mut Vec<Option<i32>>,
     lengths: &mut Vec<Option<usize>>,
     counts: &mut Vec<i64>,
 ) {
     if let Some(row) = buckets {
         valid.push(true);
-        offsets.push(row.offset);
+        offsets.push(Some(row.offset));
         lengths.push(Some(row.counts.len()));
         counts.extend(row.counts);
     } else {
         valid.push(false);
-        offsets.push(0);
-        lengths.push(Some(0));
+        offsets.push(None);
+        lengths.push(None);
     }
 }
 
@@ -1240,11 +1240,16 @@ fn bucket_struct(
     declared: &[crate::tables::fields::CanonicalField],
     element: &crate::tables::fields::CanonicalField,
     valid: Vec<bool>,
-    offsets: Vec<i32>,
+    offsets: Vec<Option<i32>>,
     lengths: &[Option<usize>],
     counts: Vec<i64>,
 ) -> Result<ArrayRef, TableError> {
     let counts = list_column(&element.to_arrow(), i64_column(counts), lengths).map_err(internal)?;
     let children = Fields::from(canonical_arrow_fields(declared));
-    struct_column(&children, vec![i32_column(offsets), counts], Some(valid)).map_err(internal)
+    struct_column(
+        &children,
+        vec![i32_opt_column(offsets), counts],
+        Some(valid),
+    )
+    .map_err(internal)
 }

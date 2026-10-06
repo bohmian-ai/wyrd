@@ -18,7 +18,6 @@ use crate::bifrost::routes::router as bifrost_router;
 use crate::components::admin::{admin_router, identity_router};
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
-use crate::components::auth::otlp_api_key::OtlpApiKeyExchange;
 use crate::components::cards::cards_router;
 use crate::components::gateway::{gateway_ingress_router, gateway_router};
 use crate::components::health::health_router;
@@ -31,9 +30,7 @@ use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
-use crate::http::middleware::authenticate::{
-    accept_otlp_api_key, require_authenticated, require_bifrost_authenticated,
-};
+use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
@@ -65,18 +62,6 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             require_bifrost_authenticated,
         ));
-    // OTLP is the one group that also admits a stock exporter's API key: the
-    // outer layer exchanges `x-wyrd-api-key` for an access token, which the
-    // ordinary `wyrd`-audience layer inside it then verifies.
-    let otlp_group = otlp_router()
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_authenticated,
-        ))
-        .layer(middleware::from_fn_with_state(
-            OtlpApiKeyExchange::new(state.clone()),
-            accept_otlp_api_key,
-        ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(cards_router())
@@ -87,11 +72,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin_router())
         .merge(identity_router())
         .merge(gateway_router())
+        .merge(otlp_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_authenticated,
         ))
-        .merge(otlp_group)
         .merge(bifrost_group)
         .fallback(v1_not_found);
 

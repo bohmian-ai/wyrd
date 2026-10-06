@@ -2,8 +2,6 @@
 
 /// The [`Caller`] extractor: token-derived tenant, principal, and delegation chain.
 pub mod caller_extractor;
-/// The OTLP-only API-key authentication entrance shared by HTTP and gRPC.
-pub(crate) mod otlp_api_key;
 pub mod platform_extractor;
 /// The authenticated-principal extractor for routes that need the verified token.
 pub mod principal_extractor;

@@ -10,9 +10,7 @@ use std::task::{Context, Poll};
 
 use tower::Service;
 use vala_bifrost_redux::contracts::DecodedOtlp;
-use vala_bifrost_redux::gate::auth::WYRD_REQUEST_ID_METADATA;
-use vala_bifrost_redux::gate::{AuthContext, IngestError};
-use wyrd_spec::request_id::RequestId;
+use vala_bifrost_redux::gate::IngestError;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -22,15 +20,12 @@ use wyrd_tonic::prost::Message;
 use wyrd_tonic::prost::bytes::Buf;
 use wyrd_tonic::tonic::body::Body as TonicBody;
 use wyrd_tonic::tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use wyrd_tonic::tonic::codegen::http::{
-    HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-};
+use wyrd_tonic::tonic::codegen::http::{Request as HttpRequest, Response as HttpResponse};
 use wyrd_tonic::tonic::codegen::{Body, StdError};
 use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::server::{Grpc, NamedService, UnaryService};
 use wyrd_tonic::tonic::{Request, Response, Status};
 
-use crate::components::auth::otlp_api_key::OtlpApiKeyExchange;
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
@@ -137,23 +132,16 @@ fn record_codec_activity(stage: &str) {
 pub(super) struct TraceOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
-    /// Per-request authentication, including the OTLP API-key entrance.
-    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl TraceOtlpGrpcService {
     /// Couples the trace adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>, api_keys: OtlpApiKeyExchange) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
-        let authentication = OtlpGrpcAuthentication {
-            gate: Arc::clone(&gate),
-            api_keys,
-        };
         Self {
             gate,
-            authentication,
             decoding_limit,
         }
     }
@@ -190,12 +178,11 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
-        let authentication = self.authentication.clone();
         Box::pin(async move {
-            let mut request = request;
-            let auth = match authentication.authenticate(request.headers_mut()).await {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(status) => return Ok(status.into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let method = TraceExportUnary {
                 gate: Arc::clone(&gate),
@@ -216,7 +203,7 @@ struct TraceExportUnary {
     /// Gate selected during server boot.
     gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
-    auth: Option<AuthContext>,
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
@@ -239,56 +226,6 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
                 partial_success: outcome.partial_success(),
             }))
         })
-    }
-}
-
-/// Per-request OTLP/gRPC authentication shared by the three signal services.
-///
-/// It runs before any payload byte is decoded: an `x-wyrd-api-key` is first
-/// exchanged for an access token through the same [`OtlpApiKeyExchange`] the
-/// HTTP adapter uses, then Gate verifies the resulting bearer exactly as it
-/// verifies one an ordinary caller sent.
-#[derive(Clone)]
-struct OtlpGrpcAuthentication {
-    /// Gate whose verifier produces the request's [`AuthContext`].
-    gate: Arc<Bifrost>,
-    /// The OTLP-only API-key entrance shared with OTLP/HTTP.
-    api_keys: OtlpApiKeyExchange,
-}
-
-impl OtlpGrpcAuthentication {
-    /// Authenticate one OTLP/gRPC call from its request headers.
-    ///
-    /// The call's request id is read from `wyrd-request-id`, or minted and
-    /// written back when absent or invalid, so the API-key grant's audit
-    /// decision and Gate's [`AuthContext`] name the same request. Headers are
-    /// rewritten only by the API-key exchange, which replaces the key with
-    /// the minted bearer.
-    ///
-    /// # Errors
-    /// Returns the API-key grant's refusal as its canonical gRPC status, or
-    /// Gate's authentication refusal through [`ingest_status`].
-    async fn authenticate(&self, headers: &mut HeaderMap) -> Result<AuthContext, Status> {
-        let request_id = headers
-            .get(WYRD_REQUEST_ID_METADATA)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| RequestId::parse(value).ok())
-            .unwrap_or_else(|| {
-                let request_id = RequestId::now_v7();
-                if let Ok(value) = HeaderValue::try_from(request_id.as_str()) {
-                    headers.insert(WYRD_REQUEST_ID_METADATA, value);
-                }
-                request_id
-            });
-        self.api_keys
-            .authorize(headers, request_id.as_str())
-            .await
-            .map_err(|error| wyrd_tonic::error::wyrd_error_to_status(error, None))?;
-        let metadata = MetadataMap::from_headers(headers.clone());
-        self.gate
-            .gate()
-            .authenticate_otlp_metadata(&metadata)
-            .map_err(ingest_status)
     }
 }
 
@@ -408,23 +345,16 @@ impl Decoder for TraceRequestDecoder {
 pub(super) struct MetricsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
-    /// Per-request authentication, including the OTLP API-key entrance.
-    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl MetricsOtlpGrpcService {
     /// Couples the metrics adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>, api_keys: OtlpApiKeyExchange) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
-        let authentication = OtlpGrpcAuthentication {
-            gate: Arc::clone(&gate),
-            api_keys,
-        };
         Self {
             gate,
-            authentication,
             decoding_limit,
         }
     }
@@ -461,12 +391,11 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
-        let authentication = self.authentication.clone();
         Box::pin(async move {
-            let mut request = request;
-            let auth = match authentication.authenticate(request.headers_mut()).await {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(status) => return Ok(status.into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let response = Grpc::new(MetricsOtlpCodec {
                 gate: Arc::clone(&gate),
@@ -490,7 +419,7 @@ struct MetricsExportUnary {
     /// Gate selected during server boot.
     gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
-    auth: Option<AuthContext>,
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUnary {
@@ -587,23 +516,16 @@ impl Decoder for MetricsRequestDecoder {
 pub(super) struct LogsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
-    /// Per-request authentication, including the OTLP API-key entrance.
-    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl LogsOtlpGrpcService {
     /// Couples the logs adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>, api_keys: OtlpApiKeyExchange) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
-        let authentication = OtlpGrpcAuthentication {
-            gate: Arc::clone(&gate),
-            api_keys,
-        };
         Self {
             gate,
-            authentication,
             decoding_limit,
         }
     }
@@ -640,12 +562,11 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
-        let authentication = self.authentication.clone();
         Box::pin(async move {
-            let mut request = request;
-            let auth = match authentication.authenticate(request.headers_mut()).await {
+            let metadata = MetadataMap::from_headers(request.headers().clone());
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(status) => return Ok(status.into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let response = Grpc::new(LogsOtlpCodec {
                 gate: Arc::clone(&gate),
@@ -669,7 +590,7 @@ struct LogsExportUnary {
     /// Gate selected during server boot.
     gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
-    auth: Option<AuthContext>,
+    auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
 
 impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {

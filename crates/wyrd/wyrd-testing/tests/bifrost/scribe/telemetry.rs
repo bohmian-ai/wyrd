@@ -316,9 +316,13 @@ fn scrape_staging(
     reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
 )]
 async fn staged_backlog_survives_abrupt_restart() {
-    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
-        .await
-        .expect("the one-pod mixed cluster starts");
+    // The insertion counter is pod-wide, so the tenant's audit table must not
+    // insert rows inside the resend window.
+    let mut cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
+    )
+    .await
+    .expect("the one-pod mixed cluster starts");
     let telemetry = cluster.telemetry().clone();
     let tenant = cluster.data_tenant_id();
     let name = unique_table("staged_restart");

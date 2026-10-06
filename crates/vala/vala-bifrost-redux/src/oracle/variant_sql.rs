@@ -27,15 +27,22 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, StructArray};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, FieldRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, ScalarValue, exec_err, plan_err};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ExprSchemable, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
-    ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Expr, ExprSchemable, InputFieldRequirement, ReturnFieldArgs, ScalarFunctionArgs,
+    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
 use datafusion::sql::sqlparser::ast::BinaryOperator;
 use parquet_variant::{Variant, VariantPath, VariantPathElement};
@@ -68,6 +75,8 @@ const PARSE_JSON: &str = "parse_json";
 const TRY_PARSE_JSON: &str = "try_parse_json";
 /// Name of the Variant-to-JSON-text renderer.
 const TO_JSON: &str = "to_json";
+/// Name of the per-file unshred step; never registered for SQL.
+const VARIANT_UNSHRED: &str = "variant_unshred";
 
 /// The process-wide Variant SQL owner; its functions are immutable.
 static SHARED: LazyLock<OracleVariantSql> = LazyLock::new(OracleVariantSql::new);
@@ -84,6 +93,8 @@ pub struct OracleVariantSql {
     functions: Vec<Arc<ScalarUDF>>,
     /// Rewrites `->` and `->>` on a Variant operand into the functions above.
     planner: Arc<VariantOperatorPlanner>,
+    /// Adapts per-file read plans to each file's own Variant layout.
+    file_adapter: Arc<VariantFileAdapterFactory>,
 }
 
 impl OracleVariantSql {
@@ -104,7 +115,19 @@ impl OracleVariantSql {
                 Arc::new(ScalarUDF::new_from_impl(ToJson::new())),
             ],
             planner,
+            file_adapter: Arc::new(VariantFileAdapterFactory {
+                unshred: Arc::new(ScalarUDF::new_from_impl(VariantUnshred::new())),
+            }),
         }
+    }
+
+    /// Return the expression adapter every per-file Parquet read plan uses.
+    ///
+    /// It is `DataFusion`'s default adapter plus the one thing a file's own
+    /// standard shredded Variant layout needs; see [`VariantFileAdapterFactory`].
+    #[must_use]
+    pub fn file_adapter(&self) -> Arc<dyn PhysicalExprAdapterFactory> {
+        Arc::clone(&self.file_adapter) as Arc<dyn PhysicalExprAdapterFactory>
     }
 
     /// Return the process-wide owner every production session installs.
@@ -289,6 +312,32 @@ impl ScalarUDFImpl for VariantGet {
         Ok(Arc::new(variant_field(VARIANT_GET, true)))
     }
 
+    /// Declare the shredded leaves a literal key path reads from one file.
+    ///
+    /// Against a file whose root carries a standard `typed_value`, the call
+    /// needs the root `metadata` and, following each key through
+    /// `typed_value.<key>.typed_value`, either the whole shredded subtree of
+    /// the last key or the residual `value` of the first level that does not
+    /// shred the next key: the standard layout never repeats a shredded field
+    /// in its residual. An unshredded root, an array index, or a non-literal
+    /// key declares nothing, so the root is read whole.
+    fn required_input_fields(&self, args: ReturnFieldArgs) -> Option<Vec<InputFieldRequirement>> {
+        let [root, ..] = args.arg_fields else {
+            return None;
+        };
+        let keys = args
+            .scalar_arguments
+            .get(1..)?
+            .iter()
+            .map(|key| key.and_then(|key| key.try_as_str().flatten()))
+            .collect::<Option<Vec<_>>>()?;
+        let leaf = shredded_leaf(root.data_type(), &keys)?;
+        Some(vec![InputFieldRequirement {
+            arg_index: 0,
+            field_paths: vec![vec!["metadata".to_owned()], leaf],
+        }])
+    }
+
     /// Extract the path, with one Arrow-rs kernel call when it is all literal.
     ///
     /// # Errors
@@ -325,6 +374,46 @@ impl ScalarUDFImpl for VariantGet {
             None => per_row_get(&root, &elements, rows)?,
         };
         Ok(ColumnarValue::Array(canonical_storage(&result)?))
+    }
+}
+
+/// Returns the one subtree of a standard shredded Variant of `storage` type
+/// that holds the value at the object-key path `keys`, or `None` when
+/// `storage` shreds no object.
+///
+/// Each key present in its level's shredded object descends into
+/// `typed_value.<key>`; the last such key selects its whole subtree. A key
+/// that level does not shred can only live in that level's residual `value`,
+/// and a key under a non-object shredded child only in the child's `value`.
+fn shredded_leaf(storage: &DataType, keys: &[&str]) -> Option<Vec<String>> {
+    let mut fields = object_fields(storage)?;
+    let mut level = Vec::new();
+    for (depth, key) in keys.iter().enumerate() {
+        let Some(child) = fields.iter().find(|field| field.name() == *key) else {
+            level.push("value".to_owned());
+            return Some(level);
+        };
+        level.extend(["typed_value".to_owned(), (*key).to_owned()]);
+        if depth + 1 == keys.len() {
+            break;
+        }
+        let Some(next) = object_fields(child.data_type()) else {
+            level.push("value".to_owned());
+            return Some(level);
+        };
+        fields = next;
+    }
+    Some(level)
+}
+
+/// Returns the fields of `storage`'s `typed_value` when it shreds an object.
+fn object_fields(storage: &DataType) -> Option<arrow::datatypes::Fields> {
+    let DataType::Struct(children) = storage else {
+        return None;
+    };
+    match children.find("typed_value")?.1.data_type() {
+        DataType::Struct(fields) => Some(fields.clone()),
+        _ => None,
     }
 }
 
@@ -498,6 +587,186 @@ impl ScalarUDFImpl for VariantAsText {
             }
         }
         Ok(ColumnarValue::Array(Arc::new(text.finish())))
+    }
+}
+
+/// `variant_unshred(v)`: one file's shredded Variant as canonical storage.
+///
+/// Never registered as SQL: only [`VariantFileAdapter`] places it, inside a
+/// per-file read plan that is built at execution and never serialized.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct VariantUnshred {
+    /// One shredded Variant storage argument.
+    signature: Signature,
+}
+
+impl VariantUnshred {
+    /// Declare the one-argument signature.
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for VariantUnshred {
+    /// The internal name of the per-file unshred step.
+    fn name(&self) -> &str {
+        VARIANT_UNSHRED
+    }
+
+    /// The one-argument signature declared by the constructor.
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// The canonical unshredded storage type.
+    ///
+    /// # Errors
+    ///
+    /// Never fails.
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(variant_storage_type())
+    }
+
+    /// A nullable canonical Variant field.
+    ///
+    /// # Errors
+    ///
+    /// Never fails.
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
+        Ok(Arc::new(variant_field(VARIANT_UNSHRED, true)))
+    }
+
+    /// Reconstruct every row's full Variant from its residual and typed leaves.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error raised when the argument is not a valid
+    /// standard shredded Variant layout.
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let variant = decode_rows(&args.args[0], args.number_rows)?;
+        Ok(ColumnarValue::Array(canonical_storage(&variant)?))
+    }
+}
+
+/// Builds the [`VariantFileAdapter`] for each file a per-file plan reads.
+///
+/// Every Variant file is standard Parquet Variant, but each final object may
+/// shred a different layout, so the file's Arrow type for a Variant column can
+/// differ from the table's canonical unshredded storage. `DataFusion`'s default
+/// adapter would cast that struct to the logical one and drop `typed_value`.
+#[derive(Debug)]
+struct VariantFileAdapterFactory {
+    /// The unshred step bare whole-Variant reads are wrapped in.
+    unshred: Arc<ScalarUDF>,
+}
+
+impl PhysicalExprAdapterFactory for VariantFileAdapterFactory {
+    /// Adapts to `physical_file_schema`, treating each Variant column whose
+    /// file type differs from its logical type as that file's shredded layout.
+    ///
+    /// The default adapter sees those columns at their logical type, so it
+    /// neither casts nor reorders them; everything else it adapts as usual.
+    ///
+    /// # Errors
+    ///
+    /// Returns the default adapter's error.
+    fn create(
+        &self,
+        logical_file_schema: SchemaRef,
+        physical_file_schema: SchemaRef,
+    ) -> Result<Arc<dyn PhysicalExprAdapter>> {
+        let mut shredded = Vec::new();
+        let presented = physical_file_schema
+            .fields()
+            .iter()
+            .map(
+                |field| match logical_file_schema.field_with_name(field.name()) {
+                    Ok(logical)
+                        if is_variant(logical) && logical.data_type() != field.data_type() =>
+                    {
+                        shredded.push(field.name().clone());
+                        Arc::new(logical.clone())
+                    }
+                    _ => Arc::clone(field),
+                },
+            )
+            .collect::<Vec<_>>();
+        let presented = Arc::new(Schema::new_with_metadata(
+            presented,
+            physical_file_schema.metadata().clone(),
+        ));
+        Ok(Arc::new(VariantFileAdapter {
+            inner: DefaultPhysicalExprAdapterFactory.create(logical_file_schema, presented)?,
+            shredded,
+            unshred: Arc::clone(&self.unshred),
+        }))
+    }
+}
+
+/// Adapts one file's expressions while keeping its shredded Variant readable.
+///
+/// A literal-key `variant_get` over a shredded root reads the root as stored,
+/// so it decodes only the leaves it declares; any other use of that root is
+/// wrapped in [`VariantUnshred`] and sees the canonical value.
+#[derive(Debug)]
+struct VariantFileAdapter {
+    /// `DataFusion`'s adapter over the file schema with shredded columns
+    /// presented at their logical type.
+    inner: Arc<dyn PhysicalExprAdapter>,
+    /// Names of this file's shredded Variant columns.
+    shredded: Vec<String>,
+    /// The unshred step.
+    unshred: Arc<ScalarUDF>,
+}
+
+impl PhysicalExprAdapter for VariantFileAdapter {
+    /// Adapts `expr` with the default rules, then unshreds bare shredded roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns the default adapter's error.
+    fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
+        let expr = self.inner.rewrite(expr)?;
+        if self.shredded.is_empty() {
+            return Ok(expr);
+        }
+        self.unshred_bare(expr)
+    }
+}
+
+impl VariantFileAdapter {
+    /// Wraps every shredded column reference in `expr` that is not the root
+    /// of a `variant_get` call in [`VariantUnshred`].
+    ///
+    /// # Errors
+    ///
+    /// Never fails in practice; the signature follows tree rewriting.
+    fn unshred_bare(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
+        if let Some(column) = expr.downcast_ref::<Column>() {
+            if !self.shredded.iter().any(|name| name == column.name()) {
+                return Ok(expr);
+            }
+            return Ok(Arc::new(ScalarFunctionExpr::new(
+                VARIANT_UNSHRED,
+                Arc::clone(&self.unshred),
+                vec![expr],
+                Arc::new(variant_field(VARIANT_UNSHRED, true)),
+                Arc::new(ConfigOptions::default()),
+            )));
+        }
+        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
+            && function.name() == VARIANT_GET
+            && function
+                .args()
+                .first()
+                .is_some_and(|root| root.downcast_ref::<Column>().is_some())
+        {
+            return Ok(expr);
+        }
+        expr.map_children(|child| self.unshred_bare(child).map(Transformed::yes))
+            .map(|rewritten| rewritten.data)
     }
 }
 

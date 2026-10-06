@@ -72,6 +72,7 @@ pub use exec::iceberg_projection_probe;
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
 pub mod follower;
 mod live;
+mod nested_pushdown;
 #[cfg(feature = "test-support")]
 pub use live::live_source_batches_for_test;
 mod participant_cut;

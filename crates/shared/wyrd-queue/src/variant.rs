@@ -335,11 +335,13 @@ impl EncoderFactory for VariantJsonEncoderFactory {
 
 /// Prepare one stored Variant column for upstream decoding.
 ///
-/// Every encoded Variant has at least one `metadata` and one `value` byte, so
-/// a cell whose two children are both empty carries no value at all. Such a
-/// cell appears under a null parent struct, whose null is neither pushed down
-/// by the Parquet reader nor by `get_field`, so it is marked null here. Every
-/// other present cell is then fully validated with [`Variant::try_new`]:
+/// Every encoded Variant has at least one `metadata` byte, and an unshredded
+/// one at least one `value` byte, so a cell with empty metadata and an empty,
+/// null, or absent value carries no value at all. Such a cell appears under a
+/// null parent struct whose null the Parquet reader does not push down, so it
+/// is marked null here. A shredded cell whose `value` is null or projected
+/// away holds its value in `typed_value`, which upstream decoding validates;
+/// every other present cell is fully validated with [`Variant::try_new`]:
 /// upstream decoding validates shallowly and panics on malformed bytes, so
 /// every reader passes the column through here first and malformed stored
 /// bytes become an error instead. A non-struct array is returned unchanged.
@@ -362,15 +364,17 @@ pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
     let (metadata, value) = (bytes("metadata")?, bytes("value")?);
     let mut present = Vec::with_capacity(storage.len());
     for row in 0..storage.len() {
-        let cell = match (&metadata, &value) {
-            (Some(metadata), Some(value)) => Some((
-                metadata.as_binary_view().value(row),
-                value.as_binary_view().value(row),
-            )),
-            _ => None,
-        };
-        let valid = storage.is_valid(row) && !matches!(cell, Some(([], [])));
-        if let (true, Some((metadata, value))) = (valid, cell) {
+        // A shredded row keeps its value in `typed_value`, leaving `value`
+        // null or projected away; only a present `value` can be validated here.
+        let cell = metadata.as_ref().map(|metadata| {
+            let value = value
+                .as_ref()
+                .filter(|value| value.is_valid(row))
+                .map(|value| value.as_binary_view().value(row));
+            (metadata.as_binary_view().value(row), value)
+        });
+        let valid = storage.is_valid(row) && !matches!(cell, Some(([], None | Some([]))));
+        if let (true, Some((metadata, Some(value)))) = (valid, cell) {
             Variant::try_new(metadata, value).map_err(|error| {
                 ArrowError::InvalidArgumentError(format!(
                     "row {row} is not a valid stored Variant: {error}"

@@ -26,10 +26,6 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::physical_plan::FileScanConfig;
-use datafusion::datasource::physical_plan::parquet::{
-    ParquetAccessPlan, ParquetFileMetrics, PerFileParquetReadInput, PerFileParquetReadPlan,
-    PerFileParquetReadPlanner, RowGroupAccessPlanFilter,
-};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -37,9 +33,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
@@ -66,7 +60,7 @@ use iceberg::io::{FileIO, FileRead};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::bloom_filter::Sbbf;
@@ -83,7 +77,9 @@ use wyrd_spec::vala::assignment_authority::{ScanLeaf, ScanLiteral, ScanPredicate
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
+use super::nested_pushdown::FileReadPlan;
 use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry, QueryCatalogError};
+use datafusion::physical_expr::projection::ProjectionExprs;
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -3001,7 +2997,7 @@ impl HotReaderFactory {
 /// file's first byte publishes its file observation before the footer is
 /// touched; every piece proves the footer's tenant before decoding anything,
 /// then keeps only the row groups whose midpoint lies in its range and applies
-/// the file's [`HotFileReadPlan`]: statistics, Bloom, then page pruning, the
+/// the file's [`FileReadPlan`]: statistics, Bloom, then page pruning, the
 /// shared projection mask and decoder row filter. It decodes at the session
 /// `batch_size`, projects to the
 /// authenticated physical schema, and holds one governed reservation for
@@ -3028,6 +3024,8 @@ fn hot_stream(
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     let filter = scan_predicate_conjunction(&predicates, &schema);
+    let projection =
+        ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema);
     let staged_lease = exec.staged_lease.clone();
     // Cancelling the query drops this stream, which drops the guard and
     // cancels any metadata decode this stream still has outstanding. Owner
@@ -3079,8 +3077,13 @@ fn hot_stream(
             else {
                 continue;
             };
-            let read_plan =
-                HotFileReadPlan::new(&metadata, &schema, filter.clone(), max_in_list_size)?;
+            let read_plan = FileReadPlan::new(
+                &metadata,
+                &schema,
+                projection.clone(),
+                filter.clone(),
+                max_in_list_size,
+            )?;
             let selection = read_plan.select_row_groups(owned_groups);
             metrics.record_row_groups(&selection);
             if selection.excludes_file() {
@@ -3098,22 +3101,12 @@ fn hot_stream(
                 continue;
             }
             let (row_groups, pages) = read_plan.select_pages(bloom.retained, &metrics)?;
-            let HotFileReadPlan { plan, .. } = read_plan;
             // The shared plan's projection turns decoded leaves back into the
             // closure's logical columns; `project_batch` below only pins the
             // exact output schema.
-            let projector = plan.projection.make_projector(&plan.projected_schema)?;
-            let mut builder = builder
-                .with_row_groups(row_groups)
-                .with_batch_size(batch_size)
-                .with_projection(plan.projection_mask);
-            if let Some(pages) = pages {
-                builder = builder.with_row_selection(pages);
-            }
-            if let Some(row_filter) = plan.row_filter {
-                builder = builder.with_row_filter(row_filter);
-            }
+            let (builder, projector) = read_plan.apply(builder, row_groups, pages)?;
             let mut batches = builder
+                .with_batch_size(batch_size)
                 .build()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
             while let Some(decoded) = batches.next().await {
@@ -3154,138 +3147,6 @@ fn hot_piece_metadata(
         ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
     Ok(Some((reader_metadata, owned)))
-}
-
-/// One hot file's read plan from `DataFusion`'s shared per-file planner.
-///
-/// Built once the footer is proved, it holds exactly what `ParquetSource`
-/// derives for the same file — the projection mask over the closure's leaves,
-/// the decoder row filter, and the row-group and page pruning predicates — so
-/// a Struct field or Variant path prunes and projects through the same
-/// machinery on every reader. Wyrd keeps only its scan metrics and Bloom
-/// probes; it owns no statistics pruning of its own.
-struct HotFileReadPlan {
-    /// The facade's owned plan for this file.
-    plan: PerFileParquetReadPlan,
-    /// The file's own Arrow schema the predicates were adapted to.
-    physical_schema: SchemaRef,
-    /// The file's cached footer.
-    metadata: Arc<ParquetMetaData>,
-    /// `DataFusion` per-file counters the row filter and pruning record into.
-    file_metrics: ParquetFileMetrics,
-}
-
-impl HotFileReadPlan {
-    /// Plans reading every `logical_schema` column from the file `reader`
-    /// describes, filtered by `filter`. Performs no IO.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `DataFusion` error raised when a projection or filter
-    /// expression cannot be adapted to or evaluated against the file schema.
-    fn new(
-        reader: &ArrowReaderMetadata,
-        logical_schema: &SchemaRef,
-        filter: Option<Arc<dyn PhysicalExpr>>,
-        max_in_list_size: usize,
-    ) -> DataFusionResult<Self> {
-        let physical_schema = Arc::clone(reader.schema());
-        let metadata = Arc::clone(reader.metadata());
-        let file_metrics = ParquetFileMetrics::new(0, "hot", &ExecutionPlanMetricsSet::new());
-        let columns = (0..logical_schema.fields().len()).collect::<Vec<_>>();
-        let plan = PerFileParquetReadPlanner::plan(PerFileParquetReadInput {
-            projection: ProjectionExprs::from_indices(&columns, logical_schema),
-            filter,
-            logical_file_schema: Arc::clone(logical_schema),
-            physical_file_schema: Arc::clone(&physical_schema),
-            metadata: Arc::clone(&metadata),
-            expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
-            max_in_list_size,
-            file_metrics: file_metrics.clone(),
-        })?;
-        Ok(Self {
-            plan,
-            physical_schema,
-            metadata,
-            file_metrics,
-        })
-    }
-
-    /// Returns an access plan scanning exactly `row_groups` of this file.
-    fn access(&self, row_groups: &[usize]) -> ParquetAccessPlan {
-        let mut access = ParquetAccessPlan::new_none(self.metadata.num_row_groups());
-        for &row_group in row_groups {
-            access.scan(row_group);
-        }
-        access
-    }
-
-    /// Keeps the `candidates` whose footer statistics may satisfy the filter.
-    ///
-    /// Without a row-group predicate every candidate is retained; absent or
-    /// unusable statistics always keep a group.
-    fn select_row_groups(&self, candidates: Vec<usize>) -> RowGroupSelection {
-        let Some(predicate) = self.plan.row_group_predicate.as_deref() else {
-            return RowGroupSelection {
-                retained: candidates,
-                pruned: 0,
-            };
-        };
-        let mut filter = RowGroupAccessPlanFilter::new(self.access(&candidates));
-        filter.prune_by_statistics_with_metadata(
-            &self.physical_schema,
-            &self.metadata,
-            predicate,
-            &self.file_metrics,
-        );
-        let retained = filter.row_group_indexes().collect::<Vec<_>>();
-        RowGroupSelection {
-            pruned: (candidates.len() - retained.len()) as u64,
-            retained,
-        }
-    }
-
-    /// Narrows `row_groups` to the pages whose page index may satisfy the
-    /// filter, recording the rows skipped in `metrics`.
-    ///
-    /// Returns the row groups still read and, when any page inside them was
-    /// skipped, the row selection over exactly those groups.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `DataFusion` error raised when the pruned access plan
-    /// cannot be turned into a row selection.
-    fn select_pages(
-        &self,
-        row_groups: Vec<usize>,
-        metrics: &OracleScanMetricsHandle,
-    ) -> DataFusionResult<(Vec<usize>, Option<RowSelection>)> {
-        let Some(pages) = self.plan.page_predicate.as_deref() else {
-            return Ok((row_groups, None));
-        };
-        let rows = |groups: &[usize]| {
-            groups
-                .iter()
-                .map(|&group| {
-                    usize::try_from(self.metadata.row_group(group).num_rows()).unwrap_or(0)
-                })
-                .sum::<usize>()
-        };
-        let access = pages.prune_plan_with_page_index(
-            self.access(&row_groups),
-            &self.physical_schema,
-            self.metadata.file_metadata().schema_descr(),
-            &self.metadata,
-            &self.file_metrics,
-        );
-        let kept_groups = access.row_group_indexes();
-        let selection = access.into_overall_row_selection(self.metadata.row_groups())?;
-        let kept_rows = selection
-            .as_ref()
-            .map_or_else(|| rows(&kept_groups), RowSelection::row_count);
-        metrics.record_page_pruned_rows(rows(&row_groups).saturating_sub(kept_rows));
-        Ok((kept_groups, selection))
-    }
 }
 
 /// The equality probes one hot file's Bloom filters can answer.
@@ -4793,14 +4654,14 @@ mod tests {
                 } else {
                     vec![0]
                 };
-                let HotFileReadPlan { plan, .. } = plan;
-                let mut builder = ParquetRecordBatchReaderBuilder::try_new(published.clone())
-                    .expect("reader builder")
-                    .with_row_groups(groups)
-                    .with_projection(plan.projection_mask);
-                if let Some(row_filter) = plan.row_filter {
-                    builder = builder.with_row_filter(row_filter);
-                }
+                let (builder, _) = plan
+                    .apply(
+                        ParquetRecordBatchReaderBuilder::try_new(published.clone())
+                            .expect("reader builder"),
+                        groups,
+                        None,
+                    )
+                    .expect("applied plan");
                 let ids = builder
                     .build()
                     .expect("reader")
@@ -5021,7 +4882,7 @@ mod tests {
     }
 
     /// Plans reading every `schema` column of the in-memory file `published`
-    /// under `predicates`, through the same [`HotFileReadPlan`] the hot reader
+    /// under `predicates`, through the same [`FileReadPlan`] the hot reader
     /// builds after footer discovery, page index included.
     ///
     /// # Panics
@@ -5032,7 +4893,7 @@ mod tests {
         published: &Bytes,
         schema: &SchemaRef,
         predicates: &[ScanPredicate],
-    ) -> HotFileReadPlan {
+    ) -> FileReadPlan {
         let reader = ArrowReaderMetadata::load(
             published,
             ArrowReaderOptions::new()
@@ -5040,7 +4901,15 @@ mod tests {
         )
         .expect("valid Parquet footer");
         let filter = scan_predicate_conjunction(predicates, schema).expect("compiled predicates");
-        HotFileReadPlan::new(&reader, schema, filter, 20).expect("per-file read plan")
+        let columns = (0..schema.fields().len()).collect::<Vec<_>>();
+        FileReadPlan::new(
+            &reader,
+            schema,
+            ProjectionExprs::from_indices(&columns, schema),
+            filter,
+            20,
+        )
+        .expect("per-file read plan")
     }
 
     /// Builds one 16-byte trace id with a constant prefix and `tail` as its

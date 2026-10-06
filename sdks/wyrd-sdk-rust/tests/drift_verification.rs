@@ -1655,8 +1655,8 @@ struct SubjectCount {
 struct EvalObservationRow {
     /// Logical record identity a run's `source_record_id` names.
     record_id: String,
-    /// The emitted JSON context.
-    context: String,
+    /// The emitted context, decoded from its Variant column.
+    context: Value,
     /// Managed subject Card UID stamped from the authorized scope.
     card_uid: Option<String>,
 }
@@ -2285,7 +2285,7 @@ impl<'a> IntegratedJourney<'a> {
             let result = owned[0];
             assert_eq!(result.implementation, "eval");
             assert_eq!(result.subject_card_uid, self.agent_uid);
-            let failed = observation.context.contains("\"answer\":\"no\"");
+            let failed = observation.context["answer"] == "no";
             assert_eq!(
                 result.verdict,
                 if failed { "failed" } else { "passed" },

@@ -26,6 +26,7 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, StructArray};
+use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{DFSchema, ScalarValue, exec_err, plan_err};
@@ -44,7 +45,8 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantViolation, variant_field, variant_storage_type,
+    EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, variant_field,
+    variant_storage_type,
 };
 
 use crate::tables::fields::is_variant;
@@ -245,7 +247,8 @@ impl ScalarUDFImpl for VariantGet {
         let root = values
             .next()
             .ok_or_else(|| DataFusionError::Internal("variant_get has no root".to_owned()))?
-            .into_array(rows)?;
+            .into_array(rows)
+            .and_then(mask_placeholders)?;
         let elements: Vec<ColumnarValue> = values.collect();
         let literal: Option<Vec<Option<VariantPathElement<'_>>>> = elements
             .iter()
@@ -364,7 +367,33 @@ fn canonical_storage(variant: &VariantArray) -> Result<ArrayRef> {
 ///
 /// Returns the Arrow error raised when the argument is not Variant storage.
 fn decode_rows(argument: &ColumnarValue, rows: usize) -> Result<VariantArray> {
-    Ok(VariantArray::try_new(&argument.to_array(rows)?)?)
+    Ok(VariantArray::try_new(&mask_placeholders(
+        argument.to_array(rows)?,
+    )?)?)
+}
+
+/// Mark every empty-storage placeholder row of a Variant column as null.
+///
+/// A Variant nested in a null struct keeps empty child bytes in place of a
+/// value, because neither the Parquet reader nor `get_field` pushes the parent
+/// null down. The upstream decoder panics on those bytes, so every Variant
+/// argument passes through here before it is decoded.
+///
+/// # Errors
+///
+/// Returns the Arrow error raised while reassembling the masked struct.
+fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef> {
+    let Some(columns) = storage.as_struct_opt() else {
+        return Ok(storage);
+    };
+    let present = (0..storage.len())
+        .map(|row| storage.is_valid(row) && !is_placeholder(storage.as_ref(), row));
+    let (fields, children, _) = columns.clone().into_parts();
+    Ok(Arc::new(StructArray::try_new(
+        fields,
+        children,
+        Some(NullBuffer::from_iter(present)),
+    )?))
 }
 
 /// `variant_as_text(v)`: the text `->>` returns.
@@ -583,6 +612,7 @@ mod tests {
 
     /// Builds a session with the Variant surface over one table `t` holding
     /// a Variant `v`, a Struct `s` with a Variant child, and a JSON text `j`.
+    /// A `None` value makes that row's `v`, `j`, and `s` null.
     fn session(values: &[Option<&str>]) -> SessionContext {
         let mut variant = VariantColumnBuilder::with_capacity(values.len());
         for value in values {
@@ -593,9 +623,19 @@ mod tests {
         }
         let child = variant_field("features", false);
         let mut features = VariantColumnBuilder::with_capacity(values.len());
-        for _ in values {
-            features.append(&EncodedVariant::from_json_text(r#"{"k":1}"#).expect("json"));
+        for value in values {
+            match value {
+                Some(_) => {
+                    features.append(&EncodedVariant::from_json_text(r#"{"k":1}"#).expect("json"))
+                }
+                None => features.append_null(),
+            }
         }
+        // A null parent leaves its child slot as a valid empty-bytes
+        // placeholder, as the Parquet reader does.
+        let (feature_fields, feature_children, _) =
+            features.finish().as_struct().clone().into_parts();
+        let features = StructArray::new(feature_fields, feature_children, None);
         let structs = StructArray::new(
             vec![
                 Arc::new(Field::new("method", DataType::Utf8, false)),
@@ -604,13 +644,13 @@ mod tests {
             .into(),
             vec![
                 Arc::new(StringArray::from(vec!["psi"; values.len()])) as ArrayRef,
-                features.finish(),
+                Arc::new(features),
             ],
-            None,
+            Some(values.iter().map(Option::is_some).collect()),
         );
         let schema = Arc::new(Schema::new(vec![
             variant_field("v", true),
-            Field::new("s", structs.data_type().clone(), false),
+            Field::new("s", structs.data_type().clone(), true),
             Field::new("j", DataType::Utf8, true),
             Field::new("n", DataType::Int64, false),
         ]));
@@ -723,12 +763,20 @@ mod tests {
             ["x", "x", "NULL"]
         );
         assert_eq!(
-            column(&context, "SELECT s['method'] FROM t ORDER BY n").await,
-            ["psi", "psi", "psi"]
+            column(
+                &context,
+                "SELECT s['method'] FROM t WHERE s IS NOT NULL ORDER BY n"
+            )
+            .await,
+            ["psi", "psi"]
         );
         assert_eq!(
             column(&context, "SELECT s['features'] ->> 'k' FROM t ORDER BY n").await,
-            ["1", "1", "1"]
+            ["1", "1", "NULL"]
+        );
+        assert_eq!(
+            column(&context, "SELECT to_json(s['features']) FROM t ORDER BY n").await,
+            [r#"{"k":1}"#, r#"{"k":1}"#, "NULL"]
         );
         assert_eq!(
             column(&context, "SELECT try_parse_json('{nope') IS NULL").await,

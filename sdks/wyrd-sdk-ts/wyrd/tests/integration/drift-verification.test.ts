@@ -1029,7 +1029,7 @@ describe("continuous verification journey", () => {
         [agentUid, run.runId],
       ]);
       const recordOf = new Map(
-        evals.map((row) => [row.record_id, JSON.parse(String(row.context)).answer as string]),
+        evals.map((row) => [row.record_id, (row.context as { answer: string }).answer]),
       );
       const verdicts = await rows(
         query,

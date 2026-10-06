@@ -278,12 +278,15 @@ pub struct VariantJsonEncoderFactory;
 impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
     /// Pre-render every non-null cell of a Variant field as JSON text.
     ///
-    /// Rendering is done up front because the encoder itself cannot fail.
+    /// Rendering is done up front because the encoder itself cannot fail. A
+    /// Variant nested in a Struct sees only its own nulls, so the slot under a
+    /// null parent row holds empty `metadata` and `value` placeholders; that
+    /// slot is never encoded and renders nothing instead of failing.
     ///
     /// # Errors
     ///
-    /// Returns [`arrow::error::ArrowError::JsonError`] when a cell is not a
-    /// decodable unshredded Variant.
+    /// Returns [`arrow::error::ArrowError::JsonError`] when a cell with storage
+    /// is not a decodable unshredded Variant.
     fn make_default_encoder<'a>(
         &self,
         field: &'a arrow_schema::FieldRef,
@@ -295,7 +298,7 @@ impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
         }
         let rendered = (0..array.len())
             .map(|row| {
-                if array.is_null(row) {
+                if array.is_null(row) || is_placeholder(array, row) {
                     return Ok(String::new());
                 }
                 variant_cell_to_json(array, row)
@@ -313,6 +316,24 @@ impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
             array.logical_nulls(),
         )))
     }
+}
+
+/// Reports whether one Variant cell is an empty-storage placeholder.
+///
+/// Every encoded Variant has at least one `metadata` and one `value` byte, so
+/// a cell whose two children are both empty carries no value at all. Such a
+/// cell appears under a null parent struct, whose null is not pushed down into
+/// the child storage, so every Variant reader treats it as SQL null.
+pub fn is_placeholder(column: &dyn Array, row: usize) -> bool {
+    let empty = |name: &str| {
+        column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .and_then(|storage| storage.column_by_name(name))
+            .and_then(|child| binary_cell(child, row))
+            .is_some_and(<[u8]>::is_empty)
+    };
+    empty("metadata") && empty("value")
 }
 
 /// Pre-rendered JSON text of each row of one Variant column.
@@ -735,7 +756,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a Variant renders as its storage struct or a null drifts.
+    /// Panics when a Variant renders as its storage struct, a null drifts, or
+    /// the placeholder under a null parent row fails the write.
     #[test]
     fn json_writer_renders_variants_as_values() {
         use arrow::array::{RecordBatch, StringArray};
@@ -772,7 +794,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                column(&[Some(json!({"big": 9_007_199_254_740_993_i64, "z": null})), None]),
+                column(&[
+                    Some(json!({"big": 9_007_199_254_740_993_i64, "z": null})),
+                    None,
+                ]),
                 Arc::new(nested),
             ],
         )
@@ -791,5 +816,40 @@ mod tests {
                 {"v": null, "s": {"method": "psi", "features": [1, "a"]}},
             ])
         );
+
+        // A null parent row leaves its non-null Variant child an empty
+        // placeholder, which the parent's null hides rather than fails on.
+        let placeholder = StructArray::new(
+            variant_storage_fields(),
+            vec![
+                Arc::new(arrow::array::BinaryArray::from(vec![&b""[..]])) as ArrayRef,
+                Arc::new(arrow::array::BinaryArray::from(vec![&b""[..]])) as ArrayRef,
+            ],
+            None,
+        );
+        let report = StructArray::new(
+            Fields::from(vec![variant_field("features", false)]),
+            vec![Arc::new(placeholder) as ArrayRef],
+            Some(arrow::buffer::NullBuffer::from(vec![false])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "r",
+                report.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(report)],
+        )
+        .expect("batch");
+        let mut writer = arrow::json::WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .build::<_, JsonArray>(Vec::new());
+        writer
+            .write(&batch)
+            .expect("a null parent hides its placeholder child");
+        writer.finish().expect("finishes");
+        let rows: Value = serde_json::from_slice(&writer.into_inner()).expect("json");
+        assert_eq!(rows, json!([{"r": null}]));
     }
 }

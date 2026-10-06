@@ -105,7 +105,7 @@ class DriftRow(BaseModel):
 class EvalRow(BaseModel):
     """The Eval row, its trace identity, and the managed identity stamped onto it."""
 
-    context: str
+    context: dict
     session_id: str | None
     trace_id: bytes | None
     span_id: bytes | None
@@ -305,7 +305,7 @@ def assert_read_back(
         f"FROM vala.eval.observations WHERE run_id = '{run_id}'",
         EvalRow,
     )
-    by_answer = {json.loads(row.context)["answer"]: row for row in evals}
+    by_answer = {row.context["answer"]: row for row in evals}
     assert set(by_answer) == {"yes", "traced", "explicit"}
     assert {row.run_id for row in evals} == {run_id}
     assert {row.card_uid for row in evals} == {agent_uid}

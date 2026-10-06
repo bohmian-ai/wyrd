@@ -22,6 +22,7 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray, make_array};
@@ -198,10 +199,12 @@ impl EncodedVariant {
     /// Unlike [`Self::from_json`], numbers are classified from their original
     /// tokens, so an integer beyond the 64-bit range keeps its exact digits
     /// instead of passing through `f64`. The text is validated once as a
-    /// [`RawValue`], then each container is split into raw children; an object
-    /// repeating a key keeps its final occurrence. `serde_json` checks a raw
-    /// value's syntax with an explicit stack and no depth limit, so syntax is
-    /// decided at any depth and nesting is decided only by the Wyrd walk.
+    /// [`RawValue`], then split once into a [`JsonTree`] whose values the walk
+    /// visits once each; an object repeating a key keeps its final
+    /// occurrence. `serde_json` checks a raw value's syntax with an explicit
+    /// stack and no depth limit, so syntax is decided at any depth, nesting is
+    /// decided only by the Wyrd walk, and the work is proportional to the
+    /// text however deep it nests.
     ///
     /// The accepted part of the value is built before any recorded violation
     /// is selected, so bytes that already exceed the size limit report size
@@ -218,13 +221,18 @@ impl EncodedVariant {
     pub fn from_json_text(text: &str) -> Result<Self, VariantViolation> {
         let mut path = JsonPointer::default();
         let raw: &RawValue = serde_json::from_str(text).map_err(|_| invalid(&path))?;
+        let tree = JsonTree::split(raw.get());
         let mut builder = VariantBuilder::new();
         let mut found = VariantViolations::default();
-        append_raw(&mut builder, raw, &mut path, 0, &mut found);
-        let (metadata, value) = builder.finish();
-        let encoded = Self::sized(metadata, value)?;
+        append_raw(&mut builder, &tree, 0, &mut path, 0, &mut found);
+        // A refused root number leaves nothing built; its violation is recorded.
+        let built = builder.try_finish();
+        if let Ok((metadata, value)) = &built {
+            Self::within_size_limit(metadata.len() + value.len())?;
+        }
         found.finish()?;
-        Ok(encoded)
+        let (metadata, value) = built.map_err(|_| invalid(&path))?;
+        Ok(Self { metadata, value })
     }
 
     /// Accept already-encoded Variant bytes after full validation.
@@ -247,18 +255,23 @@ impl EncodedVariant {
         })
     }
 
-    /// Check borrowed Variant bytes against every Bifrost rule without copying.
+    /// Check borrowed Variant bytes against every Bifrost rule without copying
+    /// and return the validated upstream value.
     ///
     /// Every raw entry point — [`Self::from_bytes`] and each stored-Variant
     /// renderer — calls this before upstream's recursive validation or
-    /// rendering. Size is checked first. Then [`scan_encoded`] visits every
+    /// rendering; a renderer consumes the returned value, so the bytes are
+    /// fully validated once. Size is checked first, then the metadata is
+    /// parsed once and shared by the scan and upstream validation. Then
+    /// [`scan_encoded`] visits every
     /// node of the size-bounded value with an explicit stack, recording
     /// malformed or non-canonical encoding, numbers outside the exact domain,
     /// and the first container past [`VARIANT_MAX_DEPTH`]. Upstream's
     /// recursive [`Variant::try_new`] recurses once per nesting level, and a
     /// compact hostile value can nest far deeper than any stack allows, so it
     /// runs only when no depth violation was found; it remains the encoding
-    /// authority for every accepted value. The shallow accessors the scan
+    /// authority for every accepted value and builds the returned value. The
+    /// shallow accessors the scan
     /// uses panic on malformed bytes, which is contained here and reported as
     /// invalid. The recorded violations then select one error, malformed
     /// first.
@@ -266,22 +279,28 @@ impl EncodedVariant {
     /// # Errors
     ///
     /// Returns the same violations, in the same order, as [`Self::from_bytes`].
-    fn validate(metadata: &[u8], value: &[u8]) -> Result<(), VariantViolation> {
+    fn validate<'m, 'v>(
+        metadata: &'m [u8],
+        value: &'v [u8],
+    ) -> Result<Variant<'m, 'v>, VariantViolation> {
         Self::within_size_limit(metadata.len() + value.len())?;
         let root = JsonPointer::default();
-        let mut found =
-            std::panic::catch_unwind(|| scan_encoded(metadata, value)).unwrap_or_else(|_| {
+        let metadata = VariantMetadata::try_new(metadata).map_err(|_| invalid(&root))?;
+        let mut found = std::panic::catch_unwind(|| scan_encoded(metadata.clone(), value))
+            .unwrap_or_else(|_| {
                 let mut found = VariantViolations::default();
                 found.record(invalid(&root));
                 found
             });
-        if found.malformed.is_none()
-            && found.depth.is_none()
-            && Variant::try_new(metadata, value).is_err()
-        {
-            found.record(invalid(&root));
+        let mut checked = None;
+        if found.malformed.is_none() && found.depth.is_none() {
+            match Variant::try_new_with_metadata(metadata, value) {
+                Ok(variant) => checked = Some(variant),
+                Err(_) => found.record(invalid(&root)),
+            }
         }
-        found.finish()
+        found.finish()?;
+        checked.ok_or_else(|| invalid(&root))
     }
 
     /// Refuse an encoding of `bytes` metadata plus value bytes past the limit.
@@ -295,19 +314,6 @@ impl EncodedVariant {
             return Err(VariantViolation::TooLarge { bytes });
         }
         Ok(())
-    }
-
-    /// Wrap finished bytes after the size check.
-    ///
-    /// Private because size is only the first check: the public constructors
-    /// call it and then add the encoding and depth guarantees the type promises.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VariantViolation::TooLarge`] past [`VARIANT_MAX_ENCODED_BYTES`].
-    fn sized(metadata: Vec<u8>, value: Vec<u8>) -> Result<Self, VariantViolation> {
-        Self::within_size_limit(metadata.len() + value.len())?;
-        Ok(Self { metadata, value })
     }
 
     /// Return the metadata bytes.
@@ -336,8 +342,9 @@ impl EncodedVariant {
 ///
 /// Result terminals use this to turn an Arrow Variant column cell into the
 /// language's native open value. The bytes pass the same bounded gate as
-/// [`EncodedVariant::from_bytes`] before upstream recursive rendering, so a
-/// hostile stored value is an error rather than unbounded work.
+/// [`EncodedVariant::from_bytes`], which returns the validated value that is
+/// rendered, so a hostile stored value is an error rather than unbounded work
+/// and an accepted one is validated once.
 ///
 /// # Errors
 ///
@@ -345,9 +352,8 @@ impl EncodedVariant {
 /// a Bifrost Variant rule, and [`VariantViolation::InvalidJson`] when an
 /// accepted value still fails to render.
 pub fn variant_bytes_to_json(metadata: &[u8], value: &[u8]) -> Result<Value, VariantViolation> {
-    EncodedVariant::validate(metadata, value)?;
-    Variant::try_new(metadata, value)
-        .and_then(|variant| variant.to_json_value())
+    EncodedVariant::validate(metadata, value)?
+        .to_json_value()
         .map_err(|_| VariantViolation::InvalidJson {
             path: String::new(),
         })
@@ -715,44 +721,194 @@ fn enter_container(depth: u32, path: &JsonPointer, found: &mut VariantViolations
     (depth, within)
 }
 
-/// Append one validated raw JSON value to any Variant builder position.
+#[cfg(test)]
+thread_local! {
+    /// Bytes of JSON text the Variant walk has read, so tests can show each
+    /// byte is read at most once.
+    static WALK_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One value inside syntax-validated JSON text.
+#[derive(Debug)]
+struct JsonNode {
+    /// Byte range of the whole value in the text.
+    span: Range<usize>,
+    /// Members in text order: an object member's key range, or `None` for a
+    /// list item, and the member's node index.
+    members: Vec<(Option<Range<usize>>, usize)>,
+}
+
+/// Syntax-validated JSON text split into its values in one pass.
 ///
-/// The token's first byte selects its kind; containers are split into raw
-/// children and walked recursively, and numbers go to [`raw_number_variant`]
-/// with their original text. `depth` is the number of containers already
-/// open above this value.
+/// `serde_json` stays the only syntax authority: the text has already been
+/// accepted as a [`RawValue`], so splitting only has to find where each
+/// value, key, and container starts and ends. The Variant walk then visits
+/// each value once through its node instead of re-parsing every container's
+/// text, so its work is proportional to the text at any depth. Keys and
+/// leaves are decoded by `serde_json` and [`raw_number_variant`] from their
+/// own disjoint spans.
+#[derive(Debug)]
+struct JsonTree<'t> {
+    /// The validated text.
+    text: &'t str,
+    /// Every value in text order; the root is node 0.
+    nodes: Vec<JsonNode>,
+}
+
+impl<'t> JsonTree<'t> {
+    /// Split validated JSON text into nodes with one left-to-right scan.
+    ///
+    /// Strings are skipped by their escapes, so a structural byte inside a
+    /// string never opens or closes anything. Inside an object, a string
+    /// with no pending key is that member's key; every other value becomes a
+    /// node attached to the innermost open container.
+    fn split(text: &'t str) -> Self {
+        let bytes = text.as_bytes();
+        let mut tree = Self {
+            text,
+            nodes: Vec::new(),
+        };
+        let mut open: Vec<usize> = Vec::new();
+        let mut key = None;
+        let mut at = 0;
+        while let Some(&byte) = bytes.get(at) {
+            let start = at;
+            at += 1;
+            match byte {
+                b'{' | b'[' => open.push(tree.attach(start..start, &open, &mut key)),
+                b'}' | b']' => {
+                    if let Some(node) = open.pop() {
+                        tree.nodes[node].span.end = at;
+                    }
+                }
+                b'"' => {
+                    while let Some(&byte) = bytes.get(at) {
+                        at += match byte {
+                            b'"' => break,
+                            b'\\' => 2,
+                            _ => 1,
+                        };
+                    }
+                    at += 1;
+                    let in_object = open
+                        .last()
+                        .is_some_and(|&node| tree.kind(node) == Some(b'{'));
+                    if in_object && key.is_none() {
+                        key = Some(start..at);
+                    } else {
+                        tree.attach(start..at, &open, &mut key);
+                    }
+                }
+                b',' | b':' | b' ' | b'\t' | b'\n' | b'\r' => {}
+                _ => {
+                    while bytes
+                        .get(at)
+                        .is_some_and(|byte| !b",]} \t\n\r".contains(byte))
+                    {
+                        at += 1;
+                    }
+                    tree.attach(start..at, &open, &mut key);
+                }
+            }
+        }
+        tree
+    }
+
+    /// Add a value spanning `span` under the innermost open container,
+    /// consuming the pending object key, and return its node index.
+    fn attach(
+        &mut self,
+        span: Range<usize>,
+        open: &[usize],
+        key: &mut Option<Range<usize>>,
+    ) -> usize {
+        let node = self.nodes.len();
+        self.nodes.push(JsonNode {
+            span,
+            members: Vec::new(),
+        });
+        if let Some(&parent) = open.last() {
+            self.nodes[parent].members.push((key.take(), node));
+        }
+        node
+    }
+
+    /// Return the first byte of a value, which selects its kind.
+    fn kind(&self, node: usize) -> Option<u8> {
+        self.text
+            .as_bytes()
+            .get(self.nodes[node].span.start)
+            .copied()
+    }
+
+    /// Return the text of one scalar value or key.
+    fn read(&self, span: Range<usize>) -> &'t str {
+        #[cfg(test)]
+        WALK_READ_BYTES.with(|read| read.set(read.get() + span.len()));
+        &self.text[span]
+    }
+
+    /// Return the text of one scalar value.
+    fn token(&self, node: usize) -> &'t str {
+        self.read(self.nodes[node].span.clone())
+    }
+
+    /// Return an object's members by decoded key, keeping the final
+    /// occurrence of a repeated key, in sorted key order.
+    ///
+    /// Returns `None` when a key does not decode, which validated text never
+    /// produces.
+    fn entries(&self, node: usize) -> Option<BTreeMap<String, usize>> {
+        let mut entries = BTreeMap::new();
+        for (key, child) in &self.nodes[node].members {
+            let key = serde_json::from_str::<String>(self.read(key.clone()?)).ok()?;
+            entries.insert(key, *child);
+        }
+        Some(entries)
+    }
+
+    /// Return a list's items in order.
+    fn items(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+        self.nodes[node].members.iter().map(|(_, item)| *item)
+    }
+}
+
+/// Append one JSON value to any Variant builder position.
+///
+/// The value's first byte selects its kind; containers are walked
+/// recursively through their [`JsonTree`] members and numbers go to
+/// [`raw_number_variant`] with their original text. `depth` is the number of
+/// containers already open above this value.
 ///
 /// Every violation is recorded in `found` rather than returned, so the walk
 /// always covers the whole value and [`VariantViolations::finish`] alone
-/// picks the error. A refused number is built as a placeholder null. A
-/// container past the depth limit is not built: [`scan_numbers`] searches it
-/// without recursion, so an out-of-range number below the limit still
-/// outranks depth. Recursion therefore never passes the limit.
+/// picks the error. Neither a refused number nor a container past the depth
+/// limit is built, so neither adds bytes to the size check: [`scan_numbers`]
+/// searches the deep container without recursion, so an out-of-range number
+/// below the limit still outranks depth. Recursion therefore never passes the
+/// limit.
 fn append_raw(
     builder: &mut impl VariantBuilderExt,
-    raw: &RawValue,
+    tree: &JsonTree<'_>,
+    node: usize,
     path: &mut JsonPointer,
     depth: u32,
     found: &mut VariantViolations,
 ) {
-    let text = raw.get();
-    let first = text.as_bytes().first();
-    let depth = if matches!(first, Some(b'{' | b'[')) {
+    let kind = tree.kind(node);
+    let depth = if matches!(kind, Some(b'{' | b'[')) {
         let (depth, within) = enter_container(depth, path, found);
         if !within {
-            scan_numbers(raw, path, found);
+            scan_numbers(tree, node, path, found);
             return;
         }
         depth
     } else {
         depth
     };
-    match first {
+    match kind {
         Some(b'{') => {
-            // A map keeps the final occurrence of a repeated key.
-            // ponytail: each level re-scans its subtree, so cost is bounded by
-            // depth (64) times size; a streaming visitor if parse_json profiles hot.
-            let Ok(entries) = serde_json::from_str::<BTreeMap<String, &RawValue>>(text) else {
+            let Some(entries) = tree.entries(node) else {
                 return found.record(invalid(path));
             };
             let Ok(mut object) = builder.try_new_object() else {
@@ -760,12 +916,13 @@ fn append_raw(
             };
             for (key, child) in entries {
                 path.push_key(&key);
-                if child.get() == "null" {
+                if tree.kind(child) == Some(b'n') {
                     // A field builder would treat null as an absent key.
                     object.insert(&key, Variant::Null);
                 } else {
                     append_raw(
                         &mut ObjectFieldBuilder::new(&key, &mut object),
+                        tree,
                         child,
                         path,
                         depth,
@@ -777,32 +934,26 @@ fn append_raw(
             object.finish();
         }
         Some(b'[') => {
-            let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) else {
-                return found.record(invalid(path));
-            };
             let Ok(mut list) = builder.try_new_list() else {
                 return found.record(invalid(path));
             };
-            for (index, item) in items.into_iter().enumerate() {
+            for (index, item) in tree.items(node).enumerate() {
                 path.push_index(index);
-                append_raw(&mut list, item, path, depth, found);
+                append_raw(&mut list, tree, item, path, depth, found);
                 path.pop();
             }
             list.finish();
         }
-        Some(b'"') => match serde_json::from_str::<String>(text) {
+        Some(b'"') => match serde_json::from_str::<String>(tree.token(node)) {
             Ok(string) => builder.append_value(string.as_str()),
             Err(_) => found.record(invalid(path)),
         },
         Some(b't') => builder.append_value(true),
         Some(b'f') => builder.append_value(false),
         Some(b'n') => builder.append_value(Variant::Null),
-        _ => match raw_number_variant(text, path) {
+        _ => match raw_number_variant(tree.token(node), path) {
             Ok(number) => builder.append_value(number),
-            Err(violation) => {
-                found.record(violation);
-                builder.append_value(Variant::Null);
-            }
+            Err(violation) => found.record(violation),
         },
     }
 }
@@ -815,46 +966,42 @@ fn append_raw(
 /// key kept, then list items — so the reported pointer is the one the normal
 /// walk would name. Nothing is searched once a numeric violation is known,
 /// since only the first one is reported. `path` is restored on return.
-///
-/// ponytail: each container re-parses its subtree to split it, so cost is
-/// subtree size times depth below the limit; a one-pass number search if
-/// deep JSON input profiles hot.
-fn scan_numbers(raw: &RawValue, path: &mut JsonPointer, found: &mut VariantViolations) {
+fn scan_numbers(
+    tree: &JsonTree<'_>,
+    root: usize,
+    path: &mut JsonPointer,
+    found: &mut VariantViolations,
+) {
     let base = path.tokens.len();
     // Each pending value carries its parent's pointer depth and its token.
-    let mut pending: Vec<(usize, Option<String>, &RawValue)> = vec![(base, None, raw)];
+    let mut pending: Vec<(usize, Option<String>, usize)> = vec![(base, None, root)];
     while found.numeric.is_none() {
-        let Some((parent, token, raw)) = pending.pop() else {
+        let Some((parent, token, node)) = pending.pop() else {
             break;
         };
         path.truncate(parent);
         if let Some(token) = token {
             path.tokens.push(token);
         }
-        let text = raw.get();
         let here = path.tokens.len();
         let start = pending.len();
-        match text.as_bytes().first() {
-            Some(b'{') => match serde_json::from_str::<BTreeMap<String, &RawValue>>(text) {
-                Ok(entries) => pending.extend(
+        match tree.kind(node) {
+            Some(b'{') => match tree.entries(node) {
+                Some(entries) => pending.extend(
                     entries
                         .into_iter()
                         .map(|(key, child)| (here, Some(JsonPointer::escape(&key)), child)),
                 ),
-                Err(_) => found.record(invalid(path)),
+                None => found.record(invalid(path)),
             },
-            Some(b'[') => match serde_json::from_str::<Vec<&RawValue>>(text) {
-                Ok(items) => pending.extend(
-                    items
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, item)| (here, Some(index.to_string()), item)),
-                ),
-                Err(_) => found.record(invalid(path)),
-            },
+            Some(b'[') => pending.extend(
+                tree.items(node)
+                    .enumerate()
+                    .map(|(index, item)| (here, Some(index.to_string()), item)),
+            ),
             Some(b'"' | b't' | b'f' | b'n') => {}
             _ => {
-                if let Err(violation) = raw_number_variant(text, path) {
+                if let Err(violation) = raw_number_variant(tree.token(node), path) {
                     found.record(violation);
                 }
             }
@@ -931,7 +1078,7 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
 
 /// Visit every node of raw Variant bytes and record what is wrong with them.
 ///
-/// Metadata is fully validated first. Nodes are then reached through
+/// The caller has fully validated the metadata. Nodes are reached through
 /// upstream's shallow, constant-time accessors from an explicit stack, so a
 /// hostile depth costs heap, not call stack, and the whole size-bounded value
 /// is covered. Together the shallow node checks, the object field-name order
@@ -940,7 +1087,8 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
 ///
 /// - each object field owns its own byte slot ([`object_field_slots`]), so no
 ///   two fields share or overlap bytes and every node owns at least one byte,
-///   which keeps this walk and every later render linear in the input;
+///   so a value holds no more nodes than bytes and neither this walk nor any
+///   later render can be amplified beyond the size-bounded input;
 /// - resolved object field names strictly increase in both metadata modes, so
 ///   a name occurs once and lookup and rendering agree;
 /// - numbers stay in the JSON domain: Decimal4 and Decimal8 are refused, a
@@ -956,13 +1104,9 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
 ///
 /// Panics when a node's bytes are malformed; [`EncodedVariant::validate`]
 /// contains it.
-fn scan_encoded(metadata: &[u8], value: &[u8]) -> VariantViolations {
+fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolations {
     let mut found = VariantViolations::default();
     let mut path = JsonPointer::default();
-    let Ok(metadata) = VariantMetadata::try_new(metadata) else {
-        found.record(invalid(&path));
-        return found;
-    };
     let exact_unsigned = i128::from(i64::MAX) + 1..=i128::from(u64::MAX);
     // Each pending node carries its parent's pointer depth, its token, and
     // the number of containers open above it.
@@ -1376,6 +1520,73 @@ mod tests {
         ));
     }
 
+    /// A refused number builds nothing, so it cannot push accepted bytes that
+    /// fit the size limit past it.
+    ///
+    /// The accepted string is sized so the value lands exactly on the limit;
+    /// adding a refused number beside it must report the number, not size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the accepted value misses the limit or the refused number
+    /// is reported as size.
+    #[test]
+    fn refused_numbers_add_no_size() {
+        let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES).expect("fits");
+        let text =
+            |length: usize, extra: &str| format!(r#"{{"big": "{}"{extra}}}"#, "x".repeat(length));
+        let near = limit - 64;
+        let overhead = EncodedVariant::from_json_text(&text(near, ""))
+            .expect("fits")
+            .encoded_bytes()
+            - near;
+        let exact = text(limit - overhead, "");
+        assert_eq!(
+            EncodedVariant::from_json_text(&exact).map(|encoded| encoded.encoded_bytes()),
+            Ok(limit)
+        );
+        assert_eq!(
+            EncodedVariant::from_json_text(&text(limit - overhead, r#", "n": 1e400"#)),
+            Err(VariantViolation::NumericOutOfRange {
+                path: "/n".to_owned(),
+                numeric_kind: "double",
+            })
+        );
+    }
+
+    /// The JSON walk reads each byte of compact deep input at most once, so
+    /// its work is proportional to the text at any depth.
+    ///
+    /// Counts the bytes the walk reads rather than timing it: re-parsing a
+    /// container's text at each level would read the shared suffix once per
+    /// level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the walk reads more bytes than the text holds or deep
+    /// input stops classifying as before.
+    #[test]
+    fn json_walk_reads_each_byte_once() {
+        for levels in [1_000, 10_000] {
+            for text in [
+                nested_text("1", levels),
+                format!(r#"{}1{}"#, r#"{"a":"#.repeat(levels), "}".repeat(levels)),
+            ] {
+                WALK_READ_BYTES.with(|read| read.set(0));
+                assert!(matches!(
+                    EncodedVariant::from_json_text(&text),
+                    Err(VariantViolation::TooDeep { depth: 65, .. })
+                ));
+                let read = WALK_READ_BYTES.with(std::cell::Cell::get);
+                assert!(
+                    read <= text.len(),
+                    "{levels}: read {read} of {}",
+                    text.len()
+                );
+            }
+        }
+    }
+
     /// A compact raw Variant nested far past the limit is refused for depth
     /// before upstream's recursive validation can exhaust the stack, and
     /// malformed bytes stay a typed error.
@@ -1629,10 +1840,11 @@ mod tests {
             .build::<_, JsonArray>(Vec::new());
         assert!(writer.write(&batch).is_err());
 
-        let ordinary = EncodedVariant::from_json(&json!({"k": [1, 2.5]})).expect("encodes");
+        let ordinary = json!({"k": {"n": [1, 2.5]}});
+        let encoded = EncodedVariant::from_json(&ordinary).expect("encodes");
         assert_eq!(
-            variant_bytes_to_json(ordinary.metadata(), ordinary.value()),
-            Ok(json!({"k": [1, 2.5]}))
+            variant_bytes_to_json(encoded.metadata(), encoded.value()),
+            Ok(ordinary)
         );
     }
 

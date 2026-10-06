@@ -331,19 +331,22 @@ impl EncoderFactory for VariantJsonEncoderFactory {
     }
 }
 
-/// Mark every empty-storage placeholder row of a Variant column as null.
+/// Prepare one stored Variant column for upstream decoding.
 ///
 /// Every encoded Variant has at least one `metadata` and one `value` byte, so
 /// a cell whose two children are both empty carries no value at all. Such a
 /// cell appears under a null parent struct, whose null is neither pushed down
-/// by the Parquet reader nor by `get_field`, and the upstream decoder panics
-/// on it, so every reader masks the column here before decoding. A non-struct
-/// array is returned unchanged.
+/// by the Parquet reader nor by `get_field`, so it is marked null here. Every
+/// other present cell is then fully validated with [`Variant::try_new`]:
+/// upstream decoding validates shallowly and panics on malformed bytes, so
+/// every reader passes the column through here first and malformed stored
+/// bytes become an error instead. A non-struct array is returned unchanged.
 ///
 /// # Errors
 ///
 /// Returns the Arrow error raised while viewing a child as bytes or
-/// reassembling the masked struct.
+/// reassembling the masked struct, and [`ArrowError::InvalidArgumentError`]
+/// naming the row of the first present cell that is not a valid Variant.
 pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
     let Some(columns) = storage.as_struct_opt() else {
         return Ok(storage);
@@ -355,18 +358,30 @@ pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
             .transpose()
     };
     let (metadata, value) = (bytes("metadata")?, bytes("value")?);
-    let empty = |child: &Option<ArrayRef>, row: usize| {
-        child
-            .as_ref()
-            .is_some_and(|child| child.as_binary_view().value(row).is_empty())
-    };
-    let present = (0..storage.len())
-        .map(|row| storage.is_valid(row) && !(empty(&metadata, row) && empty(&value, row)));
+    let mut present = Vec::with_capacity(storage.len());
+    for row in 0..storage.len() {
+        let cell = match (&metadata, &value) {
+            (Some(metadata), Some(value)) => Some((
+                metadata.as_binary_view().value(row),
+                value.as_binary_view().value(row),
+            )),
+            _ => None,
+        };
+        let valid = storage.is_valid(row) && !matches!(cell, Some(([], [])));
+        if let (true, Some((metadata, value))) = (valid, cell) {
+            Variant::try_new(metadata, value).map_err(|error| {
+                ArrowError::InvalidArgumentError(format!(
+                    "row {row} is not a valid stored Variant: {error}"
+                ))
+            })?;
+        }
+        present.push(valid);
+    }
     let (fields, children, _) = columns.clone().into_parts();
     Ok(Arc::new(StructArray::try_new(
         fields,
         children,
-        Some(present.collect::<NullBuffer>()),
+        Some(NullBuffer::from(present)),
     )?))
 }
 
@@ -908,6 +923,35 @@ mod tests {
                 path: String::new(),
             }
         );
+    }
+
+    /// Malformed stored Variant bytes are an error at every reader, not a panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reader accepts the malformed cell or upstream decoding
+    /// panics on it.
+    #[test]
+    fn malformed_stored_variant_is_an_error_not_a_panic() {
+        let column: ArrayRef = Arc::new(StructArray::new(
+            variant_storage_fields(),
+            vec![
+                Arc::new(BinaryArray::from(vec![&[0xff_u8][..]])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&[0xff_u8][..]])) as ArrayRef,
+            ],
+            None,
+        ));
+        assert!(mask_placeholders(Arc::clone(&column)).is_err());
+        assert!(variant_cell_to_json(column.as_ref(), 0).is_err());
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![variant_field("v", false)])),
+            vec![column],
+        )
+        .expect("batch");
+        let mut writer = WriterBuilder::new()
+            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .build::<_, JsonArray>(Vec::new());
+        assert!(writer.write(&batch).is_err());
     }
 
     /// Arrow's JSON writer renders top-level and nested Variants as values.

@@ -330,7 +330,9 @@ fn per_row_get(root: &ArrayRef, elements: &[ColumnarValue], rows: usize) -> Resu
             .map(|column| scalar_path_element(&ScalarValue::try_from_array(column, row).ok()?))
             .collect();
         let value = match path {
-            Some(path) if root.is_valid(row) => Some((root.value(row), VariantPath::new(path))),
+            Some(path) if root.is_valid(row) => {
+                Some((root.try_value(row)?, VariantPath::new(path)))
+            }
             _ => None,
         };
         match value
@@ -623,7 +625,7 @@ impl ScalarUDFImpl for ParseJson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::array::{BinaryArray, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::Schema;
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use datafusion::datasource::MemTable;
@@ -862,6 +864,66 @@ mod tests {
                     numeric_kind: "integer".to_owned(),
                 },
                 "{token}"
+            );
+        }
+    }
+
+    /// Malformed stored Variant bytes fail every Variant function, never panic.
+    ///
+    /// Upstream decoding validates shallowly and panics on such bytes, so this
+    /// proves each reader path validates the stored column first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a query over the malformed cell succeeds or panics.
+    #[tokio::test]
+    async fn malformed_stored_variant_fails_every_function_without_panicking() {
+        let malformed = || Arc::new(BinaryArray::from(vec![&[0xff_u8][..]])) as ArrayRef;
+        let DataType::Struct(storage) = variant_field("v", true).data_type().clone() else {
+            panic!("Variant storage is a struct");
+        };
+        let schema = Arc::new(Schema::new(vec![
+            variant_field("v", true),
+            Field::new("k", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StructArray::new(
+                    storage,
+                    vec![malformed(), malformed()],
+                    None,
+                )),
+                Arc::new(StringArray::from(vec![Some("a")])),
+            ],
+        )
+        .expect("batch");
+        let state = OracleVariantSql::shared()
+            .install(SessionStateBuilder::new().with_default_features())
+            .build();
+        let context = SessionContext::new_with_state(state);
+        context
+            .register_table(
+                "m",
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table")),
+            )
+            .expect("register");
+        for sql in [
+            "SELECT v -> 'a' FROM m",
+            "SELECT v -> k FROM m",
+            "SELECT v ->> 'a' FROM m",
+            "SELECT to_json(v) FROM m",
+        ] {
+            let error = context
+                .sql(sql)
+                .await
+                .expect(sql)
+                .collect()
+                .await
+                .expect_err(sql);
+            assert!(
+                error.to_string().contains("is not a valid stored Variant"),
+                "{sql} refuses the malformed cell instead of panicking: {error}"
             );
         }
     }

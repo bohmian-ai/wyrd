@@ -3,7 +3,9 @@
 import json
 import sys
 
-from wyrd.cli import run_wyrd_cli
+import pytest
+from wyrd import WyrdError
+from wyrd.cli import plan, run_wyrd_cli
 
 
 def _run(monkeypatch, args: list[str]) -> int:
@@ -102,3 +104,10 @@ def test_packaged_cli_preserves_runtime_codes(tmp_path, monkeypatch) -> None:
         )
         == 2
     )
+
+
+def test_in_process_plan_raises_catalog_error_for_missing_tree(tmp_path) -> None:
+    """In-process commands raise WyrdError instead of exiting."""
+    with pytest.raises(WyrdError) as caught:
+        plan(str(tmp_path / "missing.yaml"))
+    assert caught.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

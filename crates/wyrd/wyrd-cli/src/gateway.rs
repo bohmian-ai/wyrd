@@ -14,8 +14,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Error as JsonError;
 use serde_json::error::Category;
-use wyrd_client::Gateway;
 use wyrd_client::gateway_credential::CredentialWriter;
+use wyrd_client::{Gateway, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{ProviderCredentialView, ProviderCredentialWrite};
 use wyrd_spec::ids::{ProviderCredentialName, ProviderDeploymentName};
@@ -144,24 +144,18 @@ impl GatewayCommand {
             // Credential mutation runs on the handle no SDK re-exports: a
             // submission can carry a key value, and a name-only revoke or
             // delete cannot be told apart from one aimed at a managed secret.
-            GatewayResource::Credential(verb) => {
-                let credentials = CredentialWriter::new(client);
-                match verb {
-                    CredentialVerb::Put(arg) => print(
-                        &credentials
-                            .put_credential(&read_document(&arg.file)?)
-                            .await?,
-                    ),
-                    CredentialVerb::Get(arg) => print(&gateway.credential(&arg.name).await?),
-                    CredentialVerb::List => print(&gateway.credentials().await?),
-                    CredentialVerb::Revoke(arg) => {
-                        print(&credentials.revoke_credential(&arg.name).await?)
-                    }
-                    CredentialVerb::Delete(arg) => {
-                        Ok(credentials.delete_credential(&arg.name).await?)
-                    }
+            // The mutating verbs render the in-process command functions.
+            GatewayResource::Credential(verb) => match verb {
+                CredentialVerb::Put(arg) => {
+                    print(&put_credential_with(client, &read_document(&arg.file)?).await?)
                 }
-            }
+                CredentialVerb::Get(arg) => print(&gateway.credential(&arg.name).await?),
+                CredentialVerb::List => print(&gateway.credentials().await?),
+                CredentialVerb::Revoke(arg) => {
+                    print(&revoke_credential_with(client, &arg.name).await?)
+                }
+                CredentialVerb::Delete(arg) => Ok(delete_credential_with(client, &arg.name).await?),
+            },
             GatewayResource::Deployment(verb) => match verb {
                 DeploymentVerb::Put(arg) => {
                     print(&gateway.put_deployment(&read_document(&arg.file)?).await?)
@@ -201,15 +195,6 @@ impl GatewayCommand {
     }
 }
 
-/// Build the provider-credential writer, optionally re-pointed at `server`.
-///
-/// # Errors
-/// Returns the client-assembly errors documented on
-/// [`crate::client::from_global`].
-fn credential_writer(server: Option<&str>) -> Result<CredentialWriter, WyrdCliError> {
-    crate::client::from_global(server).map(CredentialWriter::new)
-}
-
 /// Create or rotate one provider credential and return its redacted view.
 ///
 /// The in-process form of `wyrd gateway credential put`; the view is exactly
@@ -225,7 +210,7 @@ pub async fn put_provider_credential(
     write: &ProviderCredentialWrite,
     server: Option<&str>,
 ) -> Result<ProviderCredentialView, WyrdError> {
-    credential_writer(server)?.put_credential(write).await
+    put_credential_with(crate::client::from_global(server)?, write).await
 }
 
 /// Terminally revoke one provider credential and return its redacted view.
@@ -240,7 +225,7 @@ pub async fn revoke_provider_credential(
     name: &ProviderCredentialName,
     server: Option<&str>,
 ) -> Result<ProviderCredentialView, WyrdError> {
-    credential_writer(server)?.revoke_credential(name).await
+    revoke_credential_with(crate::client::from_global(server)?, name).await
 }
 
 /// Delete one unreferenced provider credential; an absent name succeeds.
@@ -254,7 +239,50 @@ pub async fn delete_provider_credential(
     name: &ProviderCredentialName,
     server: Option<&str>,
 ) -> Result<(), WyrdError> {
-    credential_writer(server)?.delete_credential(name).await
+    delete_credential_with(crate::client::from_global(server)?, name).await
+}
+
+/// Create or rotate one provider credential over an assembled `client`.
+///
+/// The single credential-put path behind both [`put_provider_credential`] and
+/// the executable, which passes the client it already built.
+///
+/// # Errors
+/// Returns the server's permission, invalid-configuration, conflict, or
+/// availability error.
+async fn put_credential_with(
+    client: WyrdClient,
+    write: &ProviderCredentialWrite,
+) -> Result<ProviderCredentialView, WyrdError> {
+    CredentialWriter::new(client).put_credential(write).await
+}
+
+/// Terminally revoke one provider credential over an assembled `client`.
+///
+/// The single revoke path behind [`revoke_provider_credential`] and the
+/// executable.
+///
+/// # Errors
+/// Returns the server's permission, not-found, or availability error.
+async fn revoke_credential_with(
+    client: WyrdClient,
+    name: &ProviderCredentialName,
+) -> Result<ProviderCredentialView, WyrdError> {
+    CredentialWriter::new(client).revoke_credential(name).await
+}
+
+/// Delete one unreferenced provider credential over an assembled `client`.
+///
+/// The single delete path behind [`delete_provider_credential`] and the
+/// executable; an absent name succeeds.
+///
+/// # Errors
+/// Returns the server's permission, conflict, or availability error.
+async fn delete_credential_with(
+    client: WyrdClient,
+    name: &ProviderCredentialName,
+) -> Result<(), WyrdError> {
+    CredentialWriter::new(client).delete_credential(name).await
 }
 
 /// Reads and decodes one typed JSON request document from `path`, or from

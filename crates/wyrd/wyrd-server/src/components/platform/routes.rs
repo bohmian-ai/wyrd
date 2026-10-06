@@ -34,6 +34,7 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::oauth::{OAuthError, OAuthForm, TOKEN_EXCHANGE, no_store};
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::builtins::BuiltinTables;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
@@ -232,10 +233,7 @@ async fn create_tenant(
     caller: PlatformCaller,
     Json(request): Json<CreateTenantRequest>,
 ) -> Result<Json<CreateTenantResponse>, WyrdErrorResponse> {
-    let Some(operator) = state.postgres.operator_pool() else {
-        return Err(not_configured());
-    };
-    let provisioning = TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox));
+    let provisioning = directory(&state)?;
 
     // Two phases because the tenant id is only settled by the directory claim:
     // a resumed attempt adopts the failed attempt's id. The connection is
@@ -397,13 +395,18 @@ async fn set_tenant_status(
 
 /// Bind the tenant directory owner to this request, or report it unconfigured.
 ///
+/// The owner also carries the process's Bifrost catalog, through which a new
+/// tenant receives every built-in table before promotion.
+///
 /// # Errors
 /// Returns the unconfigured-plane error when the deployment has no operator
-/// connection.
+/// connection or this process retains no Bifrost catalog.
 fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> {
-    state
-        .postgres
-        .operator_pool()
-        .map(|operator| TenantProvisioning::new(operator, Arc::clone(&state.audit_outbox)))
-        .ok_or_else(not_configured)
+    let operator = state.postgres.operator_pool().ok_or_else(not_configured)?;
+    let catalog = state.bifrost.catalog().ok_or_else(not_configured)?;
+    Ok(TenantProvisioning::new(
+        operator,
+        Arc::clone(&state.audit_outbox),
+        BuiltinTables::new(Arc::clone(catalog)),
+    ))
 }

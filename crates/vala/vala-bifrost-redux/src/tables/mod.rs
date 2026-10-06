@@ -12,7 +12,6 @@ use wyrd_spec::vala::managed_columns::{
 };
 
 pub mod audit;
-pub mod dev;
 pub mod drift;
 pub mod eval;
 pub mod fields;
@@ -25,7 +24,6 @@ pub mod traces;
 pub mod verification;
 
 pub use audit::AuditLogTable;
-pub use dev::AgentTracesTable;
 pub use drift::ObservationsTable;
 pub use drift::{ObservationsTable as DriftObservationsTable, ResultFeaturesTable};
 pub use eval::{ObservationsTable as EvalObservationsTable, ResultItemsTable};
@@ -59,8 +57,6 @@ pub enum TableError {
 pub enum CorrelationPolicy {
     /// Traces, metrics, logs, `GenAI`, eval, and drift rows.
     Observation,
-    /// Agent traces own their `run_id` content column.
-    CodeAxis,
     /// Audit content has its own identity columns.
     None,
 }
@@ -75,7 +71,6 @@ impl CorrelationPolicy {
                 wyrd_spec::vala::CARD_UID,
                 wyrd_spec::vala::PRINCIPAL_ID,
             ],
-            Self::CodeAxis => &[wyrd_spec::vala::CARD_UID, wyrd_spec::vala::PRINCIPAL_ID],
             Self::None => &[],
         }
     }
@@ -753,8 +748,8 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of eleven server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
+/// The single canonical list of ten server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
@@ -763,14 +758,13 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
     definition::<ResultsTable>(),
     definition::<ResultFeaturesTable>(),
     definition::<ResultItemsTable>(),
-    definition::<AgentTracesTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
 ];
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 11] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 10] {
     &BUILTIN_TABLES
 }
 
@@ -782,7 +776,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the eleven built-in logical FQNs in canonical order.
+/// Return the ten built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -890,7 +884,6 @@ mod tests {
                 ("traces", "spans")
                 | ("metrics", "points")
                 | ("logs", "records")
-                | ("dev", "agent_traces")
                 | ("gateway", "calls") => TimeGranularityWire::Hour,
                 ("system", "audit_log")
                 | ("drift", "observations" | "result_features")
@@ -1435,11 +1428,6 @@ mod tests {
         );
         assert!(
             CorrelationPolicy::Observation
-                .appended_correlation_columns()
-                .contains(&RUN_ID)
-        );
-        assert!(
-            !CorrelationPolicy::CodeAxis
                 .appended_correlation_columns()
                 .contains(&RUN_ID)
         );

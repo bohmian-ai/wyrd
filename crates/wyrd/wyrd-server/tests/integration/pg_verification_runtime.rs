@@ -474,7 +474,8 @@ impl RunningRuntime {
     }
 }
 
-/// Provision `tenant` and register one subject Service and one Drift Verifier.
+/// Provision `tenant` with every built-in table and register one subject
+/// Service and one Drift Verifier.
 ///
 /// # Panics
 /// Panics when any seed write fails.
@@ -482,6 +483,10 @@ async fn seed_tenant(
     server: &WyrdTestServer,
     tenant: DataTenantId,
 ) -> (VerificationFixture, CardUid, CardUid) {
+    server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
         .await
         .expect("tenant provisions");

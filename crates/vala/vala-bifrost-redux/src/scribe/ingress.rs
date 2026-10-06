@@ -162,8 +162,10 @@ impl ScribeImpl {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when no logical-ingress catalog exists and the
-    /// frame carries no fingerprint, when built-in provisioning or the
-    /// registration lookup fails, or when the registered layout is undecodable.
+    /// frame carries no fingerprint, [`ScribeError::TableNotFound`] when the
+    /// table — built-in or caller — is not registered for the tenant, and the
+    /// mapped catalog failure when the lookup fails or the registered layout is
+    /// undecodable.
     async fn resolve_logical_frame(
         &self,
         frame: &ScribeIngressFrame,
@@ -180,20 +182,6 @@ impl ScribeImpl {
                 partition_granularity: crate::catalog::TimeGranularity::Hour,
             });
         };
-        if let Some(definition) = crate::tables::builtin_table(
-            frame
-                .table
-                .namespace
-                .as_str()
-                .strip_prefix("vala.")
-                .unwrap_or_default(),
-            &frame.table.name,
-        ) {
-            catalog
-                .ensure_builtin(frame.authenticated_tenant, definition)
-                .await
-                .map_err(scribe_catalog_error)?;
-        }
         let (registered_fingerprint, layout) = catalog
             .table_registration(&frame.table, frame.authenticated_tenant)
             .await
@@ -210,14 +198,13 @@ impl ScribeImpl {
 
     /// Resolves the registered UID Gate authorizes one record write against.
     ///
-    /// The registration lookup runs first so the common case costs one control
-    /// row. Only a missing built-in destination is provisioned, through the same
-    /// [`crate::catalog::BifrostCatalog::ensure_builtin`] owner ingest uses.
+    /// Built-ins are provisioned eagerly with their tenant, so a missing
+    /// registration — built-in or caller — is refused rather than created.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when Scribe has no catalog owner,
-    /// [`ScribeError::TableNotFound`] for an unregistered caller table, and the
+    /// [`ScribeError::TableNotFound`] for an unregistered table, and the
     /// mapped catalog failure otherwise.
     pub(super) async fn resolve_write_table_uid(
         &self,
@@ -227,24 +214,10 @@ impl ScribeImpl {
         let catalog = self.catalog.as_ref().ok_or_else(|| ScribeError::Internal {
             detail: "Scribe write authorization requires its catalog owner".to_owned(),
         })?;
-        match catalog.table_uid(table, tenant).await {
-            Err(crate::catalog::BifrostCatalogError::TableNotFound(fqn)) => {
-                let definition = crate::tables::builtin_table(
-                    table
-                        .namespace
-                        .as_str()
-                        .strip_prefix("vala.")
-                        .unwrap_or_default(),
-                    &table.name,
-                )
-                .ok_or(ScribeError::TableNotFound { table: fqn })?;
-                catalog
-                    .ensure_builtin(tenant, definition)
-                    .await
-                    .map_err(scribe_catalog_error)
-            }
-            resolved => resolved.map_err(scribe_catalog_error),
-        }
+        catalog
+            .table_uid(table, tenant)
+            .await
+            .map_err(scribe_catalog_error)
     }
 
     /// Computes one immutable material plan before root admission or binding.

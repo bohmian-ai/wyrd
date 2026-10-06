@@ -2,7 +2,8 @@
 //!
 //! Creating a tenant is one authorized operation that yields a *usable* tenant:
 //! the directory row, its administrative principal, that principal's role, its
-//! first credential, and the tenant's builtin roles. Nothing partial is ever
+//! first credential, the tenant's builtin roles, and every canonical Bifrost
+//! built-in table. Nothing partial is ever
 //! presented as live — the tenant is promoted only once every piece exists.
 //!
 //! Provisioning necessarily crosses two boundaries. The directory row sits at
@@ -37,6 +38,7 @@ use wyrd_sql::row_types::platform::TenantRow;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::builtins::BuiltinTables;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use vala_sql::audit_outbox::AuditOutbox;
@@ -106,6 +108,8 @@ pub struct TenantProvisioning {
     operator: OperatorPool,
     /// Process audit outbox every platform decision is staged on.
     audit: Arc<AuditOutbox>,
+    /// Built-in table inventory every tenant receives before promotion.
+    builtins: BuiltinTables,
 }
 
 impl Debug for TenantProvisioning {
@@ -116,11 +120,20 @@ impl Debug for TenantProvisioning {
 }
 
 impl TenantProvisioning {
-    /// Bind provisioning to the platform boundary it owns and the process
-    /// audit outbox its decisions are staged on.
+    /// Bind provisioning to the platform boundary it owns, the process audit
+    /// outbox its decisions are staged on, and the built-in inventory a new
+    /// tenant receives.
     #[must_use]
-    pub const fn new(operator: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
-        Self { operator, audit }
+    pub const fn new(
+        operator: OperatorPool,
+        audit: Arc<AuditOutbox>,
+        builtins: BuiltinTables,
+    ) -> Self {
+        Self {
+            operator,
+            audit,
+            builtins,
+        }
     }
 
     /// Claim the directory row and report which tenant the work belongs to.
@@ -245,17 +258,19 @@ impl TenantProvisioning {
         Err(error)
     }
 
-    /// Establish the tenant's administration, then promote it to active.
+    /// Establish the tenant's administration and built-in tables, then
+    /// promote it to active.
     ///
     /// Promotion is the last stage and is part of what can fail: a tenant
     /// whose rows exist but that never became active is as unusable as one
-    /// that never got its administrator, so both failures reach the caller's
-    /// single failure path.
+    /// that never got its administrator or its built-in tables, so every
+    /// failure reaches the caller's single failure path.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Store`] when a tenant-scoped write fails,
-    /// when the directory row left `provisioning` before it could be promoted,
-    /// or when the promotion write fails.
+    /// when a built-in table cannot be ensured, when the directory row left
+    /// `provisioning` before it could be promoted, or when the promotion write
+    /// fails.
     async fn establish_and_promote(
         &self,
         conn: TenantConn<'_>,
@@ -265,6 +280,10 @@ impl TenantProvisioning {
         let admin = self
             .establish_tenant_administration(conn, data_tenant_id, created_by)
             .await?;
+        self.builtins
+            .ensure_tenant(data_tenant_id)
+            .await
+            .map_err(|error| ProvisionError::Store(error.to_string()))?;
         match mark_tenant_active(&self.operator, data_tenant_id).await {
             Ok(true) => Ok(admin),
             Ok(false) => Err(ProvisionError::Store(

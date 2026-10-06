@@ -659,6 +659,17 @@ exchange) an RFC 8693 `act` chain naming the actors, the outermost being the
 current one. A delegated token's audience is `wyrd` or `bifrost`; a `bifrost`
 token is accepted only on the Bifrost ingest and query surfaces.
 
+OTLP is the one exception to exchange-first. A stock OpenTelemetry exporter
+carries static headers and cannot renew a token, so the OTLP/HTTP and OTLP/gRPC
+endpoints also accept the API key itself in an `x-wyrd-api-key` header. The
+server runs the same API-key grant `/auth/token` serves on **every** such
+request, before any payload is decoded, and the minted token yields the same
+principal, permissions, audit decision, limits, and tenant scope a bearer
+caller gets; a revoked key fails at its next export. `x-wyrd-access-token`
+remains valid on OTLP, and no other route accepts `x-wyrd-api-key`. An exporter
+is configured only with standard settings, for example
+`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`; no SDK exporter helper exists.
+
 Env vars in deployed services:
 
 | Env var | Required? | Source | Used for |
@@ -771,6 +782,21 @@ failures are no-ops; they never fail application execution or explicit Wyrd
 observation emission. Card lookup and authorization remain strict. The scope
 does not create, end, flush, or persist a Run or span. Signal-specific log and
 metric enrichment is not implied.
+
+A view identifies itself by the alias it was opened with (`alias`; the root
+Service view is `root`); the state returns the exact typed `CardRef` for an
+alias. `run.observe.verify(verifier, input)` judges the view's subject in real
+time: the client resolves the named Verifier among those bound in
+`verified_by` to that subject in the hydrated graph, shapes the input for the
+Verifier's kind (one Eval context, or Drift feature rows), and calls
+`POST /v1/verification/execute` once, without replay, returning the typed
+`Judgment`. An unbound name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or a wrongly
+shaped input (`WYRD_SDK_400_INVALID_OBSERVATION`) fails locally before any
+network IO, and a `failed` verdict is an ordinary return. Judging records no
+observation, run, dispatch, or Bifrost row and does not require Bifrost
+startup. SDKs carry no separate verification handle; binding and run
+operations remain server HTTP and MCP surfaces, and verification history is
+read with parameterized SQL through the Bifrost client.
 
 Every accepted row carries authenticated publisher and request identity; Card
 and Run correlation are optional per-row values:

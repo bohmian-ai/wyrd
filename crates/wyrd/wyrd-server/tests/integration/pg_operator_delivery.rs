@@ -277,6 +277,10 @@ impl Delivery {
             .seed_additional_tenant_with_uuid(tenant, name)
             .await
             .expect("second tenant seeds");
+        self.server
+            .ensure_builtin_tables_for_test(tenant)
+            .await
+            .expect("second tenant receives every built-in table");
         let seed = VerificationFixture::provision(self.server.state().postgres.wyrd(), tenant)
             .await
             .expect("second tenant provisions");

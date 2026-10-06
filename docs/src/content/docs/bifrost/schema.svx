@@ -14,9 +14,9 @@ All tables are pre-declared `DomainTable` instances registered at boot. The phys
 
 ### Shared signal tables
 
-**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.dev`, `vala.drift`, `vala.eval`, `vala.verification`
+**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.drift`, `vala.eval`, `vala.verification`
 
-**Partitioning:** one time transform on `wyrd_event_time`. The OpenTelemetry tables (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) and `vala.dev.agent_traces` partition by UTC hour. The five verification tables (`vala.drift.observations`, `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items`) partition by UTC day, so a Verification Result and its detail rows, which share one event time, never split across partitions. Bifrost has no bucket, identity, or tenant partition transform.
+**Partitioning:** one time transform on `wyrd_event_time`. The OpenTelemetry tables (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) partition by UTC hour. The five verification tables (`vala.drift.observations`, `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items`) partition by UTC day, so a Verification Result and its detail rows, which share one event time, never split across partitions. Bifrost has no bucket, identity, or tenant partition transform.
 
 **Tenant isolation:** tenant-qualified physical table + per-file footer tenant proof
 
@@ -232,23 +232,6 @@ are set only for a skip.
 | `duration_ms` | `Int64` nullable |
 | `skip_reason` | `Utf8` nullable |
 | `upstream_task_id` | `Utf8` nullable |
-| + system columns | |
-
-## vala.dev.agent_traces
-
-Source type: `AgentTraceRecord`.
-
-| Column | Physical type |
-|---|---|
-| `dev_session_id` | `Utf8` |
-| `repo` | `Utf8` |
-| `commit_sha` | `Utf8` nullable |
-| `branch` | `Utf8` nullable |
-| `run_id` | `Utf8` |
-| `started_at` | `Timestamp(µs, UTC)` |
-| `ended_at` | `Timestamp(µs, UTC)` |
-| `messages` | `Utf8`, **payload-gated** |
-| `tool_io` | `Utf8` nullable, **payload-gated** |
 | + system columns | |
 
 ## Type mapping

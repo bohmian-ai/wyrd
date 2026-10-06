@@ -57,12 +57,10 @@
       "type": "string"
     },
     "ArtifactManifestEntry": {
-      "description": "One heavy artifact declared by a submission.",
+      "description": "One heavy artifact declared by a submission.\n\nAn author may omit `sha256` and `size_bytes`; the client computes both from the local file before any registration call, so a request sent to the server carries both and the server refuses an entry missing either.",
       "type": "object",
       "required": [
-        "relative_path",
-        "sha256",
-        "size_bytes"
+        "relative_path"
       ],
       "properties": {
         "content_type": {
@@ -77,12 +75,18 @@
           "type": "string"
         },
         "sha256": {
-          "description": "Base64-encoded SHA-256 digest of the artifact bytes.",
-          "type": "string"
+          "description": "Base64-encoded SHA-256 digest of the artifact bytes; computed by the client when authored without one.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "size_bytes": {
-          "description": "Declared artifact size in bytes.",
-          "type": "integer",
+          "description": "Artifact size in bytes; computed by the client when authored without one.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0.0
         }

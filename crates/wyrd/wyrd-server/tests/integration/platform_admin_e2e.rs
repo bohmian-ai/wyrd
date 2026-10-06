@@ -5193,3 +5193,107 @@ async fn a_trailing_slash_platform_issuer_completes_first_login() {
         "first login pins the preregistered administrator"
     );
 }
+
+/// Read the canonical built-ins registered for `tenant` without creating any.
+///
+/// Lists the tenant's catalog registrations — a read that provisions nothing —
+/// and keeps the `namespace.name` of each that the canonical inventory owns, so
+/// the result is comparable with [`every_builtin`].
+///
+/// # Panics
+/// Panics when the catalog listing fails.
+async fn registered_builtins(
+    srv: &WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+) -> std::collections::BTreeSet<String> {
+    srv.bifrost_catalog()
+        .list_tables(tenant)
+        .await
+        .expect("the tenant's catalog lists")
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "{}.{}",
+                entry.namespace.trim_start_matches("vala."),
+                entry.name
+            )
+        })
+        .filter(|fqn| every_builtin().contains(fqn))
+        .collect()
+}
+
+/// The `namespace.name` of every table in the canonical built-in inventory.
+fn every_builtin() -> std::collections::BTreeSet<String> {
+    vala_bifrost_redux::tables::builtin_tables()
+        .iter()
+        .map(|definition| format!("{}.{}", definition.namespace, definition.name))
+        .collect()
+}
+
+/// A tenant has every canonical built-in from the moment it is usable, and a
+/// tenant that predates the inventory receives them at the next startup.
+///
+/// A provisioned tenant is read immediately, before anything writes or
+/// describes a table, so only eager provisioning can have created them. The
+/// pre-existing tenant is a directory row with no tables at all — what an
+/// upgrade finds — and gains the whole inventory only through the restart's
+/// reconciliation, which must also leave the provisioned tenant unchanged.
+#[tokio::test]
+async fn new_and_existing_tenants_receive_every_builtin() {
+    let srv = WyrdTestServer::builder()
+        .start_bound()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "eager", "display_name": "Eager" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let provisioned: wyrd_spec::DataTenantId = created["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .parse()
+        .expect("tenant id parses");
+    assert_eq!(
+        registered_builtins(&srv, provisioned).await,
+        every_builtin(),
+        "a provisioned tenant has every built-in before any write or describe"
+    );
+
+    let existing = wyrd_spec::DataTenantId::new_v7();
+    sqlx::query(
+        "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
+         VALUES ($1, 'existing', 'Existing', 'active')",
+    )
+    .bind(existing.as_uuid())
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("a pre-existing tenant row inserts");
+    assert!(
+        registered_builtins(&srv, existing).await.is_empty(),
+        "a tenant that predates the inventory starts with no built-ins"
+    );
+
+    let srv = Box::pin(srv.restart_bound(WyrdTestServer::builder()))
+        .await
+        .expect("server restarts");
+    assert_eq!(
+        registered_builtins(&srv, existing).await,
+        every_builtin(),
+        "startup backfills every built-in for an existing tenant"
+    );
+    assert_eq!(
+        registered_builtins(&srv, provisioned).await,
+        every_builtin(),
+        "startup reconciliation is idempotent for an already provisioned tenant"
+    );
+}

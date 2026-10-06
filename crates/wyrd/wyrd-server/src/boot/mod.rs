@@ -429,6 +429,10 @@ pub enum ServerBootError {
     /// let two ready members disagree about durable data.
     #[error("peer mode requires shared object storage; file:// storage is local to one process")]
     PeerLocalStorage,
+    /// Startup could not ensure every canonical built-in table for every
+    /// active tenant, so the server must not report ready.
+    #[error(transparent)]
+    BuiltinTables(#[from] Box<crate::components::platform::builtins::BuiltinTablesError>),
 }
 
 /// Resolve the operator `forge` config section into a `ForgeConfig` plus the
@@ -629,8 +633,9 @@ async fn build_bifrost_external_dependencies(
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError`] when Scribe, Forge, Oracle, role fencing, or
-/// request-boundary construction fails before publication.
+/// Returns [`ServerBootError`] when built-in table reconciliation, Scribe,
+/// Forge, Oracle, role fencing, or request-boundary construction fails before
+/// publication.
 ///
 /// # Panics
 ///
@@ -672,6 +677,13 @@ pub async fn compose_bifrost(
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
+    // Every active tenant holds the whole built-in inventory before any role
+    // activates, so a table added to the inventory is backfilled on restart
+    // and a failure aborts boot rather than serving a partial tenant.
+    crate::components::platform::builtins::BuiltinTables::new(Arc::clone(&bifrost))
+        .reconcile(&operator_pool)
+        .await
+        .map_err(Box::new)?;
     let scribe_config = bifrost_config.scribe;
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;

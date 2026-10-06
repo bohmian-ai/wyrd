@@ -68,6 +68,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
+use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
@@ -88,8 +89,9 @@ use wyrd_telemetry::TelemetryGuard;
 use crate::bifrost::ForgeObjectStoreControl;
 
 use wyrd_spec::auth::{TokenAudience, TokenResponse};
+use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -97,6 +99,7 @@ use wyrd_sql::queries::auth::{
     insert_user, provision_system_principal, revoke_role_from_service_account,
     revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
+use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageSettings};
 
 use crate::time::ClockHandle;
@@ -148,6 +151,24 @@ fn serve_task_outcome(
 }
 
 /// Wyrd server test harness supporting in-process and real-socket modes.
+///
+/// # Test controls
+///
+/// Client journeys in every SDK steer the server through exactly three
+/// controls, each driving the production code path rather than a substitute:
+///
+/// - [`flush_bifrost`](Self::flush_bifrost) publishes every accepted row now,
+///   so the next query sees it;
+/// - [`wait_for_baseline`](Self::wait_for_baseline) returns once a Drift
+///   Verifier's fitted baseline is ready, or fails at its deadline with the
+///   last observed baseline state;
+/// - [`make_binding_due`](Self::make_binding_due) makes a binding's schedule
+///   due now.
+///
+/// The Python and TypeScript test servers project these three and nothing
+/// else that steers or inspects server state. The remaining public methods are
+/// runtime-only facilities for the Rust server, Bifrost, and reliability
+/// tiers; they are not part of the SDK test contract.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each flag records one independent opt-in the harness started with"
@@ -786,6 +807,19 @@ pub enum WyrdTestServerError {
     /// SQL operation failed.
     #[error("sql error: {0}")]
     Sql(String),
+    /// A Drift Verifier's baseline was not ready by the caller's deadline.
+    #[error(
+        "baseline of verifier {verifier} was not ready within {timeout:?}; last observed: {last:?}"
+    )]
+    BaselineNotReady {
+        /// The Verifier Card whose baseline was awaited.
+        verifier: CardUid,
+        /// The deadline the caller allowed.
+        timeout: Duration,
+        /// The last baseline status read, `None` when the Verifier has no
+        /// fitted baseline at all.
+        last: Option<Box<DriftBaselineStatus>>,
+    },
 }
 
 impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
@@ -811,6 +845,15 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
                 wyrd_spec::error::WyrdError::HarnessBootstrap {
                     message: msg,
                     details: serde_json::json!({}),
+                }
+            }
+            WyrdTestServerError::BaselineNotReady { verifier, last, .. } => {
+                wyrd_spec::error::WyrdError::VerificationBaselineNotReady {
+                    message: msg,
+                    details: serde_json::json!({
+                        "verifier_uid": verifier,
+                        "baseline": last,
+                    }),
                 }
             }
         }
@@ -1885,6 +1928,7 @@ impl WyrdTestServer {
             .query_sql(
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!(
                         "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
@@ -1979,6 +2023,7 @@ impl WyrdTestServer {
         let outcome =
             ScheduledQueryCaller::new(self.inner.state.clone(), context, CancellationToken::new())
                 .run(wyrd_spec::vala::api::BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!(
                         "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
                  AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
@@ -2612,13 +2657,15 @@ impl WyrdTestServer {
 
     /// Provision one canonical built-in table for a test tenant.
     ///
-    /// A canonical signal table is materialized on first use, so a journey
-    /// that writes it through the public Arrow door - rather than through an
-    /// OTLP export, which provisions on ingest - must ask for it first.
+    /// Built-ins are created eagerly at startup and by [`Self::seed_tenant`];
+    /// a tenant seeded directly through the Postgres fixture after boot gets
+    /// neither, and ingest never creates one, so such a test asks for it here
+    /// or for the whole inventory through
+    /// [`Self::ensure_builtin_tables_for_test`]. Repeating it is a no-op.
     ///
     /// # Errors
     /// Returns an error when no built-in owns `namespace.name` or the catalog
-    /// cannot materialize it.
+    /// cannot create it.
     pub async fn ensure_builtin_table_for_test(
         &self,
         tenant: DataTenantId,
@@ -3051,14 +3098,19 @@ impl WyrdTestServer {
         })
     }
 
-    /// Provision a second active tenant: seed its row and built-in roles.
+    /// Provision a second active tenant: seed its row, built-in roles, and
+    /// every canonical built-in table.
     ///
     /// The fixture seeds one tenant at boot; the same-issuer-two-tenant
     /// isolation test calls this to stand up tenant B so a subject bound only in
-    /// tenant A fails closed in B. Returns the new tenant's isolation key.
+    /// tenant A fails closed in B. Built-in tables are ensured through the same
+    /// [`BuiltinTables`] owner tenant provisioning uses, because a tenant seeded
+    /// after boot misses startup reconciliation. Returns the new tenant's
+    /// isolation key.
     ///
     /// # Errors
-    /// Returns an error when the tenant insert or role seed fails.
+    /// Returns an error when the tenant insert, role seed, or built-in table
+    /// provisioning fails.
     pub async fn seed_tenant(&self, slug: &str) -> Result<DataTenantId, WyrdTestServerError> {
         let tenant_id = self
             .inner
@@ -3072,7 +3124,27 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         provision_system_principal(&mut conn).await.map_err(sql)?;
         conn.commit().await.map_err(sql)?;
+        self.ensure_builtin_tables_for_test(tenant_id).await?;
         Ok(tenant_id)
+    }
+
+    /// Ensure every canonical built-in table for a tenant seeded after boot.
+    ///
+    /// Startup reconciliation covers tenants that exist when the server
+    /// starts; a tenant seeded later through the Postgres fixture directly
+    /// receives its inventory here, through the same [`BuiltinTables`] owner
+    /// tenant provisioning uses. Repeating it is a no-op.
+    ///
+    /// # Errors
+    /// Returns an error when the catalog cannot ensure a built-in.
+    pub async fn ensure_builtin_tables_for_test(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        BuiltinTables::new(self.bifrost_catalog())
+            .ensure_tenant(tenant)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Return the raw sealed client secret of the tenant's human connection in
@@ -3656,6 +3728,76 @@ impl WyrdTestServer {
             self.inner.fixture.data_tenant_id(),
         )
         .await
+    }
+
+    /// Wait until the fixture tenant's Drift Verifier `verifier` has a ready
+    /// fitted baseline.
+    ///
+    /// Reads the baseline through [`DriftBaselineQueue::status`], the same
+    /// owner that projects `card.status.verification.baseline` on a Card
+    /// read, so readiness here is readiness a client observes. Polls until the
+    /// state is `ready`; a `failed` state is not final while the fitter still
+    /// retries it, so it is waited through rather than returned early.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::BaselineNotReady`] carrying the last
+    /// observed status when `timeout` elapses first, and
+    /// [`WyrdTestServerError::Sql`] when the status read fails.
+    pub async fn wait_for_baseline(
+        &self,
+        verifier: &CardUid,
+        timeout: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let deadline = Instant::now() + timeout;
+        let sql = |error: &dyn std::fmt::Display| WyrdTestServerError::Sql(error.to_string());
+        loop {
+            let mut conn = self
+                .inner
+                .state
+                .postgres
+                .wyrd()
+                .tenant_conn(self.data_tenant_id())
+                .await
+                .map_err(|error| sql(&error))?;
+            let last = DriftBaselineQueue::default()
+                .status(&mut conn, verifier)
+                .await
+                .map_err(|error| sql(&error))?;
+            conn.rollback().await.map_err(|error| sql(&error))?;
+            if last
+                .as_ref()
+                .is_some_and(|status| status.state == DriftBaselineState::Ready)
+            {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WyrdTestServerError::BaselineNotReady {
+                    verifier: verifier.clone(),
+                    timeout,
+                    last: last.map(Box::new),
+                });
+            }
+            tokio::time::sleep(BASELINE_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// Bring binding `binding`'s schedule cursor to database time, so the
+    /// verification runtime schedules its next occurrence now.
+    ///
+    /// Delegates to [`VerificationFixture::make_binding_due`]; the real
+    /// scheduler still claims, runs, and settles the occurrence.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the fixture tenant cannot be
+    /// opened or the cursor update fails.
+    pub async fn make_binding_due(&self, binding: BindingId) -> Result<(), WyrdTestServerError> {
+        self.verification_fixture()
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))?
+            .make_binding_due(binding)
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
     /// Cancel and drain a partially started bound server while preserving the
@@ -4902,6 +5044,9 @@ impl WyrdTestServerBuilder {
 /// reports nothing, so the harness names the failure instead.
 const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// Pause between baseline status reads in [`WyrdTestServer::wait_for_baseline`].
+const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Operator binding every test server declares for `Environment` gateway credentials.
 pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
 
@@ -5756,6 +5901,169 @@ mod teardown_tests {
                 .expect("the parked request joins")
                 .expect_err("the abort terminates the parked request"),
             BifrostStorageError::Closed
+        );
+    }
+}
+
+/// Proves the SDK test contract is exactly the three sanctioned controls.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::WyrdTestServer;
+
+    /// Published Python stub of `wyrd.testing`, which Python callers see.
+    const PYTHON_STUB: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../sdks/wyrd-sdk-python/python/wyrd/testing/__init__.pyi"
+    ));
+
+    /// Generated TypeScript declaration of `@wyrd/testing`.
+    const TYPESCRIPT_DECLARATION: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../sdks/wyrd-sdk-ts/testing/index.d.ts"
+    ));
+
+    /// The three Python controls REQ-195 sanctions.
+    const PYTHON_CONTROLS: [&str; 3] = ["flush_bifrost", "wait_for_baseline", "make_binding_due"];
+
+    /// The same three controls in TypeScript's camelCase projection.
+    const TYPESCRIPT_CONTROLS: [&str; 3] = ["flushBifrost", "waitForBaseline", "makeBindingDue"];
+
+    /// Python members that start, address, or credential the server and so
+    /// neither steer nor inspect its state.
+    const PYTHON_SETUP: [&str; 18] = [
+        "__init__",
+        "__enter__",
+        "__exit__",
+        "base_url",
+        "api_key",
+        "tenant_id",
+        "access_token",
+        "bootstrap_service",
+        "credential_registered_service",
+        "scoped_api_key",
+        "revoke_scoped_role",
+        "seed_tenant",
+        "bootstrap_service_in_tenant",
+        "activate_human_sso",
+        "save_human_login",
+        "expire_saved_login",
+        "saved_login_is_stale",
+        "revoke_saved_login",
+    ];
+
+    /// TypeScript members that start, address, or credential the server.
+    const TYPESCRIPT_SETUP: [&str; 16] = [
+        "baseUrl",
+        "grpcUrl",
+        "token",
+        "tableFqn",
+        "apiKey",
+        "cardRef",
+        "scopedApiKey",
+        "seedTenant",
+        "bootstrapServiceInTenant",
+        "credentialRegisteredService",
+        "activateHumanSso",
+        "saveHumanLogin",
+        "expireSavedLogin",
+        "savedLoginIsStale",
+        "revokeSavedLogin",
+        "shutdown",
+    ];
+
+    /// Member names declared in the body of `class` in `source`.
+    ///
+    /// The body runs from the `header` line to the first following line that
+    /// is not indented, blank, or a doc line; `member` extracts a name from
+    /// one indented line, or `None` for a line that declares nothing.
+    fn members(
+        source: &str,
+        header: &str,
+        member: impl Fn(&str) -> Option<&str>,
+    ) -> BTreeSet<String> {
+        source
+            .lines()
+            .skip_while(|line| !line.starts_with(header))
+            .skip(1)
+            .take_while(|line| line.is_empty() || line.starts_with(' '))
+            .filter_map(&member)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Name of a method or property a Python stub line declares at class depth.
+    fn python_member(line: &str) -> Option<&str> {
+        line.strip_prefix("    def ")
+            .and_then(|rest| rest.split('(').next())
+    }
+
+    /// Name of a method or getter a napi declaration line declares.
+    fn typescript_member(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("  ")?;
+        if rest.starts_with([' ', '/', '*']) {
+            return None;
+        }
+        let rest = rest.strip_prefix("get ").unwrap_or(rest);
+        rest.split('(').next()
+    }
+
+    /// Assert `declared` is exactly `controls` plus members of `setup`.
+    fn assert_only_controls(
+        language: &str,
+        declared: &BTreeSet<String>,
+        controls: &[&str],
+        setup: &[&str],
+    ) {
+        for control in controls {
+            assert!(
+                declared.contains(*control),
+                "{language} WyrdTestServer must document `{control}`"
+            );
+        }
+        let hooks: Vec<_> = declared
+            .iter()
+            .filter(|name| !controls.contains(&name.as_str()) && !setup.contains(&name.as_str()))
+            .collect();
+        assert!(
+            hooks.is_empty(),
+            "{language} WyrdTestServer exposes test hooks outside the three sanctioned controls: {hooks:?}"
+        );
+    }
+
+    /// Rust, Python, and TypeScript test servers expose `flush_bifrost`,
+    /// `wait_for_baseline`, and `make_binding_due`, and the Python and
+    /// TypeScript projections expose no other hook that steers or inspects
+    /// server state.
+    #[test]
+    fn public_controls_are_the_three_sanctioned_operations() {
+        let rust_controls = [
+            std::any::type_name_of_val(&WyrdTestServer::flush_bifrost),
+            std::any::type_name_of_val(&WyrdTestServer::wait_for_baseline),
+            std::any::type_name_of_val(&WyrdTestServer::make_binding_due),
+        ];
+        for (path, control) in rust_controls.iter().zip(PYTHON_CONTROLS) {
+            assert!(
+                path.ends_with(&format!("WyrdTestServer::{control}")),
+                "Rust control {path} must be `WyrdTestServer::{control}`"
+            );
+        }
+        assert_only_controls(
+            "Python",
+            &members(PYTHON_STUB, "class WyrdTestServer", python_member),
+            &PYTHON_CONTROLS,
+            &PYTHON_SETUP,
+        );
+        assert_only_controls(
+            "TypeScript",
+            &members(
+                TYPESCRIPT_DECLARATION,
+                "export declare class NativeWyrdTestServer",
+                typescript_member,
+            ),
+            &TYPESCRIPT_CONTROLS,
+            &TYPESCRIPT_SETUP,
         );
     }
 }

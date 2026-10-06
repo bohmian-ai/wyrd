@@ -21,6 +21,7 @@ use vala_bifrost_redux::storage::StorageInspection;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
+use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
@@ -2371,11 +2372,18 @@ impl WyrdTestCluster {
         self.fixture.data_tenant_id()
     }
 
-    /// Seed an additional tenant with roles needed by a real Bifrost run.
+    /// Seed an additional tenant with roles and built-in tables needed by a
+    /// real Bifrost run.
+    ///
+    /// Built-in tables are ensured through the shared catalog of the first
+    /// running pod with the same [`BuiltinTables`] owner tenant provisioning
+    /// uses. With no pod running yet, the next pod's startup reconciliation
+    /// ensures them instead.
     ///
     /// # Errors
     ///
-    /// Returns an error when tenant creation, role seeding, or commit fails.
+    /// Returns an error when tenant creation, role seeding, commit, or
+    /// built-in table provisioning fails.
     pub async fn add_tenant(&self, slug: &str) -> Result<DataTenantId, ClusterError> {
         let tenant = self
             .fixture
@@ -2393,6 +2401,12 @@ impl WyrdTestCluster {
         conn.commit()
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        if let Some(server) = self.server(0) {
+            BuiltinTables::new(server.bifrost_catalog())
+                .ensure_tenant(tenant)
+                .await
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        }
         Ok(tenant)
     }
 

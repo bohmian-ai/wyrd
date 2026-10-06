@@ -21,8 +21,6 @@ pub enum BifrostNamespace {
     Drift,
     /// `vala.verification` — the shared per-run Verifier verdict table.
     Verification,
-    /// `vala.dev` — development-time agent traces.
-    Dev,
     /// `vala.datasets` — caller-owned dynamic tables.
     Datasets, // Redux-only variant for dynamic table namespace
     /// Gateway capture tables such as `vala.gateway.calls`.
@@ -32,7 +30,7 @@ pub enum BifrostNamespace {
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -41,7 +39,6 @@ impl BifrostNamespace {
         Self::Eval,
         Self::Drift,
         Self::Verification,
-        Self::Dev,
         Self::Datasets,
         Self::Gateway,
     ];
@@ -57,7 +54,6 @@ impl BifrostNamespace {
             Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
             Self::Verification => "vala.verification",
-            Self::Dev => "vala.dev",
             Self::Datasets => "vala.datasets",
             Self::Gateway => "vala.gateway",
         }
@@ -81,7 +77,6 @@ impl BifrostNamespace {
             "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
             "verification" => Some(Self::Verification),
-            "dev" => Some(Self::Dev),
             "datasets" => Some(Self::Datasets),
             "gateway" => Some(Self::Gateway),
             _ => None,

@@ -1,11 +1,10 @@
 //! Card code-origin provenance — the commit a card was declared from.
 //!
 //! `Origin` is the platform's **code axis**: it ties a registered Card back to
-//! the exact repository commit (and path) it was authored at. Runtime
-//! observations that carry the same commit (see
-//! [`crate::vala::correlation::CorrelationContext`]) can then be joined to the
-//! card across the full develop → review → deploy → observe lifecycle, even
-//! though identity (the service principal) is only minted at registration.
+//! the exact repository commit (and path) it was authored at, so the card can be
+//! traced back to its source across the develop → review → deploy → observe
+//! lifecycle, even though identity (the service principal) is only minted at
+//! registration.
 //!
 //! `Origin` is distinct from a Source card, which is a read-side reference to an
 //! external data system. Origin describes where a card's *own* code came from.

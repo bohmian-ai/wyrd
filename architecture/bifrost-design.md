@@ -97,14 +97,15 @@ footer the reader cannot prove, fails the query closed with
 There is no per-row tenant column and no per-row tenant check.
 
 Built-in and user-defined tables share this physical model. "Built-in" names
-definition ownership, not a weaker tenant scope or a separate storage mode. A
-built-in's per-tenant row is materialized on first use from its owning
-definition rather than seeded at tenant provisioning, and describing one
-materializes it exactly as ingesting into it does. A client that must confirm a
-fixed table before it writes — an SDK describing `vala.drift.observations` and
-`vala.eval.observations` at startup — therefore sees the same table a first
-ingest would create, instead of a missing-table error in a tenant that has not
-written yet.
+definition ownership, not a weaker tenant scope or a separate storage mode.
+Built-ins are created eagerly, never lazily: tenant provisioning ensures every
+table in the canonical built-in inventory through the catalog's idempotent
+ensure operation before the tenant becomes active, and server startup ensures
+the same inventory for every active tenant before any role activates, which
+backfills tables added to the inventory after a tenant was created. Either
+failure fails provisioning or startup rather than exposing a partially ready
+tenant or server. An unwritten built-in is therefore queryable and empty, and
+neither first write nor describe owns its creation.
 
 ## Durability and visibility
 
@@ -1021,7 +1022,7 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.verification`, `vala.dev`, `vala.gateway`, and
+`vala.eval`, `vala.drift`, `vala.verification`, `vala.gateway`, and
 `vala.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
 only read contract;
 the namespace does not create another storage or authorization model.

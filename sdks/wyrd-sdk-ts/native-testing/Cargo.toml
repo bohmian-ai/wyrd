@@ -13,9 +13,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow = { workspace = true }
-napi = { workspace = true }
+napi = { workspace = true, features = ["serde-json"] }
 napi-derive = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
 url = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 wyrd-runtime = { workspace = true }

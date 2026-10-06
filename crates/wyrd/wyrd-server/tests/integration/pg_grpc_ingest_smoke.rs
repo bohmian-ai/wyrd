@@ -68,6 +68,10 @@ async fn seed_tenant(server: &WyrdTestServer, tenant: DataTenantId, slug: &str) 
         .seed_additional_tenant_with_uuid(tenant, slug)
         .await
         .expect("fixture seeds the requested tenant");
+    server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("the seeded tenant receives every built-in table");
 }
 
 /// Mints one user token carrying the requested built-in roles' permissions.
@@ -1135,8 +1139,9 @@ async fn public_result_writes_are_refused_over_grpc() {
 /// The tokenless SYSTEM read authority reads only the tables it names.
 ///
 /// Resolving needs the tenant's SYSTEM principal; without one it is refused.
-/// Before the tenant's first observation no table is registered, so the
-/// authority holds no grant. Once the table is registered, it holds exactly
+/// Naming a table the tenant never registered yields no grant. The
+/// observation table is a built-in the tenant was provisioned with, so before
+/// any observation the authority already holds exactly
 /// `bifrost_query:read` on that table's UID under the SYSTEM principal kind
 /// with an empty Card scope; Oracle admits its read of the observation table
 /// with an audited read decision and refuses, with an audited denial, a read
@@ -1152,6 +1157,7 @@ async fn system_read_authority_reads_only_the_named_table() {
     let harness = ResultTableHarness::start("system-read-authority").await;
     let state = harness.server.state();
     let observations = [TableRef::new(BifrostNamespace::Drift, "observations")];
+    let unregistered_table = [TableRef::new(BifrostNamespace::Datasets, "unregistered")];
     let system = Some(PrincipalId::new(harness.system));
     let resolve = |principal: Option<PrincipalId>| {
         SystemReadAuthority::resolve(state, harness.tenant, principal, &observations)
@@ -1163,21 +1169,21 @@ async fn system_read_authority_reads_only_the_named_table() {
         ),
         "no SYSTEM principal means no read authority"
     );
-    let unregistered = resolve(system).await.expect("authority resolves");
+    let unregistered =
+        SystemReadAuthority::resolve(state, harness.tenant, system, &unregistered_table)
+            .await
+            .expect("authority resolves");
     assert!(
         unregistered
             .context()
             .principal
             .effective_permissions
             .is_empty(),
-        "no observation table means nothing to read"
+        "an unregistered table means nothing to read"
     );
 
-    harness
-        .server
-        .ensure_builtin_table_for_test(harness.tenant, "drift", "observations")
-        .await
-        .expect("observation table provisions");
+    // The tenant was provisioned with every built-in, so the observation table
+    // already exists without any write.
     let authority = resolve(system).await.expect("authority resolves");
     let table_uid: Vec<u8> = sqlx::query_scalar(
         "SELECT table_uid FROM vala.bifrost_tables \

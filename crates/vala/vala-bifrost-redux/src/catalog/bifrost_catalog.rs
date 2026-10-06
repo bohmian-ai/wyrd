@@ -1015,8 +1015,17 @@ impl BifrostCatalog {
 
     /// Ensure one canonical built-in exists for a tenant.
     ///
-    /// Built-ins are lazy: this method is the only path that creates one, and
-    /// callers choose when a tenant first needs the table.
+    /// This is the only path that creates a built-in, and tenant provisioning
+    /// and server boot are its only production callers: the server ensures the whole
+    /// canonical inventory when it provisions a tenant and again for every
+    /// active tenant at startup. Ingest and describe never create one and
+    /// treat a missing built-in as an unregistered table.
+    /// Repeating it for an existing built-in returns the same [`TableUid`].
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] for a definition in an
+    /// unknown namespace, and the registration, SQL, or Iceberg failure of the
+    /// underlying create otherwise.
     pub async fn ensure_builtin(
         &self,
         tenant: DataTenantId,
@@ -1065,7 +1074,9 @@ impl BifrostCatalog {
     /// new table's `write.target-file-size-bytes` in its create transaction.
     ///
     /// # Errors
-    /// Returns [`BifrostCatalogError::Registration`] for an invalid or
+    /// Returns [`BifrostCatalogError::ReservedColumn`] when a declaration
+    /// names a server-owned column,
+    /// [`BifrostCatalogError::Registration`] for an invalid or
     /// conflicting layout or compaction target,
     /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict, and
     /// metadata, Iceberg, SQL, or audit errors otherwise.
@@ -1476,14 +1487,6 @@ impl BifrostCatalog {
                 .unwrap_or_default(),
             &table.name,
         );
-        // Built-ins are lazy, and ingest already materializes one on first use.
-        // Describing one must do the same: a client that must describe a fixed
-        // system table before it may write it — the SDK's observation startup —
-        // would otherwise fail against a table the server owns and would have
-        // created on the very next call.
-        if let Some(definition) = builtin {
-            self.ensure_builtin(tenant, definition).await?;
-        }
         let row = self
             .lookup_table_row(&fqn, tenant)
             .await?
@@ -1976,7 +1979,7 @@ mod tests {
 
     /// Registration admits exactly 256 physical Parquet leaves, managed
     /// columns included, refuses the 257th with the typed schema refusal, and
-    /// admits every built-in its lazy creation resolves.
+    /// admits every built-in its eager creation resolves.
     ///
     /// # Panics
     /// Panics when the boundary schema is refused or the next one admitted.
@@ -2014,7 +2017,7 @@ mod tests {
                 Some(&(definition.physical_layout)()),
                 Some(&(definition.schema)()),
             )
-            .unwrap_or_else(|error| panic!("lazily created built-in {fqn} registers: {error}"));
+            .unwrap_or_else(|error| panic!("eagerly created built-in {fqn} registers: {error}"));
         }
     }
 }
@@ -2294,6 +2297,51 @@ mod production_pin_tests {
                         .await
                         .expect("the registered table resolves"),
                     registered
+                );
+            }
+        });
+    }
+
+    /// Every canonical built-in is created through [`BifrostCatalog::ensure_builtin`].
+    ///
+    /// Tenant provisioning and server startup ensure the whole
+    /// [`crate::tables::builtin_tables`] inventory, so each definition must
+    /// register — which also proves no built-in declares a reserved column —
+    /// and must then resolve to the UID its ensure returned.
+    ///
+    /// # Panics
+    /// Panics when the fixture fails, when any built-in cannot be ensured, or
+    /// when an ensured built-in does not resolve to its returned UID.
+    #[test]
+    fn every_builtin_is_created_through_ensure_builtin() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            for definition in crate::tables::builtin_tables() {
+                let fqn = format!("{}.{}", definition.namespace, definition.name);
+                let created = catalog
+                    .ensure_builtin(tenant, definition)
+                    .await
+                    .unwrap_or_else(|error| panic!("built-in {fqn} is ensured: {error}"));
+                let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)
+                    .expect("every built-in namespace is known");
+                assert_eq!(
+                    catalog
+                        .table_uid(&TableRef::new(namespace, definition.name), tenant)
+                        .await
+                        .unwrap_or_else(|error| panic!("built-in {fqn} resolves: {error}")),
+                    created,
+                    "built-in {fqn} resolves to the UID its ensure returned"
                 );
             }
         });

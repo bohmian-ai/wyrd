@@ -12,7 +12,11 @@
 //! connection, the humans registered against it, and their login. It never
 //! replaces the global credential, so losing the provider costs the deployment
 //! nothing but individual sign-in.
+//!
+//! `builtins` gives every tenant the canonical Bifrost built-in tables at
+//! provisioning and reconciles them for active tenants at startup.
 
+pub mod builtins;
 pub mod credentials;
 pub mod identity;
 pub mod provisioning;

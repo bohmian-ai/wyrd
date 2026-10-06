@@ -1045,6 +1045,7 @@ pub fn builtin_fqns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{BinaryArray, Int64Array, StructArray};
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
@@ -1054,6 +1055,8 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
+    use wyrd_queue::variant::VariantViolation;
+    use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -1273,7 +1276,7 @@ mod tests {
                 ts_us_utc("ended_at", false),
                 Field::new(
                     "drift_report",
-                    arrow::datatypes::DataType::Struct(
+                    DataType::Struct(
                         vec![
                             utf8("method", false),
                             fields::variant("features", false),
@@ -1285,7 +1288,7 @@ mod tests {
                 ),
                 Field::new(
                     "eval_summary",
-                    arrow::datatypes::DataType::Struct(
+                    DataType::Struct(
                         vec![
                             int32("total_tasks", false),
                             int32("passed_tasks", false),
@@ -2177,8 +2180,6 @@ mod tests {
     /// pre-declared built-in claims a canonical validator it cannot own.
     #[test]
     fn builtin_registry_dispatches_canonical_value_validation() {
-        use arrow::array::{Array, BinaryArray, Int64Array, StructArray};
-
         let (spans, _) =
             crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
                 .expect("the span fixture projects");
@@ -2453,9 +2454,6 @@ mod tests {
     ///
     /// Panics when any of those locked values drifts.
     fn assert_variant_identity_and_errors() {
-        use wyrd_queue::variant::VariantViolation;
-        use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
-
         assert_eq!(VARIANT_TYPE_TAG, 0x0d);
         assert_eq!(VARIANT_MAX_DEPTH, 64);
         assert_eq!(VARIANT_MAX_ENCODED_BYTES, 8_388_608);

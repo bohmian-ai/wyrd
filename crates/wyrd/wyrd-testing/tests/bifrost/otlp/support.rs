@@ -7,10 +7,14 @@
 //! order, or normalizes a query result: doing so would let a projection defect
 //! agree with a matching test defect and pass.
 
+use std::collections::HashMap;
+
 use arrow::array::{Array, ListArray, StringArray, StructArray};
 use arrow::record_batch::RecordBatch;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::Value as Json;
+use wyrd_spec::vala::api::VARIANT_MAX_ENCODED_BYTES;
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
@@ -1196,9 +1200,7 @@ pub(super) fn expected_any_value(value: Option<&AnyValue>) -> Json {
         Some(any_value::Value::DoubleValue(number)) => {
             Json::Number(serde_json::Number::from_f64(*number).expect("a fixture double is finite"))
         }
-        Some(any_value::Value::BytesValue(bytes)) => {
-            Json::String(base64::engine::general_purpose::STANDARD.encode(bytes))
-        }
+        Some(any_value::Value::BytesValue(bytes)) => Json::String(STANDARD.encode(bytes)),
         Some(any_value::Value::ArrayValue(array)) => Json::Array(
             array
                 .values
@@ -1231,7 +1233,7 @@ pub(super) fn variant_json(array: &StructArray) -> Json {
 /// # Panics
 ///
 /// Panics when the array does not hold a Variant attribute object.
-pub(super) fn decode_attributes(array: &StructArray) -> std::collections::HashMap<String, String> {
+pub(super) fn decode_attributes(array: &StructArray) -> HashMap<String, String> {
     let Json::Object(entries) = variant_json(array) else {
         panic!("a stored attribute column holds a Variant object");
     };
@@ -1365,8 +1367,8 @@ pub(super) fn variant_scope(name: &str) -> InstrumentationScope {
 ///
 /// Panics when the Variant limit does not fit `usize`.
 pub(super) fn oversized_attribute() -> KeyValue {
-    let limit = usize::try_from(wyrd_spec::vala::api::VARIANT_MAX_ENCODED_BYTES)
-        .expect("the Variant size limit fits usize");
+    let limit =
+        usize::try_from(VARIANT_MAX_ENCODED_BYTES).expect("the Variant size limit fits usize");
     string_attribute("wyrd.variant.oversized", &"x".repeat(limit))
 }
 

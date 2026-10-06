@@ -14,11 +14,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow::array::{Array as _, AsArray as _};
+use arrow::array::{Array as _, AsArray as _, RecordBatch};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Int64Type};
+use arrow::util::display::array_value_to_string;
 use futures_util::TryStreamExt as _;
 use iceberg::metadata_columns::{
     RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
-    RESERVED_COL_NAME_ROW_ID,
+    RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_ROW_ID,
 };
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, FormatVersion, ManifestContentType, Operation,
@@ -1175,7 +1178,7 @@ impl LineageTable {
         if table.metadata().current_snapshot().is_none() {
             return rows;
         }
-        let batches: Vec<arrow::array::RecordBatch> = table
+        let batches: Vec<RecordBatch> = table
             .scan()
             .select([
                 self.key_column,
@@ -1192,20 +1195,22 @@ impl LineageTable {
             .await
             .expect("lineage scan reads");
         for batch in &batches {
-            let cast = |name: &str, to: &arrow::datatypes::DataType| {
+            let lineage_column = |name: &str, to: &DataType| {
                 let column = batch
                     .column_by_name(name)
                     .unwrap_or_else(|| panic!("the scan returns {name}"));
-                let cast = arrow::compute::cast(column, to).expect("lineage values cast");
-                assert_eq!(cast.null_count(), 0, "every live row carries {name}");
-                cast
+                let values = cast(column, to).expect("lineage values cast");
+                assert_eq!(values.null_count(), 0, "every live row carries {name}");
+                values
             };
-            let int64 = arrow::datatypes::DataType::Int64;
-            let row_ids = cast(RESERVED_COL_NAME_ROW_ID, &int64);
-            let sequences = cast(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, &int64);
-            let files = cast(RESERVED_COL_NAME_FILE, &arrow::datatypes::DataType::Utf8);
-            let row_ids = row_ids.as_primitive::<arrow::datatypes::Int64Type>();
-            let sequences = sequences.as_primitive::<arrow::datatypes::Int64Type>();
+            let row_ids = lineage_column(RESERVED_COL_NAME_ROW_ID, &DataType::Int64);
+            let sequences = lineage_column(
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                &DataType::Int64,
+            );
+            let files = lineage_column(RESERVED_COL_NAME_FILE, &DataType::Utf8);
+            let row_ids = row_ids.as_primitive::<Int64Type>();
+            let sequences = sequences.as_primitive::<Int64Type>();
             let files = files.as_string::<i32>();
             let keys = batch
                 .column_by_name(self.key_column)
@@ -1213,8 +1218,7 @@ impl LineageTable {
             for row in 0..batch.num_rows() {
                 let lineage = RowLineage {
                     last_updated_sequence_number: sequences.value(row),
-                    key: arrow::util::display::array_value_to_string(keys, row)
-                        .expect("key renders"),
+                    key: array_value_to_string(keys, row).expect("key renders"),
                 };
                 let previous =
                     rows.insert(row_ids.value(row), (lineage, files.value(row).to_owned()));
@@ -1362,10 +1366,7 @@ async fn publish_duplicate_lineage(promoted: &PromotedRewriteFixture) -> DataFil
         .live_data_files()
         .await
         .into_iter()
-        .find(|file| {
-            file.value_counts()
-                .contains_key(&iceberg::metadata_columns::RESERVED_FIELD_ID_ROW_ID)
-        })
+        .find(|file| file.value_counts().contains_key(&RESERVED_FIELD_ID_ROW_ID))
         .expect("a live rewrite output carries physical lineage");
     let prefix = &promoted.fixture.binding.object_prefix;
     let key = |path: &str| {

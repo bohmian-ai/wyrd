@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
+use wyrd_queue::variant::VariantJsonEncoderFactory;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{BifrostQueryRequest, BifrostTableEntry};
@@ -641,8 +642,8 @@ impl ResultCollector {
             return Err(ValaError::QueryResultTooLarge.into());
         }
         let schema = batch.schema();
-        let options = EncoderOptions::default()
-            .with_encoder_factory(Arc::new(wyrd_queue::variant::VariantJsonEncoderFactory));
+        let options =
+            EncoderOptions::default().with_encoder_factory(Arc::new(VariantJsonEncoderFactory));
         let mut encoders = Vec::with_capacity(batch.num_columns());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
             encoders.push(

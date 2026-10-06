@@ -12,6 +12,7 @@ mod tests {
         Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
         StringArray, StructArray,
     };
+    use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
     use serde_json::json;
     use std::sync::Arc;
@@ -387,8 +388,7 @@ mod tests {
                                 batch.num_rows(),
                             ))) as Arc<dyn Array>
                         };
-                        let arrow::datatypes::DataType::Struct(children) = variant_storage_type()
-                        else {
+                        let DataType::Struct(children) = variant_storage_type() else {
                             panic!("Variant storage is a struct");
                         };
                         Arc::new(StructArray::new(children, vec![invalid(), invalid()], None))

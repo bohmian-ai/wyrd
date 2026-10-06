@@ -3,10 +3,14 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use arrow::json::WriterBuilder;
+use arrow::json::writer::LineDelimited;
 use clap::{ArgGroup, Args, ValueEnum};
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_client::{Bifrost, WyrdClient};
+use wyrd_queue::variant::VariantJsonEncoderFactory;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use crate::error::{CliBoundaryError, WyrdCliError};
@@ -151,11 +155,9 @@ async fn write_jsonl(
     stream: &mut QueryResultStream,
     stdout: &mut dyn Write,
 ) -> Result<(), CliBoundaryError> {
-    let mut writer = arrow::json::WriterBuilder::new()
-        .with_encoder_factory(std::sync::Arc::new(
-            wyrd_queue::variant::VariantJsonEncoderFactory,
-        ))
-        .build::<_, arrow::json::writer::LineDelimited>(stdout);
+    let mut writer = WriterBuilder::new()
+        .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+        .build::<_, LineDelimited>(stdout);
     while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::from)? {
         writer
             .write(&batch)

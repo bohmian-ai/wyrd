@@ -22,6 +22,7 @@ mod pg_tests {
     use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
+    use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::seed_query_fixture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
 
@@ -584,8 +585,6 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()
     -> Result<(), McpJourneyError> {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let server = WyrdTestServer::start_bound().await?;
         let seeded = fixture::seed_canonical_signals(&server, "mcp-canonical-signals").await?;
         let scope = seeded.scope.as_str();
@@ -738,8 +737,6 @@ mod pg_tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn builtin_variant_and_struct_payloads_are_queryable() -> Result<(), McpJourneyError> {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let server = WyrdTestServer::start_bound().await?;
         let seeded = fixture::seed_canonical_signals(&server, "mcp-variant-payloads").await?;
         let parent = format!(

@@ -22,12 +22,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BinaryBuilder, StructArray};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BinaryViewArray, LargeBinaryArray, StructArray,
+};
 use arrow::buffer::NullBuffer;
+use arrow::error::ArrowError;
+use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::{DataType, Field, FieldRef, Fields};
 use parquet_variant::{
-    ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder, VariantBuilderExt, VariantDecimal16,
+    BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
+    VariantBuilderExt, VariantDecimal16,
 };
 use parquet_variant_json::VariantToJson;
 use serde_json::{Number, Value};
@@ -267,7 +272,7 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
 ///
 /// Arrow's JSON writer would otherwise print a Variant as its storage struct
 /// of `metadata`/`value` bytes. Installing this factory on a writer's
-/// [`EncoderOptions`](arrow::json::writer::EncoderOptions) makes every field
+/// [`EncoderOptions`] makes every field
 /// carrying the `arrow.parquet.variant` extension — top level or nested in a
 /// Struct or List — render through [`variant_cell_to_json`], so every
 /// row-as-JSON surface shares one rendering. Other fields keep Arrow's
@@ -275,7 +280,7 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
 #[derive(Debug, Default)]
 pub struct VariantJsonEncoderFactory;
 
-impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
+impl EncoderFactory for VariantJsonEncoderFactory {
     /// Pre-render every non-null cell of a Variant field as JSON text.
     ///
     /// Rendering is done up front because the encoder itself cannot fail. A
@@ -285,14 +290,14 @@ impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
     ///
     /// # Errors
     ///
-    /// Returns [`arrow::error::ArrowError::JsonError`] when a cell with storage
+    /// Returns [`ArrowError::JsonError`] when a cell with storage
     /// is not a decodable unshredded Variant.
     fn make_default_encoder<'a>(
         &self,
-        field: &'a arrow_schema::FieldRef,
+        field: &'a FieldRef,
         array: &'a dyn Array,
-        _options: &'a arrow::json::writer::EncoderOptions,
-    ) -> Result<Option<arrow::json::writer::NullableEncoder<'a>>, arrow::error::ArrowError> {
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
         if field.extension_type_name() != Some(VARIANT_EXTENSION_NAME) {
             return Ok(None);
         }
@@ -304,14 +309,14 @@ impl arrow::json::writer::EncoderFactory for VariantJsonEncoderFactory {
                 variant_cell_to_json(array, row)
                     .map(|value| value.to_string())
                     .map_err(|_| {
-                        arrow::error::ArrowError::JsonError(format!(
+                        ArrowError::JsonError(format!(
                             "field {} row {row} is not a decodable Variant",
                             field.name()
                         ))
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(arrow::json::writer::NullableEncoder::new(
+        Ok(Some(NullableEncoder::new(
             Box::new(RenderedJson(rendered)),
             array.logical_nulls(),
         )))
@@ -339,7 +344,7 @@ pub fn is_placeholder(column: &dyn Array, row: usize) -> bool {
 /// Pre-rendered JSON text of each row of one Variant column.
 struct RenderedJson(Vec<String>);
 
-impl arrow::json::writer::Encoder for RenderedJson {
+impl Encoder for RenderedJson {
     /// Copy row `idx`'s rendered JSON into the writer's buffer.
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         out.extend_from_slice(self.0[idx].as_bytes());
@@ -348,7 +353,6 @@ impl arrow::json::writer::Encoder for RenderedJson {
 
 /// Return one binary child cell regardless of its offset width or view form.
 fn binary_cell(array: &ArrayRef, row: usize) -> Option<&[u8]> {
-    use arrow::array::{BinaryArray, BinaryViewArray, LargeBinaryArray};
     if array.is_null(row) {
         return None;
     }
@@ -567,7 +571,7 @@ fn append_json(
 /// # Errors
 ///
 /// Propagates every [`append_json`] failure.
-fn append_items<S: parquet_variant::BuilderSpecificState>(
+fn append_items<S: BuilderSpecificState>(
     list: &mut ListBuilder<'_, S>,
     items: &[Value],
     path: &mut JsonPointer,
@@ -673,6 +677,10 @@ fn check_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::json::WriterBuilder;
+    use arrow::json::writer::JsonArray;
+    use arrow_schema::Schema;
     use serde_json::json;
 
     /// JSON converts with exact integers, null-vs-missing, and limits.
@@ -760,10 +768,6 @@ mod tests {
     /// the placeholder under a null parent row fails the write.
     #[test]
     fn json_writer_renders_variants_as_values() {
-        use arrow::array::{RecordBatch, StringArray};
-        use arrow::json::writer::JsonArray;
-        use arrow_schema::Schema;
-
         let column = |values: &[Option<Value>]| {
             let mut builder = VariantColumnBuilder::with_capacity(values.len());
             for value in values {
@@ -802,7 +806,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        let mut writer = arrow::json::WriterBuilder::new()
+        let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
             .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());
@@ -822,15 +826,15 @@ mod tests {
         let placeholder = StructArray::new(
             variant_storage_fields(),
             vec![
-                Arc::new(arrow::array::BinaryArray::from(vec![&b""[..]])) as ArrayRef,
-                Arc::new(arrow::array::BinaryArray::from(vec![&b""[..]])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&b""[..]])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&b""[..]])) as ArrayRef,
             ],
             None,
         );
         let report = StructArray::new(
             Fields::from(vec![variant_field("features", false)]),
             vec![Arc::new(placeholder) as ArrayRef],
-            Some(arrow::buffer::NullBuffer::from(vec![false])),
+            Some(NullBuffer::from(vec![false])),
         );
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -841,7 +845,7 @@ mod tests {
             vec![Arc::new(report)],
         )
         .expect("batch");
-        let mut writer = arrow::json::WriterBuilder::new()
+        let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
             .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());

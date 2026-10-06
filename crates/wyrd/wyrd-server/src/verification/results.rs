@@ -808,7 +808,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::TimestampMicrosecondType;
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
     use chrono::TimeZone;
     use vala_drift::FeatureDriftReport;
     use wyrd_spec::card::drift::DriftMethod;
@@ -1036,7 +1036,7 @@ mod tests {
         let scores = features
             .column_by_name("score")
             .expect("score column")
-            .as_primitive::<arrow::datatypes::Float64Type>();
+            .as_primitive::<Float64Type>();
         assert!(scores.is_valid(0) && scores.is_null(1), "NaN score is null");
         assert_eq!(cell(summary, "implementation", 0).as_deref(), Some("drift"));
         assert_eq!(
@@ -1157,7 +1157,7 @@ mod tests {
         let count = |name: &str| {
             eval.column_by_name(name)
                 .expect("count column")
-                .as_primitive::<arrow::datatypes::Int32Type>()
+                .as_primitive::<Int32Type>()
                 .value(0)
         };
         assert_eq!((count("total_tasks"), count("passed_tasks")), (1, 1));
@@ -1185,7 +1185,7 @@ mod tests {
             summary
                 .column_by_name("pass_rate")
                 .expect("pass rate")
-                .as_primitive::<arrow::datatypes::Float64Type>()
+                .as_primitive::<Float64Type>()
                 .value(0),
             0.0
         );
@@ -1193,7 +1193,7 @@ mod tests {
             summary
                 .column_by_name("duration_ms")
                 .expect("duration")
-                .as_primitive::<arrow::datatypes::Int64Type>()
+                .as_primitive::<Int64Type>()
                 .value(0),
             0
         );

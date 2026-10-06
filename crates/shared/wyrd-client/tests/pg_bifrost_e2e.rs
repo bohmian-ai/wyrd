@@ -40,6 +40,7 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome, RegisterOutcome};
+    use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
     use wyrd_tonic::tonic::Request;
@@ -2462,8 +2463,6 @@ mod pg_tests {
     /// refuses the wrong caller.
     #[tokio::test]
     async fn canonical_signal_arrow_write_and_sql_read_round_trip() {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");
@@ -2729,8 +2728,6 @@ mod pg_tests {
     /// the invalid-JSON query does not fail with its catalog code.
     #[tokio::test]
     async fn builtin_variant_and_struct_payloads_are_queryable() {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");

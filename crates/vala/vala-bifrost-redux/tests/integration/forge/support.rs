@@ -18,8 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -59,7 +63,9 @@ use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwn
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
@@ -2809,8 +2815,8 @@ fn ingress_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            WYRD_EVENT_TIME,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
     ]))
@@ -2868,11 +2874,11 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
     let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
     let mut schema_fields = fields.to_vec();
     schema_fields.push(Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        WYRD_EVENT_TIME,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         false,
     ));
-    let columns: Vec<arrow::array::ArrayRef> = schema_fields
+    let columns: Vec<ArrayRef> = schema_fields
         .iter()
         .map(|field| fixture_column(field, file_number, noon, &offsets))
         .collect();
@@ -2890,25 +2896,17 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
 ///
 /// Panics when the field type is not one [`flat_builtin_batch`] supports or a
 /// Variant value cannot be encoded.
-fn fixture_column(
-    field: &Field,
-    file_number: i64,
-    noon: i64,
-    offsets: &[i64],
-) -> arrow::array::ArrayRef {
+fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -> ArrayRef {
     if vala_bifrost_redux::tables::fields::is_variant(field) {
-        let mut builder = wyrd_queue::variant::VariantColumnBuilder::with_capacity(offsets.len());
+        let mut builder = VariantColumnBuilder::with_capacity(offsets.len());
         for row in offsets {
             let value = serde_json::json!({ field.name().as_str(): [file_number, row] });
-            builder.append(
-                &wyrd_queue::variant::EncodedVariant::from_json(&value)
-                    .expect("fixture Variant encodes"),
-            );
+            builder.append(&EncodedVariant::from_json(&value).expect("fixture Variant encodes"));
         }
         return builder.finish();
     }
     match field.data_type() {
-        DataType::Utf8 => Arc::new(arrow::array::StringArray::from_iter_values(
+        DataType::Utf8 => Arc::new(StringArray::from_iter_values(
             offsets
                 .iter()
                 .map(|row| format!("{}-{file_number}-{row}", field.name())),
@@ -2916,31 +2914,25 @@ fn fixture_column(
         DataType::Int64 => Arc::new(Int64Array::from_iter_values(
             offsets.iter().map(|row| file_number * 1_000 + row),
         )),
-        DataType::Int32 => Arc::new(arrow::array::Int32Array::from_iter_values(
-            offsets.iter().map(|row| {
-                i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
-            }),
-        )),
-        DataType::Float64 => Arc::new(arrow::array::Float64Array::from_iter_values(
-            offsets.iter().map(|row| {
-                f64::from(i32::try_from(file_number * 1_000 + row).expect("bounded fixture value"))
-            }),
-        )),
+        DataType::Int32 => Arc::new(Int32Array::from_iter_values(offsets.iter().map(|row| {
+            i32::try_from(file_number * 1_000 + row).expect("bounded fixture value")
+        }))),
+        DataType::Float64 => Arc::new(Float64Array::from_iter_values(offsets.iter().map(|row| {
+            f64::from(i32::try_from(file_number * 1_000 + row).expect("bounded fixture value"))
+        }))),
         DataType::Boolean => Arc::new(
             offsets
                 .iter()
                 .map(|row| Some(row % 2 == 0))
-                .collect::<arrow::array::BooleanArray>(),
+                .collect::<BooleanArray>(),
         ),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(zone))
-            if zone.as_ref() == "UTC" =>
-        {
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => {
             Arc::new(
                 TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
                     .with_timezone("UTC"),
             )
         }
-        DataType::Struct(children) => Arc::new(arrow::array::StructArray::new(
+        DataType::Struct(children) => Arc::new(StructArray::new(
             children.clone(),
             children
                 .iter()
@@ -2964,8 +2956,7 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     let mut ipc = Vec::new();
     {
         let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
-                .expect("fixture IPC writer");
+            StreamWriter::try_new(&mut ipc, batch.schema().as_ref()).expect("fixture IPC writer");
         writer.write(batch).expect("fixture IPC batch");
         writer.finish().expect("fixture IPC finish");
     }

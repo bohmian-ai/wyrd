@@ -657,6 +657,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::Schema;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
@@ -743,9 +744,9 @@ mod tests {
             .expect(sql);
         let mut out = Vec::new();
         for batch in batches {
-            let rendered = arrow::util::display::ArrayFormatter::try_new(
+            let rendered = ArrayFormatter::try_new(
                 batch.column(0).as_ref(),
-                &arrow::util::display::FormatOptions::default().with_null("NULL"),
+                &FormatOptions::default().with_null("NULL"),
             )
             .expect("formatter");
             for row in 0..batch.num_rows() {
@@ -853,10 +854,10 @@ mod tests {
             .collect()
             .await
             .expect_err("invalid JSON is refused");
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut source: Option<&(dyn Error + 'static)> = Some(&error);
         let mut found = None;
         while let Some(current) = source {
-            if let Some(bifrost) = current.downcast_ref::<wyrd_spec::vala::BifrostError>() {
+            if let Some(bifrost) = current.downcast_ref::<BifrostError>() {
                 found = Some(bifrost.clone());
             }
             source = current.source();

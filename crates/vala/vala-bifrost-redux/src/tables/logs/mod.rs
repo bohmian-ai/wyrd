@@ -151,6 +151,10 @@ mod tests {
     ///
     /// Comparing bytes rather than JSON keeps values JSON cannot express, such
     /// as a NaN double with a payload, exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is missing or is not Variant storage.
     fn variant_bytes<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> (&'a [u8], &'a [u8]) {
         let storage = typed::<StructArray>(batch, name);
         let child = |part: &str| {

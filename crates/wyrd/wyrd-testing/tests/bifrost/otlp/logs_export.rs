@@ -356,6 +356,10 @@ mod pg_tests {
     const VARIANT_BODY_TEXT: &str = "order 7 delayed";
 
     /// Builds one Variant journey log record named by its event name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
     fn variant_record(time: i64, event_name: &str, body: Option<AnyValue>) -> LogRecord {
         LogRecord {
             time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),

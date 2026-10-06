@@ -85,6 +85,7 @@ impl DomainTable for CallsTable {
     const NAME: &'static str = "calls";
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
+    /// Both Variant payload columns require payload-read authority.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
 
     /// The `GatewayCallPayloadV1` fields in contract order.

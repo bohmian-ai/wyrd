@@ -247,11 +247,13 @@ struct SpanColumns {
     status_present: Vec<bool>,
     status_code: Vec<Option<i32>>,
     status_message: Vec<Option<String>>,
+    /// Span attributes as one Variant object, final duplicate key kept.
     attributes: Vec<EncodedVariant>,
     dropped_attributes_count: Vec<u32>,
     event_lengths: Vec<Option<usize>>,
     event_time: Vec<i64>,
     event_name: Vec<String>,
+    /// Flattened span-event attributes, one Variant object each.
     event_attributes: Vec<EncodedVariant>,
     event_dropped: Vec<u32>,
     dropped_events_count: Vec<u32>,
@@ -260,32 +262,45 @@ struct SpanColumns {
     link_span_id: Vec<Vec<u8>>,
     link_trace_state: Vec<String>,
     link_flags: Vec<u32>,
+    /// Flattened span-link attributes, one Variant object each.
     link_attributes: Vec<EncodedVariant>,
     link_dropped: Vec<u32>,
     dropped_links_count: Vec<u32>,
     resource_present: Vec<bool>,
+    /// Resource attributes as one Variant object, final duplicate key kept.
     resource_attributes: Vec<EncodedVariant>,
     resource_dropped_attributes_count: Vec<u32>,
     resource_schema_url: Vec<String>,
     entity_ref_lengths: Vec<Option<usize>>,
+    /// Flattened resource entity references, split per row by `entity_ref_lengths`.
     entity_refs: Vec<EntityRef>,
     scope_present: Vec<bool>,
     scope_name: Vec<String>,
     scope_version: Vec<String>,
+    /// Scope attributes as one Variant object, final duplicate key kept.
     scope_attributes: Vec<EncodedVariant>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
     service_name: Vec<Option<String>>,
     gen_ai_strings: [Vec<Option<String>>; 4],
     gen_ai_ints: [Vec<Option<i64>>; 2],
+    /// Promoted `service.version` resource string.
     service_version: Vec<Option<String>>,
+    /// Promoted `deployment.environment.name` resource string.
     deployment_environment: Vec<Option<String>>,
+    /// Promoted `http.request.method` attribute string.
     http_request_method: Vec<Option<String>>,
+    /// Promoted `http.route` attribute string.
     http_route: Vec<Option<String>>,
+    /// Promoted `http.response.status_code` attribute integer.
     http_response_status_code: Vec<Option<i64>>,
+    /// Promoted `url.full` attribute string.
     url_full: Vec<Option<String>>,
+    /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
+    /// Promoted `exception.message` attribute string.
     exception_message: Vec<Option<String>>,
+    /// Promoted `exception.stacktrace` attribute string.
     exception_stacktrace: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,

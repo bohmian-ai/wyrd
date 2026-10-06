@@ -2295,6 +2295,11 @@ mod tests {
     /// included — matches the registered user fingerprint, keeps `run_id` in its
     /// declared slot, and stamps to the table's own physical schema with no
     /// second correlation `run_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the definition is missing, the decode fails, or `run_id`
+    /// leaves its declared slot.
     #[test]
     fn code_axis_decode_keeps_declared_run_id_content() {
         let definition =

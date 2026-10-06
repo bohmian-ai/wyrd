@@ -204,14 +204,22 @@ impl VariantGet {
 }
 
 impl ScalarUDFImpl for VariantGet {
+    /// The SQL name `->` and `variant_get` calls resolve to.
     fn name(&self) -> &str {
         VARIANT_GET
     }
 
+    /// The signature declared by the constructor; `DataFusion` coerces and
+    /// checks call arguments against it before planning the return field.
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
+    /// The unshredded Variant storage type every path lookup returns.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the argument checks run in `return_field_from_args`.
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(variant_storage_type())
     }
@@ -417,18 +425,28 @@ impl VariantAsText {
 }
 
 impl ScalarUDFImpl for VariantAsText {
+    /// The internal name the `->>` operator plans to.
     fn name(&self) -> &str {
         VARIANT_AS_TEXT
     }
 
+    /// The signature declared by the constructor; `DataFusion` coerces and
+    /// checks call arguments against it before planning the return field.
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
+    /// `Utf8`, the text every `->>` lookup returns.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the argument checks run in `return_field_from_args`.
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
     }
 
+    /// Require one Variant argument and return a nullable `Utf8` field.
+    ///
     /// # Errors
     ///
     /// Returns a plan error when the argument is not a Variant.
@@ -479,18 +497,28 @@ impl ToJson {
 }
 
 impl ScalarUDFImpl for ToJson {
+    /// The SQL name `to_json`.
     fn name(&self) -> &str {
         TO_JSON
     }
 
+    /// The signature declared by the constructor; `DataFusion` coerces and
+    /// checks call arguments against it before planning the return field.
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
+    /// `Utf8`, the JSON text of each Variant.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the argument checks run in `return_field_from_args`.
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
     }
 
+    /// Require one Variant argument and return a nullable `Utf8` field.
+    ///
     /// # Errors
     ///
     /// Returns a plan error when the argument is not a Variant.
@@ -553,6 +581,7 @@ impl ParseJson {
 }
 
 impl ScalarUDFImpl for ParseJson {
+    /// `try_parse_json` for the lenient parser, otherwise `parse_json`.
     fn name(&self) -> &str {
         if self.lenient {
             TRY_PARSE_JSON
@@ -561,14 +590,27 @@ impl ScalarUDFImpl for ParseJson {
         }
     }
 
+    /// The signature declared by the constructor; `DataFusion` coerces and
+    /// checks call arguments against it before planning the return field.
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
+    /// The unshredded Variant storage type of each parsed value.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the argument checks run in `return_field_from_args`.
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(variant_storage_type())
     }
 
+    /// A nullable Variant field named after the function, so the parsed
+    /// column carries the `arrow.parquet.variant` extension downstream.
+    ///
+    /// # Errors
+    ///
+    /// Never fails; the signature already coerced the argument to `Utf8`.
     fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
         Ok(Arc::new(variant_field(self.name(), true)))
     }
@@ -652,6 +694,7 @@ impl Error for VariantQueryError {
     }
 }
 
+/// Contract tests for the Variant SQL surface over an in-memory session.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +707,11 @@ mod tests {
     /// Builds a session with the Variant surface over one table `t` holding
     /// a Variant `v`, a Struct `s` with a Variant child, and a JSON text `j`.
     /// A `None` value makes that row's `v`, `j`, and `s` null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture value does not encode or the table does not
+    /// register.
     fn session(values: &[Option<&str>]) -> SessionContext {
         let mut variant = VariantColumnBuilder::with_capacity(values.len());
         for value in values {
@@ -734,6 +782,10 @@ mod tests {
     }
 
     /// Runs `sql` and returns its first column rendered as display strings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query fails to plan, execute, or render.
     async fn column(context: &SessionContext, sql: &str) -> Vec<String> {
         let batches = context
             .sql(sql)

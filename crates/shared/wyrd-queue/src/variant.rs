@@ -674,6 +674,7 @@ fn check_depth(
     Ok(())
 }
 
+/// Contract tests for Variant encoding, validation, and JSON rendering.
 #[cfg(test)]
 mod tests {
     use super::*;

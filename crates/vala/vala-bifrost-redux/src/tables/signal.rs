@@ -1138,6 +1138,10 @@ mod tests {
     }
 
     /// Decode one encoded Variant back to JSON.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bytes are not a valid Variant.
     fn json_of(encoded: &EncodedVariant) -> serde_json::Value {
         variant_bytes_to_json(encoded.metadata(), encoded.value()).expect("valid Variant")
     }

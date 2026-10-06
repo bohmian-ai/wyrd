@@ -398,7 +398,7 @@ fn payload_bounds_from(message: &str, details: &serde_json::Value) -> (usize, us
 
 #[cfg(test)]
 mod tests {
-    use super::{WyrdClientError, from_problem_json};
+    use super::{BifrostError, WyrdClientError, from_problem_json};
     use wyrd_spec::error::{WyrdError, WyrdStorageError};
 
     #[test]
@@ -417,10 +417,15 @@ mod tests {
     /// The body is the server's own rendering, so a Variant query failure keeps
     /// its catalog code and location instead of collapsing to an upstream
     /// failure on the client.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reconstructed code or problem document drifts from the
+    /// sent error.
     #[test]
     fn bifrost_problem_details_reconstruct_exact_variant() {
         let sent = WyrdError::Vala {
-            error: wyrd_spec::vala::error::BifrostError::VariantInvalidJson {
+            error: BifrostError::VariantInvalidJson {
                 field: "parse_json".to_owned(),
                 row: 0,
                 path: String::new(),

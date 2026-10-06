@@ -613,6 +613,10 @@ mod pg_tests {
     ///
     /// Every Variant collection the span carries is filled by the caller, so
     /// the accepted and the oversized spans share every other field.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
     fn variant_span(
         start: i64,
         span_id: u8,
@@ -651,6 +655,10 @@ mod pg_tests {
 
     /// The accepted span: probes on every Variant collection plus every HTTP
     /// and exception convention the ledger promotes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
     fn promoted_variant_span(start: i64) -> Span {
         let mut attributes = support::variant_probe_attributes("span");
         attributes.extend([

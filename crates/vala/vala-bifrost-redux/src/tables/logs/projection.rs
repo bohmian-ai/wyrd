@@ -129,30 +129,42 @@ struct LogColumns {
     severity_number: Vec<i32>,
     severity_text: Vec<String>,
     event_name: Vec<Option<String>>,
+    /// Record body as a Variant; null when the record carries none.
     body: Vec<Option<EncodedVariant>>,
     trace_id: Vec<Option<Vec<u8>>>,
     span_id: Vec<Option<Vec<u8>>>,
     flags: Vec<u32>,
+    /// Record attributes as one Variant object, final duplicate key kept.
     attributes: Vec<EncodedVariant>,
     dropped_attributes_count: Vec<u32>,
     resource_present: Vec<bool>,
+    /// Resource attributes as one Variant object, final duplicate key kept.
     resource_attributes: Vec<EncodedVariant>,
     resource_dropped_attributes_count: Vec<u32>,
     resource_schema_url: Vec<String>,
     entity_ref_lengths: Vec<Option<usize>>,
+    /// Flattened resource entity references, split per row by `entity_ref_lengths`.
     entity_refs: Vec<EntityRef>,
     scope_present: Vec<bool>,
     scope_name: Vec<String>,
     scope_version: Vec<String>,
+    /// Scope attributes as one Variant object, final duplicate key kept.
     scope_attributes: Vec<EncodedVariant>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
+    /// Promoted `service.name` resource string.
     service_name: Vec<Option<String>>,
+    /// Promoted `service.version` resource string.
     service_version: Vec<Option<String>>,
+    /// Promoted `deployment.environment.name` resource string.
     deployment_environment: Vec<Option<String>>,
+    /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
+    /// Promoted `exception.message` attribute string.
     exception_message: Vec<Option<String>>,
+    /// Promoted `exception.stacktrace` attribute string.
     exception_stacktrace: Vec<Option<String>>,
+    /// The body when it is a string, else null.
     body_text: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,

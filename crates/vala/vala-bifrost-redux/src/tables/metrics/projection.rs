@@ -832,11 +832,13 @@ struct PointColumns {
     metric_name: Vec<String>,
     description: Vec<String>,
     unit: Vec<String>,
+    /// Metric metadata as one Variant object, final duplicate key kept.
     metadata: Vec<EncodedVariant>,
     metric_type: Vec<String>,
     time_unix_nano: Vec<i64>,
     start_time_unix_nano: Vec<i64>,
     flags: Vec<u32>,
+    /// Point attributes as one Variant object, final duplicate key kept.
     attributes: Vec<EncodedVariant>,
     int_value: Vec<Option<i64>>,
     double_value: Vec<Option<f64>>,
@@ -870,23 +872,30 @@ struct PointColumns {
     exemplar_time: Vec<i64>,
     exemplar_int: Vec<Option<i64>>,
     exemplar_double: Vec<Option<f64>>,
+    /// Flattened exemplar filtered attributes, one Variant object each.
     exemplar_attributes: Vec<EncodedVariant>,
     exemplar_trace_id: Vec<Option<Vec<u8>>>,
     exemplar_span_id: Vec<Option<Vec<u8>>>,
     resource_present: Vec<bool>,
+    /// Resource attributes as one Variant object, final duplicate key kept.
     resource_attributes: Vec<EncodedVariant>,
     resource_dropped_attributes_count: Vec<u32>,
     resource_schema_url: Vec<String>,
     entity_ref_lengths: Vec<Option<usize>>,
+    /// Flattened resource entity references, split per row by `entity_ref_lengths`.
     entity_refs: Vec<EntityRef>,
     scope_present: Vec<bool>,
     scope_name: Vec<String>,
     scope_version: Vec<String>,
+    /// Scope attributes as one Variant object, final duplicate key kept.
     scope_attributes: Vec<EncodedVariant>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
+    /// Promoted `service.name` resource string.
     service_name: Vec<Option<String>>,
+    /// Promoted `service.version` resource string.
     service_version: Vec<Option<String>>,
+    /// Promoted `deployment.environment.name` resource string.
     deployment_environment: Vec<Option<String>>,
     card_ref: Vec<Option<String>>,
     run_id: Vec<Option<String>>,

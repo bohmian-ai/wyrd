@@ -682,6 +682,10 @@ mod pg_tests {
     ///
     /// `points` is the number of identical points, so a metric-level failure
     /// is visible as a rejection of each of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
     fn variant_gauge(
         time: i64,
         name: &str,
@@ -722,6 +726,10 @@ mod pg_tests {
     }
 
     /// The one exemplar whose filtered attributes carry the fidelity probe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
     fn variant_exemplar(time: i64) -> Exemplar {
         Exemplar {
             filtered_attributes: support::variant_probe_attributes("exemplar"),

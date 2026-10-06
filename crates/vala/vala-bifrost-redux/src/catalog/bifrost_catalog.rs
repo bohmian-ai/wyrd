@@ -1836,20 +1836,33 @@ mod schema_shape_tests {
     /// Struct, or a Variant stops matching itself.
     #[test]
     fn schema_shape_keeps_variant_identity_at_any_depth() {
-        let variant = || variant_field("payload", true);
-        let storage = || Field::new("payload", variant_storage_type(), true);
-        let placements: [(&str, fn(Field) -> Field); 3] = [
-            ("top level", |field| field),
-            ("struct child", |field| {
-                Field::new("outer", DataType::Struct(Fields::from(vec![field])), true)
-            }),
-            ("list element", |field| {
-                Field::new("outer", DataType::List(Arc::new(field)), true)
-            }),
+        let variant = variant_field("payload", true);
+        let storage = Field::new("payload", variant_storage_type(), true);
+        let struct_child = |field: &Field| {
+            Field::new(
+                "outer",
+                DataType::Struct(Fields::from(vec![field.clone()])),
+                true,
+            )
+        };
+        let list_element =
+            |field: &Field| Field::new("outer", DataType::List(Arc::new(field.clone())), true);
+        let placements = [
+            ("top level", variant.clone(), storage.clone()),
+            (
+                "struct child",
+                struct_child(&variant),
+                struct_child(&storage),
+            ),
+            (
+                "list element",
+                list_element(&variant),
+                list_element(&storage),
+            ),
         ];
-        for (placement, place) in placements {
-            let variant = Schema::new(vec![place(variant())]);
-            let storage = Schema::new(vec![place(storage())]);
+        for (placement, variant, storage) in placements {
+            let variant = Schema::new(vec![variant]);
+            let storage = Schema::new(vec![storage]);
             assert!(schema_shape_matches(&variant, &variant), "{placement}");
             assert!(!schema_shape_matches(&variant, &storage), "{placement}");
             assert!(!schema_shape_matches(&storage, &variant), "{placement}");

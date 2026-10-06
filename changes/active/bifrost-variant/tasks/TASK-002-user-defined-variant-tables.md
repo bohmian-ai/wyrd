@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: implemented
 spec: SPEC-bifrost-variant
-spec_revision: 13
+spec_revision: 14
 requirements: [REQ-003, REQ-004, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-018, REQ-019, INV-002, INV-003, INV-004, INV-006, INV-007, AC-004, AC-005, AC-008]
 depends_on: [TASK-001]
 parent_task:
@@ -38,7 +38,7 @@ budget mutation; multi-row calls are all-or-none.
 
 ## Approach
 
-1. Map revision-13 declaration forms to existing canonical Variant, Struct,
+1. Map revision-14 declaration forms to existing canonical Variant, Struct,
    List, scalar, and nullability shapes; reject unsupported forms on client and
    server.
 2. Add the single prepared-input boundary. Validate/normalize the complete
@@ -57,8 +57,8 @@ budget mutation; multi-row calls are all-or-none.
 
 **Behavior.** Every REQ-012 form maps exactly; fixed objects become Struct,
 open/mixed shapes Variant, typed arrays List whose items keep their declared
-nullability, and unsupported types fail in the
-SDK before a request and again at the server. Open extras beside fixed fields
+nullability, and unsupported types fail at every SDK declaration boundary that
+can represent them before a request and again at the server. Open extras beside fixed fields
 return `WYRD_VALA_400_SCHEMA_PARSE`. This proves REQ-003, REQ-012, REQ-015,
 REQ-016, INV-002, INV-006, and AC-005.
 
@@ -108,7 +108,8 @@ declared Variant fields. Remaining refusals are selected exactly as for rows:
 earliest input row, then declared field. Describe failure, duplicate names,
 invalid JSON, and wrong wire types leave queue, budget, and direct-send state
 unchanged; server input must be the extension, and the server repeats Variant
-value checks for every table, dynamic tables included. Row strings are not
+value checks for every table, dynamic tables included, against the registered
+declaration rather than the supplied schema. Row strings are not
 JSON-parsed. This proves REQ-014, REQ-019,
 INV-002, INV-007, AC-004, and AC-005.
 
@@ -131,17 +132,18 @@ access; returns native values (`bigint` for TypeScript 64-bit integers); and
 proves Struct uses `get_field`, Variant uses semantic `variant_get`, and a
 refusal has no durable row. Arrow terminals retain the extension. Each SDK
 also proves the AC-005 refusal matrix at its public boundary with exact
-catalog codes: a model allowing extra keys (`SCHEMA_PARSE`), an undeclared
-write with no durable row (`BIFROST_UNDECLARED_FIELD`), and the REQ-016
-unsupported types (`BIFROST_UNSUPPORTED_TYPE`). Rust and Python declare each
-REQ-016 type (UInt64, Date64, Time32, second and millisecond timestamps, a
-non-UTC zone) through their Arrow door. TypeScript declares tables only from
-JSON Schema, which cannot express those types, so it proves the
-unsupported-type projection on a Variant column written as Int64. The Rust
-journey also sends malformed, depth-65, and over-8-MiB Variant bytes
-unchanged over authenticated gRPC to a dynamic table and proves the server
-refuses each with its catalog code and stores nothing, while a valid batch on
-the same path is stored. This proves REQ-013, REQ-014, REQ-015, REQ-016,
+catalog codes: a model allowing extra keys (`SCHEMA_PARSE`) and an undeclared
+write with no durable row (`BIFROST_UNDECLARED_FIELD`). Rust and Python also
+declare and refuse each REQ-016 type (UInt64, Date64, Time32, second and
+millisecond timestamps, a non-UTC zone) through their Arrow door
+(`BIFROST_UNSUPPORTED_TYPE`). Per revision 14, TypeScript declares tables only
+from JSON Schema/Zod, which cannot express those types; its Variant column
+written as Int64 is REQ-014 evidence only. The Rust journey also sends Variant data
+unchanged over authenticated gRPC to a dynamic table: a registered Variant
+without its extension or with a foreign one, the Variant extension on the
+ordinary `point` Struct and on its nested `label`, and malformed, depth-65, and
+over-8-MiB bytes; the server refuses each with its catalog code and stores
+nothing, while a valid batch on the same path is stored. This proves REQ-013, REQ-014, REQ-015, REQ-016,
 REQ-018, REQ-019, INV-003, INV-004, INV-007, AC-004, AC-005, AC-008.
 
 **RED.** Add the cases to one focused journey file per SDK:
@@ -232,7 +234,7 @@ it is not a Bifrost data or Iceberg migration.
 
 ## Material Stop Conditions
 
-- A declaration needs a new durable public type beyond revision 13.
+- A declaration needs a new durable public type beyond revision 14.
 - Pre-admission rejection cannot be achieved without language-local queues or
   durable validation outside Rust.
 - `write_batch` cannot use the existing authoritative `describe(table)` before
@@ -248,7 +250,7 @@ schema acquisition are fixed above; only local symbol placement remains.
 
 ## Authority Links
 
-- `changes/active/bifrost-variant/spec.md` revision 13
+- `changes/active/bifrost-variant/spec.md` revision 14
 - `changes/active/bifrost-variant/tasks/TASK-001-variant-storage-and-query.md`
 - `AGENTS.md`
 - `architecture/{agent-rules,wyrd-design,wyrd-doctrine,bifrost-design}.md`

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 13
+revision: 14
 status: approved
 ---
 
@@ -805,9 +805,13 @@ field for open data.
 Registering a table with a type Iceberg cannot store (UInt64, Date64, Time32,
 second- or millisecond-precision timestamps, a timestamp with a non-UTC zone,
 or any other type the canonical schema model does not support) is refused with
-`WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at the SDK
-before any request and again at the server. SDK documentation lists exactly
-the supported types.
+`WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at every
+SDK declaration boundary capable of representing that type before any
+request, and again at the server. Rust and Python Arrow declaration boundaries
+cover every listed Arrow type. TypeScript's JSON Schema/Zod declaration
+boundary covers only forms representable by JSON Schema and does not gain a
+`TableConfig.fromArrow` surface for this requirement. SDK documentation lists
+exactly the types its public declaration formats support.
 
 ### Query
 
@@ -1123,10 +1127,15 @@ field access and decoded into native values by the typed row terminal.
 
 #### AC-005 — Refusals
 
-In each SDK, an undeclared row key, a model allowing extra keys, and each
-unsupported type of REQ-016 are refused with their exact catalog codes, and no
-row is queued for a refused write. Invalid JSON in `parse_json` returns a
-stable query error; `try_parse_json` returns null.
+In each SDK, an undeclared row key and a model allowing extra keys are refused
+with their exact catalog codes, and no row is queued for a refused write.
+Rust and Python additionally declare and refuse every Arrow type listed in
+REQ-016 before any request. TypeScript proves declaration-time refusals for
+unsupported forms expressible through its public JSON Schema/Zod boundary; it
+is not required to synthesize Arrow declarations that boundary cannot
+represent. A `write_batch` wire-type mismatch proves REQ-014 and does not
+substitute for declaration-time REQ-016 evidence. Invalid JSON in
+`parse_json` returns a stable query error; `try_parse_json` returns null.
 
 #### AC-006 — Shredding equivalence
 
@@ -1186,6 +1195,14 @@ None.
 
 ## Revision history
 
+- **Revision 14 (2026-10-06, approved):** Resolves TASK-002 repeat-review
+  `FIND-TASK-002-6` without adding the explicitly excluded TypeScript
+  `TableConfig.fromArrow`. REQ-016 and AC-005 now require exhaustive
+  unsupported-type declaration proof only at public SDK declaration boundaries
+  capable of representing those types. Rust and Python retain the full Arrow
+  matrix; TypeScript retains JSON Schema/Zod refusals, while write-time wire
+  mismatches remain REQ-014 evidence rather than a substitute for declaration
+  evidence. No runtime behavior or supported type changes.
 - **Revision 13 (2026-10-06, approved):** From TASK-002 implementation. Arrow
   `write_batch` follows the same column rules as row `insert`: columns match by
   name in any order and take their declared nullability, an omitted nullable

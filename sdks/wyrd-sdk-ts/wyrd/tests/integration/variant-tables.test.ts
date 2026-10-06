@@ -203,8 +203,7 @@ it("refuses a model allowing extra keys", () => {
 });
 
 it("refuses a Variant column sent as neither Variant nor JSON text", async () => {
-  // JSON Schema cannot declare the types Iceberg cannot store, so this is
-  // where a TypeScript caller meets the unsupported-type refusal.
+  // A Variant column takes the Variant extension or JSON text, nothing else.
   const arrow = new Table({
     id: vectorFromArray([1n], new Int64()),
     payload: vectorFromArray([7n], new Int64()),

@@ -1,6 +1,7 @@
 """Real Python SDK to Gate to Oracle query journey."""
 
 import asyncio
+import json
 
 import pyarrow
 import pytest
@@ -191,120 +192,176 @@ def _otlp_headers(server: WyrdTestServer) -> tuple[tuple[str, str], ...]:
     return (("x-wyrd-access-token", f"Bearer {server.access_token()}"),)
 
 
-def _export_canonical_signals(server: WyrdTestServer, scope: str) -> None:
-    """Export the GenAI chat, its failing tool call, the tool's log, and three metrics.
+TRACE_ID = bytes.fromhex("c1a0112233445566778899aabbccddee")
+PARENT_SPAN_ID = bytes.fromhex("a1a2a3a4a5a6a7a8")
+CHILD_SPAN_ID = bytes.fromhex("b1b2b3b4b5b6b7b8")
 
-    Every signal goes through the stock OpenTelemetry SDK and OTLP exporters,
-    so the canonical rows, including their Variant payloads, are produced by
-    the server's own ingress rather than by a Python fixture encoder.
+
+def _is_variant(field: pyarrow.Field) -> bool:
+    return (field.metadata or {}).get(b"ARROW:extension:name") == b"arrow.parquet.variant"
+
+
+def _empty(field: pyarrow.Field) -> object:
+    """The value a column takes in a row that does not name it."""
+
+    if field.nullable:
+        return None
+    if _is_variant(field):
+        return "{}"
+    if pyarrow.types.is_string(field.type):
+        return ""
+    if pyarrow.types.is_boolean(field.type):
+        return False
+    if pyarrow.types.is_list(field.type):
+        return []
+    return 0
+
+
+def _batch(schema: pyarrow.Schema, rows: list[dict[str, object]]) -> pyarrow.RecordBatch:
+    """One batch for a built-in signal table, written the way a caller would.
+
+    Variant columns are JSON text, which ``write_batch`` encodes. Nullable
+    columns no row names are left out and arrive as nulls; required ones take
+    their empty value.
     """
 
-    import logging
-    import os
-    from math import inf
-
-    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-    from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor
-    from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.trace import (
-        Link,
-        SpanContext,
-        SpanKind,
-        Status,
-        StatusCode,
-        TraceFlags,
+    columns = [
+        field for field in schema if not field.nullable or any(field.name in row for row in rows)
+    ]
+    return pyarrow.RecordBatch.from_pylist(
+        [{field.name: row.get(field.name, _empty(field)) for field in columns} for row in rows],
+        schema=pyarrow.schema(
+            pyarrow.field(field.name, pyarrow.string(), field.nullable)
+            if _is_variant(field)
+            else field
+            for field in columns
+        ),
     )
 
-    endpoint = os.environ["WYRD_GRPC_URL"]
-    headers = _otlp_headers(server)
-    resource = Resource.create({"service.name": SERVICE})
-    traces = TracerProvider(resource=resource)
-    traces.add_span_processor(
-        SimpleSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True, headers=headers))
-    )
-    logs = LoggerProvider(resource=resource)
-    logs.add_log_record_processor(
-        SimpleLogRecordProcessor(OTLPLogExporter(endpoint=endpoint, insecure=True, headers=headers))
-    )
-    logger = logging.getLogger(scope)
-    logger.propagate = False
-    handler = LoggingHandler(logger_provider=logs)
-    logger.addHandler(handler)
 
-    tracer = traces.get_tracer(scope, "1.0.0")
-    linked = SpanContext(
-        trace_id=1,
-        span_id=2,
-        is_remote=True,
-        trace_flags=TraceFlags(TraceFlags.SAMPLED),
-    )
-    try:
-        with tracer.start_as_current_span(
-            "chat claude-opus-5", kind=SpanKind.CLIENT, links=[Link(linked)]
-        ) as parent:
-            parent.set_attributes(
-                {
-                    "gen_ai.operation.name": "chat",
-                    "gen_ai.request.model": MODEL,
-                    "gen_ai.usage.input_tokens": INPUT_TOKENS,
-                    "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
-                    "gen_ai.input.messages": INPUT_MESSAGES,
-                    "gen_ai.output.messages": OUTPUT_MESSAGES,
-                }
-            )
-            parent.add_event(EVENT_NAME, {"gen_ai.finish_reason": "stop"})
-            parent.set_status(Status(StatusCode.OK))
-            with tracer.start_as_current_span("execute_tool search") as child:
-                child.set_attributes(
-                    {
-                        "gen_ai.operation.name": "execute_tool",
-                        "gen_ai.request.model": MODEL,
-                        "gen_ai.tool.name": "search",
-                        "gen_ai.usage.input_tokens": 64,
-                        "gen_ai.usage.output_tokens": 16,
-                    }
-                )
-                logger.error(LOG_BODY, extra={"gen_ai.tool.name": "search"})
-                child.set_status(Status(StatusCode.ERROR, LOG_BODY))
-    finally:
-        logger.removeHandler(handler)
-        logs.shutdown()
-        traces.shutdown()
+def _envelope(scope: str) -> dict[str, object]:
+    """The resource and scope every signal row shares."""
 
-    reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(endpoint=endpoint, insecure=True, headers=headers),
-        export_interval_millis=inf,
-    )
-    metrics = MeterProvider(resource=resource, metric_readers=[reader])
-    meter = metrics.get_meter(scope, "1.0.0")
-    attributes = {"gen_ai.request.model": MODEL}
-    meter.create_counter("wyrd.fixture.requests").add(COUNTER_VALUE, attributes)
-    meter.create_gauge("wyrd.fixture.saturation").set(GAUGE_VALUE, attributes)
-    latency = meter.create_histogram("wyrd.fixture.latency")
-    for value in HISTOGRAM_VALUES:
-        latency.record(value, attributes)
-    # An infinite interval starts no export thread, so the flush is the one export.
-    assert metrics.force_flush()
-    metrics.shutdown()
+    return {
+        "resource_present": True,
+        "resource_attributes": json.dumps({"service.name": SERVICE}),
+        "scope_present": True,
+        "scope_name": scope,
+        "scope_version": "1.0.0",
+    }
+
+
+def _spans(scope: str, anchor: int) -> list[dict[str, object]]:
+    """The GenAI chat span and the failing tool call it made."""
+
+    span = _envelope(scope) | {
+        "trace_id": TRACE_ID,
+        "service_name": SERVICE,
+        "gen_ai_request_model": MODEL,
+        "status_present": True,
+    }
+    chat = span | {
+        "span_id": PARENT_SPAN_ID,
+        "name": "chat claude-opus-5",
+        "kind": 3,
+        "start_time_unix_nano": anchor,
+        "end_time_unix_nano": anchor + 2_000_000,
+        "duration_nano": 2_000_000,
+        "status_code": 1,
+        "attributes": json.dumps(
+            {
+                "gen_ai.input.messages": INPUT_MESSAGES,
+                "gen_ai.output.messages": OUTPUT_MESSAGES,
+                "gen_ai.usage.input_tokens": INPUT_TOKENS,
+            }
+        ),
+        "gen_ai_operation_name": "chat",
+        "gen_ai_usage_input_tokens": INPUT_TOKENS,
+        "gen_ai_usage_output_tokens": OUTPUT_TOKENS,
+    }
+    tool = span | {
+        "span_id": CHILD_SPAN_ID,
+        "parent_span_id": PARENT_SPAN_ID,
+        "name": "execute_tool search",
+        "kind": 1,
+        "start_time_unix_nano": anchor + 100_000,
+        "end_time_unix_nano": anchor + 900_000,
+        "duration_nano": 800_000,
+        "status_code": 2,
+        "status_message": LOG_BODY,
+        "attributes": json.dumps({"gen_ai.tool.name": "search"}),
+        "gen_ai_operation_name": "execute_tool",
+        "gen_ai_usage_input_tokens": 64,
+        "gen_ai_usage_output_tokens": 16,
+    }
+    return [chat, tool]
+
+
+def _logs(scope: str, anchor: int) -> list[dict[str, object]]:
+    """The error log the failing tool call wrote."""
+
+    return [
+        _envelope(scope)
+        | {
+            "time_unix_nano": anchor + 800_000,
+            "observed_time_unix_nano": anchor + 850_000,
+            "severity_number": 17,
+            "severity_text": "ERROR",
+            "body": json.dumps(LOG_BODY),
+            "trace_id": TRACE_ID,
+            "span_id": CHILD_SPAN_ID,
+            "attributes": json.dumps({"gen_ai.tool.name": "search"}),
+        }
+    ]
+
+
+def _points(scope: str, anchor: int) -> list[dict[str, object]]:
+    """One counter, one gauge, and one histogram point."""
+
+    point = _envelope(scope) | {
+        "unit": "1",
+        "time_unix_nano": anchor,
+        "start_time_unix_nano": anchor,
+        "attributes": json.dumps({"gen_ai.request.model": MODEL}),
+    }
+    return [
+        point
+        | {
+            "metric_name": "wyrd.fixture.requests",
+            "metric_type": "sum",
+            "int_value": COUNTER_VALUE,
+            "aggregation_temporality": 2,
+            "is_monotonic": True,
+        },
+        point
+        | {
+            "metric_name": "wyrd.fixture.saturation",
+            "metric_type": "gauge",
+            "double_value": GAUGE_VALUE,
+        },
+        point
+        | {
+            "metric_name": "wyrd.fixture.latency",
+            "metric_type": "histogram",
+            "aggregation_temporality": 2,
+            "histogram_count": len(HISTOGRAM_VALUES),
+            "histogram_sum": sum(HISTOGRAM_VALUES),
+            "histogram_min": min(HISTOGRAM_VALUES),
+            "histogram_max": max(HISTOGRAM_VALUES),
+        },
+    ]
 
 
 @pytest.mark.integration
 def test_canonical_signal_arrow_write_and_sql_read_round_trip(
     wyrd_server: WyrdTestServer,
 ) -> None:
-    """Stock OTLP signals land canonically and answer canonical SQL from Python.
+    """Python writes canonical signal Arrow batches and reads them back natively.
 
-    Built-in signal payloads are Variant, so the rows come from the stock
-    OpenTelemetry exporters and the Python caller reads every Variant column
-    back as native values. Hierarchy, token totals, log-to-span correlation,
-    and metric aggregation are canonical SQL; the payload gate is proved from
+    Each batch follows the table's described schema with its Variant columns
+    as JSON text, which ``write_batch`` encodes. Hierarchy, token totals,
+    log-to-span correlation, and metric aggregation are canonical SQL; Variant
+    payloads read back as native values, and the payload gate is proved from
     the caller's side with a separately scoped principal.
     """
 
@@ -314,10 +371,24 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
     from pydantic import BaseModel
     from wyrd.bifrost import Bifrost
 
+    for namespace, name in (("traces", "spans"), ("logs", "records"), ("metrics", "points")):
+        wyrd_server.ensure_builtin_table(namespace, name)
+
     scope = f"wyrd.python.canonical.{uuid.uuid4().hex}"
-    _export_canonical_signals(wyrd_server, scope)
+    anchor = 1_760_000_000_000_000_000
+    writer = Bifrost(
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.bootstrap_service(["admin"], "python-canonical-writer"),
+    )
+    for table, rows in (
+        ("vala.traces.spans", _spans(scope, anchor)),
+        ("vala.logs.records", _logs(scope, anchor)),
+        ("vala.metrics.points", _points(scope, anchor)),
+    ):
+        writer.use_table_by_name(table)
+        assert writer.table is not None
+        writer.write_batch(table, _batch(writer.table.arrow_schema, rows))
     wyrd_server.flush_bifrost()
-    writer = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
 
     hierarchy = (
         writer.sql(
@@ -412,12 +483,8 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
     ]
 
     class Payload(BaseModel):
-        events: int
-        links: int
-        event_name: str
-        finish_reason: str
-        link_span: bytes
         attributes: dict[str, Any]
+        input_tokens: int
         service: str
 
     payload_reader = Bifrost(
@@ -427,29 +494,24 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
         ),
     )
     payload = payload_reader.sql(
-        "SELECT CAST(array_length(events) AS BIGINT) AS events, "
-        "CAST(array_length(links) AS BIGINT) AS links, "
-        "events[1]['name'] AS event_name, "
-        "events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, "
-        "links[1]['span_id'] AS link_span, attributes, "
+        "SELECT attributes, "
+        "CAST(attributes ->> 'gen_ai.usage.input_tokens' AS BIGINT) AS input_tokens, "
         "resource_attributes ->> 'service.name' AS service "
         "FROM vala.traces.spans "
         f"WHERE scope_name = '{scope}' AND parent_span_id IS NULL",
         Payload,
     )
-    assert len(payload) == 1
-    [row] = payload
-    assert (row.events, row.links, row.event_name, row.finish_reason, row.link_span) == (
-        1,
-        1,
-        EVENT_NAME,
-        "stop",
-        (2).to_bytes(8, "big"),
-    )
-    assert row.attributes["gen_ai.input.messages"] == INPUT_MESSAGES
-    assert row.attributes["gen_ai.output.messages"] == OUTPUT_MESSAGES
-    assert row.attributes["gen_ai.usage.input_tokens"] == INPUT_TOKENS
-    assert row.service == SERVICE
+    assert payload == [
+        Payload(
+            attributes={
+                "gen_ai.input.messages": INPUT_MESSAGES,
+                "gen_ai.output.messages": OUTPUT_MESSAGES,
+                "gen_ai.usage.input_tokens": INPUT_TOKENS,
+            },
+            input_tokens=INPUT_TOKENS,
+            service=SERVICE,
+        )
+    ]
 
 
 @pytest.mark.integration

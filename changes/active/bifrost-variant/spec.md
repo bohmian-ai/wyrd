@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -224,6 +224,15 @@ field, unsupported/wire-mismatched type, Variant byte limit, JSON/extension
 validity, numeric range, then depth. The first failure is returned. Query
 `parse_json` uses `WYRD_VALA_400_VARIANT_INVALID_JSON`; `try_parse_json`
 returns SQL null.
+
+Canonical Arrow Variant input follows the same exact numeric domain as JSON.
+Integer primitives must fit `i64`. A Decimal16 is accepted only when its scale
+is zero and its coefficient is from `i64::MAX + 1` through `u64::MAX`, which is
+the canonical Variant representation of a JSON integer in that range. Every
+other Decimal16 is refused before acknowledgement with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`.
+This keeps every accepted number exact in Rust, Python, TypeScript, HTTP, MCP,
+and CLI without adding an arbitrary-precision public number type.
 
 ### Persisted built-in Structs
 
@@ -647,6 +656,13 @@ integer is refused with `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`
 terminal, including Rust `serde_json::Value`, without serde_json
 `arbitrary_precision`. This matches BigQuery `PARSE_JSON`'s default exact mode;
 callers needing wider integers send them as strings.
+
+Already-encoded Arrow Variant input uses that same domain: its only accepted
+Decimal16 form is scale zero with a coefficient from `i64::MAX + 1` through
+`u64::MAX`. Other decimals are refused with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`.
+Callers needing an exact fractional decimal or a wider integer send it as a
+string. Wyrd does not add a second arbitrary-precision numeric surface.
 
 #### REQ-005 — Bloom filters sized to the data
 
@@ -1172,6 +1188,14 @@ None.
 
 ## Revision history
 
+- **Revision 13 (2026-10-06, approved):** From TASK-001 review r5 and explicit
+  human direction to choose the smallest user-facing contract. Canonical Arrow
+  Variant input now uses the same exact numeric domain as JSON: integer
+  primitives fit `i64`; Decimal16 is accepted only as the scale-zero encoding
+  of `i64::MAX + 1..=u64::MAX`; every other Decimal16 is refused before ACK
+  with `VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`. Exact
+  fractional or wider numbers travel as strings; no arbitrary-precision public
+  terminal is added.
 - **Revision 12 (2026-10-06, approved):** From TASK-001 review r4. The
   children of the nullable `drift_report` and `eval_summary` Structs become
   nullable. A non-null child is a required Parquet leaf, whose parent-masked

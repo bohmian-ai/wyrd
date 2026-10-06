@@ -1398,6 +1398,14 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             invalid_messages.clone(),
         ),
         (
+            "objects whose fields share one child at every level",
+            (
+                messages(),
+                raw_variant(&AB_METADATA, &shared_objects(VARIANT_MAX_DEPTH)?)?,
+            ),
+            invalid_messages.clone(),
+        ),
+        (
             "malformed bytes after an over-deep sibling",
             (
                 messages(),
@@ -1712,6 +1720,9 @@ const EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
 
 /// Variant metadata with an empty key dictionary.
 const EMPTY_METADATA: [u8; 3] = [0x01, 0x00, 0x00];
+
+/// Variant metadata with the sorted key dictionary `["a", "b"]`.
+const AB_METADATA: [u8; 7] = [0x11, 2, 0, 1, 2, b'a', b'b'];
 
 /// The Variant null primitive value.
 const VARIANT_NULL: u8 = 0x00;
@@ -2058,6 +2069,29 @@ fn variant_list(items: &[Vec<u8>]) -> Result<Vec<u8>, ServerJourneyError> {
     }
     list.extend(items.concat());
     Ok(list)
+}
+
+/// Variant value bytes for `levels` objects whose fields `a` and `b` both
+/// point at the same child, ending in a null.
+///
+/// A few bytes per level describe 2^`levels` nodes, the shape a hostile
+/// writer uses to make a naive walk run forever. Keys come from
+/// [`AB_METADATA`].
+///
+/// # Errors
+///
+/// Returns an error when the chain outgrows a two-byte offset.
+fn shared_objects(levels: u32) -> Result<Vec<u8>, ServerJourneyError> {
+    (0..levels).try_fold(vec![VARIANT_NULL], |child, _| {
+        let end = u16::try_from(child.len())?;
+        // Object header with two-byte offsets, two fields, ids 0 and 1.
+        let mut object = vec![0x06, 2, 0, 1];
+        for offset in [0, 0, end] {
+            object.extend(offset.to_le_bytes());
+        }
+        object.extend(child);
+        Ok(object)
+    })
 }
 
 /// Variant value bytes for one Decimal16 primitive.

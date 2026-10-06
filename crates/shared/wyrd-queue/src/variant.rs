@@ -236,7 +236,10 @@ impl EncodedVariant {
                 found.record(invalid(&root));
                 found
             });
-        if found.depth.is_none() && Variant::try_new(metadata, value).is_err() {
+        if found.malformed.is_none()
+            && found.depth.is_none()
+            && Variant::try_new(metadata, value).is_err()
+        {
             found.record(invalid(&root));
         }
         found.finish()?;
@@ -880,6 +883,12 @@ pub fn narrow_integer(integer: i64) -> Variant<'static, 'static> {
 /// its pointer: only the scale-zero form of `i64::MAX + 1..=u64::MAX`, the
 /// encoding of a JSON integer in that range, is accepted.
 ///
+/// Object field offsets may point at shared bytes, so a few hundred bytes can
+/// describe a tree with exponentially many nodes. Every honestly encoded node
+/// owns at least one byte, so a walk that visits more nodes than the value has
+/// bytes records the value as malformed and stops, keeping the scan linear in
+/// the input.
+///
 /// # Panics
 ///
 /// Panics when a node's bytes are malformed; [`EncodedVariant::from_bytes`]
@@ -895,7 +904,13 @@ fn scan_encoded(metadata: &[u8], value: &[u8]) -> VariantViolations {
     // Each pending node carries its parent's pointer depth, its token, and
     // the number of containers open above it.
     let mut pending = vec![(0, None, 0, Variant::new_with_metadata(metadata, value))];
+    let mut visited = 0_usize;
     while let Some((parent, token, depth, node)) = pending.pop() {
+        visited += 1;
+        if visited > value.len() {
+            found.record(invalid(&JsonPointer::default()));
+            break;
+        }
         path.truncate(parent);
         if let Some(token) = token {
             path.tokens.push(token);
@@ -1172,6 +1187,38 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// Object fields that share bytes are refused before the walk explodes.
+    ///
+    /// Each of 64 levels holds fields `a` and `b` pointing at the same child,
+    /// about 640 bytes describing 2^64 nodes. It must be refused as invalid
+    /// encoding at once, not walked node by node.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shared value is accepted or reported as anything but
+    /// invalid encoding.
+    #[test]
+    fn raw_shared_field_values_are_refused() {
+        let metadata = [0x11_u8, 2, 0, 1, 2, b'a', b'b'];
+        let mut value = vec![0x00_u8];
+        for _ in 0..64 {
+            let end = u16::try_from(value.len()).expect("the chain fits two-byte offsets");
+            // Object, two-byte offsets: fields a and b both start at offset 0.
+            let mut node = vec![0x06, 2, 0, 1];
+            for offset in [0, 0, end] {
+                node.extend_from_slice(&offset.to_le_bytes());
+            }
+            node.extend_from_slice(&value);
+            value = node;
+        }
+        assert_eq!(
+            EncodedVariant::from_bytes(&metadata, &value),
+            Err(VariantViolation::InvalidJson {
+                path: String::new()
+            })
+        );
     }
 
     /// Raw Decimal16 values are accepted only as the exact JSON integers

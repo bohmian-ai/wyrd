@@ -335,9 +335,34 @@ Nothing in the diff adds a dependency, public API, error, configuration,
 migration, compatibility schema, arbitrary-precision number surface, or
 shredding. Query-error transport, authorization, tenancy, Iceberg lineage,
 Forge, SDK collection semantics, and TASK-002/TASK-003 ownership are
-unchanged. The task-review skills are unchanged. Known upstream limit, not
-addressed: `parquet-variant` 59.3 full validation is recursive, and an object
-whose field offsets overlap can make it slow.
+unchanged. The task-review skills are unchanged.
+
+### Addendum — shared object field values (human direction, 2026-10-06)
+
+- **Problem:** object field offsets may point at the same bytes, so about 640
+  bytes describe 2^64 nodes. Both `scan_encoded` and upstream
+  `Variant::try_new` walk every field: a throwaway probe measured 22 levels
+  (221 bytes) at 5.5 s and 2.3 s respectively, doubling per level. Upstream
+  arrow-rs `main` (release 60.0.0) still validates each offset with no overlap
+  check, and no issue or PR tracks it.
+- **Fix:** `scan_encoded` counts visited nodes; every honest node owns at
+  least one byte, so past `value.len()` nodes the value is recorded malformed
+  (`WYRD_VALA_400_VARIANT_INVALID_JSON`) and the walk stops. `from_bytes` no
+  longer runs `Variant::try_new` once a malformed value is found.
+- **Proof:** `variant::tests::raw_shared_field_values_are_refused` (64-level
+  shared chain refused in milliseconds); journey case "objects whose fields
+  share one child at every level" in
+  `verification_runtime::builtin_variant_columns_are_refused_before_ack`.
+
+| Command | Exit |
+|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(/^variant::/)'` (12 tests) | 0 |
+| V2 journeys `typed_builtin_payloads_are_queryable`, `builtin_variant_columns_are_refused_before_ack` (Postgres wrapper) | 0 |
+| Oracle `test(/^oracle::variant_sql::/)` (Postgres wrapper, 4 tests) | 0 |
+| `mise run fmt`; `mise run lints`; `git diff --check` | 0 |
+
+New items: `shared_objects` and `AB_METADATA` (journey fixtures; `nested_lists`
+and `EMPTY_METADATA` cannot express a keyed object) and the unit test above.
 
 ### New items
 

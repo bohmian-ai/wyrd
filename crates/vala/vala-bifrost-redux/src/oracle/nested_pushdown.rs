@@ -436,4 +436,107 @@ mod tests {
             ["v.metadata", "v.value"]
         );
     }
+
+    /// Writes `groups` of JSON documents as one row group each, with `v`
+    /// shredded on `a: Int64` and ids numbered from 1 across groups.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be shredded or encoded.
+    fn write_groups(groups: &[&[&str]]) -> Bytes {
+        let layout = ShreddedSchemaBuilder::new()
+            .with_path("a", &DataType::Int64)
+            .expect("layout")
+            .build();
+        let mut id = 0_i64;
+        let batches = groups
+            .iter()
+            .map(|documents| {
+                let text: ArrayRef = Arc::new(StringArray::from(documents.to_vec()));
+                let variant: ArrayRef =
+                    shred_variant(&json_to_variant(&text).expect("encode"), &layout)
+                        .expect("shred")
+                        .into();
+                let ids = (id + 1
+                    ..=id + i64::try_from(documents.len()).expect("group length fits i64"))
+                    .collect::<Vec<_>>();
+                id += i64::try_from(documents.len()).expect("group length fits i64");
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("v", variant.data_type().clone(), true),
+                ]));
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids)), variant])
+                    .expect("group batch")
+            })
+            .collect::<Vec<_>>();
+        let mut sink = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut sink, batches[0].schema(), None).expect("writer");
+        for batch in &batches {
+            writer.write(batch).expect("write");
+            writer.flush().expect("row group");
+        }
+        writer.close().expect("close");
+        Bytes::from(sink)
+    }
+
+    /// Typed Variant statistics prune a row group only when its residual is
+    /// all null and the comparison's type is exactly the shredded type: the
+    /// group holding a residual `"10"` is always read and its row still
+    /// matches, an all-typed group outside the literal is skipped, a `Utf8`
+    /// comparison against the `Int64` shredding prunes nothing, and pruned
+    /// and unpruned reads return identical rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a group is pruned or kept against the rule above, or when
+    /// pruned and unpruned reads differ.
+    #[test]
+    fn typed_variant_statistics_prune_only_with_all_null_residuals() {
+        let published = write_groups(&[
+            &[r#"{"a":1}"#, r#"{"a":2}"#],
+            &[r#"{"a":10}"#, r#"{"a":"10"}"#],
+            &[r#"{"a":20}"#, r#"{"a":21}"#],
+        ]);
+        let text = || OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()]);
+        let number = || {
+            Expr::Cast(datafusion::logical_expr::expr::Cast::new(
+                Box::new(text()),
+                DataType::Int64,
+            ))
+        };
+        for (filter, retained, ids) in [
+            (number().eq(lit(2_i64)), vec![0, 1], vec![2]),
+            (number().eq(lit(10_i64)), vec![1], vec![3, 4]),
+            (text().eq(lit("2")), vec![0, 1, 2], vec![2]),
+        ] {
+            let read_plan = || plan(&published, &[("id", col("id"))], Some(&filter));
+            assert_eq!(
+                read_plan().select_row_groups(vec![0, 1, 2]).retained,
+                retained,
+                "{filter}"
+            );
+            for groups in [retained.clone(), vec![0, 1, 2]] {
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(published.clone()).expect("reader");
+                let (builder, projector) = read_plan()
+                    .apply(builder, groups, None)
+                    .expect("applied plan");
+                let read = builder
+                    .build()
+                    .expect("decoder")
+                    .flat_map(|batch| {
+                        projector
+                            .project_batch(&batch.expect("batch"))
+                            .expect("projected")
+                            .column(0)
+                            .as_primitive::<Int64Type>()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(read, ids, "{filter}");
+            }
+        }
+    }
 }

@@ -699,6 +699,7 @@ impl PhysicalExprAdapterFactory for VariantFileAdapterFactory {
         ));
         Ok(Arc::new(VariantFileAdapter {
             inner: DefaultPhysicalExprAdapterFactory.create(logical_file_schema, presented)?,
+            physical: physical_file_schema,
             shredded,
             unshred: Arc::clone(&self.unshred),
         }))
@@ -709,12 +710,16 @@ impl PhysicalExprAdapterFactory for VariantFileAdapterFactory {
 ///
 /// A literal-key `variant_get` over a shredded root reads the root as stored,
 /// so it decodes only the leaves it declares; any other use of that root is
-/// wrapped in [`VariantUnshred`] and sees the canonical value.
+/// wrapped in [`VariantUnshred`] and sees the canonical value. A comparison of
+/// a Variant leaf with a literal of exactly its shredded type also gains the
+/// typed form statistics can prune; see [`Self::typed_comparison`].
 #[derive(Debug)]
 struct VariantFileAdapter {
     /// `DataFusion`'s adapter over the file schema with shredded columns
     /// presented at their logical type.
     inner: Arc<dyn PhysicalExprAdapter>,
+    /// The file's own Arrow schema.
+    physical: SchemaRef,
     /// Names of this file's shredded Variant columns.
     shredded: Vec<String>,
     /// The unshred step.
@@ -756,6 +761,9 @@ impl VariantFileAdapter {
                 Arc::new(ConfigOptions::default()),
             )));
         }
+        if let Some(typed) = self.typed_comparison(&expr) {
+            return typed;
+        }
         if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
             && function.name() == VARIANT_GET
             && function
@@ -767,6 +775,124 @@ impl VariantFileAdapter {
         }
         expr.map_children(|child| self.unshred_bare(child).map(Transformed::yes))
             .map(|rewritten| rewritten.data)
+    }
+
+    /// Rewrites `leaf op literal` over a shredded key into an equivalent
+    /// predicate whose typed half statistics can prune, or `None`.
+    ///
+    /// The leaf is `variant_as_text(variant_get(v, keys))` with a `Utf8`
+    /// literal, or that text cast `AS T` with a `T` literal, and
+    /// the file must shred the last key with a `typed_value` of exactly the
+    /// literal's type next to its residual `value`. The result is
+    /// `(typed op literal AND residual IS NULL) OR (residual IS NOT NULL AND
+    /// original)`: a row's value lives in exactly one of the two, so the
+    /// rewrite is three-valued identical to the original, and a row group
+    /// can only be pruned when its residual is all null and its typed
+    /// statistics exclude the literal.
+    ///
+    /// # Errors
+    ///
+    /// The inner result carries the `DataFusion` error raised when a typed or
+    /// residual field access cannot be bound to the file schema.
+    fn typed_comparison(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Option<Result<Arc<dyn PhysicalExpr>>> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{
+            BinaryExpr, CastExpr, IsNotNullExpr, IsNullExpr, Literal,
+        };
+
+        let binary = expr.downcast_ref::<BinaryExpr>()?;
+        if !matches!(
+            binary.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            return None;
+        }
+        let literal = binary.right().downcast_ref::<Literal>()?.value();
+        let (text, wanted) = match binary.left().downcast_ref::<CastExpr>() {
+            Some(cast) => (cast.expr(), cast.cast_type().clone()),
+            None => (binary.left(), DataType::Utf8),
+        };
+        let text = text.downcast_ref::<ScalarFunctionExpr>()?;
+        if text.name() != VARIANT_AS_TEXT {
+            return None;
+        }
+        let call = text.args().first()?.downcast_ref::<ScalarFunctionExpr>()?;
+        let (root, keys) = call.args().split_first()?;
+        let column = root.downcast_ref::<Column>()?;
+        if call.name() != VARIANT_GET
+            || literal.data_type() != wanted
+            || !self.shredded.iter().any(|name| name == column.name())
+        {
+            return None;
+        }
+        let keys = keys
+            .iter()
+            .map(|key| {
+                key.downcast_ref::<Literal>()?
+                    .value()
+                    .try_as_str()
+                    .flatten()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut leaf = self.physical.field(column.index()).data_type().clone();
+        let mut path: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::clone(root)];
+        for key in &keys {
+            leaf = object_fields(&leaf)?.find(key)?.1.data_type().clone();
+            path.extend([
+                Arc::new(Literal::new(ScalarValue::from("typed_value"))) as Arc<dyn PhysicalExpr>,
+                Arc::new(Literal::new(ScalarValue::from(*key))),
+            ]);
+        }
+        let DataType::Struct(children) = &leaf else {
+            return None;
+        };
+        if children.find("typed_value")?.1.data_type() != &wanted
+            || children.find("value").is_none()
+        {
+            return None;
+        }
+        let at = |last: &str| -> Result<Arc<dyn PhysicalExpr>> {
+            let mut args = path.clone();
+            args.push(Arc::new(Literal::new(ScalarValue::from(last))));
+            Ok(Arc::new(ScalarFunctionExpr::try_new(
+                datafusion::functions::core::get_field(),
+                args,
+                &self.physical,
+                Arc::new(ConfigOptions::default()),
+            )?))
+        };
+        let rewrite = || -> Result<Arc<dyn PhysicalExpr>> {
+            let typed: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                at("typed_value")?,
+                *binary.op(),
+                Arc::clone(binary.right()),
+            ));
+            let residual = at("value")?;
+            let typed_only: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                typed,
+                Operator::And,
+                Arc::new(IsNullExpr::new(Arc::clone(&residual))),
+            ));
+            let residual_only: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(IsNotNullExpr::new(residual)),
+                Operator::And,
+                Arc::clone(expr),
+            ));
+            Ok(Arc::new(BinaryExpr::new(
+                typed_only,
+                Operator::Or,
+                residual_only,
+            )))
+        };
+        Some(rewrite())
     }
 }
 

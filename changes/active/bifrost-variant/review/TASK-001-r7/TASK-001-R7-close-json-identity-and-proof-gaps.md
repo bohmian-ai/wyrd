@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R7
 kind: remediation
-status: ready
+status: review
 spec: SPEC-bifrost-variant
 spec_revision: 13
 requirements: [REQ-003, REQ-004, REQ-006, REQ-011, REQ-019, INV-002, INV-007, AC-001, AC-003, AC-005, AC-008]
@@ -276,3 +276,84 @@ git diff --check 80b33286e7dcaab8ed04d06b63eb0ca329b0c2a2..HEAD
 
 Record every command, selected test count, and exit status in this file before
 returning the task to review.
+
+## Implementation evidence
+
+Commits: `d66f3e741`, `11fc2d00d`, `9cb5ca4d3`, `ce2ec6e00`, `b5aacc424`,
+`dbec11312`, `4abfd3ccd`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-18` one proportional traversal | `crates/shared/wyrd-queue/src/variant.rs`: serde_json `RawValue` stays the syntax authority; `JsonTree::split` indexes spans in one byte scan, and `append_raw`/`scan_numbers` walk it iteratively; shared by writes and Oracle `parse_json` through `EncodedVariant::from_json_text` | `variant::tests::json_walk_reads_each_byte_once` (each byte is read at most once at depth 1,000), `json_depth_is_decided_by_wyrd_at_any_depth` | PASS |
+| `FIND-TASK-001-25` refused numbers add no bytes | A refused number only records the violation; upstream `ObjectFieldBuilder` inserts nothing without an append, and size is taken from the actual `try_finish` output | `variant::tests::refused_numbers_add_no_size`, `json_size_outranks_numeric_and_depth` | PASS |
+| `FIND-TASK-001-4` truthful bound | `architecture/bifrost-design.md`, the `EncodedVariant::validate` rustdoc and the R6 evidence state iterative, fixed-size-bounded, non-amplifying validation; linearity is no longer claimed; `object_field_slots` is unchanged | `mise run docs:check` | PASS |
+| `FIND-TASK-001-27` one raw validation | `EncodedVariant::validate` returns the `Variant` from its single `Variant::try_new_with_metadata`; `variant_bytes_to_json` renders that value; `sized` is removed | `variant::tests::renderers_refuse_hostile_stored_variants`, `raw_shared_field_values_are_refused` | PASS |
+| `FIND-TASK-001-24` OTLP journey | `crates/wyrd/wyrd-testing/tests/bifrost/otlp/logs_export.rs`: the existing log Variant journey sends a NaN body and a valid sibling; the collector's partial success carries `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`; after publish the query returns only the sibling | `logs_export::pg_tests::log_variant_body_attributes_and_promotions_are_queryable`, `test:bifrost:journey:otlp` | PASS |
+| `FIND-TASK-001-28` physical Variant identity | `tables::field_layout_matches` (Variant parity, nullability, recursive shape) is the one comparator; `bifrost_catalog::field_shape_matches` reuses it | `catalog::bifrost_catalog::schema_shape_tests::schema_shape_keeps_variant_identity_at_any_depth` (top level, struct child, list element, both directions) | PASS |
+| `FIND-TASK-001-3` missing lineage, no commit | The existing rewrite seam gains `RewriteOutputBreak::UnassignRowIds`, which serves manifest lists with no `first_row_id`, so the real reader yields null lineage; `refuse_rewrite_without_lineage` runs the managed attempt | `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`: fails on the lineage check, no output opened, no possible outputs, zero catalog commits, live set and every row's lineage unchanged | PASS (see limits) |
+| Exact R6 selectors | — | Commands table below | PASS |
+| Cumulative whitespace | `TASK-001-r6/standards-review.md` trailing blank line removed | `git diff --check 80b33286e7dcaab8ed04d06b63eb0ca329b0c2a2..HEAD` exit 0 | PASS |
+
+### Commands
+
+`CARGO_TARGET_DIR=<repo>/target` is set for every command. `PG` means
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && …"`
+(`db:migrate:inner` for `wyrd-testing`).
+
+| Command | Selected | Exit |
+|---|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=variant::tests::raw_shared_field_values_are_refused) \| test(=variant::tests::renderers_refuse_hostile_stored_variants) \| test(=variant::tests::json_depth_is_decided_by_wyrd_at_any_depth) \| test(=variant::tests::raw_numbers_outside_the_json_domain_are_refused) \| test(=variant::tests::json_size_outranks_numeric_and_depth) \| test(=variant::tests::raw_repeated_field_names_are_refused) \| test(=variant::tests::refused_numbers_add_no_size) \| test(=variant::tests::json_walk_reads_each_byte_once)'` | 8 passed | 0 |
+| `mise exec -- cargo nextest run --locked -p wyrd-queue --lib` | 70 passed | 0 |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::logs::tests::maximal_log_projection_preserves_body_context_and_presence)'` | 1 passed | 0 |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=catalog::bifrost_catalog::schema_shape_tests::schema_shape_keeps_variant_identity_at_any_depth)'` | 1 passed | 0 |
+| `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::capture::tests::unresolved_call_nulls_resolved_model_children)'` | 1 passed | 0 |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::analytical::tests::follower_graph_release_waits_for_children_and_retains_cleanup_failure)'` | 1 passed (failed before `4abfd3ccd`) | 0 |
+| `PG mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib` | 848 passed | 0 |
+| `PG mise exec -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(/^forge::managed_rewrite::/)'` | 10 passed, including `v3_row_lineage_survives_repeated_rewrite` | 0 |
+| `PG mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all -E 'test(=logs_export::pg_tests::log_variant_body_attributes_and_promotions_are_queryable)'` | 1 passed | 0 |
+| `mise run test:bifrost:journey:otlp` | 14 passed | 0 |
+| `PG mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=distributed::iceberg_filtering_mechanisms_cover_all_table_kinds)'` | 1 passed | 0 |
+| `mise run test:bifrost:journey:oracle` | 50 passed | 0 |
+| `mise run fmt` | — | 0 |
+| `mise run lints` | — | 0 |
+| `mise run codegen:check` | — | 0 |
+| `mise run check:skills-sync` | — | 0 |
+| `mise run docs:check` | — | 0 |
+| `git diff --check 80b33286e7dcaab8ed04d06b63eb0ca329b0c2a2..HEAD` | — | 0 |
+
+### Failure diagnoses
+
+**Oracle filtering journey**
+- Symptom: `distributed::iceberg_filtering_mechanisms_cover_all_table_kinds` failed with "the row group holding key 50000 must carry several key pages, saw 1". It failed on every run.
+- Evidence: the trace shows the Rewritten cut's row groups at about 17,000 rows. The Hot and Promoted cuts held 45,000-row groups.
+- Cause: v3 rewrites now carry a unique `_row_id` as well as `key_id` and `score`. Each unique column counts its uncompressed dictionary toward the size estimate, so the 512 KiB `REWRITE_ROW_GROUP_BYTES` closed each group before it reached the 20,000-row page limit. 1 MiB also failed, producing a single 135,000-row group: once a dictionary reaches the 256 KiB page limit it falls back to plain encoding, and the estimate turns compressed.
+- Fix site: the fixture constant only; the shared writer recipe is correct. At 768 KiB the groups close near 26,000 rows. Fresh diagnostician report recorded; its 1 MiB suggestion was falsified by the run above.
+
+**Oracle held-cut journey**
+- Symptom: `distributed::held_cut_owns_active_reads_until_all_descendants_settle` failed intermittently, in one full-lane run only, with `attempts_active: 1.0` left after drop.
+- Evidence: the WARN "follower could not settle a closed graph … still owns a live attempt", and the ingress refusing SetPlan with `reason=ownership`.
+- Cause: `GraphLease::settle` copied its live attempts without calling `supervisor.begin_draining`, so a SetPlan that had already resolved the lease could still pass `spawn_attempt`'s Active check. That attempt was never joined.
+- Fix site: `GraphLease::settle`, which now drains first, as the leader (`analytical.rs` leader settle) and shutdown paths already do. Every follower settlement route goes through it. Fresh diagnostician report recorded.
+- Deterministic regression: a lease resolved before a failed settle must refuse admission.
+
+### New items
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `JsonTree`, `JsonNode` (private) | `EncodedVariant`, serde_json `RawValue`/`Value`, the parquet-variant builders | serde_json has no span tree; `Value` re-materialises and loses exact numbers. One private index is what lets the build make a single pass |
+| `WALK_READ_BYTES` (test-only thread-local) | the existing variant tests | Gives deterministic work evidence without timing |
+| `tables::field_layout_matches` | `arrow_type_shape_matches`, `equals_datatype`, `is_variant` | The one field comparator; the catalog reuses it instead of keeping its own |
+| `assert_variant_reason`, `VARIANT_NUMERIC_OUT_OF_RANGE`, `VARIANT_NON_FINITE_LOG_SCOPE` | the OTLP `support.rs` assertions | Shared by the logs, metrics and trace journeys instead of three copies |
+| `RewriteOutputBreak::UnassignRowIds`, `is_manifest_list`, `without_row_id_assignment` | the existing rewrite seam `RewriteOutputBreak`, iceberg `ManifestListWriter` | Extends the existing seam; manifest lists are rewritten with iceberg's own v3 writer |
+| `refuse_rewrite_without_lineage` | `v3_row_lineage_survives_repeated_rewrite` and its fixtures | The failure phase of the existing journey, reusing `PromotedRewriteFixture`, `CountingObjectStore` and `LineageTable` |
+
+### Non-goals confirmed
+
+- No public API, configuration, migration, compatibility schema, new JSON syntax authority, per-language validator, second renderer, timeout guard, public test hook, TASK-002 or TASK-003 change, or finding-13 revival.
+- `object_field_slots` is unchanged.
+- The two Oracle fixes stay inside their owners: a test constant, and one fence in `GraphLease::settle`.
+
+### Limits
+
+- `FIND-TASK-001-3` requested a valid batch followed by a null-lineage batch. Iceberg's v3 `ManifestListWriter` assigns a `first_row_id` to every unassigned data manifest, so a v3 snapshot never mixes files with and without lineage. A stripped manifest list nulls `_row_id` and `_last_updated_sequence_number` for every file, because `first_row_id` gates even lineage that is physically present.
+- The proof therefore drives an all-null attempt through the real reader and the fork's per-batch check. It fails before any output opens, so complete accounting of opened outputs is shown as zero opened and zero possible outputs. Settled-output reclaim stays proven by the existing `managed_rewrite_failure_preserves_attempt_global_possible_outputs`.

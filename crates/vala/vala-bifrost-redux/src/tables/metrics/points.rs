@@ -15,7 +15,8 @@ use crate::tables::fields::{
 };
 use crate::tables::signal;
 use crate::tables::{
-    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
+    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
+    sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -152,7 +153,7 @@ impl DomainTable for PointsTable {
         "scope_attributes",
     ];
 
-    const CANONICAL_VALIDATOR: crate::tables::CanonicalBatchValidator =
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator =
         crate::tables::metrics::projection::validate_metric_points;
 
     fn canonical_fields() -> Option<&'static [CanonicalField]> {

@@ -5,6 +5,7 @@
 //! tables, every downstream representation is derived from it and nothing
 //! outside this module restates a log column's order or meaning.
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 
 use crate::tables::fields::{
@@ -12,8 +13,10 @@ use crate::tables::fields::{
 };
 use crate::tables::signal;
 use crate::tables::{
-    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc_nulls_first, sort_desc,
+    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout,
+    sort_asc_nulls_first, sort_desc,
 };
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
@@ -81,8 +84,7 @@ impl DomainTable for RecordsTable {
         "scope_attributes",
     ];
 
-    const CANONICAL_VALIDATOR: crate::tables::CanonicalBatchValidator =
-        validate_canonical_user_batch_for_table;
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_canonical_user_batch_for_table;
 
     fn canonical_fields() -> Option<&'static [CanonicalField]> {
         Some(LOG_FIELDS)
@@ -116,7 +118,7 @@ impl DomainTable for RecordsTable {
 /// the supplied schema drifts from the declared ledger or a Variant value
 /// cannot be stored.
 fn validate_canonical_user_batch_for_table(
-    batch: &arrow::array::RecordBatch,
-) -> Result<arrow::array::RecordBatch, wyrd_spec::vala::BifrostError> {
-    crate::tables::signal::validate_canonical_user_batch(LOG_FIELDS, batch)
+    batch: &RecordBatch,
+) -> Result<RecordBatch, BifrostError> {
+    signal::validate_canonical_user_batch(LOG_FIELDS, batch)
 }

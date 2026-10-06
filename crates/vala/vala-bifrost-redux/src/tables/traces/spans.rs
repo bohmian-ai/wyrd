@@ -9,13 +9,16 @@
 //! this module restates a span column's order or meaning. Field ids belong to
 //! the registered Iceberg table, not to this ledger.
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 
 use crate::tables::fields::{CanonicalField as F, CanonicalType as T, canonical_arrow_fields};
 use crate::tables::signal;
 use crate::tables::{
-    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
+    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
+    sort_desc,
 };
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
@@ -126,8 +129,7 @@ impl DomainTable for SpansTable {
         "scope_attributes",
     ];
 
-    const CANONICAL_VALIDATOR: crate::tables::CanonicalBatchValidator =
-        validate_canonical_user_batch_for_table;
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_canonical_user_batch_for_table;
 
     fn canonical_fields() -> Option<&'static [crate::tables::fields::CanonicalField]> {
         Some(SPAN_FIELDS)
@@ -158,7 +160,7 @@ impl DomainTable for SpansTable {
 /// the supplied schema drifts from the declared ledger or a Variant value
 /// cannot be stored.
 fn validate_canonical_user_batch_for_table(
-    batch: &arrow::array::RecordBatch,
-) -> Result<arrow::array::RecordBatch, wyrd_spec::vala::BifrostError> {
-    crate::tables::signal::validate_canonical_user_batch(SPAN_FIELDS, batch)
+    batch: &RecordBatch,
+) -> Result<RecordBatch, BifrostError> {
+    signal::validate_canonical_user_batch(SPAN_FIELDS, batch)
 }

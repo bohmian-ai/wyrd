@@ -147,9 +147,11 @@ keep their IEEE meaning; strings, booleans, bytes, arrays, and objects keep
 their type; and an absent object key stays distinct from a key whose value is
 null. Object keys are unique: when an OTel attribute collection repeats a key,
 the final occurrence is stored. JSON input converts an integer in the signed
-64-bit range to an integer, another integer that fits a Variant decimal to a
-decimal, and any other number to a double; an integer no Variant numeric type
-holds is refused with `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`. A value
+64-bit (`i64`) range to an integer, an integer from `i64::MAX + 1` through
+`u64::MAX` to a scale-zero Variant decimal, and a non-integer number to a
+double; every other integer is refused with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`, so every accepted integer reads
+back exactly without `serde_json` `arbitrary_precision`. A value
 nested beyond 64 containers is `WYRD_VALA_400_VARIANT_TOO_DEEP`, one whose
 encoded metadata plus value exceeds 8,388,608 bytes is
 `WYRD_VALA_413_VARIANT_TOO_LARGE`, and undecodable bytes are
@@ -461,8 +463,8 @@ full root value. Struct access stays DataFusion's exact `s['field']`
 `get_field`. Every Variant result keeps the `arrow.parquet.variant` extension
 on the wire. The functions travel in physical plans by name, so the function
 set's version is bound into the plan and stage digests peers verify before
-decoding. Variant failures keep their stable code and details across
-interactive and distributed execution.
+decoding. Variant failures, like every catalogued query failure, keep their
+stable code and details across interactive and distributed execution.
 
 ### Distributed analytical execution
 
@@ -713,6 +715,17 @@ framing is `QueryQueueFull`; any other admission refusal before framing is
 exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.
+
+A query failure carries the same complete derive-backed catalog problem, code
+and details, whether it occurs before the first frame or after rows were sent,
+in Interactive and Analytical execution over HTTP and gRPC. The failure
+terminal holds that problem, every SDK raises it unchanged, and collecting a
+result returns no partial rows. Distributed workers forward an execution error
+only as text, so a catalogued Oracle error crosses as its tagged serde form
+inside the existing external `DataFusion` error, and the coordinator
+reconstructs it in one place before mapping the failure; no failure is
+classified from its human message. Only a failure with no catalog identity
+becomes `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
 
 A public distributed-plan or execution-path `EXPLAIN` surface is deferred and
 is not part of this delivery. Selected-path evidence reaches callers only

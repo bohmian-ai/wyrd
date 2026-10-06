@@ -294,12 +294,15 @@ fn map_type(
         }
         Some("array") => match node.get("items") {
             None => DataTypeSpec::Variant,
-            Some(items) => DataTypeSpec::List(Box::new(FieldSpec {
-                name: "item".to_owned(),
-                data_type: map_type(items, defs)?.0,
-                nullable: true,
-                metadata: BTreeMap::new(),
-            })),
+            Some(items) => {
+                let (data_type, nullable) = map_type(items, defs)?;
+                DataTypeSpec::List(Box::new(FieldSpec {
+                    name: "item".to_owned(),
+                    data_type,
+                    nullable,
+                    metadata: BTreeMap::new(),
+                }))
+            }
         },
         Some("object") if node.contains_key("properties") => {
             DataTypeSpec::Struct(build_fields(prop, defs)?)
@@ -583,13 +586,14 @@ fn data_type_to_arrow(spec: &DataTypeSpec, carry_metadata: bool) -> DataType {
 mod schema_tests {
     //! `schema_to_fieldspec` mapping-table proof: JSON-Schema and Arrow → C2 `FieldSpec`.
 
-    use crate::WyrdQueueError;
     use crate::schema::{
-        arrow_schema_to_fieldspec, field_to_spec, fieldspec_to_arrow, json_schema_to_arrow,
-        json_schema_to_fieldspec,
+        arrow_schema_to_fieldspec, check_supported, field_to_spec, fieldspec_to_arrow,
+        json_schema_to_arrow, json_schema_to_fieldspec,
     };
+    use crate::{RowPreflight, WyrdQueueError};
     use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
     use serde_json::json;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
     fn field<'a>(specs: &'a [FieldSpec], name: &str) -> &'a FieldSpec {
@@ -682,17 +686,40 @@ mod schema_tests {
         assert_eq!(field(inner, "zip").data_type, DataTypeSpec::Int64);
     }
 
+    /// A typed array maps to a List whose items keep the declared
+    /// nullability, and row preparation refuses a null item only where the
+    /// items are non-null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an item's nullability differs from its declaration or a
+    /// null item is admitted into a non-null List.
     #[test]
     fn array_becomes_list() {
         let schema = json!({
-            "properties": {"tags": {"type": "array", "items": {"type": "string"}}}
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "maybe_tags": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            }
         });
         let specs = json_schema_to_fieldspec(&schema).expect("maps");
 
         assert_eq!(
             field(&specs, "tags").data_type,
+            DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, false)))
+        );
+        assert_eq!(
+            field(&specs, "maybe_tags").data_type,
             DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, true)))
         );
+        let preflight = RowPreflight::new(&fieldspec_to_arrow(&specs).expect("arrow"));
+        preflight
+            .prepare(&[r#"{"maybe_tags": ["a", null]}"#], None, None)
+            .expect("nullable items admit null");
+        let refused = preflight
+            .prepare(&[r#"{"tags": ["a", null]}"#], None, None)
+            .expect_err("non-null items refuse null");
+        assert_eq!(refused.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
     #[test]
@@ -711,7 +738,7 @@ mod schema_tests {
         assert_eq!(field(inner, "x").data_type, DataTypeSpec::Float64);
     }
 
-    /// Every REQ-012 declaration form maps to its exact column, and every
+    /// Every supported open and nested declaration form maps to its exact column, and every
     /// unsupported form is refused with its exact catalog code.
     ///
     /// # Panics
@@ -720,9 +747,6 @@ mod schema_tests {
     /// carries another code or detail.
     #[test]
     fn open_nested_and_unsupported_schemas_map_exactly() {
-        use crate::schema::check_supported;
-        use wyrd_spec::vala::BifrostError;
-
         let variant = DataTypeSpec::Variant;
         let schema = json!({
             "definitions": {"Inner": {"type": "object", "properties": {"k": {"type": "string"}}, "required": ["k"]}},
@@ -741,11 +765,13 @@ mod schema_tests {
                 "wrapped": {"allOf": [{"$ref": "#/definitions/Inner"}]},
                 "untyped_list": {"type": "array"},
                 "typed_list": {"type": "array", "items": {"type": "integer"}},
+                "nullable_items": {"type": "array", "items": {"type": ["integer", "null"]}},
                 "closed": {"type": "object", "properties": {"x": {"type": "number"}}, "additionalProperties": false, "required": ["x"]},
             },
             "required": ["any", "always", "dict_any", "union", "type_list", "wrapped", "typed_list", "closed"]
         });
-        let specs = json_schema_to_fieldspec(&schema).expect("every REQ-012 form maps");
+        let specs =
+            json_schema_to_fieldspec(&schema).expect("every supported open and nested form maps");
         let inner = DataTypeSpec::Struct(vec![make_field("k", DataTypeSpec::Utf8, false)]);
         let expected = vec![
             ("any", variant.clone(), true),
@@ -763,8 +789,13 @@ mod schema_tests {
             ("untyped_list", variant, true),
             (
                 "typed_list",
-                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, true))),
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, false))),
                 false,
+            ),
+            (
+                "nullable_items",
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, true))),
+                true,
             ),
             (
                 "closed",

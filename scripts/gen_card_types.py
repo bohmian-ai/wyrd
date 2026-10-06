@@ -241,7 +241,7 @@ class TypeScript:
                     out.append(f"  readonly {key}{optional}: {self.expr(expr)};")
                 out.append("}")
             out.append("")
-        return "\n".join(out) + "\n"
+        return "\n".join(out)
 
 
 class Python:

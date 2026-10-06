@@ -4184,4 +4184,3 @@ export interface XgboostMeta {
    */
   readonly model_subtype?: string | null;
 }
-

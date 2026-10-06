@@ -27,8 +27,11 @@
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
 //! guidance). Every other ingest failure maps to its stable `WYRD_VALA_*`
 //! [`WyrdError`](wyrd_spec::error::WyrdError) and problem+json status. Authentication is enforced by the
-//! `require_authenticated` layer on the `/v1` group; the [`Caller`] extractor
-//! then yields the token-derived tenant/principal (never wire-derived).
+//! `require_authenticated` layer on this router, behind the OTLP-only
+//! `accept_otlp_api_key` layer that exchanges a stock exporter's
+//! `x-wyrd-api-key` for an access token on every request; the [`Caller`]
+//! extractor then yields the token-derived tenant/principal (never
+//! wire-derived).
 //!
 //! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
 //! bounded adapter decode, owner-backed Gate routing
@@ -207,8 +210,10 @@ where
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
@@ -319,8 +324,10 @@ async fn export_traces(
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
@@ -432,8 +439,10 @@ async fn export_metrics(
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \

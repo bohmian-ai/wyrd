@@ -39,6 +39,7 @@ use wyrd_tonic::tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::AppState;
+use crate::components::auth::otlp_api_key::OtlpApiKeyExchange;
 
 /// Encoded bytes occupied by the gRPC compression flag and big-endian length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -353,9 +354,10 @@ where
         return Ok(router);
     }
     let bifrost = Arc::clone(&state.bifrost);
-    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost));
-    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost));
-    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost));
+    let api_keys = OtlpApiKeyExchange::new(state.clone());
+    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost), api_keys.clone());
+    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost), api_keys.clone());
+    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost), api_keys);
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state.bifrost.transport_admission();
     Ok(router

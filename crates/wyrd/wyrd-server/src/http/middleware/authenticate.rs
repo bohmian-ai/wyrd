@@ -8,7 +8,11 @@ use axum::response::{IntoResponse, Response};
 
 use wyrd_auth_verify::TokenAudience;
 
+use wyrd_spec::request_id::RequestId;
+
+use crate::components::auth::otlp_api_key::OtlpApiKeyExchange;
 use crate::components::auth::token_extract::verify_authenticated_principal;
+use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Reject unauthenticated requests before they reach protected handlers.
@@ -41,6 +45,32 @@ pub async fn require_bifrost_authenticated(
     next: Next,
 ) -> Response {
     authenticate_on(&state, request, next, TokenAudience::Bifrost).await
+}
+
+/// Exchange an OTLP request's `x-wyrd-api-key` for an access token.
+///
+/// Layered only on the OTLP router, outside [`require_authenticated`], so a
+/// stock exporter's API key becomes the bearer that layer then verifies. The
+/// exchange's audit decision carries the request id `attach_request_id`
+/// already attached. A refused key returns its mapped Wyrd error without
+/// calling `next`.
+pub(crate) async fn accept_otlp_api_key(
+    State(exchange): State<OtlpApiKeyExchange>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::now_v7);
+    match exchange
+        .authorize(request.headers_mut(), request_id.as_str())
+        .await
+    {
+        Ok(()) => next.run(request).await,
+        Err(error) => WyrdErrorResponse(error).into_response(),
+    }
 }
 
 /// Verify the request's token for `surface`, insert the principal, and run

@@ -190,11 +190,14 @@ async fn token(
 
 /// The tenant grants of one token-endpoint request, over the server's auth
 /// configuration and the request's id.
-struct TokenGrants<'a> {
+///
+/// The OTLP API-key entrance runs the same API-key grant per request, so it
+/// is crate-visible rather than private to the token endpoint.
+pub(crate) struct TokenGrants<'a> {
     /// Server state holding the auth owners and the runtime store.
-    state: &'a AppState,
+    pub(crate) state: &'a AppState,
     /// The request id every audit event of the grant carries.
-    request_id: &'a str,
+    pub(crate) request_id: &'a str,
 }
 
 impl TokenGrants<'_> {
@@ -236,7 +239,7 @@ impl TokenGrants<'_> {
     /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, its
     /// refusal staged on the audit outbox when it names a tenant, and a store
     /// or issuance error.
-    async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
+    pub(crate) async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
         let presented = SecretString::from(api_key.expose().to_owned());
         let Ok(parsed) = WyrdApiKey::parse(api_key.expose()) else {
             verify_presented(&presented, None)

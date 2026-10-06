@@ -423,7 +423,7 @@ impl VerifierRunner {
                 counts: report.counts(),
             },
             Ok(Err(error)) => {
-                tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
+                tracing::warn!(run_id = %run.lease.run_id, ?error, "verification result publication failed");
                 Transition::Retry(failure(
                     RESULT_PUBLICATION_FAILED,
                     "result publication was not acknowledged",

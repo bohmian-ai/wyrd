@@ -829,7 +829,7 @@ pub struct QueryTerminalFrame {
     /// returned had it failed before the first frame, so a caller reads one
     /// error whatever the row on which the failure happened. A failure with
     /// no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
-    pub error: Option<WyrdProblem>,
+    pub error: Option<Box<WyrdProblem>>,
     /// Arrow IPC end-of-stream delta closing the query's single IPC stream.
     ///
     /// The public query stream is one Arrow IPC stream split across Wyrd
@@ -970,9 +970,11 @@ mod query_terminal_tests {
     }
 
     /// The generic execution failure a failed fixture terminal carries.
-    fn execution_failed() -> WyrdProblem {
-        crate::error::WyrdError::from(crate::vala::error::BifrostError::QueryExecutionFailed)
-            .problem()
+    fn execution_failed() -> Box<WyrdProblem> {
+        Box::new(
+            crate::error::WyrdError::from(crate::vala::error::BifrostError::QueryExecutionFailed)
+                .problem(),
+        )
     }
 
     /// Builds one terminal from its independently varied fields.
@@ -2145,12 +2147,12 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(
+            error: Some(Box::new(
                 crate::error::WyrdError::from(
                     crate::vala::error::BifrostError::QueryExecutionFailed,
                 )
                 .problem(),
-            ),
+            )),
             arrow_ipc_eos: Vec::new(),
             ..base.clone()
         };

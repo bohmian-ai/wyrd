@@ -1696,7 +1696,9 @@ mod tests {
             let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);
             assert_eq!(
                 terminal.error,
-                Some(wyrd_spec::error::WyrdError::from(error.clone()).problem())
+                Some(Box::new(
+                    wyrd_spec::error::WyrdError::from(error.clone()).problem()
+                ))
             );
         }
     }

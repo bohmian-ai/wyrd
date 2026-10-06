@@ -1829,12 +1829,12 @@ fn sql_terminal_rejects_failed_output_after_rows() {
             complete(QuerySource::HotSealed),
             complete(QuerySource::LiveTail),
         ],
-        error: Some(
+        error: Some(Box::new(
             wyrd_spec::error::WyrdError::from(
                 wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
             )
             .problem(),
-        ),
+        )),
         arrow_ipc_eos: Vec::new(),
     };
     failed

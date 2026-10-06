@@ -813,7 +813,7 @@ mod tests {
             row_count: 1,
             warnings: Vec::new(),
             source_completion: Vec::new(),
-            error: Some(
+            error: Some(Box::new(
                 wyrd_spec::error::WyrdError::from(
                     wyrd_spec::vala::BifrostError::VariantInvalidJson {
                         field: "parse_json".to_owned(),
@@ -822,7 +822,7 @@ mod tests {
                     },
                 )
                 .problem(),
-            ),
+            )),
             // A failed stream never calls `finish`, so it has no end-of-stream.
             arrow_ipc_eos: Vec::new(),
         });

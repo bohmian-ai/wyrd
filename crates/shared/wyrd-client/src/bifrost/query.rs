@@ -128,7 +128,7 @@ impl From<&BifrostClientError> for WyrdError {
             BifrostClientError::IncompleteQueryStream => Self::Vala {
                 error: BifrostError::QueryStreamIncomplete,
             },
-            BifrostClientError::FailedTerminal { terminal } => terminal.error.as_ref().map_or(
+            BifrostClientError::FailedTerminal { terminal } => terminal.error.as_deref().map_or(
                 Self::Vala {
                     error: BifrostError::QueryExecutionFailed,
                 },
@@ -2249,7 +2249,7 @@ mod tests {
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(),
-            error: Some(WyrdError::from(error).problem()),
+            error: Some(Box::new(WyrdError::from(error).problem())),
             // A failed stream never calls `finish`, so it has no end-of-stream.
             arrow_ipc_eos: Vec::new(),
         }

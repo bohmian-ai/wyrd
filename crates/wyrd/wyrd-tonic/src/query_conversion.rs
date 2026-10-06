@@ -578,12 +578,12 @@ fn source_completion(
 /// # Errors
 /// Returns [`QueryConversionError::ErrorProblem`] when non-empty bytes are not
 /// a Wyrd problem document.
-fn terminal_error(bytes: &[u8]) -> Result<Option<WyrdProblem>, QueryConversionError> {
+fn terminal_error(bytes: &[u8]) -> Result<Option<Box<WyrdProblem>>, QueryConversionError> {
     if bytes.is_empty() {
         return Ok(None);
     }
     serde_json::from_slice(bytes)
-        .map(Some)
+        .map(|problem| Some(Box::new(problem)))
         .map_err(|_| QueryConversionError::ErrorProblem)
 }
 
@@ -676,7 +676,7 @@ mod tests {
         else {
             panic!("terminal frame must decode as a terminal");
         };
-        assert_eq!(decoded.error, Some(problem));
+        assert_eq!(decoded.error, Some(Box::new(problem)));
         let mut roundtrip = QueryStreamConverter::new();
         prime_schema(&mut roundtrip);
         assert_eq!(

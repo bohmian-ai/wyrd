@@ -3692,7 +3692,7 @@ fn failed_terminal_on_path(
         row_count,
         warnings: Vec::new(),
         source_completion,
-        error: Some(WyrdError::from(error).problem()),
+        error: Some(Box::new(WyrdError::from(error).problem())),
         // A failed stream never finished its Arrow IPC stream, so there is no
         // end-of-stream delta to report.
         arrow_ipc_eos: Vec::new(),
@@ -5167,7 +5167,10 @@ mod tests {
         assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
         assert_eq!(terminal.row_count, 17);
         assert!(terminal.validate().is_ok());
-        assert_eq!(terminal.error, Some(WyrdError::from(error).problem()));
+        assert_eq!(
+            terminal.error,
+            Some(Box::new(WyrdError::from(error).problem()))
+        );
     }
 
     /// The standard recorder observes the canonical failed stream labels.

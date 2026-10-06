@@ -304,7 +304,7 @@ impl ScheduledQueryCaller {
                         .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(terminal.clone());
-                        return Err(super::service::terminal_error(terminal.error.as_ref()));
+                        return Err(super::service::terminal_error(terminal.error.as_deref()));
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
@@ -432,7 +432,9 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(WyrdError::from(BifrostError::QueryTimeout).problem()),
+            error: Some(Box::new(
+                WyrdError::from(BifrostError::QueryTimeout).problem(),
+            )),
             ..success_terminal(3, Vec::new())
         };
 

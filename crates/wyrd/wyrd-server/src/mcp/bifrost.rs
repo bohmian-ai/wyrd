@@ -592,7 +592,9 @@ impl ResultCollector {
                     }
                     if frame.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(frame.clone());
-                        return Err(crate::query::service::terminal_error(frame.error.as_ref()));
+                        return Err(crate::query::service::terminal_error(
+                            frame.error.as_deref(),
+                        ));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
                         stream.request_cancel();
@@ -907,8 +909,9 @@ mod tests {
                     "EOS" => terminal.arrow_ipc_eos = vec![1],
                     "failed" => {
                         terminal.outcome = QueryTerminalOutcome::Failed;
-                        terminal.error =
-                            Some(WyrdError::from(BifrostError::QueryTimeout).problem());
+                        terminal.error = Some(Box::new(
+                            WyrdError::from(BifrostError::QueryTimeout).problem(),
+                        ));
                         terminal.arrow_ipc_eos.clear();
                     }
                     "duplicate" => frames.push(frames[2].clone()),

@@ -598,14 +598,14 @@ mod tests {
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
-                error: Some(
+                error: Some(Box::new(
                     wyrd_spec::error::WyrdError::from(BifrostError::VariantInvalidJson {
                         field: "parse_json".to_owned(),
                         row: 1,
                         path: String::new(),
                     })
                     .problem(),
-                ),
+                )),
                 // A failed stream never calls `finish`, so it has no end-of-stream.
                 arrow_ipc_eos: Vec::new(),
             }),

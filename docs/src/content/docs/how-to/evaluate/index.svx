@@ -88,8 +88,13 @@ The operation is not idempotent, takes no `Idempotency-Key`, and no SDK retries
 it. Disconnecting cancels in-flight work, but judge provider calls already
 issued may have incurred cost.
 
-The SDKs expose the same operation as `client.verification.execute(&request)`
-in Rust, `Verification().execute(request)` in Python, and
-`verification.execute(request)` in TypeScript. The MCP tool
+The SDKs reach the same operation from a hydrated `WyrdState` Run view, which
+judges its own subject with a Verifier bound to it in `verified_by`, named by
+the Verifier Card's `metadata.name`: `run.observe().verify(name, &input).await` in
+Rust, `run.observe.verify(name, input)` in Python (returning a
+`wyrd.observe.Judgment`), and `await run.observe.verify(name, input)` in
+TypeScript. An Eval Verifier takes one context object and optional media; a
+Drift Verifier takes a non-empty list of flat feature rows, sent as
+`drift_samples` columns. The MCP tool
 `verification.execute` takes the same request and appears only to a caller
 holding `evals:run`.

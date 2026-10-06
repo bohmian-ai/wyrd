@@ -4534,7 +4534,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               ]
             },
             "url": {
-              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
               "type": "string"
             }
           },
@@ -9784,7 +9784,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           ]
         },
         "url": {
-          "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+          "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
           "type": "string"
         }
       },
@@ -14889,7 +14889,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               ]
             },
             "url": {
-              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
               "type": "string"
             }
           },
@@ -20968,7 +20968,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               ]
             },
             "url": {
-              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
               "type": "string"
             }
           },
@@ -27104,7 +27104,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               ]
             },
             "url": {
-              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
               "type": "string"
             }
           },

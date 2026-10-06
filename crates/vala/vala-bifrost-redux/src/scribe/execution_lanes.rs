@@ -556,20 +556,15 @@ fn decode_rows(
             return Err(ScribeError::InvalidFrame);
         }
     }
+    if let Some(definition) = context.definition {
+        enforce_builtin_source_contract(rows, definition)?;
+    }
     let actual_source_fingerprint =
         source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
     if actual_source_fingerprint != context.expected_schema_fingerprint {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
-    }
-    if let Some(definition) = context.definition {
-        definition
-            .validate_variants(rows)
-            .map_err(ScribeError::ContractViolation)?;
-        if definition.canonical_validator.is_some() {
-            enforce_canonical_source_contract(rows, definition)?;
-        }
     }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
@@ -582,72 +577,59 @@ fn decode_rows(
     }
 }
 
-/// Enforces one canonical built-in's exact user contract before stamping.
+/// Enforces one built-in's user contract before the fingerprint check.
 ///
-/// The caller of a canonical signal table owns exactly the table's declared
-/// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
-/// optional `wyrd_event_time`). This rejects any unknown `wyrd_*` field, runs
-/// the table's own registered value validator over
-/// the remaining user block, and then requires that block to match
-/// `(definition.arrow_fields)()` in order, name, nullability, and type shape,
-/// so no structurally different Arrow spelling reaches the physical schema.
-/// Field metadata is not compared: the field id and sensitivity tag are the
-/// server's own physical identity, stamped downstream from the registered
-/// table and the definition, so
-/// a writer building from the published description neither supplies them nor
+/// The caller's user block — the batch without server-owned columns — goes
+/// through the table's own value validator, the one seam every built-in
+/// owns, so the Variant contract and a canonical signal's ledger refuse with
+/// their catalogued code before the storage fingerprint could reduce them to
+/// a mismatch. A canonical signal table additionally refuses any unknown
+/// `wyrd_*` field first, and afterwards requires its user block to match
+/// `(definition.arrow_fields)()` in order, so no structurally different Arrow
+/// spelling reaches the physical schema. Field metadata is not compared: the
+/// field id and sensitivity tag are the server's own physical identity,
+/// stamped downstream from the registered table and the definition, so a
+/// writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column, and
-/// [`ScribeError::FingerprintMismatch`] when the table's value
-/// validator refuses the batch or the remaining user fields differ from the
-/// table's declared fields.
-fn enforce_canonical_source_contract(
+/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
+/// [`ScribeError::ContractViolation`] carrying the validator's catalogued
+/// refusal, and [`ScribeError::FingerprintMismatch`] when a canonical user
+/// block is not in the declared order.
+fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
 ) -> Result<(), ScribeError> {
+    let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
-    for field in schema.fields() {
-        if field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME {
-            return Err(ScribeError::InvalidFrame);
-        }
+    if canonical
+        && schema
+            .fields()
+            .iter()
+            .any(|field| field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME)
+    {
+        return Err(ScribeError::InvalidFrame);
     }
-    let permitted = [CARD_REF, RUN_ID, WYRD_EVENT_TIME];
-    let mut fields = Vec::with_capacity(schema.fields().len());
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for (index, field) in schema.fields().iter().enumerate() {
-        if permitted.contains(&field.name().as_str()) {
-            continue;
-        }
-        fields.push(field.as_ref().clone());
-        columns.push(Arc::clone(rows.column(index)));
-    }
+    let policy = definition.correlation_policy;
+    let user = RecordBatch::try_new(
+        Arc::new(Schema::new(user_fields(rows, policy))),
+        user_columns(rows, policy),
+    )
+    .map_err(|_| ScribeError::InvalidFrame)?;
+    (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
     let declared = (definition.arrow_fields)();
-    let shape_matches = fields.len() == declared.len()
-        && fields.iter().zip(&declared).all(|(supplied, expected)| {
-            supplied.name() == expected.name()
-                && supplied.is_nullable() == expected.is_nullable()
-                && supplied.data_type().equals_datatype(expected.data_type())
-        });
-    if !shape_matches {
+    let in_order = user
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .eq(declared.iter().map(Field::name));
+    if canonical && !in_order {
         return Err(ScribeError::FingerprintMismatch {
             table: format!("{}.{}", definition.namespace, definition.name),
         });
-    }
-    let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|_| ScribeError::InvalidFrame)?;
-    if let Some(validate) = definition.canonical_validator {
-        validate(&user).map_err(|reason| {
-            tracing::warn!(
-                table = %format!("{}.{}", definition.namespace, definition.name),
-                %reason,
-                "canonical user block was refused by the table's value validator"
-            );
-            ScribeError::FingerprintMismatch {
-                table: format!("{}.{}", definition.namespace, definition.name),
-            }
-        })?;
     }
     Ok(())
 }
@@ -955,7 +937,7 @@ fn stamp_correlation_columns(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stamped = RecordBatch::try_new(physical, columns).map_err(|_| ScribeError::InvalidFrame)?;
-    if definition.canonical_validator.is_some() {
+    if (definition.canonical_fields)().is_some() {
         enforce_canonical_physical_identity(&stamped, definition)?;
     }
     Ok(stamped)
@@ -2179,6 +2161,7 @@ mod tests {
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
         CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
@@ -2330,6 +2313,48 @@ mod tests {
                 .filter(|field| field.name() == "run_id")
                 .count(),
             1,
+        );
+    }
+
+    /// A canonical built-in's validator refusal reaches the caller unchanged.
+    ///
+    /// An undeclared column also changes the storage fingerprint, so this
+    /// proves the table's validator runs first and its catalogued
+    /// `UndeclaredField` is not reduced to a fingerprint mismatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the definition is missing or the decode does not refuse
+    /// with the catalogued `UndeclaredField`.
+    #[test]
+    fn canonical_validator_refusal_keeps_its_catalogued_code() {
+        let definition =
+            crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+        let mut fields = (definition.arrow_fields)();
+        fields.push(Field::new("surprise", DataType::Utf8, true));
+        let rows = RecordBatch::new_empty(Arc::new(Schema::new(fields)));
+
+        let refusal = decode(
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: Some(definition),
+                registered_schema: None,
+            },
+        )
+        .expect_err("an undeclared column is refused");
+
+        assert!(
+            matches!(
+                refusal,
+                ScribeError::ContractViolation(BifrostError::UndeclaredField { ref field, row: 0 })
+                    if field == "surprise"
+            ),
+            "{refusal:?}"
         );
     }
 

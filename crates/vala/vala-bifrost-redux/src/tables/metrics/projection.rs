@@ -42,6 +42,7 @@ use crate::tables::signal::{
     validate_canonical_user_batch, variant_column,
 };
 use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::vala::BifrostError;
 
 /// Largest accepted metric name, in bytes.
 const MAX_METRIC_NAME_BYTES: usize = 256;
@@ -282,16 +283,17 @@ pub fn canonical_metric_schema() -> Arc<Schema> {
 ///
 /// # Errors
 ///
-/// Returns a describing message when the supplied schema drifts from the
-/// ledger, a canonical payload is not canonical, `metric_type` is unknown, a
-/// column outside the declared kind is populated, or a numeric point carries
-/// both or neither value alternative.
-pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, String> {
+/// Returns the refusal of [`validate_canonical_user_batch`], and
+/// [`BifrostError::SchemaParse`] when `metric_type` is unknown, a column
+/// outside the declared kind is populated, or a numeric point carries both or
+/// neither value alternative.
+pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, BifrostError> {
+    let schema_parse = |detail| BifrostError::SchemaParse { detail };
     let batch = validate_canonical_user_batch(METRIC_FIELDS, batch)?;
     let kinds = batch
         .column_by_name("metric_type")
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| "metric_type is not the declared Utf8 column".to_owned())?;
+        .ok_or_else(|| schema_parse("metric_type is not the declared Utf8 column".to_owned()))?;
 
     for row in 0..batch.num_rows() {
         let kind = kinds.value(row);
@@ -299,29 +301,33 @@ pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, String
             .iter()
             .find(|(name, _)| *name == kind)
             .map(|(_, columns)| *columns)
-            .ok_or_else(|| format!("row {row} declares unknown metric_type {kind}"))?;
+            .ok_or_else(|| {
+                schema_parse(format!("row {row} declares unknown metric_type {kind}"))
+            })?;
         for column in KIND_SPECIFIC_COLUMNS {
             if permitted.contains(&column) {
                 continue;
             }
             let values = batch
                 .column_by_name(column)
-                .ok_or_else(|| format!("canonical batch lacks column {column}"))?;
+                .ok_or_else(|| schema_parse(format!("canonical batch lacks column {column}")))?;
             if values.is_valid(row) {
-                return Err(format!("row {row} of kind {kind} populates {column}"));
+                return Err(schema_parse(format!(
+                    "row {row} of kind {kind} populates {column}"
+                )));
             }
         }
         if matches!(kind, METRIC_TYPE_GAUGE | METRIC_TYPE_SUM) {
             let ints = batch
                 .column_by_name("int_value")
-                .ok_or_else(|| "canonical batch lacks int_value".to_owned())?;
+                .ok_or_else(|| schema_parse("canonical batch lacks int_value".to_owned()))?;
             let doubles = batch
                 .column_by_name("double_value")
-                .ok_or_else(|| "canonical batch lacks double_value".to_owned())?;
+                .ok_or_else(|| schema_parse("canonical batch lacks double_value".to_owned()))?;
             if ints.is_valid(row) == doubles.is_valid(row) {
-                return Err(format!(
+                return Err(schema_parse(format!(
                     "row {row} of kind {kind} must carry exactly one numeric alternative"
-                ));
+                )));
             }
         }
     }

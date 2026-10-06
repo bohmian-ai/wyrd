@@ -28,9 +28,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantViolation, is_variant, narrow_integer,
-};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation, narrow_integer};
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
@@ -884,115 +882,113 @@ pub fn f64_column(values: Vec<f64>) -> ArrayRef {
 /// is that input projected back into declared ledger order so every downstream
 /// authority sees one canonical column order. For each declared field the
 /// supplied field must agree on Arrow type shape and nullability, recursively
-/// through every nested child, and a top-level Variant must carry the
-/// `arrow.parquet.variant` extension. Other field metadata is deliberately not
+/// through every nested child, and every Variant, top level or nested, must
+/// carry the `arrow.parquet.variant` extension. Other field metadata is deliberately not
 /// compared: the sensitivity tag is the server's own physical identity,
 /// re-derived here when the validated columns are reassembled under the
 /// declared schema, and any caller-supplied field id is dropped, so a writer
 /// neither supplies nor can be wrong about either.
 ///
 /// Checks run in the locked write order: an undeclared column first, then
-/// each declared field's presence and type. Variant values are not walked
-/// here: Scribe validates every built-in's Variant values once, through
-/// [`crate::tables::BuiltinTableDefinition::validate_variants`], before this
-/// validator runs, so the catalogued Variant error reaches the caller intact.
+/// each declared field's presence, type, and nullability, then the Variant
+/// contract through [`crate::tables::validate_declared_variants`], so every
+/// catalogued refusal reaches the caller with its own code.
 ///
 /// # Errors
 ///
-/// Returns a stable reason when a column is undeclared, a declared field is
-/// missing, or an identity or type check fails. An undeclared column carries
-/// its catalogued error code at the start of the reason.
+/// Returns [`BifrostError::UndeclaredField`] for an undeclared column,
+/// [`BifrostError::UnsupportedType`] for a declared field supplied in another
+/// type, the catalogued Variant error for a Variant that cannot be stored, and
+/// [`BifrostError::SchemaParse`] naming the column when a declared field is
+/// missing or its nullability differs.
 pub fn validate_canonical_user_batch(
     declared: &[CanonicalField],
     batch: &RecordBatch,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, BifrostError> {
     let schema = batch.schema();
     if let Some(undeclared) = schema
         .fields()
         .iter()
         .find(|supplied| !declared.iter().any(|field| field.name == supplied.name()))
     {
-        return Err(refusal(&BifrostError::UndeclaredField {
+        return Err(BifrostError::UndeclaredField {
             field: undeclared.name().clone(),
             row: 0,
-        }));
+        });
     }
     if schema.fields().len() != declared.len() {
-        return Err(format!(
-            "canonical batch declares {} columns, expected {}",
-            schema.fields().len(),
-            declared.len()
-        ));
+        return Err(BifrostError::SchemaParse {
+            detail: format!(
+                "canonical batch declares {} columns, expected {}",
+                schema.fields().len(),
+                declared.len()
+            ),
+        });
     }
 
     let mut supplied = Vec::with_capacity(declared.len());
     for field in declared {
         let index = schema
             .index_of(field.name)
-            .map_err(|_| format!("canonical batch is missing column {}", field.name))?;
+            .map_err(|_| BifrostError::SchemaParse {
+                detail: format!("canonical batch is missing column {}", field.name),
+            })?;
         validate_field_identity(field, schema.field(index))?;
         supplied.push(Arc::clone(batch.column(index)));
     }
+    let fields = fields::canonical_arrow_fields(declared);
+    crate::tables::validate_declared_variants(&fields, batch)?;
+    let canonical = Schema::new(fields);
 
-    let columns = declared
+    let columns = canonical
+        .fields()
         .iter()
         .zip(&supplied)
         .map(|(field, column)| {
-            crate::tables::restamp_field_identity(column.as_ref(), field.to_arrow().data_type())
-                .map_err(|error| {
-                    format!(
+            crate::tables::restamp_field_identity(column.as_ref(), field.data_type()).map_err(
+                |error| BifrostError::SchemaParse {
+                    detail: format!(
                         "canonical field {} does not carry its declared identity: {error}",
-                        field.name
-                    )
-                })
+                        field.name()
+                    ),
+                },
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let canonical = Schema::new(
-        declared
-            .iter()
-            .map(CanonicalField::to_arrow)
-            .collect::<Vec<_>>(),
-    );
-    RecordBatch::try_new(Arc::new(canonical), columns)
-        .map_err(|error| format!("canonical batch does not assemble: {error}"))
+    RecordBatch::try_new(Arc::new(canonical), columns).map_err(|error| BifrostError::SchemaParse {
+        detail: format!("canonical batch does not assemble: {error}"),
+    })
 }
 
-/// Render one catalogued refusal as a validator reason led by its code.
-fn refusal(error: &BifrostError) -> String {
-    format!("{}: {error}", error.code())
-}
-
-/// Verify one supplied Arrow field against its ledger declaration.
+/// Verify one supplied Arrow field's storage type and nullability.
+///
+/// The Variant extension is not compared here: the Variant contract walk that
+/// follows owns it, top level and nested.
 ///
 /// # Errors
 ///
-/// Returns a stable reason naming the first disagreement in name, type shape,
-/// Variant extension, nullability, or any nested child.
-fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Result<(), String> {
-    if supplied.name() != declared.name {
-        return Err(format!(
-            "canonical field {} was supplied as {}",
-            declared.name,
-            supplied.name()
-        ));
-    }
+/// Returns [`BifrostError::UnsupportedType`] when the storage type differs and
+/// [`BifrostError::SchemaParse`] when the nullability differs.
+fn validate_field_identity(
+    declared: &CanonicalField,
+    supplied: &Field,
+) -> Result<(), BifrostError> {
     let expected = declared.to_arrow();
-    let extension_matches = !matches!(declared.ty, T::Variant) || is_variant(supplied);
-    if !extension_matches || !supplied.data_type().equals_datatype(expected.data_type()) {
-        return Err(format!(
-            "canonical field {} has type {}, expected {}",
-            declared.name,
-            supplied.data_type(),
-            expected.data_type()
-        ));
+    if !supplied.data_type().equals_datatype(expected.data_type()) {
+        return Err(BifrostError::UnsupportedType {
+            field: declared.name.to_owned(),
+            data_type: supplied.data_type().to_string(),
+        });
     }
     if supplied.is_nullable() != declared.nullable {
-        return Err(format!(
-            "canonical field {} nullability is {}, expected {}",
-            declared.name,
-            supplied.is_nullable(),
-            declared.nullable
-        ));
+        return Err(BifrostError::SchemaParse {
+            detail: format!(
+                "canonical field {} nullability is {}, expected {}",
+                declared.name,
+                supplied.is_nullable(),
+                declared.nullable
+            ),
+        });
     }
     Ok(())
 }

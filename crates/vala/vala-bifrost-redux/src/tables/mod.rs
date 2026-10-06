@@ -148,13 +148,14 @@ pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> Phy
     }
 }
 
-/// A table-owned canonical value validator.
+/// A table-owned value validator: Scribe's one validation seam for built-ins.
 ///
-/// A canonical signal table supplies one of these so the registry can enforce
-/// the value-level rules its Arrow schema alone cannot express — canonical
-/// payload encoding, and for metrics the kind/column agreement — without any
-/// caller matching on a table name.
-pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, String>;
+/// Every built-in carries one, so the registry enforces the rules its storage
+/// fingerprint alone cannot express — the Variant contract, a canonical
+/// signal's exact ledger, and for metrics the kind/column agreement — without
+/// any caller matching on a table name. A refusal is the catalogued error the
+/// caller receives unchanged.
+pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, BifrostError>;
 
 /// Canonical immutable definition for one built-in table.
 #[derive(Debug, Clone, Copy)]
@@ -181,8 +182,8 @@ pub struct BuiltinTableDefinition {
     pub canonical_fields: fn() -> Option<&'static [fields::CanonicalField]>,
     /// Canonical physical fingerprint constructor, `None` when not canonical.
     pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
-    /// Canonical value validator, `None` for a pre-declared table.
-    pub canonical_validator: Option<CanonicalBatchValidator>,
+    /// Value validator Scribe runs over every supplied user block.
+    pub canonical_validator: CanonicalBatchValidator,
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -193,50 +194,79 @@ pub struct BuiltinTableDefinition {
     pub physical_layout: fn() -> PhysicalLayoutWire,
 }
 
-impl BuiltinTableDefinition {
-    /// Repeat the Variant contract over one supplied batch at the trust boundary.
-    ///
-    /// Clients prepare Variant values before sending, but a raw Arrow IPC
-    /// writer can skip that, and the schema fingerprint compares storage
-    /// types only. This pass walks the table's declared fields once, top level
-    /// and nested inside Structs and Lists: every declared Variant must carry
-    /// the `arrow.parquet.variant` extension, and every present Variant value
-    /// must pass [`EncodedVariant::from_bytes`]. Fields are checked in logical
-    /// order first, then values row by row in input order and field order, so
-    /// the first failure follows the locked precedence. A declared field the
-    /// batch does not supply is left to the fingerprint check that precedes
-    /// this one. It reads the batch only and has no side effects.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::UnsupportedType`] naming the top-level field
-    /// when a declared Variant arrives without the extension or in a storage
-    /// layout other than the declared one, and the catalogued Variant error
-    /// (size, encoding, or depth) for the first stored value that fails.
-    pub(crate) fn validate_variants(&self, batch: &RecordBatch) -> Result<(), BifrostError> {
-        let schema = batch.schema();
-        let mut variant_columns = Vec::new();
-        for declared in (self.arrow_fields)() {
-            if !holds_variant(&declared) {
-                continue;
-            }
-            let Ok(index) = schema.index_of(declared.name()) else {
-                continue;
-            };
-            let supplied = schema.field(index);
-            if !variant_identity_matches(&declared, supplied) {
-                return Err(unsupported_variant(declared.name(), supplied.data_type()));
-            }
-            variant_columns.push((declared, Arc::clone(batch.column(index))));
+/// Enforce the Variant contract over one supplied batch at the trust boundary.
+///
+/// Clients prepare Variant values before sending, but a raw Arrow IPC writer
+/// can skip that, and the schema fingerprint compares storage types only.
+/// Every table validator runs this walk over its declared fields, top level
+/// and nested inside Structs and Lists: every field holding a Variant must
+/// match its declaration on the wire, where `wyrd_queue::field_to_spec` keeps
+/// the `arrow.parquet.variant` extension that storage types drop, and every
+/// present Variant value must pass [`EncodedVariant::from_bytes`]. Fields are
+/// checked in logical order first, then values row by row in input order and
+/// field order, so the first failure follows the locked precedence. A
+/// declared field the batch does not supply is left to the fingerprint check.
+/// It reads the batch only and has no side effects.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UnsupportedType`] naming the top-level field when
+/// a field holding a Variant arrives without the extension or in a storage
+/// layout other than the declared one, and the catalogued Variant error
+/// (size, encoding, or depth) for the first stored value that fails.
+pub(crate) fn validate_declared_variants(
+    declared: &[Field],
+    batch: &RecordBatch,
+) -> Result<(), BifrostError> {
+    let schema = batch.schema();
+    let wire = |field: &Field| {
+        wyrd_queue::field_to_spec(field)
+            .ok()
+            .map(|spec| wyrd_queue::spec_to_field(&spec, false))
+    };
+    let mut variant_columns = Vec::new();
+    for declared in declared {
+        if !holds_variant(declared) {
+            continue;
         }
-        for index in 0..batch.num_rows() {
-            let row = u64::try_from(index).unwrap_or(u64::MAX);
-            for (declared, column) in &variant_columns {
-                validate_variant_values(declared, declared.name(), column.as_ref(), index, row)?;
-            }
+        let Ok(index) = schema.index_of(declared.name()) else {
+            continue;
+        };
+        let supplied = schema.field(index);
+        let matches = matches!(
+            (wire(declared), wire(supplied)),
+            (Some(declared), Some(supplied))
+                if declared.data_type() == supplied.data_type()
+                    && is_variant(&declared) == is_variant(&supplied)
+        );
+        if !matches {
+            return Err(unsupported_variant(declared.name(), supplied.data_type()));
         }
-        Ok(())
+        variant_columns.push((declared, Arc::clone(batch.column(index))));
     }
+    for index in 0..batch.num_rows() {
+        let row = u64::try_from(index).unwrap_or(u64::MAX);
+        for (declared, column) in &variant_columns {
+            validate_variant_values(declared, declared.name(), column.as_ref(), index, row)?;
+        }
+    }
+    Ok(())
+}
+
+/// The value validator of a pre-declared built-in: its Variant contract.
+///
+/// A pre-declared table's fingerprint already fixes every other column's
+/// storage type, so the Variant walk over its declared fields is its only
+/// value rule. The batch is returned unchanged.
+///
+/// # Errors
+///
+/// Returns the refusal of [`validate_declared_variants`].
+fn validate_predeclared<T: DomainTable + ?Sized>(
+    batch: &RecordBatch,
+) -> Result<RecordBatch, BifrostError> {
+    validate_declared_variants(&T::arrow_fields(), batch)?;
+    Ok(batch.clone())
 }
 
 /// Report whether a declared field is or nests a Variant.
@@ -247,29 +277,6 @@ fn holds_variant(field: &Field) -> bool {
             DataType::List(element) => holds_variant(element),
             _ => false,
         }
-}
-
-/// Report whether every Variant a declaration holds is supplied as a Variant.
-///
-/// The storage types already matched the fingerprint, so only the extension
-/// marker remains to compare, at the same position in the nesting.
-fn variant_identity_matches(declared: &Field, supplied: &Field) -> bool {
-    if is_variant(declared) {
-        return is_variant(supplied);
-    }
-    match (declared.data_type(), supplied.data_type()) {
-        (DataType::Struct(declared), DataType::Struct(supplied)) => {
-            declared.len() == supplied.len()
-                && declared
-                    .iter()
-                    .zip(supplied.iter())
-                    .all(|(declared, supplied)| variant_identity_matches(declared, supplied))
-        }
-        (DataType::List(declared), DataType::List(supplied)) => {
-            variant_identity_matches(declared, supplied)
-        }
-        _ => true,
-    }
 }
 
 /// The refusal for a declared Variant supplied in another wire type.
@@ -377,12 +384,12 @@ pub trait DomainTable: Send + Sync + 'static {
         None
     }
 
-    /// The table-owned canonical value validator, when this table is canonical.
+    /// The table-owned value validator Scribe runs over every user block.
     ///
     /// A canonical signal table sets this to the function that enforces its
-    /// value-level rules; a pre-declared table leaves it `None` and is value
-    /// validated by its declared Arrow schema alone.
-    const CANONICAL_VALIDATOR: Option<CanonicalBatchValidator> = None;
+    /// ledger and value-level rules; a pre-declared table keeps the Variant
+    /// contract over its declared Arrow fields.
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -2193,9 +2200,7 @@ mod tests {
             ("metrics", "points", points),
         ] {
             let definition = builtin_table(namespace, name).expect("canonical built-in");
-            let validate = definition
-                .canonical_validator
-                .expect("a canonical signal table owns a value validator");
+            let validate = definition.canonical_validator;
             let batch = crate::tables::signal::without_correlation_columns(&projected)
                 .expect("the correlation columns split off cleanly");
             validate(&batch).expect("the table's own projection validates");
@@ -2229,9 +2234,7 @@ mod tests {
                     .collect(),
             )
             .expect("the corrupted batch still assembles");
-            let refusal = definition
-                .validate_variants(&corrupted)
-                .expect_err("invalid Variant bytes are refused");
+            let refusal = validate(&corrupted).expect_err("invalid Variant bytes are refused");
             assert_eq!(
                 refusal.code(),
                 "WYRD_VALA_400_VARIANT_INVALID_JSON",
@@ -2266,19 +2269,18 @@ mod tests {
         .expect("the kind-violating batch still assembles");
         let validate = builtin_table("metrics", "points")
             .expect("points definition")
-            .canonical_validator
-            .expect("the points table owns a value validator");
+            .canonical_validator;
         assert!(
             validate(&kind_violation).is_err(),
             "a point may not populate a foreign kind's column"
         );
 
-        assert!(
-            builtin_table("drift", "observations")
-                .expect("drift observations definition")
-                .canonical_validator
-                .is_none(),
-            "a pre-declared built-in owns no canonical value validation"
+        let drift = builtin_table("drift", "observations").expect("drift observations definition");
+        let empty = RecordBatch::new_empty(Arc::new(Schema::new((drift.arrow_fields)())));
+        assert_eq!(
+            (drift.canonical_validator)(&empty).expect("a declared batch validates"),
+            empty,
+            "a pre-declared built-in's validator returns its batch unchanged"
         );
     }
 

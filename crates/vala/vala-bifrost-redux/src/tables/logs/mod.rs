@@ -404,9 +404,7 @@ mod tests {
                 .collect(),
         )
         .expect("the malformed batch still assembles");
-        let refusal = crate::tables::builtin_table("logs", "records")
-            .expect("the logs built-in is registered")
-            .validate_variants(&malformed)
+        let refusal = validate_canonical_user_batch(LOG_FIELDS, &malformed)
             .expect_err("invalid attribute Variant bytes are rejected");
         assert_eq!(
             refusal,

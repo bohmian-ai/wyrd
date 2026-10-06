@@ -126,8 +126,8 @@ impl DomainTable for SpansTable {
         "scope_attributes",
     ];
 
-    const CANONICAL_VALIDATOR: Option<crate::tables::CanonicalBatchValidator> =
-        Some(validate_canonical_user_batch_for_table);
+    const CANONICAL_VALIDATOR: crate::tables::CanonicalBatchValidator =
+        validate_canonical_user_batch_for_table;
 
     fn canonical_fields() -> Option<&'static [crate::tables::fields::CanonicalField]> {
         Some(SPAN_FIELDS)
@@ -154,11 +154,11 @@ impl DomainTable for SpansTable {
 ///
 /// # Errors
 ///
-/// Returns the shared canonical reason when the supplied schema drifts from
-/// the declared ledger or a canonical payload value is not canonically
-/// encoded.
+/// Returns the catalogued refusal of the shared canonical validation when
+/// the supplied schema drifts from the declared ledger or a Variant value
+/// cannot be stored.
 fn validate_canonical_user_batch_for_table(
     batch: &arrow::array::RecordBatch,
-) -> Result<arrow::array::RecordBatch, String> {
+) -> Result<arrow::array::RecordBatch, wyrd_spec::vala::BifrostError> {
     crate::tables::signal::validate_canonical_user_batch(SPAN_FIELDS, batch)
 }

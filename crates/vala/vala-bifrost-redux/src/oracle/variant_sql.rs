@@ -83,7 +83,7 @@ pub struct OracleVariantSql {
     /// `to_json`, in that order.
     functions: Vec<Arc<ScalarUDF>>,
     /// Rewrites `->` and `->>` on a Variant operand into the functions above.
-    planner: Arc<dyn ExprPlanner>,
+    planner: Arc<VariantOperatorPlanner>,
 }
 
 impl OracleVariantSql {
@@ -128,8 +128,55 @@ impl OracleVariantSql {
         builder
             .expr_planners()
             .get_or_insert_with(Vec::new)
-            .push(Arc::clone(&self.planner));
+            .push(Arc::clone(&self.planner) as Arc<dyn ExprPlanner>);
         builder
+    }
+
+    /// Build `root ->> keys`: the text at a literal object-key path.
+    ///
+    /// This is exactly the expression the `->>` operator plans for a literal
+    /// key chain, so a leaf predicate rebuilt from a distributed assignment
+    /// evaluates the same `variant_get` semantics the leader classified.
+    #[must_use]
+    pub fn text_at(&self, root: Expr, keys: &[String]) -> Expr {
+        let mut args = vec![root];
+        args.extend(
+            keys.iter()
+                .map(|key| Expr::Literal(ScalarValue::Utf8(Some(key.clone())), None)),
+        );
+        self.planner
+            .as_text
+            .call(vec![Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::clone(&self.planner.get),
+                args,
+            ))])
+    }
+
+    /// Return the object-key path of `expr` when it is exactly `root ->> keys`
+    /// for literal string keys, as `(root, keys)`.
+    ///
+    /// The inverse of [`Self::text_at`]; any other shape, including an integer
+    /// index or a non-literal key, returns `None`.
+    #[must_use]
+    pub fn text_path(expr: &Expr) -> Option<(&Expr, Vec<String>)> {
+        let Expr::ScalarFunction(text) = expr else {
+            return None;
+        };
+        let [Expr::ScalarFunction(get)] = text.args.as_slice() else {
+            return None;
+        };
+        if text.func.name() != VARIANT_AS_TEXT || get.func.name() != VARIANT_GET {
+            return None;
+        }
+        let (root, path) = get.args.split_first()?;
+        let keys = path
+            .iter()
+            .map(|key| match key {
+                Expr::Literal(ScalarValue::Utf8(Some(key)), _) => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!keys.is_empty()).then_some((root, keys))
     }
 }
 

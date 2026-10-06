@@ -159,9 +159,8 @@ impl AnalyticalScanExec {
                     "resolved provider schema fingerprint differs from assignment".to_owned(),
                 ));
             }
-            let expected =
-                signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
-                    .map_err(DataFusionError::Plan)?;
+            let expected = signed_closure_schema(resolved.full_schema.as_ref(), assignment)
+                .map_err(DataFusionError::Plan)?;
             if resolved.plan.schema() != expected {
                 return Err(DataFusionError::Plan(
                     "resolved provider schema differs from the signed projection closure"

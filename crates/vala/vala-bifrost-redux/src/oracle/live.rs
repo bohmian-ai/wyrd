@@ -834,6 +834,7 @@ mod tests {
 
     use super::*;
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
+    use wyrd_spec::vala::assignment_authority::ScanLeaf;
 
     /// Encodes `rows` through the Scribe's own attempt encoder.
     fn frames(fingerprint: &str, rows: &[i64]) -> Vec<WorkerAttemptFrame> {
@@ -1134,14 +1135,14 @@ mod tests {
             routes: vec![early, late.clone()],
         };
         let floor = ScanPredicate::GtEq(
-            wyrd_spec::vala::WYRD_EVENT_TIME.to_owned(),
+            ScanLeaf::Column(wyrd_spec::vala::WYRD_EVENT_TIME.to_owned()),
             wyrd_spec::vala::assignment_authority::ScanLiteral::TimestampMicros(
                 1_787_497_200_000_000,
             ),
         );
         assert_eq!(table.select(std::slice::from_ref(&floor)), vec![late]);
         let other = ScanPredicate::GtEq(
-            "id".to_owned(),
+            ScanLeaf::Column("id".to_owned()),
             wyrd_spec::vala::assignment_authority::ScanLiteral::I64(0),
         );
         assert_eq!(table.select(&[other]).len(), 2);

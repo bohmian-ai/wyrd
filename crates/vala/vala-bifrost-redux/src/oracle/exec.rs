@@ -73,7 +73,7 @@ use wyrd_spec::vala::BifrostError;
 use crate::scribe::hot_source::StagedSourceLease;
 use crate::storage::error_chain_contains_not_found;
 use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
-use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+use wyrd_spec::vala::assignment_authority::{ScanLeaf, ScanLiteral, ScanPredicate};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
@@ -2123,17 +2123,16 @@ impl OracleTableProvider {
 /// `DataFusion` qualified it, because a planned query always qualifies column
 /// references against the registered relation and rejecting qualified
 /// references would make pushdown unreachable in practice. The ownership
-/// check therefore happens here instead: every leaf column must resolve by
-/// name against the complete physical schema, so a reference belonging to a
-/// different relation makes the whole filter `Unsupported` and can never
-/// prune this source.
+/// check therefore happens here instead: every leaf must resolve against the
+/// complete physical schema with a matching root kind, so a reference
+/// belonging to a different relation makes the whole filter `Unsupported` and
+/// can never prune this source.
 fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> FilterClassification {
     match classify_filter(filter) {
         FilterClassification::Supported(leaves) => {
             if leaves.iter().all(|leaf| {
-                physical_schema
-                    .column_with_name(leaf.column())
-                    .is_some_and(|(_, field)| literal_fits_column(leaf, field.data_type()))
+                leaf_resolves(physical_schema, leaf.leaf())
+                    && literal_fits_column(leaf, leaf_data_type(physical_schema, leaf.leaf()))
             }) {
                 FilterClassification::Supported(leaves)
             } else {
@@ -2144,26 +2143,28 @@ fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> Filter
     }
 }
 
-/// Reports whether `leaf`'s literal can be materialized against a column of
-/// `data_type` without a cast.
+/// Reports whether every literal of `leaf` can be materialized against a leaf
+/// of `data_type` without a cast.
 ///
 /// Only a binary literal is constrained here: it must compare against a
 /// binary-family column, and a fixed-size column additionally requires the
 /// literal's exact width, because a `FixedSizeBinary` scalar of any other width
 /// is not a value of that column. Every other literal keeps the classifier's
 /// existing contract, where the residual filter decides typed comparisons.
-fn literal_fits_column(leaf: &ScanPredicate, data_type: &DataType) -> bool {
-    match (leaf.literal(), data_type) {
-        (Some(ScanLiteral::Bytes(value)), DataType::FixedSizeBinary(width)) => {
-            usize::try_from(*width).is_ok_and(|width| width == value.len())
-        }
-        (
-            Some(ScanLiteral::Bytes(_)),
-            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
-        ) => true,
-        (Some(ScanLiteral::Bytes(_)), _) => false,
-        _ => true,
-    }
+fn literal_fits_column(leaf: &ScanPredicate, data_type: Option<&DataType>) -> bool {
+    leaf.literals()
+        .iter()
+        .all(|literal| match (literal, data_type) {
+            (ScanLiteral::Bytes(value), Some(DataType::FixedSizeBinary(width))) => {
+                usize::try_from(*width).is_ok_and(|width| width == value.len())
+            }
+            (
+                ScanLiteral::Bytes(_),
+                Some(DataType::Binary | DataType::LargeBinary | DataType::BinaryView),
+            ) => true,
+            (ScanLiteral::Bytes(_), _) => false,
+            _ => true,
+        })
 }
 
 #[async_trait]
@@ -3161,11 +3162,13 @@ fn hot_piece_metadata(
 /// a physical encoding this reader hashes exactly. Probing reads each filter
 /// through the scan's governed reader, so Bloom bytes are charged like every
 /// other range read. Missing filters, unreadable filters, unsupported physical
-/// types, and any leaf other than equality keep the row group: a Bloom filter
-/// can only prove absence, and a false positive merely retains a group.
+/// types, and any leaf other than equality or `IN` keep the row group: a Bloom
+/// filter can only prove absence, and a false positive merely retains a group.
 struct HotBloomProbes {
-    /// `(Parquet leaf column index, hashed probe value)` per supported leaf.
-    probes: Vec<(usize, BloomProbe)>,
+    /// `(Parquet leaf column index, hashed probe values)` per supported leaf.
+    /// An equality leaf carries one value and an `IN` leaf one per list
+    /// element; the group is excluded only when every value is absent.
+    probes: Vec<(usize, Vec<BloomProbe>)>,
 }
 
 /// One literal encoded exactly as Parquet hashes its column's physical values.
@@ -3224,21 +3227,24 @@ impl BloomProbe {
 impl HotBloomProbes {
     /// Collects the Bloom probes `predicates` allow against `metadata`'s file.
     ///
-    /// Only equality leaves become probes; a column the file does not carry or
-    /// a literal [`BloomProbe::for_column`] cannot encode is skipped.
+    /// Only equality and `IN` leaves become probes. A leaf whose full path the
+    /// file does not carry, or any literal [`BloomProbe::for_column`] cannot
+    /// encode, is skipped whole: an `IN` list with one unencodable value can
+    /// never prove the group empty.
     fn new(metadata: &ParquetMetaData, predicates: &[ScanPredicate]) -> Self {
         let schema = metadata.file_metadata().schema_descr();
         let probes = predicates
             .iter()
-            .filter_map(|predicate| match predicate {
-                ScanPredicate::Eq(column, literal) => {
-                    let index = parquet_column_index(metadata, column)?;
-                    Some((
-                        index,
-                        BloomProbe::for_column(&schema.column(index), literal)?,
-                    ))
-                }
-                _ => None,
+            .filter(|predicate| matches!(predicate, ScanPredicate::Eq(..) | ScanPredicate::In(..)))
+            .filter_map(|predicate| {
+                let index = parquet_column_index(metadata, predicate.leaf())?;
+                let column = schema.column(index);
+                let values = predicate
+                    .literals()
+                    .iter()
+                    .map(|literal| BloomProbe::for_column(&column, literal))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((index, values))
             })
             .collect();
         Self { probes }
@@ -3266,12 +3272,12 @@ impl HotBloomProbes {
         let mut pruned = 0_u64;
         for row_group in candidates {
             let mut absent = false;
-            for (column, probe) in &self.probes {
+            for (column, values) in &self.probes {
                 match builder
                     .get_row_group_column_bloom_filter(row_group, *column)
                     .await
                 {
-                    Ok(Some(filter)) if !probe.may_contain(&filter) => {
+                    Ok(Some(filter)) if !values.iter().any(|value| value.may_contain(&filter)) => {
                         absent = true;
                         break;
                     }
@@ -3330,9 +3336,9 @@ enum FilterClassification {
 }
 
 /// Classifies one filter expression: recursively flattens `AND`, and
-/// classifies each leaf as a closed [`ScanPredicate`](wyrd_spec::vala::assignment_authority::ScanPredicate)
-/// comparison or null-check. Any `OR`, `NOT`, cast, function call, arithmetic,
-/// column-to-column comparison, qualified/unknown column, non-finite float,
+/// classifies each leaf as a closed [`ScanPredicate`] comparison, `IN` list,
+/// or null-check over one [`ScanLeaf`]. Any `OR`, `NOT`, negated `IN`,
+/// arithmetic, column-to-column comparison, dynamic path, non-finite float,
 /// or unrecognized literal type makes the entire expression `Unsupported` —
 /// classification never partially decomposes one filter.
 fn classify_filter(expr: &Expr) -> FilterClassification {
@@ -3349,91 +3355,213 @@ fn classify_filter(expr: &Expr) -> FilterClassification {
 /// Returns `false` (leaving `out` in an unspecified partial state that the
 /// caller discards) as soon as one leaf is not representable in the closed
 /// subset.
-fn flatten_supported_conjunction(
-    expr: &Expr,
-    out: &mut Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-) -> bool {
-    match expr {
+fn flatten_supported_conjunction(expr: &Expr, out: &mut Vec<ScanPredicate>) -> bool {
+    let predicate = match expr {
         Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::And => {
-            flatten_supported_conjunction(&binary.left, out)
-                && flatten_supported_conjunction(&binary.right, out)
+            return flatten_supported_conjunction(&binary.left, out)
+                && flatten_supported_conjunction(&binary.right, out);
         }
-        Expr::BinaryExpr(binary) => {
-            let Some(predicate) = classify_comparison(&binary.left, binary.op, &binary.right)
-            else {
-                return false;
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+            classify_equality_disjunction(expr)
+        }
+        Expr::BinaryExpr(binary) => classify_comparison(&binary.left, binary.op, &binary.right),
+        Expr::IsNull(inner) => match leaf_for_pushdown(inner) {
+            Some((leaf, None)) => Some(ScanPredicate::IsNull(leaf)),
+            _ => None,
+        },
+        Expr::IsNotNull(inner) => match leaf_for_pushdown(inner) {
+            Some((leaf, None)) => Some(ScanPredicate::IsNotNull(leaf)),
+            _ => None,
+        },
+        Expr::InList(list) if !list.negated => classify_in_list(&list.expr, &list.list),
+        _ => None,
+    };
+    predicate.map(|predicate| out.push(predicate)).is_some()
+}
+
+/// Returns the pushdown leaf `expr` reads, with the cast a Variant text leaf
+/// carries, or `None` when `expr` is not a leaf reference.
+///
+/// A bare column, an exact `get_field` chain of literal names over a column,
+/// and `variant_as_text(variant_get(column, 'k'...))` — the `->>` form —
+/// optionally under one `CAST`, are leaves. A table qualifier is accepted and
+/// discarded: `DataFusion` qualifies every column reference against the
+/// registered relation, so a filter reaching a registered provider always
+/// arrives qualified. The bare name is authoritative because the caller
+/// resolves it against the complete physical schema before it can prune, and
+/// an unresolvable name classifies the whole filter `Unsupported`.
+fn leaf_for_pushdown(expr: &Expr) -> Option<(ScanLeaf, Option<DataType>)> {
+    if let Expr::Cast(cast) = expr {
+        return match leaf_for_pushdown(&cast.expr)? {
+            (leaf @ ScanLeaf::Variant { .. }, None) => {
+                Some((leaf, Some(cast.field.data_type().clone())))
+            }
+            _ => None,
+        };
+    }
+    if let Some((root, keys)) = super::variant_sql::OracleVariantSql::text_path(expr) {
+        let Expr::Column(column) = root else {
+            return None;
+        };
+        return Some((
+            ScanLeaf::Variant {
+                column: column.name.clone(),
+                keys,
+            },
+            None,
+        ));
+    }
+    match expr {
+        Expr::Column(column) => Some((ScanLeaf::Column(column.name.clone()), None)),
+        Expr::ScalarFunction(call) if call.func.name() == "get_field" => {
+            let (base, names) = call.args.split_first()?;
+            let (mut leaf, None) = leaf_for_pushdown(base)? else {
+                return None;
             };
-            out.push(predicate);
-            true
+            let names = names
+                .iter()
+                .map(|name| match name {
+                    Expr::Literal(ScalarValue::Utf8(Some(name)), _) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if names.is_empty() {
+                return None;
+            }
+            match &mut leaf {
+                ScanLeaf::Column(column) => {
+                    leaf = ScanLeaf::StructField {
+                        column: std::mem::take(column),
+                        fields: names,
+                    };
+                }
+                ScanLeaf::StructField { fields, .. } => fields.extend(names),
+                ScanLeaf::Variant { .. } => return None,
+            }
+            Some((leaf, None))
         }
-        Expr::IsNull(inner) => {
-            let Some(column) = column_name_for_pushdown(inner) else {
-                return false;
-            };
-            out.push(wyrd_spec::vala::assignment_authority::ScanPredicate::IsNull(column));
-            true
-        }
-        Expr::IsNotNull(inner) => {
-            let Some(column) = column_name_for_pushdown(inner) else {
-                return false;
-            };
-            out.push(wyrd_spec::vala::assignment_authority::ScanPredicate::IsNotNull(column));
-            true
-        }
-        _ => false,
+        _ => None,
     }
 }
 
-/// Returns the bare column name of `expr`, or `None` when `expr` is not a
-/// column reference.
+/// The `CAST` target a Variant text leaf compared with `literal` carries:
+/// none for a text literal compared with `->>` directly, and the literal's own
+/// type for a typed literal compared with `CAST(->> AS type)`.
 ///
-/// A table qualifier is accepted and discarded: `DataFusion` qualifies every
-/// column reference against the registered relation, so a filter reaching a
-/// registered provider always arrives as `catalog.schema.table.column`.
-/// Rejecting qualified references here would make the closed subset
-/// unreachable in practice. The bare name is authoritative because the caller
-/// resolves it against the complete physical schema before it can prune, and
-/// an unresolvable name classifies the whole filter `Unsupported`.
-fn column_name_for_pushdown(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Column(column) => Some(column.name.clone()),
-        _ => None,
+/// Classification accepts a Variant comparison only when the observed cast is
+/// exactly this one, so a follower rebuilds the identical expression from the
+/// leaf and literal alone.
+fn variant_leaf_cast(literal: &ScanLiteral) -> Option<DataType> {
+    match literal {
+        ScanLiteral::I64(_) => Some(DataType::Int64),
+        ScanLiteral::U64(_) => Some(DataType::UInt64),
+        ScanLiteral::F64Bits(_) => Some(DataType::Float64),
+        ScanLiteral::Bool(_) => Some(DataType::Boolean),
+        ScanLiteral::Utf8(_) | ScanLiteral::TimestampMicros(_) | ScanLiteral::Bytes(_) => None,
+    }
+}
+
+/// Reports whether `leaf` read under `cast` may be compared with `literal`.
+///
+/// Only a Variant leaf carries a cast, and only the one [`variant_leaf_cast`]
+/// prescribes for the literal's type; timestamp and binary literals have no
+/// Variant leaf form.
+fn leaf_accepts(leaf: &ScanLeaf, cast: Option<&DataType>, literal: &ScanLiteral) -> bool {
+    match leaf {
+        ScanLeaf::Variant { .. } => {
+            !matches!(
+                literal,
+                ScanLiteral::TimestampMicros(_) | ScanLiteral::Bytes(_)
+            ) && variant_leaf_cast(literal).as_ref() == cast
+        }
+        ScanLeaf::Column(_) | ScanLeaf::StructField { .. } => cast.is_none(),
     }
 }
 
 /// Classifies one binary comparison as a closed leaf predicate.
 ///
 /// A literal on the left is normalized by reversing the operator so the
-/// returned predicate always carries `(column, literal)`. Returns `None` for
+/// returned predicate always carries `(leaf, literal)`. Returns `None` for
 /// any operator outside the closed comparison set, a non-finite float
-/// literal, a literal type outside the closed [`ScanLiteral`](wyrd_spec::vala::assignment_authority::ScanLiteral)
-/// vocabulary, or an operand pair that is not exactly one unqualified column
-/// and one closed literal.
+/// literal, a literal type outside the closed [`ScanLiteral`] vocabulary, or
+/// an operand pair that is not exactly one leaf and one closed literal.
 fn classify_comparison(
     left: &Expr,
     op: datafusion::logical_expr::Operator,
     right: &Expr,
-) -> Option<wyrd_spec::vala::assignment_authority::ScanPredicate> {
-    use wyrd_spec::vala::assignment_authority::ScanPredicate;
-
+) -> Option<ScanPredicate> {
     let normalized_op = closed_comparison_op(op)?;
-    let (column, literal_expr, normalized_op) = match (
-        column_name_for_pushdown(left),
-        column_name_for_pushdown(right),
-    ) {
-        (Some(column), None) => (column, right, normalized_op),
-        (None, Some(column)) => (column, left, reverse_comparison_op(normalized_op)),
-        _ => return None,
-    };
+    let ((leaf, cast), literal_expr, normalized_op) =
+        match (leaf_for_pushdown(left), leaf_for_pushdown(right)) {
+            (Some(leaf), None) => (leaf, right, normalized_op),
+            (None, Some(leaf)) => (leaf, left, reverse_comparison_op(normalized_op)),
+            _ => return None,
+        };
     let literal = classify_literal(literal_expr)?;
+    if !leaf_accepts(&leaf, cast.as_ref(), &literal) {
+        return None;
+    }
     Some(match normalized_op {
-        ClosedComparisonOp::Eq => ScanPredicate::Eq(column, literal),
-        ClosedComparisonOp::NotEq => ScanPredicate::NotEq(column, literal),
-        ClosedComparisonOp::Lt => ScanPredicate::Lt(column, literal),
-        ClosedComparisonOp::LtEq => ScanPredicate::LtEq(column, literal),
-        ClosedComparisonOp::Gt => ScanPredicate::Gt(column, literal),
-        ClosedComparisonOp::GtEq => ScanPredicate::GtEq(column, literal),
+        ClosedComparisonOp::Eq => ScanPredicate::Eq(leaf, literal),
+        ClosedComparisonOp::NotEq => ScanPredicate::NotEq(leaf, literal),
+        ClosedComparisonOp::Lt => ScanPredicate::Lt(leaf, literal),
+        ClosedComparisonOp::LtEq => ScanPredicate::LtEq(leaf, literal),
+        ClosedComparisonOp::Gt => ScanPredicate::Gt(leaf, literal),
+        ClosedComparisonOp::GtEq => ScanPredicate::GtEq(leaf, literal),
     })
+}
+
+/// Classifies one non-negated `IN` list as a closed leaf predicate.
+///
+/// Returns `None` unless `expr` is a leaf and `list` is a non-empty list of
+/// closed literals of one [`ScanLiteral`] type the leaf accepts.
+fn classify_in_list(expr: &Expr, list: &[Expr]) -> Option<ScanPredicate> {
+    let (leaf, cast) = leaf_for_pushdown(expr)?;
+    let literals = list
+        .iter()
+        .map(classify_literal)
+        .collect::<Option<Vec<_>>>()?;
+    leaf_accepts(&leaf, cast.as_ref(), literals.first()?)
+        .then(|| uniform_in_list(leaf, literals))
+        .flatten()
+}
+
+/// Classifies an `OR` chain of equalities on one leaf as an `IN` list.
+///
+/// `DataFusion`'s simplifier rewrites a short `column IN (...)` list into
+/// exactly this chain before pushdown, so recognizing it is what keeps a
+/// small `IN` list on a plain column prunable. Returns `None` unless every
+/// disjunct is a closed equality on the same leaf.
+fn classify_equality_disjunction(expr: &Expr) -> Option<ScanPredicate> {
+    let mut leaf = None;
+    let mut literals = Vec::new();
+    for disjunct in
+        datafusion::logical_expr::utils::split_binary(expr, datafusion::logical_expr::Operator::Or)
+    {
+        let Expr::BinaryExpr(binary) = disjunct else {
+            return None;
+        };
+        let ScanPredicate::Eq(next, literal) =
+            classify_comparison(&binary.left, binary.op, &binary.right)?
+        else {
+            return None;
+        };
+        if *leaf.get_or_insert_with(|| next.clone()) != next {
+            return None;
+        }
+        literals.push(literal);
+    }
+    uniform_in_list(leaf?, literals)
+}
+
+/// Builds `leaf IN (literals)` when the list is non-empty and single-typed,
+/// the shape every assignment `IN` list must have.
+fn uniform_in_list(leaf: ScanLeaf, literals: Vec<ScanLiteral>) -> Option<ScanPredicate> {
+    let first = std::mem::discriminant(literals.first()?);
+    literals
+        .iter()
+        .all(|literal| std::mem::discriminant(literal) == first)
+        .then_some(ScanPredicate::In(leaf, literals))
 }
 
 /// Closed comparison operators reachable through predicate pushdown.
@@ -3720,68 +3848,134 @@ pub(super) fn project_plan_by_name(
     Ok(Arc::new(ProjectionExec::try_new(expressions, plan)?))
 }
 
-/// Builds the physical predicate for one closed comparison/null-check leaf
-/// against `schema`.
+/// Builds the physical predicate for one closed leaf predicate against
+/// `schema`.
+///
+/// The physical form is planned from [`scan_predicate_logical_expr`], so the
+/// leader's provider filter, a follower's leaf, and its rebuilt logical
+/// filters evaluate one expression: a Struct leaf stays exact `get_field` and a
+/// Variant leaf stays semantic `variant_get`.
 ///
 /// # Errors
-/// Returns a `DataFusion` plan error when the predicate's column is absent
-/// from `schema`.
+/// Returns a `DataFusion` plan error when the predicate's root column is
+/// absent from `schema`, or the planning error for a leaf whose path or
+/// literal does not type-check against it.
 fn scan_predicate_physical_expr(
-    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
+    predicate: &ScanPredicate,
     schema: &SchemaRef,
-) -> DataFusionResult<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
-    use datafusion::logical_expr::Operator;
-    use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_expr::expressions::{BinaryExpr, IsNotNullExpr, IsNullExpr, Literal};
-    use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+    let expr = scan_predicate_logical_expr(predicate, schema).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "pushed predicate column {} is absent from the scan schema",
+            predicate.column()
+        ))
+    })?;
+    let df_schema = datafusion::common::DFSchema::try_from(Arc::clone(schema))?;
+    datafusion::physical_expr::create_physical_expr(
+        &expr,
+        &df_schema,
+        &datafusion::execution::context::ExecutionProps::new(),
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+    )
+}
 
-    let column_expr = |name: &str| -> DataFusionResult<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(Column::new_with_schema(name, schema)?))
-    };
-    // A timestamp literal adopts the compared column's own timezone. The
-    // durable `ScanLiteral` carries microseconds since the epoch and nothing
-    // else, so materializing it as a naive instant would make every comparison
-    // against a timezone-carrying column — `wyrd_event_time` among them — an
-    // Arrow type error at execution rather than a filter.
-    let literal_expr = |column: &str, literal: &ScanLiteral| -> Arc<dyn PhysicalExpr> {
-        Arc::new(Literal::new(scan_literal_scalar(schema, column, literal)))
-    };
-    let comparison = |column: &str, op: Operator, literal: &ScanLiteral| {
-        Ok(Arc::new(BinaryExpr::new(
-            column_expr(column)?,
-            op,
-            literal_expr(column, literal),
-        )) as Arc<dyn PhysicalExpr>)
-    };
-    match predicate {
-        ScanPredicate::Eq(column, literal) => comparison(column, Operator::Eq, literal),
-        ScanPredicate::NotEq(column, literal) => comparison(column, Operator::NotEq, literal),
-        ScanPredicate::Lt(column, literal) => comparison(column, Operator::Lt, literal),
-        ScanPredicate::LtEq(column, literal) => comparison(column, Operator::LtEq, literal),
-        ScanPredicate::Gt(column, literal) => comparison(column, Operator::Gt, literal),
-        ScanPredicate::GtEq(column, literal) => comparison(column, Operator::GtEq, literal),
-        ScanPredicate::IsNull(column) => Ok(Arc::new(IsNullExpr::new(column_expr(column)?))),
-        ScanPredicate::IsNotNull(column) => Ok(Arc::new(IsNotNullExpr::new(column_expr(column)?))),
+/// Builds the logical predicate for one closed leaf predicate against
+/// `schema`, or `None` when its root column is absent.
+///
+/// This is the single authority for rebuilding a classified leaf: literals are
+/// materialized in the compared leaf's own type through
+/// [`scan_literal_scalar`], and the leaf itself through [`leaf_logical_expr`].
+fn scan_predicate_logical_expr(predicate: &ScanPredicate, schema: &SchemaRef) -> Option<Expr> {
+    use datafusion::logical_expr::lit;
+
+    schema.field_with_name(predicate.column()).ok()?;
+    let leaf_type = leaf_data_type(schema, predicate.leaf());
+    let leaf = leaf_logical_expr(predicate.leaf(), predicate.literals().first());
+    let scalar = |literal| lit(scan_literal_scalar(leaf_type, literal));
+    Some(match predicate {
+        ScanPredicate::Eq(_, literal) => leaf.eq(scalar(literal)),
+        ScanPredicate::NotEq(_, literal) => leaf.not_eq(scalar(literal)),
+        ScanPredicate::Lt(_, literal) => leaf.lt(scalar(literal)),
+        ScanPredicate::LtEq(_, literal) => leaf.lt_eq(scalar(literal)),
+        ScanPredicate::Gt(_, literal) => leaf.gt(scalar(literal)),
+        ScanPredicate::GtEq(_, literal) => leaf.gt_eq(scalar(literal)),
+        ScanPredicate::In(_, literals) => {
+            leaf.in_list(literals.iter().map(scalar).collect(), false)
+        }
+        ScanPredicate::IsNull(_) => leaf.is_null(),
+        ScanPredicate::IsNotNull(_) => leaf.is_not_null(),
+    })
+}
+
+/// Builds the logical expression that reads `leaf`, the inverse of
+/// [`leaf_for_pushdown`].
+///
+/// A column is an unqualified column reference, a Struct field one exact
+/// `get_field` path, and a Variant key path `->>` under the cast
+/// [`variant_leaf_cast`] prescribes for `literal` (none for a null-check).
+fn leaf_logical_expr(leaf: &ScanLeaf, literal: Option<&ScanLiteral>) -> Expr {
+    use datafusion::logical_expr::{expr::Cast, lit};
+
+    let root = Expr::Column(datafusion::common::Column::new_unqualified(leaf.column()));
+    match leaf {
+        ScanLeaf::Column(_) => root,
+        ScanLeaf::StructField { fields, .. } => {
+            datafusion::functions::core::expr_fn::get_field_path(
+                root,
+                fields.iter().map(|field| lit(field.as_str())).collect(),
+            )
+        }
+        ScanLeaf::Variant { keys, .. } => {
+            let text = super::variant_sql::OracleVariantSql::shared().text_at(root, keys);
+            match literal.and_then(variant_leaf_cast) {
+                Some(data_type) => Expr::Cast(Cast::new(Box::new(text), data_type)),
+                None => text,
+            }
+        }
     }
 }
 
-/// Materializes one closed [`ScanLiteral`](wyrd_spec::vala::assignment_authority::ScanLiteral)
-/// as the Arrow scalar the compared column expects.
-///
-/// This is the single authority for turning a durable literal into a value,
-/// shared by the physical and logical predicate builders so a leaf rebuilt on
-/// a follower compares exactly what the leader planned. A timestamp bound is
-/// stored as bare microseconds, so the column's own type supplies the
-/// timezone; materializing it naive would make every comparison against a
-/// timezone-carrying column an Arrow type error instead of a filter.
-fn scan_literal_scalar(
-    schema: &SchemaRef,
-    column: &str,
-    literal: &wyrd_spec::vala::assignment_authority::ScanLiteral,
-) -> datafusion::scalar::ScalarValue {
-    use datafusion::scalar::ScalarValue;
-    use wyrd_spec::vala::assignment_authority::ScanLiteral;
+/// Reports whether `leaf` resolves against `schema` with a matching logical
+/// root kind: a column exists, a Struct path names nested Struct fields, and a
+/// Variant path is rooted at a Variant column.
+pub(super) fn leaf_resolves(schema: &Schema, leaf: &ScanLeaf) -> bool {
+    match leaf {
+        ScanLeaf::Column(_) | ScanLeaf::StructField { .. } => {
+            leaf_data_type(schema, leaf).is_some()
+        }
+        ScanLeaf::Variant { column, .. } => schema
+            .field_with_name(column)
+            .is_ok_and(wyrd_queue::variant::is_variant),
+    }
+}
 
+/// Resolves the Arrow type of a column or Struct-field leaf in `schema`, or
+/// `None` for a Variant leaf or a path the schema does not carry.
+fn leaf_data_type<'a>(schema: &'a Schema, leaf: &ScanLeaf) -> Option<&'a DataType> {
+    if matches!(leaf, ScanLeaf::Variant { .. }) {
+        return None;
+    }
+    let mut data_type = schema.field_with_name(leaf.column()).ok()?.data_type();
+    for name in leaf.path() {
+        let DataType::Struct(fields) = data_type else {
+            return None;
+        };
+        data_type = fields.find(name)?.1.data_type();
+    }
+    Some(data_type)
+}
+
+/// Materializes one closed [`ScanLiteral`] as the Arrow scalar the compared
+/// leaf of type `leaf_type` expects.
+///
+/// Shared by the physical and logical predicate builders so a leaf rebuilt on
+/// a follower compares exactly what the leader planned. A timestamp bound is
+/// stored as bare microseconds, so the leaf's own type supplies the timezone;
+/// materializing it naive would make every comparison against a
+/// timezone-carrying column an Arrow type error instead of a filter. A binary
+/// literal adopts the leaf's binary spelling so no cast is needed; an unknown
+/// leaf type falls back to the literal's natural type.
+fn scan_literal_scalar(leaf_type: Option<&DataType>, literal: &ScanLiteral) -> ScalarValue {
     match literal {
         ScanLiteral::Bool(inner) => ScalarValue::Boolean(Some(*inner)),
         ScanLiteral::I64(inner) => ScalarValue::Int64(Some(*inner)),
@@ -3789,32 +3983,22 @@ fn scan_literal_scalar(
         ScanLiteral::F64Bits(inner) => ScalarValue::Float64(Some(f64::from_bits(*inner))),
         ScanLiteral::Utf8(inner) => ScalarValue::Utf8(Some(inner.clone())),
         ScanLiteral::TimestampMicros(inner) => {
-            ScalarValue::TimestampMicrosecond(Some(*inner), timestamp_timezone_of(schema, column))
+            let timezone = match leaf_type {
+                Some(DataType::Timestamp(_, timezone)) => timezone.clone(),
+                _ => None,
+            };
+            ScalarValue::TimestampMicrosecond(Some(*inner), timezone)
         }
-        ScanLiteral::Bytes(inner) => binary_scalar_for(schema, column, inner),
-    }
-}
-
-/// Materializes one binary literal in the compared column's own binary type.
-///
-/// A fixed-size column of the literal's exact width yields a `FixedSizeBinary`
-/// scalar, and the variable-width binary types yield their own spelling, so the
-/// physical comparison never needs a cast. Any other column — absent, or a
-/// width the classifier would have refused — falls back to plain `Binary`,
-/// leaving the residual filter authoritative.
-fn binary_scalar_for(schema: &SchemaRef, column: &str, value: &[u8]) -> ScalarValue {
-    match schema
-        .field_with_name(column)
-        .map(arrow::datatypes::Field::data_type)
-    {
-        Ok(DataType::FixedSizeBinary(width))
-            if usize::try_from(*width).is_ok_and(|width| width == value.len()) =>
-        {
-            ScalarValue::FixedSizeBinary(*width, Some(value.to_vec()))
-        }
-        Ok(DataType::LargeBinary) => ScalarValue::LargeBinary(Some(value.to_vec())),
-        Ok(DataType::BinaryView) => ScalarValue::BinaryView(Some(value.to_vec())),
-        _ => ScalarValue::Binary(Some(value.to_vec())),
+        ScanLiteral::Bytes(value) => match leaf_type {
+            Some(DataType::FixedSizeBinary(width))
+                if usize::try_from(*width).is_ok_and(|width| width == value.len()) =>
+            {
+                ScalarValue::FixedSizeBinary(*width, Some(value.clone()))
+            }
+            Some(DataType::LargeBinary) => ScalarValue::LargeBinary(Some(value.clone())),
+            Some(DataType::BinaryView) => ScalarValue::BinaryView(Some(value.clone())),
+            _ => ScalarValue::Binary(Some(value.clone())),
+        },
     }
 }
 
@@ -3822,55 +4006,24 @@ fn binary_scalar_for(schema: &SchemaRef, column: &str, value: &[u8]) -> ScalarVa
 /// authorizes, against the full physical `schema`.
 ///
 /// A follower resolves its own leaf rather than receiving one, so the closed
-/// predicates the leader classified and signed are the only description of
-/// what that leaf may skip. Handing them back to a
+/// predicates the leader classified are the only description of what that
+/// leaf may skip. Handing them back to a
 /// [`TableProvider`](datafusion::datasource::TableProvider) as logical filters
 /// is what lets the underlying source prune files and row groups; without it a
 /// follower reads its whole assigned cut and leans on the residual filter
 /// above the leaf for correctness alone.
 ///
-/// A predicate whose column is absent from `schema` is skipped rather than
-/// failing the scan: pushdown is a pruning aid, and the residual filter stays
-/// authoritative for correctness.
+/// A predicate whose root column is absent from `schema` is skipped rather
+/// than failing the scan: pushdown is a pruning aid, and the residual filter
+/// stays authoritative for correctness.
 pub(super) fn scan_predicate_logical_exprs(
-    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    predicates: &[ScanPredicate],
     schema: &SchemaRef,
 ) -> Vec<Expr> {
-    use datafusion::logical_expr::{col, lit};
-    use wyrd_spec::vala::assignment_authority::ScanPredicate;
-
     predicates
         .iter()
-        .filter(|predicate| schema.field_with_name(predicate.column()).is_ok())
-        .map(|predicate| {
-            let scalar = |column: &str, literal| lit(scan_literal_scalar(schema, column, literal));
-            match predicate {
-                ScanPredicate::Eq(column, literal) => col(column).eq(scalar(column, literal)),
-                ScanPredicate::NotEq(column, literal) => {
-                    col(column).not_eq(scalar(column, literal))
-                }
-                ScanPredicate::Lt(column, literal) => col(column).lt(scalar(column, literal)),
-                ScanPredicate::LtEq(column, literal) => col(column).lt_eq(scalar(column, literal)),
-                ScanPredicate::Gt(column, literal) => col(column).gt(scalar(column, literal)),
-                ScanPredicate::GtEq(column, literal) => col(column).gt_eq(scalar(column, literal)),
-                ScanPredicate::IsNull(column) => col(column).is_null(),
-                ScanPredicate::IsNotNull(column) => col(column).is_not_null(),
-            }
-        })
+        .filter_map(|predicate| scan_predicate_logical_expr(predicate, schema))
         .collect()
-}
-
-/// Returns the timezone of one microsecond-timestamp column, or `None` when
-/// the column is absent or is not a timezone-carrying timestamp.
-///
-/// The closed predicate vocabulary stores a timestamp bound as bare
-/// microseconds, so the compared column is the only authority on whether that
-/// instant is timezone-aware.
-fn timestamp_timezone_of(schema: &SchemaRef, column: &str) -> Option<Arc<str>> {
-    match schema.field_with_name(column).ok()?.data_type() {
-        arrow::datatypes::DataType::Timestamp(_, timezone) => timezone.clone(),
-        _ => None,
-    }
 }
 
 /// Combines one or more physical predicates into a single conjunction, or
@@ -3973,14 +4126,31 @@ fn statistics_bound(
     }
 }
 
-/// Returns the Parquet leaf column index whose name matches `column`, or
-/// `None` when the physical schema carries no column by that name.
+/// Returns the Parquet leaf column index whose full path is exactly `leaf`'s
+/// path, or `None` when the file carries no such primitive column.
+///
+/// Matching the whole path from the root means a Struct field or nested leaf
+/// is never confused with a top-level column of the same name. A Variant leaf
+/// never matches: its physical layout differs per file and its statistics are
+/// only usable through the shared per-file read plan.
 fn parquet_column_index(
     metadata: &parquet::file::metadata::ParquetMetaData,
-    column: &str,
+    leaf: &wyrd_spec::vala::assignment_authority::ScanLeaf,
 ) -> Option<usize> {
+    use wyrd_spec::vala::assignment_authority::ScanLeaf;
+
+    if matches!(leaf, ScanLeaf::Variant { .. }) {
+        return None;
+    }
     let schema = metadata.file_metadata().schema_descr();
-    (0..schema.num_columns()).find(|&index| schema.column(index).name() == column)
+    (0..schema.num_columns()).find(|&index| {
+        let column = schema.column(index);
+        column
+            .path()
+            .parts()
+            .split_first()
+            .is_some_and(|(root, rest)| root == leaf.column() && rest == leaf.path())
+    })
 }
 
 /// Returns true only when Parquet footer statistics prove no row in
@@ -3992,7 +4162,7 @@ fn leaf_excludes_row_group(
     row_group_index: usize,
     predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
 ) -> bool {
-    let Some(column_index) = parquet_column_index(metadata, predicate.column()) else {
+    let Some(column_index) = parquet_column_index(metadata, predicate.leaf()) else {
         return false;
     };
     let row_group = metadata.row_group(row_group_index);
@@ -4027,6 +4197,13 @@ fn leaf_excludes_span(
     match predicate {
         ScanPredicate::IsNull(_) => return null_count == Some(0),
         ScanPredicate::IsNotNull(_) => return null_count == Some(rows),
+        ScanPredicate::In(_, literals) => {
+            return literals.iter().all(|literal| {
+                literal_bound(literal).is_some_and(|target| {
+                    bounds(&target).is_some_and(|(min, max)| target < min || max < target)
+                })
+            });
+        }
         _ => {}
     }
     let Some(target) = predicate.literal().and_then(literal_bound) else {
@@ -4048,7 +4225,7 @@ fn leaf_excludes_span(
             Some(Ordering::Equal | Ordering::Greater)
         ),
         ScanPredicate::GtEq(..) => max < target,
-        ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => false,
+        ScanPredicate::In(..) | ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => false,
     }
 }
 
@@ -4117,7 +4294,7 @@ fn select_pages_for_predicates(
         let rows = usize::try_from(metadata.row_group(row_group).num_rows()).unwrap_or(0);
         let mut excluded: Vec<Range<usize>> = Vec::new();
         for predicate in predicates {
-            let Some(column) = parquet_column_index(metadata, predicate.column()) else {
+            let Some(column) = parquet_column_index(metadata, predicate.leaf()) else {
                 continue;
             };
             let (Some(index), Some(offsets)) = (
@@ -4762,7 +4939,7 @@ mod tests {
             .parse_and_finish(&published)
             .expect("valid Parquet footer and page index");
         let predicates = vec![ScanPredicate::Eq(
-            "value".to_owned(),
+            ScanLeaf::Column("value".to_owned()),
             ScanLiteral::I64(TARGET),
         )];
 
@@ -4844,7 +5021,7 @@ mod tests {
         assert_dictionary_bloom_groups(&metadata);
 
         let predicates = vec![ScanPredicate::Eq(
-            "service_name".to_owned(),
+            ScanLeaf::Column("service_name".to_owned()),
             ScanLiteral::Utf8("checkout".to_owned()),
         )];
         let selection = select_row_groups_for_predicates(
@@ -4996,7 +5173,7 @@ mod tests {
 
         let lookup = |id: &[u8; 16]| {
             vec![ScanPredicate::Eq(
-                "trace_id".to_owned(),
+                ScanLeaf::Column("trace_id".to_owned()),
                 ScanLiteral::Bytes(id.to_vec()),
             )]
         };
@@ -5027,15 +5204,15 @@ mod tests {
         // builds none either, so every candidate survives.
         for predicates in [
             vec![ScanPredicate::Eq(
-                "score".to_owned(),
+                ScanLeaf::Column("score".to_owned()),
                 ScanLiteral::F64Bits(3.0_f64.to_bits()),
             )],
             vec![ScanPredicate::Eq(
-                "missing".to_owned(),
+                ScanLeaf::Column("missing".to_owned()),
                 ScanLiteral::Bytes(absent.to_vec()),
             )],
             vec![ScanPredicate::Eq(
-                "trace_id".to_owned(),
+                ScanLeaf::Column("trace_id".to_owned()),
                 ScanLiteral::Bytes(vec![0x5a; 8]),
             )],
         ] {
@@ -5062,7 +5239,7 @@ mod tests {
             .parse_and_finish(&published)
             .expect("valid Parquet footer");
         let above = vec![ScanPredicate::Eq(
-            "trace_id".to_owned(),
+            ScanLeaf::Column("trace_id".to_owned()),
             ScanLiteral::Bytes(vec![0xff; 16]),
         )];
         let selection = select_row_groups_for_predicates(&metadata, vec![0, 1], &above);
@@ -5070,7 +5247,7 @@ mod tests {
         assert_eq!(selection.pruned, 2);
         // Strictly below the smallest written id, so neither group can match.
         let below = vec![ScanPredicate::Lt(
-            "trace_id".to_owned(),
+            ScanLeaf::Column("trace_id".to_owned()),
             ScanLiteral::Bytes(trace_id_with_tail(0).to_vec()),
         )];
         assert!(select_row_groups_for_predicates(&metadata, vec![0, 1], &below).excludes_file());
@@ -5132,14 +5309,17 @@ mod tests {
             FilterClassification::Supported(leaves) => assert_eq!(
                 leaves,
                 vec![ScanPredicate::Eq(
-                    "trace_id".to_owned(),
+                    ScanLeaf::Column("trace_id".to_owned()),
                     ScanLiteral::Bytes(expected.clone())
                 )]
             ),
             FilterClassification::Unsupported => panic!("binary equality must push down"),
         }
         assert_eq!(
-            scan_literal_scalar(&schema, "trace_id", &ScanLiteral::Bytes(expected)),
+            scan_literal_scalar(
+                leaf_data_type(&schema, &ScanLeaf::Column("trace_id".to_owned())),
+                &ScanLiteral::Bytes(expected)
+            ),
             datafusion::scalar::ScalarValue::FixedSizeBinary(16, Some([0xff, 0x00].repeat(8)))
         );
 
@@ -6396,12 +6576,15 @@ mod tests {
                     leaves,
                     vec![
                         ScanPredicate::Eq(
-                            "service_name".to_string(),
+                            ScanLeaf::Column("service_name".to_string()),
                             ScanLiteral::Utf8("api".to_string())
                         ),
-                        ScanPredicate::IsNotNull("duration_ms".to_string()),
+                        ScanPredicate::IsNotNull(ScanLeaf::Column("duration_ms".to_string())),
                         // `500 > duration_ms` normalizes to `duration_ms < 500`.
-                        ScanPredicate::Lt("duration_ms".to_string(), ScanLiteral::I64(500)),
+                        ScanPredicate::Lt(
+                            ScanLeaf::Column("duration_ms".to_string()),
+                            ScanLiteral::I64(500)
+                        ),
                     ]
                 );
             }
@@ -6464,6 +6647,199 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
+    }
+
+    /// Builds the `v` Variant, `s.a.b` Struct, and `n` column table every
+    /// leaf-classification test plans against, in a session that runs only
+    /// expression simplification: a provider is offered filters after it and
+    /// before leaf-expression extraction rewrites them.
+    fn leaf_session() -> (SchemaRef, datafusion::prelude::SessionContext) {
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::SessionStateBuilder;
+        use wyrd_queue::variant::variant_field;
+
+        let inner = DataType::Struct(vec![Field::new("b", DataType::Int64, true)].into());
+        let schema = Arc::new(Schema::new(vec![
+            variant_field("v", true),
+            Field::new(
+                "s",
+                DataType::Struct(vec![Field::new("a", inner, true)].into()),
+                true,
+            ),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let state = super::super::variant_sql::OracleVariantSql::shared()
+            .install(
+                SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_optimizer_rules(vec![Arc::new(
+                        datafusion::optimizer::simplify_expressions::SimplifyExpressions::new(),
+                    )]),
+            )
+            .build();
+        let context = datafusion::prelude::SessionContext::new_with_state(state);
+        context
+            .register_table(
+                "t",
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("table")),
+            )
+            .expect("register");
+        (schema, context)
+    }
+
+    /// Plans `SELECT n FROM t WHERE <sql>` and returns the filter predicate a
+    /// provider would be offered.
+    async fn planned_filter(context: &datafusion::prelude::SessionContext, sql: &str) -> Expr {
+        let plan = context
+            .sql(&format!("SELECT n FROM t WHERE {sql}"))
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimize");
+        let mut found = None;
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node {
+                found = Some(filter.predicate.clone());
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .expect("walk");
+        found.expect("filter")
+    }
+
+    /// Drops every column qualifier in `expr`, matching the unqualified
+    /// references a rebuilt leaf predicate carries.
+    fn unqualified(expr: &Expr) -> Expr {
+        use datafusion::common::tree_node::Transformed;
+
+        expr.clone()
+            .transform(|expr| {
+                Ok(match expr {
+                    Expr::Column(column) => Transformed::yes(Expr::Column(
+                        datafusion::common::Column::new_unqualified(column.name),
+                    )),
+                    other => Transformed::no(other),
+                })
+            })
+            .expect("strip")
+            .data
+    }
+
+    /// Struct `get_field` chains, Variant `->>` paths (bare and under the
+    /// literal's matching `CAST`), `IN` lists, and the short-`IN` `OR` chain
+    /// `DataFusion` simplifies a column list into classify as leaf predicates
+    /// from real planned SQL, and each rebuilds to the exact planned expression
+    /// and plans physically.
+    #[tokio::test]
+    async fn leaf_predicates_classify_from_sql_and_rebuild_identically() {
+        let (schema, context) = leaf_session();
+        let structure = ScanLeaf::StructField {
+            column: "s".to_owned(),
+            fields: vec!["a".to_owned(), "b".to_owned()],
+        };
+        let variant = |keys: &[&str]| ScanLeaf::Variant {
+            column: "v".to_owned(),
+            keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+        };
+        let cases = [
+            (
+                "s['a']['b'] = 1",
+                vec![ScanPredicate::Eq(structure, ScanLiteral::I64(1))],
+            ),
+            (
+                "(v ->> 'k') IN ('x', 'y')",
+                vec![ScanPredicate::In(
+                    variant(&["k"]),
+                    vec![
+                        ScanLiteral::Utf8("x".to_owned()),
+                        ScanLiteral::Utf8("y".to_owned()),
+                    ],
+                )],
+            ),
+            (
+                "CAST(v -> 'a' ->> 'b' AS BIGINT) > 3 AND (v ->> 'z') IS NULL",
+                vec![
+                    ScanPredicate::Gt(variant(&["a", "b"]), ScanLiteral::I64(3)),
+                    ScanPredicate::IsNull(variant(&["z"])),
+                ],
+            ),
+            (
+                "n IN (1, 2)",
+                vec![ScanPredicate::In(
+                    ScanLeaf::Column("n".to_owned()),
+                    vec![ScanLiteral::I64(1), ScanLiteral::I64(2)],
+                )],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let expr = planned_filter(&context, sql).await;
+            let FilterClassification::Supported(leaves) =
+                classify_filter_for_schema(&schema, &expr)
+            else {
+                panic!("{sql} must push down: {expr:?}");
+            };
+            assert_eq!(leaves, expected, "{sql}");
+            // The short column list arrives as an `OR` chain and rebuilds as
+            // the equivalent `IN`, so only the other shapes compare verbatim.
+            if !matches!(expected[0], ScanPredicate::In(ScanLeaf::Column(_), _)) {
+                let original = datafusion::logical_expr::utils::split_conjunction(&expr)
+                    .into_iter()
+                    .map(unqualified)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    scan_predicate_logical_exprs(&leaves, &schema),
+                    original,
+                    "{sql}"
+                );
+            }
+            for predicate in &leaves {
+                scan_predicate_physical_expr(predicate, &schema).expect("physical leaf");
+            }
+        }
+    }
+
+    /// A Variant leaf under a cast that does not match its literal's type, a
+    /// cast null-check, and a mixed-leaf `OR` stay unpushed, and a leaf
+    /// resolves only against a root of its own kind.
+    #[tokio::test]
+    async fn mismatched_leaf_shapes_and_root_kinds_are_refused() {
+        let (schema, context) = leaf_session();
+        for refused in [
+            "CAST(v ->> 'k' AS INT) = 1",
+            "(v ->> 'k') = 'x' OR n = 1",
+            "CAST((v ->> 'k') AS BIGINT) IS NULL",
+        ] {
+            let expr = planned_filter(&context, refused).await;
+            assert!(
+                matches!(
+                    classify_filter_for_schema(&schema, &expr),
+                    FilterClassification::Unsupported
+                ),
+                "{refused}"
+            );
+        }
+        let path = vec!["a".to_owned()];
+        assert!(!leaf_resolves(
+            &schema,
+            &ScanLeaf::Variant {
+                column: "s".to_owned(),
+                keys: path.clone(),
+            }
+        ));
+        assert!(!leaf_resolves(
+            &schema,
+            &ScanLeaf::StructField {
+                column: "n".to_owned(),
+                fields: path.clone(),
+            }
+        ));
+        assert!(leaf_resolves(
+            &schema,
+            &ScanLeaf::StructField {
+                column: "s".to_owned(),
+                fields: path,
+            }
+        ));
     }
 
     /// The projection closure is `scan output + predicate columns`, in that
@@ -6560,7 +6936,7 @@ mod tests {
             FilterClassification::Supported(leaves) => assert_eq!(
                 leaves,
                 vec![ScanPredicate::Eq(
-                    "service_name".to_string(),
+                    ScanLeaf::Column("service_name".to_string()),
                     ScanLiteral::Utf8("api".to_string())
                 )]
             ),

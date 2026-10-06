@@ -114,15 +114,30 @@ impl std::fmt::Debug for ResolvedFollowerSource {
 ///
 /// # Errors
 ///
+/// The same derivation validates every signed predicate leaf against the
+/// authenticated schema, so a leaf whose kind does not match its logical root
+/// — a Struct path over a non-Struct column, or a Variant path over a
+/// non-Variant one — is refused before any provider construction or I/O.
+///
+/// # Errors
+///
 /// Returns a redacted message when a signed name is absent from the
-/// authenticated schema or names it ambiguously. Neither is repaired: silently
-/// deduplicating or reordering a signed assignment would read something other
-/// than what the leader signed.
+/// authenticated schema or names it ambiguously, or when a predicate leaf does
+/// not resolve against its root. None is repaired: silently deduplicating or
+/// reordering a signed assignment would read something other than what the
+/// leader signed.
 pub(super) fn signed_closure_schema(
     full_schema: &arrow::datatypes::Schema,
-    required_columns: &[String],
+    assignment: &FollowerScanAssignment,
 ) -> Result<SchemaRef, String> {
-    super::exec::select_schema_by_name(full_schema, required_columns)
+    if !assignment
+        .predicates
+        .iter()
+        .all(|predicate| super::exec::leaf_resolves(full_schema, predicate.leaf()))
+    {
+        return Err("assignment predicate leaf does not match its logical root".to_owned());
+    }
+    super::exec::select_schema_by_name(full_schema, &assignment.required_columns)
         .map(|(schema, _)| schema)
         .map_err(|_| {
             "assignment closure does not resolve against the authenticated schema".to_owned()
@@ -479,8 +494,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         }
         // Derived before any object I/O so an assignment naming a column this
         // table does not have is refused rather than partially read.
-        let required_schema =
-            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
+        let required_schema = signed_closure_schema(full_schema.as_ref(), assignment)?;
         if assignment.persisted.files.is_empty() {
             return empty_assignment_leaf(&required_schema, full_schema);
         }
@@ -958,8 +972,7 @@ where
                 "resolved provider schema fingerprint differs from assignment".to_owned(),
             ));
         }
-        let required_schema =
-            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
+        let required_schema = signed_closure_schema(full_schema.as_ref(), assignment)?;
         let table_name = format!(
             "{}.{}",
             assignment.binding.namespace, assignment.binding.table
@@ -1253,9 +1266,8 @@ where
                     ),
                 ));
             }
-            let expected =
-                signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
-                    .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
+            let expected = signed_closure_schema(resolved.full_schema.as_ref(), &assignment)
+                .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
             if resolved.plan.schema() != expected {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     FollowerResolutionError::Fault(
@@ -1622,6 +1634,7 @@ pub(crate) mod tests {
     use crate::scribe::tail_rpc::tests::StagedGenerationFixture;
     use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wyrd_spec::vala::assignment_authority::ScanLeaf;
 
     /// Builds a non-spilling execution over a pool bounded to `granted_memory_bytes`.
     ///
@@ -1872,8 +1885,7 @@ pub(crate) mod tests {
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let required_schema =
-                signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
+            let required_schema = signed_closure_schema(self.schema.as_ref(), assignment)?;
             Ok(ResolvedFollowerSource {
                 plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
                     required_schema,
@@ -2636,7 +2648,7 @@ pub(crate) mod tests {
             schema_fingerprint,
             required_columns,
             predicates: vec![wyrd_spec::vala::assignment_authority::ScanPredicate::Eq(
-                "status_code".to_owned(),
+                ScanLeaf::Column("status_code".to_owned()),
                 wyrd_spec::vala::assignment_authority::ScanLiteral::Utf8(
                     "STATUS_CODE_ERROR".to_owned(),
                 ),
@@ -2961,7 +2973,10 @@ pub(crate) mod tests {
         let plan = resolve_staged_fixture(
             &fixture,
             service,
-            vec![ScanPredicate::Eq("value".to_owned(), ScanLiteral::I64(2))],
+            vec![ScanPredicate::Eq(
+                ScanLeaf::Column("value".to_owned()),
+                ScanLiteral::I64(2),
+            )],
             &session,
         )
         .await;

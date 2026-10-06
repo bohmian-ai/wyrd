@@ -53,7 +53,7 @@ fn time_partition_proto(value: domain::TimePartitionWire) -> proto::TimePartitio
 }
 
 /// Error returned before malformed private input reaches a runtime owner.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PrivateConversionError {
     /// A required nested message or oneof was absent.
     #[error("required protobuf field `{0}` is missing")]
@@ -547,57 +547,143 @@ impl From<assignment_authority::ScanLiteral> for proto::ScanLiteral {
     }
 }
 
+impl TryFrom<proto::ScanLeafRef> for assignment_authority::ScanLeaf {
+    type Error = PrivateConversionError;
+
+    /// Decodes one predicate leaf from its protobuf oneof.
+    ///
+    /// Column names must be non-blank. A Struct or Variant path must hold at
+    /// least one element, and every element must be non-empty; elements are
+    /// otherwise whole UTF-8 names, so a whitespace key stays a valid key.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError::Missing`] when the oneof is empty and
+    /// [`PrivateConversionError::Invalid`] for a blank column, an empty path,
+    /// or an empty path element.
+    fn try_from(value: proto::ScanLeafRef) -> Result<Self, Self::Error> {
+        use crate::wyrd::v1::scan_leaf_ref::Kind;
+        /// Validates one non-empty path of non-empty elements.
+        fn path(
+            elements: Vec<String>,
+            field: &'static str,
+        ) -> Result<Vec<String>, PrivateConversionError> {
+            if elements.is_empty() || elements.iter().any(String::is_empty) {
+                return Err(PrivateConversionError::Invalid { field });
+            }
+            Ok(elements)
+        }
+        match value
+            .kind
+            .ok_or(PrivateConversionError::Missing("scan_predicate.leaf.kind"))?
+        {
+            Kind::Column(leaf) => {
+                nonempty(&leaf.column, "scan_predicate.leaf.column")?;
+                Ok(Self::Column(leaf.column))
+            }
+            Kind::StructField(leaf) => {
+                nonempty(&leaf.column, "scan_predicate.leaf.struct_field.column")?;
+                Ok(Self::StructField {
+                    column: leaf.column,
+                    fields: path(leaf.fields, "scan_predicate.leaf.struct_field.fields")?,
+                })
+            }
+            Kind::Variant(leaf) => {
+                nonempty(&leaf.column, "scan_predicate.leaf.variant.column")?;
+                Ok(Self::Variant {
+                    column: leaf.column,
+                    keys: path(leaf.keys, "scan_predicate.leaf.variant.keys")?,
+                })
+            }
+        }
+    }
+}
+
+impl From<assignment_authority::ScanLeaf> for proto::ScanLeafRef {
+    /// Encodes one predicate leaf into its protobuf oneof.
+    fn from(value: assignment_authority::ScanLeaf) -> Self {
+        use crate::wyrd::v1::scan_leaf_ref::Kind;
+        let kind = match value {
+            assignment_authority::ScanLeaf::Column(column) => {
+                Kind::Column(proto::ScanColumnRef { column })
+            }
+            assignment_authority::ScanLeaf::StructField { column, fields } => {
+                Kind::StructField(proto::ScanStructRef { column, fields })
+            }
+            assignment_authority::ScanLeaf::Variant { column, keys } => {
+                Kind::Variant(proto::ScanVariantRef { column, keys })
+            }
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
 impl TryFrom<proto::ScanPredicate> for assignment_authority::ScanPredicate {
     type Error = PrivateConversionError;
 
-    /// Decodes one closed leaf predicate, validating the op/literal-presence
-    /// shape the wire enum requires (comparisons carry a literal, null
-    /// checks do not).
+    /// Decodes one closed leaf predicate, validating the operator's literal
+    /// cardinality: comparisons carry exactly one literal, `IN` at least one
+    /// literal of a single type, and null-checks none.
     ///
     /// # Errors
     /// Returns [`PrivateConversionError`] when the operator is unspecified or
-    /// unknown, the column is empty, or the literal is present/absent in
-    /// violation of the operator's closed shape.
+    /// unknown, the leaf is missing or malformed, a literal is malformed, the
+    /// literal count violates the operator's cardinality, or an `IN` list
+    /// mixes literal types.
     fn try_from(value: proto::ScanPredicate) -> Result<Self, Self::Error> {
-        nonempty(&value.column, "scan_predicate.column")?;
         let op = proto::ScanPredicateOp::try_from(value.op)
             .map_err(|_| PrivateConversionError::RequiredEnum("scan_predicate.op"))?;
-        let literal = value.literal;
+        if op == proto::ScanPredicateOp::Unspecified {
+            return Err(PrivateConversionError::RequiredEnum("scan_predicate.op"));
+        }
+        let leaf: assignment_authority::ScanLeaf = value
+            .leaf
+            .ok_or(PrivateConversionError::Missing("scan_predicate.leaf"))?
+            .try_into()?;
+        let mut literals = value
+            .literals
+            .into_iter()
+            .map(assignment_authority::ScanLiteral::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cardinality = PrivateConversionError::Invalid {
+            field: "scan_predicate.literals",
+        };
         match op {
-            proto::ScanPredicateOp::Unspecified => {
-                Err(PrivateConversionError::RequiredEnum("scan_predicate.op"))
-            }
-            proto::ScanPredicateOp::IsNull => {
-                if literal.is_some() {
-                    return Err(PrivateConversionError::Invalid {
-                        field: "scan_predicate.literal",
-                    });
+            proto::ScanPredicateOp::IsNull | proto::ScanPredicateOp::IsNotNull => {
+                if !literals.is_empty() {
+                    return Err(cardinality);
                 }
-                Ok(Self::IsNull(value.column))
+                Ok(if op == proto::ScanPredicateOp::IsNull {
+                    Self::IsNull(leaf)
+                } else {
+                    Self::IsNotNull(leaf)
+                })
             }
-            proto::ScanPredicateOp::IsNotNull => {
-                if literal.is_some() {
-                    return Err(PrivateConversionError::Invalid {
-                        field: "scan_predicate.literal",
-                    });
+            proto::ScanPredicateOp::In => {
+                let Some(first) = literals.first() else {
+                    return Err(cardinality);
+                };
+                let tag = first.digest_tag();
+                if literals.iter().any(|literal| literal.digest_tag() != tag) {
+                    return Err(cardinality);
                 }
-                Ok(Self::IsNotNull(value.column))
+                Ok(Self::In(leaf, literals))
             }
             comparison => {
-                let literal: assignment_authority::ScanLiteral = literal
-                    .ok_or(PrivateConversionError::Missing("scan_predicate.literal"))?
-                    .try_into()?;
+                let (Some(literal), None) = (literals.pop(), literals.pop()) else {
+                    return Err(cardinality);
+                };
                 Ok(match comparison {
-                    proto::ScanPredicateOp::Eq => Self::Eq(value.column, literal),
-                    proto::ScanPredicateOp::NotEq => Self::NotEq(value.column, literal),
-                    proto::ScanPredicateOp::Lt => Self::Lt(value.column, literal),
-                    proto::ScanPredicateOp::LtEq => Self::LtEq(value.column, literal),
-                    proto::ScanPredicateOp::Gt => Self::Gt(value.column, literal),
-                    proto::ScanPredicateOp::GtEq => Self::GtEq(value.column, literal),
+                    proto::ScanPredicateOp::Eq => Self::Eq(leaf, literal),
+                    proto::ScanPredicateOp::NotEq => Self::NotEq(leaf, literal),
+                    proto::ScanPredicateOp::Lt => Self::Lt(leaf, literal),
+                    proto::ScanPredicateOp::LtEq => Self::LtEq(leaf, literal),
+                    proto::ScanPredicateOp::Gt => Self::Gt(leaf, literal),
+                    proto::ScanPredicateOp::GtEq => Self::GtEq(leaf, literal),
                     proto::ScanPredicateOp::Unspecified
+                    | proto::ScanPredicateOp::In
                     | proto::ScanPredicateOp::IsNull
                     | proto::ScanPredicateOp::IsNotNull => unreachable!(
-                        "comparison arm excludes IsNull/IsNotNull/Unspecified by construction"
+                        "comparison arm excludes Unspecified/In/IsNull/IsNotNull by construction"
                     ),
                 })
             }
@@ -606,25 +692,25 @@ impl TryFrom<proto::ScanPredicate> for assignment_authority::ScanPredicate {
 }
 
 impl From<assignment_authority::ScanPredicate> for proto::ScanPredicate {
-    /// Encodes one closed leaf predicate into its protobuf op/column/literal
-    /// shape.
+    /// Encodes one closed leaf predicate into its protobuf op/leaf/literals
+    /// shape, preserving `IN` literal order.
     fn from(value: assignment_authority::ScanPredicate) -> Self {
-        let op = match &value {
-            assignment_authority::ScanPredicate::Eq(..) => proto::ScanPredicateOp::Eq,
-            assignment_authority::ScanPredicate::NotEq(..) => proto::ScanPredicateOp::NotEq,
-            assignment_authority::ScanPredicate::Lt(..) => proto::ScanPredicateOp::Lt,
-            assignment_authority::ScanPredicate::LtEq(..) => proto::ScanPredicateOp::LtEq,
-            assignment_authority::ScanPredicate::Gt(..) => proto::ScanPredicateOp::Gt,
-            assignment_authority::ScanPredicate::GtEq(..) => proto::ScanPredicateOp::GtEq,
-            assignment_authority::ScanPredicate::IsNull(_) => proto::ScanPredicateOp::IsNull,
-            assignment_authority::ScanPredicate::IsNotNull(_) => proto::ScanPredicateOp::IsNotNull,
+        use assignment_authority::ScanPredicate as Domain;
+        let (op, leaf, literals) = match value {
+            Domain::Eq(leaf, literal) => (proto::ScanPredicateOp::Eq, leaf, vec![literal]),
+            Domain::NotEq(leaf, literal) => (proto::ScanPredicateOp::NotEq, leaf, vec![literal]),
+            Domain::Lt(leaf, literal) => (proto::ScanPredicateOp::Lt, leaf, vec![literal]),
+            Domain::LtEq(leaf, literal) => (proto::ScanPredicateOp::LtEq, leaf, vec![literal]),
+            Domain::Gt(leaf, literal) => (proto::ScanPredicateOp::Gt, leaf, vec![literal]),
+            Domain::GtEq(leaf, literal) => (proto::ScanPredicateOp::GtEq, leaf, vec![literal]),
+            Domain::In(leaf, literals) => (proto::ScanPredicateOp::In, leaf, literals),
+            Domain::IsNull(leaf) => (proto::ScanPredicateOp::IsNull, leaf, Vec::new()),
+            Domain::IsNotNull(leaf) => (proto::ScanPredicateOp::IsNotNull, leaf, Vec::new()),
         };
-        let column = value.column().to_string();
-        let literal = value.literal().cloned().map(Into::into);
         Self {
             op: op as i32,
-            column,
-            literal,
+            leaf: Some(leaf.into()),
+            literals: literals.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1613,35 +1699,39 @@ mod tests {
     fn follower_assignment_v2_contract() {
         let predicates = vec![
             assignment_authority::ScanPredicate::Eq(
-                "service_name".into(),
+                assignment_authority::ScanLeaf::Column("service_name".into()),
                 assignment_authority::ScanLiteral::Utf8("api".into()),
             ),
             assignment_authority::ScanPredicate::NotEq(
-                "status".into(),
+                assignment_authority::ScanLeaf::Column("status".into()),
                 assignment_authority::ScanLiteral::I64(-1),
             ),
             assignment_authority::ScanPredicate::Lt(
-                "duration_ms".into(),
+                assignment_authority::ScanLeaf::Column("duration_ms".into()),
                 assignment_authority::ScanLiteral::U64(500),
             ),
             assignment_authority::ScanPredicate::LtEq(
-                "score".into(),
+                assignment_authority::ScanLeaf::Column("score".into()),
                 assignment_authority::ScanLiteral::F64Bits(1.5_f64.to_bits()),
             ),
             assignment_authority::ScanPredicate::Gt(
-                "wyrd_event_time".into(),
+                assignment_authority::ScanLeaf::Column("wyrd_event_time".into()),
                 assignment_authority::ScanLiteral::TimestampMicros(1_000_000),
             ),
             assignment_authority::ScanPredicate::GtEq(
-                "active".into(),
+                assignment_authority::ScanLeaf::Column("active".into()),
                 assignment_authority::ScanLiteral::Bool(true),
             ),
             assignment_authority::ScanPredicate::Eq(
-                "trace_id".into(),
+                assignment_authority::ScanLeaf::Column("trace_id".into()),
                 assignment_authority::ScanLiteral::Bytes(vec![0xff, 0x00, 0x7f]),
             ),
-            assignment_authority::ScanPredicate::IsNull("optional_field".into()),
-            assignment_authority::ScanPredicate::IsNotNull("required_field".into()),
+            assignment_authority::ScanPredicate::IsNull(assignment_authority::ScanLeaf::Column(
+                "optional_field".into(),
+            )),
+            assignment_authority::ScanPredicate::IsNotNull(assignment_authority::ScanLeaf::Column(
+                "required_field".into(),
+            )),
         ];
 
         let expected = domain::FollowerScanAssignment {
@@ -1669,61 +1759,210 @@ mod tests {
         ))
         .expect("valid v2 assignment round-trips");
         assert_eq!(actual, expected);
+    }
 
-        // Unspecified op is rejected before the literal is inspected.
-        let unspecified_op = proto::FollowerScanAssignment::from(expected.clone());
-        let mut malformed = unspecified_op.clone();
-        malformed.predicates = vec![proto::ScanPredicate {
-            op: proto::ScanPredicateOp::Unspecified as i32,
-            column: "x".into(),
-            literal: None,
-        }];
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(malformed),
-            Err(PrivateConversionError::RequiredEnum("scan_predicate.op"))
-        ));
+    /// Every leaf kind and operator round-trips through the in-place protobuf
+    /// predicate, and every malformed tag, leaf, path, cardinality, and mixed
+    /// `IN` list is refused at this sole wire/domain boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a valid predicate fails to round-trip or a malformed one is
+    /// accepted.
+    #[test]
+    fn leaf_predicates_round_trip_and_reject_malformed() {
+        use crate::wyrd::v1::scan_leaf_ref::Kind;
+        use assignment_authority::{ScanLiteral, ScanPredicate};
+        let names = |values: &[&str]| values.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        let leaves = [
+            assignment_authority::ScanLeaf::Column("service_name".into()),
+            assignment_authority::ScanLeaf::StructField {
+                column: "drift_report".into(),
+                fields: names(&["method"]),
+            },
+            assignment_authority::ScanLeaf::Variant {
+                column: "attributes".into(),
+                keys: names(&["http", "route"]),
+            },
+        ];
+        let utf8 = |value: &str| ScanLiteral::Utf8(value.into());
+        for leaf in leaves {
+            let predicates = [
+                ScanPredicate::Eq(leaf.clone(), utf8("a")),
+                ScanPredicate::NotEq(leaf.clone(), ScanLiteral::I64(-1)),
+                ScanPredicate::Lt(leaf.clone(), ScanLiteral::U64(5)),
+                ScanPredicate::LtEq(leaf.clone(), ScanLiteral::F64Bits(1.5_f64.to_bits())),
+                ScanPredicate::Gt(leaf.clone(), ScanLiteral::TimestampMicros(1)),
+                ScanPredicate::GtEq(leaf.clone(), ScanLiteral::Bool(true)),
+                ScanPredicate::In(leaf.clone(), vec![utf8("b"), utf8("a")]),
+                ScanPredicate::In(leaf.clone(), vec![ScanLiteral::Bytes(vec![0xff])]),
+                ScanPredicate::IsNull(leaf.clone()),
+                ScanPredicate::IsNotNull(leaf.clone()),
+            ];
+            for predicate in predicates {
+                let wire = proto::ScanPredicate::from(predicate.clone());
+                assert_eq!(ScanPredicate::try_from(wire), Ok(predicate));
+            }
+        }
 
-        // A literal on a null-check violates the closed shape.
-        let mut literal_on_null_check = unspecified_op.clone();
-        literal_on_null_check.predicates = vec![proto::ScanPredicate {
-            op: proto::ScanPredicateOp::IsNull as i32,
-            column: "x".into(),
-            literal: Some(proto::ScanLiteral {
-                value: Some(crate::wyrd::v1::scan_literal::Value::BoolValue(true)),
-            }),
-        }];
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(literal_on_null_check),
-            Err(PrivateConversionError::Invalid {
-                field: "scan_predicate.literal"
-            })
-        ));
-
-        // A missing literal on a comparison is rejected.
-        let mut missing_literal = unspecified_op.clone();
-        missing_literal.predicates = vec![proto::ScanPredicate {
-            op: proto::ScanPredicateOp::Eq as i32,
-            column: "x".into(),
-            literal: None,
-        }];
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(missing_literal),
-            Err(PrivateConversionError::Missing("scan_predicate.literal"))
-        ));
-
-        // An empty predicate column is rejected regardless of operator.
-        let mut empty_column = unspecified_op;
-        empty_column.predicates = vec![proto::ScanPredicate {
-            op: proto::ScanPredicateOp::IsNull as i32,
-            column: String::new(),
-            literal: None,
-        }];
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(empty_column),
-            Err(PrivateConversionError::Invalid {
-                field: "scan_predicate.column"
-            })
-        ));
+        let literal = |value: &str| proto::ScanLiteral::from(utf8(value));
+        let column = |name: &str| proto::ScanLeafRef {
+            kind: Some(Kind::Column(proto::ScanColumnRef {
+                column: name.into(),
+            })),
+        };
+        let predicate =
+            |op: proto::ScanPredicateOp,
+             leaf: Option<proto::ScanLeafRef>,
+             literals: Vec<proto::ScanLiteral>| proto::ScanPredicate {
+                op: op as i32,
+                leaf,
+                literals,
+            };
+        use proto::ScanPredicateOp as Op;
+        let cases = [
+            (
+                predicate(Op::Unspecified, Some(column("x")), vec![literal("a")]),
+                PrivateConversionError::RequiredEnum("scan_predicate.op"),
+            ),
+            (
+                proto::ScanPredicate {
+                    op: 99,
+                    leaf: Some(column("x")),
+                    literals: vec![literal("a")],
+                },
+                PrivateConversionError::RequiredEnum("scan_predicate.op"),
+            ),
+            (
+                predicate(Op::Eq, None, vec![literal("a")]),
+                PrivateConversionError::Missing("scan_predicate.leaf"),
+            ),
+            (
+                predicate(
+                    Op::Eq,
+                    Some(proto::ScanLeafRef { kind: None }),
+                    vec![literal("a")],
+                ),
+                PrivateConversionError::Missing("scan_predicate.leaf.kind"),
+            ),
+            (
+                predicate(Op::Eq, Some(column(" ")), vec![literal("a")]),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.leaf.column",
+                },
+            ),
+            (
+                predicate(
+                    Op::Eq,
+                    Some(proto::ScanLeafRef {
+                        kind: Some(Kind::StructField(proto::ScanStructRef {
+                            column: String::new(),
+                            fields: names(&["a"]),
+                        })),
+                    }),
+                    vec![literal("a")],
+                ),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.leaf.struct_field.column",
+                },
+            ),
+            (
+                predicate(
+                    Op::Eq,
+                    Some(proto::ScanLeafRef {
+                        kind: Some(Kind::StructField(proto::ScanStructRef {
+                            column: "s".into(),
+                            fields: Vec::new(),
+                        })),
+                    }),
+                    vec![literal("a")],
+                ),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.leaf.struct_field.fields",
+                },
+            ),
+            (
+                predicate(
+                    Op::Eq,
+                    Some(proto::ScanLeafRef {
+                        kind: Some(Kind::Variant(proto::ScanVariantRef {
+                            column: "v".into(),
+                            keys: Vec::new(),
+                        })),
+                    }),
+                    vec![literal("a")],
+                ),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.leaf.variant.keys",
+                },
+            ),
+            (
+                predicate(
+                    Op::Eq,
+                    Some(proto::ScanLeafRef {
+                        kind: Some(Kind::Variant(proto::ScanVariantRef {
+                            column: "v".into(),
+                            keys: names(&["a", ""]),
+                        })),
+                    }),
+                    vec![literal("a")],
+                ),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.leaf.variant.keys",
+                },
+            ),
+            (
+                predicate(Op::Eq, Some(column("x")), Vec::new()),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(Op::Gt, Some(column("x")), vec![literal("a"), literal("b")]),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(Op::IsNull, Some(column("x")), vec![literal("a")]),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(Op::IsNotNull, Some(column("x")), vec![literal("a")]),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(Op::In, Some(column("x")), Vec::new()),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(
+                    Op::In,
+                    Some(column("x")),
+                    vec![literal("a"), proto::ScanLiteral::from(ScanLiteral::I64(1))],
+                ),
+                PrivateConversionError::Invalid {
+                    field: "scan_predicate.literals",
+                },
+            ),
+            (
+                predicate(
+                    Op::In,
+                    Some(column("x")),
+                    vec![proto::ScanLiteral { value: None }],
+                ),
+                PrivateConversionError::Missing("scan_literal.value"),
+            ),
+        ];
+        for (wire, expected) in cases {
+            assert_eq!(ScanPredicate::try_from(wire), Err(expected));
+        }
     }
 
     /// A v1-shaped peer that omits `required_columns` is rejected outright:

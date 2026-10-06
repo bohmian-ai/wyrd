@@ -101,6 +101,7 @@ impl EventTimeQueryInterval {
                 ScanPredicate::LtEq(..) => interval.narrow_upper(Some(*value)),
                 ScanPredicate::Lt(..) => interval.narrow_upper(value.checked_sub(1)),
                 ScanPredicate::NotEq(..)
+                | ScanPredicate::In(..)
                 | ScanPredicate::IsNull(_)
                 | ScanPredicate::IsNotNull(_) => {}
             }
@@ -198,11 +199,12 @@ impl EventTimeQueryInterval {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyrd_spec::vala::assignment_authority::ScanLeaf;
 
     /// Builds a `wyrd_event_time` timestamp comparison predicate.
-    fn event_time(build: fn(String, ScanLiteral) -> ScanPredicate, micros: i64) -> ScanPredicate {
+    fn event_time(build: fn(ScanLeaf, ScanLiteral) -> ScanPredicate, micros: i64) -> ScanPredicate {
         build(
-            WYRD_EVENT_TIME.to_owned(),
+            ScanLeaf::Column(WYRD_EVENT_TIME.to_owned()),
             ScanLiteral::TimestampMicros(micros),
         )
     }
@@ -223,10 +225,16 @@ mod tests {
         // A different column, a non-timestamp literal, `NotEq`, and null-checks
         // all leave the axis unconstrained.
         let ignored = EventTimeQueryInterval::from_predicates(&[
-            ScanPredicate::GtEq("other".to_owned(), ScanLiteral::TimestampMicros(100)),
-            ScanPredicate::GtEq(WYRD_EVENT_TIME.to_owned(), ScanLiteral::I64(100)),
+            ScanPredicate::GtEq(
+                ScanLeaf::Column("other".to_owned()),
+                ScanLiteral::TimestampMicros(100),
+            ),
+            ScanPredicate::GtEq(
+                ScanLeaf::Column(WYRD_EVENT_TIME.to_owned()),
+                ScanLiteral::I64(100),
+            ),
             event_time(ScanPredicate::NotEq, 100),
-            ScanPredicate::IsNotNull(WYRD_EVENT_TIME.to_owned()),
+            ScanPredicate::IsNotNull(ScanLeaf::Column(WYRD_EVENT_TIME.to_owned())),
         ]);
         assert!(ignored.is_unbounded());
     }

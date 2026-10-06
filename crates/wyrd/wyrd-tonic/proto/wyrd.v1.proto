@@ -195,6 +195,7 @@ enum ScanPredicateOp {
   SCAN_PREDICATE_OP_GT_EQ = 6;
   SCAN_PREDICATE_OP_IS_NULL = 7;
   SCAN_PREDICATE_OP_IS_NOT_NULL = 8;
+  SCAN_PREDICATE_OP_IN = 9;
 }
 message ScanLiteral {
   oneof value {
@@ -203,7 +204,21 @@ message ScanLiteral {
     bytes bytes_value = 7;
   }
 }
-message ScanPredicate { ScanPredicateOp op = 1; string column = 2; ScanLiteral literal = 3; }
+message ScanColumnRef { string column = 1; }
+message ScanStructRef { string column = 1; repeated string fields = 2; }
+message ScanVariantRef { string column = 1; repeated string keys = 2; }
+message ScanLeafRef {
+  oneof kind {
+    ScanColumnRef column = 1;
+    ScanStructRef struct_field = 2;
+    ScanVariantRef variant = 3;
+  }
+}
+message ScanPredicate {
+  ScanPredicateOp op = 1;
+  ScanLeafRef leaf = 2;
+  repeated ScanLiteral literals = 3;
+}
 message FollowerScanAssignment {
   string scan_id = 1; TenantTableBinding binding = 2;
   PersistedFileAssignment persisted = 3; ScribeProviderCut scribe_provider_cut = 4;

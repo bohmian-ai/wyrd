@@ -61,42 +61,117 @@ impl ScanLiteral {
     }
 }
 
+/// The value one closed predicate reads: a top-level column, a fixed Struct
+/// field, or a literal object-key path inside a Variant column.
+///
+/// Every variant names its top-level logical `column` first, because
+/// authorization, the hidden-tenant closure, and `required_columns` are rooted
+/// at that column; the path never widens what the caller may read. Path
+/// elements are whole UTF-8 field names or object keys, so the flat OTel key
+/// `http.route` is one element, distinct from `http` → `route`. Producers and
+/// the protobuf boundary guarantee every name is non-empty and every path has
+/// at least one element.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum ScanLeaf {
+    /// A whole top-level column.
+    Column(String),
+    /// Exact `get_field` access to a fixed Struct field at any depth.
+    StructField {
+        /// Top-level Struct column.
+        column: String,
+        /// Field names from the column root to the leaf, in order.
+        fields: Vec<String>,
+    },
+    /// Semantic `variant_get` access to a literal object-key path.
+    Variant {
+        /// Top-level Variant column.
+        column: String,
+        /// Object keys from the Variant root to the value, in order.
+        keys: Vec<String>,
+    },
+}
+
+impl ScanLeaf {
+    /// Borrows the top-level logical column this leaf is rooted at.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        match self {
+            ScanLeaf::Column(column)
+            | ScanLeaf::StructField { column, .. }
+            | ScanLeaf::Variant { column, .. } => column,
+        }
+    }
+
+    /// Borrows the path below [`Self::column`]; empty for a whole column.
+    #[must_use]
+    pub fn path(&self) -> &[String] {
+        match self {
+            ScanLeaf::Column(_) => &[],
+            ScanLeaf::StructField { fields, .. } => fields,
+            ScanLeaf::Variant { keys, .. } => keys,
+        }
+    }
+
+    /// Returns the top-level column name when this leaf is a whole column.
+    #[must_use]
+    pub fn as_column(&self) -> Option<&str> {
+        match self {
+            ScanLeaf::Column(column) => Some(column),
+            ScanLeaf::StructField { .. } | ScanLeaf::Variant { .. } => None,
+        }
+    }
+
+    /// Returns the digest leaf tag (`Column` 0, `StructField` 1, `Variant` 2).
+    #[must_use]
+    pub fn digest_tag(&self) -> u8 {
+        match self {
+            ScanLeaf::Column(_) => 0,
+            ScanLeaf::StructField { .. } => 1,
+            ScanLeaf::Variant { .. } => 2,
+        }
+    }
+}
+
 /// Closed leaf predicate vocabulary reachable through predicate pushdown.
 ///
-/// This is the complete supported-expression subset: typed comparisons over
-/// exactly one unqualified column and one [`ScanLiteral`], plus null-checks.
-/// Any DataFusion filter outside this shape (`OR`, `NOT`, casts, functions,
-/// arithmetic, column-to-column comparison, qualified/unknown columns,
-/// non-finite floats, mixed-type comparisons) is classified `Unsupported` by
+/// This is the complete supported-expression subset: typed comparisons and
+/// `IN` lists over exactly one [`ScanLeaf`] and closed [`ScanLiteral`]s, plus
+/// null-checks. Any `DataFusion` filter outside this shape (`OR`, `NOT`,
+/// dynamic paths, arithmetic, column-to-column comparison, unknown columns,
+/// non-finite floats, mixed-type `IN` lists) is classified `Unsupported` by
 /// the caller and never reaches this type. A literal appearing on the left of
 /// a comparison is normalized by the caller (operator reversed) before
 /// constructing this enum, so every comparison variant here always carries
-/// `(column, literal)` in that order.
+/// `(leaf, literal)` in that order. An `In` list is non-empty, single-typed,
+/// and keeps the caller's literal order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ScanPredicate {
-    /// `column = literal`.
-    Eq(String, ScanLiteral),
-    /// `column != literal`.
-    NotEq(String, ScanLiteral),
-    /// `column < literal`.
-    Lt(String, ScanLiteral),
-    /// `column <= literal`.
-    LtEq(String, ScanLiteral),
-    /// `column > literal`.
-    Gt(String, ScanLiteral),
-    /// `column >= literal`.
-    GtEq(String, ScanLiteral),
-    /// `column IS NULL`.
-    IsNull(String),
-    /// `column IS NOT NULL`.
-    IsNotNull(String),
+    /// `leaf = literal`.
+    Eq(ScanLeaf, ScanLiteral),
+    /// `leaf != literal`.
+    NotEq(ScanLeaf, ScanLiteral),
+    /// `leaf < literal`.
+    Lt(ScanLeaf, ScanLiteral),
+    /// `leaf <= literal`.
+    LtEq(ScanLeaf, ScanLiteral),
+    /// `leaf > literal`.
+    Gt(ScanLeaf, ScanLiteral),
+    /// `leaf >= literal`.
+    GtEq(ScanLeaf, ScanLiteral),
+    /// `leaf IN (literals...)`.
+    In(ScanLeaf, Vec<ScanLiteral>),
+    /// `leaf IS NULL`.
+    IsNull(ScanLeaf),
+    /// `leaf IS NOT NULL`.
+    IsNotNull(ScanLeaf),
 }
 
 impl ScanPredicate {
     /// Returns the digest operator tag defined by the assignment-authority
     /// encoding (`Eq` 0, `NotEq` 1, `Lt` 2, `LtEq` 3, `Gt` 4, `GtEq` 5,
-    /// `IsNull` 6, `IsNotNull` 7).
+    /// `In` 6, `IsNull` 7, `IsNotNull` 8).
     #[must_use]
     pub fn digest_op_tag(&self) -> u8 {
         match self {
@@ -106,27 +181,36 @@ impl ScanPredicate {
             ScanPredicate::LtEq(..) => 3,
             ScanPredicate::Gt(..) => 4,
             ScanPredicate::GtEq(..) => 5,
-            ScanPredicate::IsNull(..) => 6,
-            ScanPredicate::IsNotNull(..) => 7,
+            ScanPredicate::In(..) => 6,
+            ScanPredicate::IsNull(..) => 7,
+            ScanPredicate::IsNotNull(..) => 8,
         }
     }
 
-    /// Borrows the predicate's column name, regardless of variant.
+    /// Borrows the predicate's leaf, regardless of variant.
+    #[must_use]
+    pub fn leaf(&self) -> &ScanLeaf {
+        match self {
+            ScanPredicate::Eq(leaf, _)
+            | ScanPredicate::NotEq(leaf, _)
+            | ScanPredicate::Lt(leaf, _)
+            | ScanPredicate::LtEq(leaf, _)
+            | ScanPredicate::Gt(leaf, _)
+            | ScanPredicate::GtEq(leaf, _)
+            | ScanPredicate::In(leaf, _)
+            | ScanPredicate::IsNull(leaf)
+            | ScanPredicate::IsNotNull(leaf) => leaf,
+        }
+    }
+
+    /// Borrows the top-level logical column the predicate's leaf is rooted at.
     #[must_use]
     pub fn column(&self) -> &str {
-        match self {
-            ScanPredicate::Eq(column, _)
-            | ScanPredicate::NotEq(column, _)
-            | ScanPredicate::Lt(column, _)
-            | ScanPredicate::LtEq(column, _)
-            | ScanPredicate::Gt(column, _)
-            | ScanPredicate::GtEq(column, _)
-            | ScanPredicate::IsNull(column)
-            | ScanPredicate::IsNotNull(column) => column,
-        }
+        self.leaf().column()
     }
 
-    /// Borrows the predicate's literal operand, or `None` for a null-check.
+    /// Borrows the predicate's single comparison literal, or `None` for an
+    /// `In` list or a null-check.
     #[must_use]
     pub fn literal(&self) -> Option<&ScanLiteral> {
         match self {
@@ -136,7 +220,20 @@ impl ScanPredicate {
             | ScanPredicate::LtEq(_, literal)
             | ScanPredicate::Gt(_, literal)
             | ScanPredicate::GtEq(_, literal) => Some(literal),
-            ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => None,
+            ScanPredicate::In(..) | ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => None,
+        }
+    }
+
+    /// Borrows every literal operand in order: one for a comparison, the list
+    /// for `In`, and none for a null-check.
+    #[must_use]
+    pub fn literals(&self) -> &[ScanLiteral] {
+        match self {
+            ScanPredicate::In(_, literals) => literals,
+            other => other
+                .literal()
+                .map(std::slice::from_ref)
+                .unwrap_or_default(),
         }
     }
 }
@@ -187,7 +284,13 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v7 assignment-authority digest.
+/// Domain separator for the v8 assignment-authority digest.
+///
+/// v8 replaces each predicate's bare column with a tagged [`ScanLeaf`]
+/// (column, Struct field path, or Variant key path) written before the
+/// operator tag, and adds `In` with a counted, ordered literal list. Operator
+/// tags for `IsNull` and `IsNotNull` move to `7` and `8`. Every other rule is
+/// unchanged from v7, and the domain differs so v7 bytes never validate as v8.
 ///
 /// v7 drops the follower reader cut: followers no longer establish snapshot
 /// protection, because the leader's committed active table read covers every
@@ -212,7 +315,7 @@ pub enum AssignmentDigestError {
 /// the declared event-time bounds. Every other count, length, option,
 /// predicate, projection, cut, and numeric rule is unchanged from v3, and the
 /// domain differs so a v3 signature can never validate against v4 bytes.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v7\0";
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v8\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -297,12 +400,46 @@ fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), Assig
     Ok(())
 }
 
+/// Appends one leaf as its tag, length-prefixed column, path-element count,
+/// and length-prefixed path elements.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when a name or the path
+/// exceeds the `u32` domain.
+fn push_leaf(buffer: &mut Vec<u8>, leaf: &ScanLeaf) -> Result<(), AssignmentDigestError> {
+    buffer.push(leaf.digest_tag());
+    push_string(buffer, leaf.column())?;
+    push_count(buffer, leaf.path().len(), "leaf path")?;
+    for element in leaf.path() {
+        push_string(buffer, element)?;
+    }
+    Ok(())
+}
+
+/// Appends one predicate: its leaf, its operator tag, then its literals.
+///
+/// Comparisons and null-checks keep the option-tagged single literal; `In`
+/// writes a `u32` count followed by every literal in caller order, so
+/// reordering an `IN` list changes the digest.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when any name, path,
+/// literal, or list exceeds the `u32` domain.
 fn push_predicate(
     buffer: &mut Vec<u8>,
     predicate: &ScanPredicate,
 ) -> Result<(), AssignmentDigestError> {
+    push_leaf(buffer, predicate.leaf())?;
     buffer.push(predicate.digest_op_tag());
-    push_string(buffer, predicate.column())?;
+    if let ScanPredicate::In(_, literals) = predicate {
+        push_count(buffer, literals.len(), "in literals")?;
+        for literal in literals {
+            push_literal(buffer, literal)?;
+        }
+        return Ok(());
+    }
     push_option(buffer, predicate.literal(), push_literal)
 }
 
@@ -559,15 +696,16 @@ mod tests {
             .expect("fixture start is canonical")
     }
 
-    /// Normative v7 vector: one assignment for tenant
+    /// Normative v8 vector: one assignment for tenant
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
     /// `00..1f`, one typed hot descriptor, three required columns carried once
-    /// on the assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut must encode to exactly 348 bytes and hash to the
+    /// on the assignment, a single `Eq(Column(service_name), "api")` predicate,
+    /// and the normative Scribe cut must encode to exactly 353 bytes and hash to the
     /// fixed digest below. Asserting both the byte length and the hash prevents
     /// a compensating pair of layout mistakes from passing.
     ///
-    /// v7 is exactly 112 bytes shorter than v6's 460: the reader cut's 16 table
+    /// v8 is exactly 5 bytes longer than v7's 348: the predicate's leaf tag and
+    /// its `u32` path-element count. v7 was 112 bytes shorter than v6's 460: the reader cut's 16 table
     /// uuid + 8 snapshot + 8 snapshot timestamp + 8 retained head + 4 ancestry
     /// count + 24 for its three entries + 4 digest version + 32 digest + 8
     /// epoch fence are gone.
@@ -575,7 +713,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a fixture identifier fails to parse, encoding fails, or the
-    /// encoded vector differs from the normative 348-byte length or fixed
+    /// encoded vector differs from the normative 353-byte length or fixed
     /// digest.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
@@ -588,7 +726,7 @@ mod tests {
             "data_tenant_id".to_string(),
         ];
         let predicates = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Utf8("api".to_string()),
         )];
         let cut = normative_scribe_cut();
@@ -607,14 +745,14 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            348,
-            "normative vector must encode to exactly 348 bytes"
+            353,
+            "normative vector must encode to exactly 353 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "82ba611135f393fff2757dc27b7b87b81b092aca16cf35c9ca8cb0565d597be4"
+            "86fd1744d39046760978386a643aa6a5da0430d6611f83afd6abfb4e55dd33de"
         );
     }
 
@@ -841,7 +979,7 @@ mod tests {
     #[test]
     fn every_field_class_mutation_changes_the_digest() {
         let predicates = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Utf8("api".to_string()),
         )];
         let baseline = baseline_digest(&predicates);
@@ -976,47 +1114,104 @@ mod tests {
 
         // predicate operator
         let noteq_predicate = vec![ScanPredicate::NotEq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Utf8("api".to_string()),
         )];
         assert_ne!(baseline, baseline_digest(&noteq_predicate));
 
         // predicate column
         let other_column_predicate = vec![ScanPredicate::Eq(
-            "other_column".to_string(),
+            ScanLeaf::Column("other_column".to_string()),
             ScanLiteral::Utf8("api".to_string()),
         )];
         assert_ne!(baseline, baseline_digest(&other_column_predicate));
 
         // predicate literal
         let other_literal_predicate = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Utf8("apk".to_string()),
         )];
         assert_ne!(baseline, baseline_digest(&other_literal_predicate));
 
         // float bits
         let float_baseline = baseline_digest(&[ScanPredicate::Gt(
-            "duration_ms".to_string(),
+            ScanLeaf::Column("duration_ms".to_string()),
             ScanLiteral::F64Bits(1.0_f64.to_bits()),
         )]);
         let float_mutated = baseline_digest(&[ScanPredicate::Gt(
-            "duration_ms".to_string(),
+            ScanLeaf::Column("duration_ms".to_string()),
             ScanLiteral::F64Bits(1.0000001_f64.to_bits()),
         )]);
         assert_ne!(float_baseline, float_mutated);
 
         // binary literal: distinct from its UTF-8 spelling and from other bytes
         let bytes_baseline = baseline_digest(&[ScanPredicate::Eq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Bytes(b"api".to_vec()),
         )]);
         assert_ne!(baseline, bytes_baseline);
         let bytes_mutated = baseline_digest(&[ScanPredicate::Eq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Bytes(vec![0xff, 0x00, 0x01]),
         )]);
         assert_ne!(bytes_baseline, bytes_mutated);
+    }
+
+    /// The v8 leaf and `IN` encodings are unambiguous: the same column and
+    /// path under a different leaf kind, a different path, a moved path
+    /// boundary, a different `IN` order, and `IN` versus `=` all move the
+    /// digest.
+    #[test]
+    fn leaf_kind_path_and_in_list_change_the_digest() {
+        let utf8 = |value: &str| ScanLiteral::Utf8(value.to_string());
+        let path = |elements: &[&str]| elements.iter().map(|e| (*e).to_string()).collect();
+        let struct_leaf = ScanLeaf::StructField {
+            column: "payload".to_string(),
+            fields: path(&["http", "route"]),
+        };
+        let variant_leaf = ScanLeaf::Variant {
+            column: "payload".to_string(),
+            keys: path(&["http", "route"]),
+        };
+        let digests = [
+            baseline_digest(&[ScanPredicate::Eq(struct_leaf.clone(), utf8("/a"))]),
+            baseline_digest(&[ScanPredicate::Eq(variant_leaf.clone(), utf8("/a"))]),
+            baseline_digest(&[ScanPredicate::Eq(
+                ScanLeaf::Variant {
+                    column: "payload".to_string(),
+                    keys: path(&["http.route"]),
+                },
+                utf8("/a"),
+            )]),
+            baseline_digest(&[ScanPredicate::Eq(
+                ScanLeaf::Variant {
+                    column: "payload".to_string(),
+                    keys: path(&["http", "rout", "e"]),
+                },
+                utf8("/a"),
+            )]),
+            baseline_digest(&[ScanPredicate::Eq(
+                ScanLeaf::Column("payload".to_string()),
+                utf8("/a"),
+            )]),
+            baseline_digest(&[ScanPredicate::In(variant_leaf.clone(), vec![utf8("/a")])]),
+            baseline_digest(&[ScanPredicate::In(
+                variant_leaf.clone(),
+                vec![utf8("/a"), utf8("/b")],
+            )]),
+            baseline_digest(&[ScanPredicate::In(
+                variant_leaf.clone(),
+                vec![utf8("/b"), utf8("/a")],
+            )]),
+            baseline_digest(&[ScanPredicate::IsNull(variant_leaf.clone())]),
+            baseline_digest(&[ScanPredicate::IsNotNull(variant_leaf)]),
+        ];
+        let distinct: std::collections::BTreeSet<_> = digests.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            digests.len(),
+            "every v8 form digests uniquely"
+        );
     }
 
     #[test]
@@ -1087,7 +1282,7 @@ mod tests {
 
         // Predicates stay signed alongside a cut for the same reason.
         let widened_predicates = vec![ScanPredicate::NotEq(
-            "service_name".to_string(),
+            ScanLeaf::Column("service_name".to_string()),
             ScanLiteral::Utf8("api".to_string()),
         )];
         assert_ne!(

@@ -899,13 +899,46 @@ mod tests {
         );
         assert!(plan.contains("get_field(t.s, Utf8(\"method\"))"), "{plan}");
 
+        assert_eq!(
+            refusal(&context, "SELECT parse_json('{nope')").await.code(),
+            "WYRD_VALA_400_VARIANT_INVALID_JSON"
+        );
+
+        let max_decimal = "9".repeat(38);
+        let exact = format!(
+            "[{}, 18446744073709551616, -9223372036854775809, {max_decimal}, -{max_decimal}]",
+            i64::MAX
+        );
+        assert_eq!(
+            column(&context, &format!("SELECT to_json(parse_json('{exact}'))")).await,
+            [exact.replace(' ', "")]
+        );
+        let past_decimal = format!("1{}", "0".repeat(38));
+        assert_eq!(
+            refusal(&context, &format!("SELECT parse_json('{past_decimal}')")).await,
+            BifrostError::VariantNumericOutOfRange {
+                field: "parse_json".to_owned(),
+                row: 0,
+                path: String::new(),
+                numeric_kind: "integer".to_owned(),
+            }
+        );
+    }
+
+    /// Run a query expected to fail and return its typed Variant error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query fails to plan, succeeds, or fails without a
+    /// [`BifrostError`] in its source chain.
+    async fn refusal(context: &SessionContext, sql: &str) -> BifrostError {
         let error = context
-            .sql("SELECT parse_json('{nope')")
+            .sql(sql)
             .await
-            .expect("plans")
+            .expect(sql)
             .collect()
             .await
-            .expect_err("invalid JSON is refused");
+            .expect_err(sql);
         let mut source: Option<&(dyn Error + 'static)> = Some(&error);
         let mut found = None;
         while let Some(current) = source {
@@ -914,7 +947,6 @@ mod tests {
             }
             source = current.source();
         }
-        let found = found.expect("a typed Variant error");
-        assert_eq!(found.code(), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+        found.expect("a typed Variant error")
     }
 }

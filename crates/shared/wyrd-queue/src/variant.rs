@@ -19,7 +19,7 @@
 //! unshredded Arrow storage: a struct of non-null `metadata` and `value`
 //! binary children under the `arrow.parquet.variant` extension.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -35,6 +35,7 @@ use parquet_variant::{
     VariantBuilderExt, VariantDecimal16,
 };
 use parquet_variant_json::VariantToJson;
+use serde_json::value::RawValue;
 use serde_json::{Number, Value};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{VARIANT_EXTENSION_NAME, VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
@@ -140,16 +141,26 @@ impl EncodedVariant {
 
     /// Parse JSON text and encode it under the Bifrost Variant rules.
     ///
+    /// Unlike [`Self::from_json`], numbers are classified from their original
+    /// tokens, so an integer beyond the 64-bit range keeps its exact digits
+    /// instead of passing through `f64`. The text is validated once as a
+    /// [`RawValue`], then each container is split into raw children; an object
+    /// repeating a key keeps its final occurrence.
+    ///
     /// # Errors
     ///
     /// Returns [`VariantViolation::InvalidJson`] at the root when the text is
-    /// not JSON, then every [`Self::from_json`] error.
+    /// not JSON, [`VariantViolation::NumericOutOfRange`] for a number no
+    /// Variant numeric type holds, [`VariantViolation::TooDeep`] for a
+    /// container past the depth limit, and [`VariantViolation::TooLarge`] when
+    /// the encoding exceeds the size limit.
     pub fn from_json_text(text: &str) -> Result<Self, VariantViolation> {
-        let value: Value =
-            serde_json::from_str(text).map_err(|_| VariantViolation::InvalidJson {
-                path: String::new(),
-            })?;
-        Self::from_json(&value)
+        let mut path = JsonPointer::default();
+        let raw: &RawValue = serde_json::from_str(text).map_err(|_| invalid(&path))?;
+        let mut builder = VariantBuilder::new();
+        append_raw(&mut builder, raw, &mut path, 0)?;
+        let (metadata, value) = builder.finish();
+        Self::sized(metadata, value)
     }
 
     /// Accept already-encoded Variant bytes after full validation.
@@ -566,6 +577,131 @@ fn append_json(
     Ok(())
 }
 
+/// Append one validated raw JSON value to any Variant builder position.
+///
+/// The token's first byte selects its kind; containers are split into raw
+/// children and walked recursively, and numbers go to [`raw_number_variant`]
+/// with their original text. `depth` is the number of containers already
+/// open above this value.
+///
+/// # Errors
+///
+/// Returns [`VariantViolation::TooDeep`] for a container past the limit,
+/// [`VariantViolation::NumericOutOfRange`] for an unrepresentable number, and
+/// [`VariantViolation::InvalidJson`] when a builder refuses a container.
+fn append_raw(
+    builder: &mut impl VariantBuilderExt,
+    raw: &RawValue,
+    path: &mut JsonPointer,
+    depth: u32,
+) -> Result<(), VariantViolation> {
+    let text = raw.get();
+    match text.as_bytes().first() {
+        Some(b'{') => {
+            let depth = enter_container(depth, path)?;
+            // A map keeps the final occurrence of a repeated key.
+            // ponytail: each level re-scans its subtree, so cost is bounded by
+            // depth (64) times size; a streaming visitor if parse_json profiles hot.
+            let entries: BTreeMap<String, &RawValue> =
+                serde_json::from_str(text).map_err(|_| invalid(path))?;
+            let mut object = builder.try_new_object().map_err(|_| invalid(path))?;
+            for (key, child) in entries {
+                path.push_key(&key);
+                if child.get() == "null" {
+                    // A field builder would treat null as an absent key.
+                    object.insert(&key, Variant::Null);
+                } else {
+                    append_raw(
+                        &mut ObjectFieldBuilder::new(&key, &mut object),
+                        child,
+                        path,
+                        depth,
+                    )?;
+                }
+                path.pop();
+            }
+            object.finish();
+        }
+        Some(b'[') => {
+            let depth = enter_container(depth, path)?;
+            let items: Vec<&RawValue> = serde_json::from_str(text).map_err(|_| invalid(path))?;
+            let mut list = builder.try_new_list().map_err(|_| invalid(path))?;
+            for (index, item) in items.into_iter().enumerate() {
+                path.push_index(index);
+                append_raw(&mut list, item, path, depth)?;
+                path.pop();
+            }
+            list.finish();
+        }
+        Some(b'"') => {
+            let string: String = serde_json::from_str(text).map_err(|_| invalid(path))?;
+            builder.append_value(string.as_str());
+        }
+        Some(b't') => builder.append_value(true),
+        Some(b'f') => builder.append_value(false),
+        Some(b'n') => builder.append_value(Variant::Null),
+        _ => builder.append_value(raw_number_variant(text, path)?),
+    }
+    Ok(())
+}
+
+/// Convert one JSON number token under the Bifrost numeric rules.
+///
+/// A token without a fraction or exponent is an integer and is parsed exactly
+/// as `i128` before [`integer_variant`] narrows it; any other token is a
+/// double.
+///
+/// # Errors
+///
+/// Returns [`VariantViolation::NumericOutOfRange`] for an integer no Variant
+/// integer or decimal holds and for a double that is not finite.
+fn raw_number_variant(
+    token: &str,
+    path: &JsonPointer,
+) -> Result<Variant<'static, 'static>, VariantViolation> {
+    if !token.contains(['.', 'e', 'E']) {
+        return token
+            .parse::<i128>()
+            .map_err(|_| out_of_range(path, "integer"))
+            .and_then(|integer| integer_variant(integer, path));
+    }
+    token
+        .parse::<f64>()
+        .ok()
+        .filter(|double| double.is_finite())
+        .map(Variant::from)
+        .ok_or_else(|| out_of_range(path, "double"))
+}
+
+/// Store an integer as the narrowest Variant integer, else a scale-zero
+/// decimal.
+///
+/// Both JSON paths route integers through this one rule.
+///
+/// # Errors
+///
+/// Returns [`VariantViolation::NumericOutOfRange`] when the integer exceeds
+/// the 38 digits a Variant decimal holds.
+fn integer_variant(
+    integer: i128,
+    path: &JsonPointer,
+) -> Result<Variant<'static, 'static>, VariantViolation> {
+    if let Ok(integer) = i64::try_from(integer) {
+        return Ok(narrow_integer(integer));
+    }
+    VariantDecimal16::try_new(integer, 0)
+        .map(Variant::from)
+        .map_err(|_| out_of_range(path, "integer"))
+}
+
+/// Return a numeric-range violation at the current pointer.
+fn out_of_range(path: &JsonPointer, numeric_kind: &'static str) -> VariantViolation {
+    VariantViolation::NumericOutOfRange {
+        path: path.render(),
+        numeric_kind,
+    }
+}
+
 /// Append every array item to an open list builder.
 ///
 /// # Errors
@@ -603,24 +739,16 @@ fn number_variant(
     path: &JsonPointer,
 ) -> Result<Variant<'static, 'static>, VariantViolation> {
     if let Some(integer) = number.as_i64() {
-        return Ok(narrow_integer(integer));
+        return integer_variant(i128::from(integer), path);
     }
     if let Some(unsigned) = number.as_u64() {
-        return VariantDecimal16::try_new(i128::from(unsigned), 0)
-            .map(Variant::from)
-            .map_err(|_| VariantViolation::NumericOutOfRange {
-                path: path.render(),
-                numeric_kind: "integer",
-            });
+        return integer_variant(i128::from(unsigned), path);
     }
     number
         .as_f64()
         .filter(|double| double.is_finite())
         .map(Variant::from)
-        .ok_or_else(|| VariantViolation::NumericOutOfRange {
-            path: path.render(),
-            numeric_kind: "double",
-        })
+        .ok_or_else(|| out_of_range(path, "double"))
 }
 
 /// Store a signed integer at the narrowest Variant integer width.
@@ -737,6 +865,59 @@ mod tests {
                 path: String::new()
             })
         );
+    }
+
+    /// JSON text keeps exact integers past 64 bits and the final duplicate key.
+    ///
+    /// Covers the `i64` boundary, `u64::MAX + 1`, a negative below `i64::MIN`,
+    /// the largest and first-unsupported Decimal16 integers on both signs,
+    /// fraction and exponent tokens as doubles, and a repeated object key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a token converts to another Variant type, loses digits, or
+    /// is not refused with the exact range violation.
+    #[test]
+    fn json_text_classifies_integers_from_their_tokens() {
+        let max_decimal = "9".repeat(38);
+        let text = format!(
+            r#"{{"i64_max": {}, "past_u64": 18446744073709551616,
+                "below_i64": -9223372036854775809, "max_decimal": {max_decimal},
+                "min_decimal": -{max_decimal}, "fraction": 2.5, "exponent": 1e3,
+                "dup": 1, "dup": "last"}}"#,
+            i64::MAX
+        );
+        let encoded = EncodedVariant::from_json_text(&text).expect("encodes");
+        let variant = Variant::try_new(encoded.metadata(), encoded.value()).expect("valid");
+        let object = variant.as_object().expect("object");
+        let decimal = |integer: i128| {
+            Some(Variant::from(
+                VariantDecimal16::try_new(integer, 0).expect("in range"),
+            ))
+        };
+        let max = max_decimal.parse::<i128>().expect("38 digits fit i128");
+        assert_eq!(object.get("i64_max"), Some(Variant::Int64(i64::MAX)));
+        assert_eq!(object.get("past_u64"), decimal(i128::from(u64::MAX) + 1));
+        assert_eq!(object.get("below_i64"), decimal(i128::from(i64::MIN) - 1));
+        assert_eq!(object.get("max_decimal"), decimal(max));
+        assert_eq!(object.get("min_decimal"), decimal(-max));
+        assert_eq!(object.get("fraction"), Some(Variant::Double(2.5)));
+        assert_eq!(object.get("exponent"), Some(Variant::Double(1000.0)));
+        assert_eq!(object.get("dup"), Some(Variant::from("last")));
+
+        for token in [
+            format!("1{}", "0".repeat(38)),
+            format!("-1{}", "0".repeat(38)),
+        ] {
+            assert_eq!(
+                EncodedVariant::from_json_text(&format!(r#"{{"n": [{token}]}}"#)),
+                Err(VariantViolation::NumericOutOfRange {
+                    path: "/n/0".to_owned(),
+                    numeric_kind: "integer",
+                }),
+                "{token}"
+            );
+        }
     }
 
     /// The column builder writes canonical storage that decodes per cell.

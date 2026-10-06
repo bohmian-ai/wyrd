@@ -1121,11 +1121,14 @@ mod pg_tests {
                 stored.name()
             );
             assert!(
-                described.metadata().is_empty(),
-                "`{}` sends no field identity: the stable id and sensitivity \
-                 tag are the server's own, re-derived on every stamp, so \
-                 ingress compares an incoming block by shape and never asks a \
-                 writer to restate them",
+                described
+                    .metadata()
+                    .keys()
+                    .all(|key| wyrd_queue::is_extension_key(key)),
+                "`{}` sends no field identity, only its Arrow extension type: \
+                 the stable id and sensitivity tag are the server's own, \
+                 re-derived on every stamp, so ingress compares an incoming \
+                 block by shape and never asks a writer to restate them",
                 stored.name()
             );
         }

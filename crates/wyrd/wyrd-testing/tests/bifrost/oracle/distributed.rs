@@ -2413,7 +2413,13 @@ async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyE
 /// Small enough that Forge's rewrite of the three 45,000-row slices closes
 /// several row groups, each still spanning more than one 20,000-row page, so
 /// one sorted output file exposes row-group and page pruning together.
-const REWRITE_ROW_GROUP_BYTES: u64 = 512 * 1024;
+///
+/// Rewritten rows carry the v3 `_row_id` beside the unique `key_id` and
+/// `score`, and each unique column counts its uncompressed dictionary until
+/// the dictionary page limit forces plain encoding near 32,000 rows. The
+/// target must close each group between 20,000 rows and that fallback; a
+/// larger one is never reached once the estimate turns compressed.
+const REWRITE_ROW_GROUP_BYTES: u64 = 768 * 1024;
 
 /// After an actual Forge promotion, and again after an actual Forge rewrite,
 /// the caller-registered custom dataset and the built-in spans, records, and

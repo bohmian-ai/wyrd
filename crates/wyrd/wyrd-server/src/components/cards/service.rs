@@ -20,7 +20,7 @@ use wyrd_spec::card::verifier::{
     OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus, VerifierImplementation,
     VerifierSpec,
 };
-use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
+use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
@@ -70,7 +70,9 @@ use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
 use crate::components::auth::Caller;
-use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
+use crate::components::cards::mapping::{
+    existing_row_to_response, lifecycle_status, outcome_row_to_response,
+};
 use crate::components::cards::resolve::{EffectiveSpecs, ResolvedRefs, bind_card_references};
 use crate::components::storage::routes::storage_caller;
 use crate::state::{AppState, registry_db_error};
@@ -466,20 +468,9 @@ fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
             .map_err(|error| WyrdError::registry_invalid_version_block(error.to_string()))?,
         spec_hash: row.spec_hash.clone(),
         artifact_hash: row.artifact_hash.clone(),
-        status: lifecycle_status(status)?,
+        status: lifecycle_status(status),
         created_at: row.created_at,
         updated_at: row.updated_at,
-    })
-}
-
-fn lifecycle_status(status: CardStatus) -> Result<CardLifecycleStatus, WyrdError> {
-    Ok(match status {
-        CardStatus::Pending => CardLifecycleStatus::Pending,
-        CardStatus::Active => CardLifecycleStatus::Active,
-        CardStatus::Deprecated => CardLifecycleStatus::Deprecated,
-        CardStatus::Deleted => CardLifecycleStatus::Deleted,
-        CardStatus::Failed => CardLifecycleStatus::Failed,
-        CardStatus::Expired => CardLifecycleStatus::Expired,
     })
 }
 
@@ -1093,7 +1084,7 @@ impl RegistrationWriter<'_> {
             outcomes,
             upload_plans: Vec::new(),
         };
-        let seed = replay_seed(&response, &plan.submissions)?;
+        let seed = replay_seed(&response, &plan.submissions);
         commit_registration_operation(&mut conn, operation_id, &seed).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok((operation_id, seed))
@@ -1454,7 +1445,7 @@ fn hash_request(request: &CreateCardRequest) -> Result<String, WyrdError> {
 fn replay_seed(
     response: &CreateCardResponse,
     submissions: &[CardSubmission],
-) -> Result<RegistrationReplaySeed, WyrdError> {
+) -> RegistrationReplaySeed {
     let artifact_manifest_paths = response
         .outcomes
         .iter()
@@ -1472,11 +1463,11 @@ fn replay_seed(
             })
         })
         .collect();
-    Ok(RegistrationReplaySeed {
+    RegistrationReplaySeed {
         root: response.root.clone(),
         outcomes: response.outcomes.clone(),
         artifact_manifest_paths,
-    })
+    }
 }
 
 /// Decode one submission into the typed card envelope persisted by SQL.
@@ -2217,7 +2208,7 @@ async fn cleanup_card_artifacts(
     let mut failures = Vec::new();
     for manifest in manifests {
         if let Err(error) = cleanup_manifest_artifact(state, caller, manifest).await {
-            failures.push(error.to_string());
+            failures.push(error.clone());
         }
     }
     if let Err(error) = cleanup_card_blob(state, caller, card).await {
@@ -2257,14 +2248,16 @@ async fn cleanup_card_blob(
         .card_blob_uri
         .as_deref()
         .and_then(|uri| uri.strip_prefix("wyrd://"))
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            tenant_path::build(
-                caller.data_tenant_id,
-                &card.card_uid.to_string(),
-                &format!("blob/{}.json", card.spec_hash),
-            )
-        });
+        .map_or_else(
+            || {
+                tenant_path::build(
+                    caller.data_tenant_id,
+                    &card.card_uid.to_string(),
+                    &format!("blob/{}.json", card.spec_hash),
+                )
+            },
+            str::to_owned,
+        );
     let validated =
         tenant_path::validate(&path, caller.data_tenant_id).map_err(|error| error.to_string())?;
     match state.storage.delete_object(&validated).await {
@@ -2308,7 +2301,7 @@ async fn cleanup_manifest_artifact(
                 }
             }
         }
-        Some("pending") | Some("initiating") => {
+        Some("pending" | "initiating") => {
             upload_abort(
                 &state.storage,
                 state.postgres.wyrd(),
@@ -2473,7 +2466,7 @@ async fn write_card_blob(
             origin: None,
         },
         spec: card.spec.clone(),
-        relationships: Default::default(),
+        relationships: Relationships::default(),
         status: None,
     };
     let bytes = immutable_card_blob_bytes(envelope)?;

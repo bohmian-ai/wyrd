@@ -66,6 +66,10 @@ async fn published_cache_pruning_and_shutdown_are_production_governed() {
 ///
 /// Returns a client, Postgres, ingest, Forge-scheduling, telemetry, or
 /// cluster-lifecycle error surfaced by any phase.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn prove_published_governance() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
@@ -396,7 +400,7 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
 
     let _ = server.cancel_and_join_for_test().await;
     barrier.release();
-    let outcome = tokio::time::timeout(Duration::from_secs(60), stalled)
+    let outcome = tokio::time::timeout(Duration::from_mins(1), stalled)
         .await
         .map_err(|_| "a cancelled read must terminate, not hang")??;
     assert!(
@@ -610,6 +614,10 @@ const RETIRED_QUERY_FAMILIES: [&str; 6] = [
 ///
 /// # Panics
 /// Panics when an emitted fact disagrees with the stream the client observed.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn prove_query_stream_telemetry(
     cluster: &WyrdTestCluster,
     server: &WyrdTestServer,

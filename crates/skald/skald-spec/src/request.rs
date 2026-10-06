@@ -98,6 +98,7 @@ impl ProviderRequest {
     }
 
     /// Return a copy of the native request with provider-specific tool fields populated.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
         if tools.is_empty() {
             return self;

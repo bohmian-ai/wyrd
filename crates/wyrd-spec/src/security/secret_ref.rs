@@ -44,11 +44,16 @@ use serde::{Deserialize, Serialize};
 /// `File.path`, `Vault.key`); for `Inline`, equality and hashing use the
 /// redacted debug form so the secret value is never exposed. See the explicit
 /// `impl` blocks below the enum definition.
+///
+/// The enum is `#[non_exhaustive]` because the test-only `Inline` variant
+/// exists only under `cfg(any(test, feature = "test-utils"))`; downstream
+/// matches keep a wildcard arm so feature unification never breaks them.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(
     description = "Pointer into a Wyrd runtime secret source. Production builds support environment variables, mounted files, and external secret-manager keys."
 )]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum SecretRef {
     /// An environment variable name. The runtime reads `std::env::var(name)`
     /// at connect time. Conventionally `SCREAMING_SNAKE_CASE`.

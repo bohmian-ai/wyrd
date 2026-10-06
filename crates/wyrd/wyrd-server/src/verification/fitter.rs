@@ -190,7 +190,7 @@ impl BaselineFitter {
                 Ok(false) if stop.is_cancelled() => break,
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(%tenant, %error, "drift baseline fit failed to settle")
+                    tracing::warn!(%tenant, %error, "drift baseline fit failed to settle");
                 }
             }
         }

@@ -32,6 +32,10 @@ impl RecordSample<'_> {
     /// Returns [`EvalExecError::JsonPathFailure`] or
     /// [`EvalExecError::ExtractPathMissing`] when a `deterministic_by_hash`
     /// key path fails or resolves to nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `sampling` task id literal fails validation.
     pub fn selected(&self, sampling: Option<&EvalSampling>) -> Result<bool, EvalExecError> {
         Ok(match sampling {
             None => true,

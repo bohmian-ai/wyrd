@@ -48,3 +48,6 @@ serde_urlencoded = "0.7"
 [[example]]
 name = "gen_schemas"
 path = "examples/gen_schemas.rs"
+
+[lints]
+workspace = true

@@ -1795,11 +1795,10 @@ impl AnalyticalStageIngress {
     /// # Errors
     ///
     /// Returns the untouched activation with the failure that stopped it.
-    // justification: the error half must carry the rollback-owning
-    // `PendingGraphActivation` back beside the failure that stopped it, so the
-    // caller can hand the envelope back to its still-open grant. A
-    // one-use alias would only rename that pair, not simplify it.
-    #[allow(clippy::type_complexity)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "the error half must carry the rollback-owning `PendingGraphActivation` back beside the failure that stopped it, so the caller can hand the envelope back to its still-open grant. A one-use alias would only rename that pair, not simplify it."
+    )]
     fn publish(
         &self,
         graph: AnalyticalGraphKey,

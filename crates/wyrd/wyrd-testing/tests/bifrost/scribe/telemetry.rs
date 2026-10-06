@@ -311,6 +311,10 @@ fn scrape_staging(
 /// the staging owner, the persisted ready time, or the committed files.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn staged_backlog_survives_abrupt_restart() {
     let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
         .await
@@ -444,6 +448,10 @@ async fn staged_backlog_survives_abrupt_restart() {
 /// durable fact observed beside it.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn scribe_hot_path_telemetry_reconciles() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");

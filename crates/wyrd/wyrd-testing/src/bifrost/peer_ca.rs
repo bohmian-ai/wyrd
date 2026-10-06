@@ -47,7 +47,7 @@ impl std::fmt::Debug for BifrostPeerLeaf {
             .debug_struct("BifrostPeerLeaf")
             .field("certificate_bytes", &self.certificate_pem.len())
             .field("private_key", &"[REDACTED]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

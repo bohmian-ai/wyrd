@@ -54,8 +54,8 @@ const WAL_SEGMENT_BYTES: u64 = 64 * 1024;
 async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
     let geometry = ScribeGeometry::for_uniform_shard_rotation(
         WAL_SEGMENT_BYTES,
-        DEFAULT_GENERATION_ROTATION_BYTES as usize,
-        std::time::Duration::from_secs(60),
+        usize::try_from(DEFAULT_GENERATION_ROTATION_BYTES).expect("rotation bytes fit usize"),
+        std::time::Duration::from_mins(1),
     )
     .expect("the scaled WAL segment size is a coherent geometry");
     let server = start_scribe_server_with_geometry(geometry).await;
@@ -87,8 +87,8 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
     // is also what closes the WAL segments retirement later reclaims.
     let mut admitted: Vec<i64> = Vec::with_capacity(BATCHES_BEFORE_PRESSURE * ROWS_PER_BATCH);
     for batch in 0..BATCHES_BEFORE_PRESSURE {
-        let first_row = (batch * ROWS_PER_BATCH) as i64;
-        let rows: Vec<i64> = (first_row..first_row + ROWS_PER_BATCH as i64).collect();
+        let first_row = i64::try_from(batch * ROWS_PER_BATCH).expect("test row ordinals fit i64");
+        let rows: Vec<i64> = (first_row..).take(ROWS_PER_BATCH).collect();
         append_values(&first, &first_table, uuid::Uuid::now_v7(), &rows)
             .await
             .unwrap_or_else(|error| {
@@ -108,7 +108,7 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
         .expect("the WAL breaker is reachable");
 
     // Refusal is pod-wide and typed, not one tenant's punishment.
-    let refused: Vec<i64> = (1_000_000..1_000_000 + ROWS_PER_BATCH as i64).collect();
+    let refused: Vec<i64> = (1_000_000..).take(ROWS_PER_BATCH).collect();
     for (label, client, table) in [
         ("first", &first, &first_table),
         ("second", &second, &second_table),
@@ -149,7 +149,7 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
 
     // Recovery, and it reaches both tenants rather than only the one that was
     // writing when the disk drained.
-    let recovered: Vec<i64> = (2_000_000..2_000_000 + ROWS_PER_BATCH as i64).collect();
+    let recovered: Vec<i64> = (2_000_000..).take(ROWS_PER_BATCH).collect();
     append_values(&first, &first_table, uuid::Uuid::now_v7(), &recovered)
         .await
         .expect("the first tenant is served again once WAL space is reclaimed");

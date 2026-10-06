@@ -3283,7 +3283,7 @@ mod source_card_tests {
                     sslmode: None,
                     auth: SourceAuth::Basic {
                         username: "wyrd_reader".to_owned(),
-                        password_env: "".to_owned(),
+                        password_env: String::new(),
                     },
                 },
             },
@@ -3448,7 +3448,7 @@ mod source_card_tests {
                     schema: None,
                     role: None,
                     auth: SourceAuth::SecretStore {
-                        provider: "".to_owned(),
+                        provider: String::new(),
                         name: "secret/snowflake".to_owned(),
                     },
                 },
@@ -3521,7 +3521,7 @@ mod source_card_tests {
             description: None,
             source: SourceKind::SqlWarehouse {
                 connection: SqlConnection::Postgres {
-                    host: "".to_owned(),
+                    host: String::new(),
                     port: None,
                     database: "telemetry".to_owned(),
                     sslmode: None,
@@ -3622,7 +3622,7 @@ mod source_card_tests {
             description: None,
             source: SourceKind::Logs {
                 connection: LogConnection::Loki {
-                    endpoint: "".to_owned(),
+                    endpoint: String::new(),
                     auth: SourceAuth::None,
                 },
             },

@@ -1222,7 +1222,7 @@ const LIVE_HOLD: Duration = Duration::from_secs(31);
 const LIVE_DEADLINE_MS: i64 = 120_000;
 
 /// Bound on waiting for a paused, cancelled, or dropped live read to settle.
-const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Returns the query-memory bytes the writer Scribe's follower views hold.
 ///
@@ -1957,7 +1957,7 @@ async fn staged_runs(
             match live.authority {
                 HotAuthority::StagedRun { runs: staged, .. } => runs.extend(staged),
                 HotAuthority::Memtable => memtable = true,
-                _ => {}
+                HotAuthority::Published { .. } => {}
             }
         }
         if !runs.is_empty() && !memtable {

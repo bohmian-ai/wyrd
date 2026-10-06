@@ -23,7 +23,7 @@ use crate::row_types::gateway::{
 /// one, stamping `rotated_at`. Returns no row for a revoked name so the caller
 /// reports a conflict; a provider change that would orphan a deployment fails
 /// the composite foreign key with `23503`.
-const UPSERT_CREDENTIAL_SQL: &str = r#"
+const UPSERT_CREDENTIAL_SQL: &str = r"
     INSERT INTO wyrd.gateway_provider_credentials AS c (
         data_tenant_id, name, provider, source, secret_key_version,
         secret_nonce, secret_ciphertext, state
@@ -38,53 +38,53 @@ const UPSERT_CREDENTIAL_SQL: &str = r#"
         rotated_at = now()
      WHERE c.state = 'active'
     RETURNING name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
-"#;
+";
 
 /// Reads one credential row by name within the tenant RLS scope.
-const CREDENTIAL_SQL: &str = r#"
+const CREDENTIAL_SQL: &str = r"
     SELECT name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
       FROM wyrd.gateway_provider_credentials
      WHERE name = $1
-"#;
+";
 
 /// Reads one credential row under a `FOR SHARE` lock held until commit, so a
 /// concurrent revoke or delete serializes behind the deployment write that
 /// references it.
-const CREDENTIAL_FOR_SHARE_SQL: &str = r#"
+const CREDENTIAL_FOR_SHARE_SQL: &str = r"
     SELECT name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
       FROM wyrd.gateway_provider_credentials
      WHERE name = $1
        FOR SHARE
-"#;
+";
 
 /// Lists the tenant's credential rows ordered by name.
-const CREDENTIALS_SQL: &str = r#"
+const CREDENTIALS_SQL: &str = r"
     SELECT name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
       FROM wyrd.gateway_provider_credentials
      ORDER BY name
-"#;
+";
 
 /// Terminally revokes a credential; repeating keeps the first `revoked_at` and
 /// leaves `updated_at` unchanged.
-const REVOKE_CREDENTIAL_SQL: &str = r#"
+const REVOKE_CREDENTIAL_SQL: &str = r"
     UPDATE wyrd.gateway_provider_credentials
        SET state = 'revoked',
            revoked_at = COALESCE(revoked_at, now()),
            updated_at = CASE WHEN state = 'active' THEN now() ELSE updated_at END
      WHERE name = $1
     RETURNING name, provider, source, state, created_at, updated_at, rotated_at, revoked_at
-"#;
+";
 
 /// Deletes one credential; a referencing deployment fails the composite foreign
 /// key with `23503`.
-const DELETE_CREDENTIAL_SQL: &str = r#"
+const DELETE_CREDENTIAL_SQL: &str = r"
     DELETE FROM wyrd.gateway_provider_credentials
      WHERE name = $1
-"#;
+";
 
 /// Creates or replaces one deployment document together with its provider,
 /// model, and credential-reference columns that the foreign keys check.
-const UPSERT_DEPLOYMENT_SQL: &str = r#"
+const UPSERT_DEPLOYMENT_SQL: &str = r"
     INSERT INTO wyrd.gateway_provider_deployments (
         data_tenant_id, name, provider, model, credential_name, deployment
     ) VALUES ($1, $2, $3, $4, $5, $6)
@@ -94,107 +94,107 @@ const UPSERT_DEPLOYMENT_SQL: &str = r#"
         credential_name = EXCLUDED.credential_name,
         deployment = EXCLUDED.deployment,
         updated_at = now()
-"#;
+";
 
 /// Reads one deployment document by name.
-const DEPLOYMENT_SQL: &str = r#"
+const DEPLOYMENT_SQL: &str = r"
     SELECT deployment
       FROM wyrd.gateway_provider_deployments
      WHERE name = $1
-"#;
+";
 
 /// Lists the tenant's deployment documents ordered by name.
-const DEPLOYMENTS_SQL: &str = r#"
+const DEPLOYMENTS_SQL: &str = r"
     SELECT deployment
       FROM wyrd.gateway_provider_deployments
      ORDER BY name
-"#;
+";
 
 /// Deletes one deployment; an absent name deletes nothing.
-const DELETE_DEPLOYMENT_SQL: &str = r#"
+const DELETE_DEPLOYMENT_SQL: &str = r"
     DELETE FROM wyrd.gateway_provider_deployments
      WHERE name = $1
-"#;
+";
 
 /// Creates the tenant's single policy row when absent so it can be locked.
-const ENSURE_POLICY_ROW_SQL: &str = r#"
+const ENSURE_POLICY_ROW_SQL: &str = r"
     INSERT INTO wyrd.gateway_policies (data_tenant_id)
     VALUES ($1)
     ON CONFLICT (data_tenant_id) DO NOTHING
-"#;
+";
 
 /// Reads the tenant's policy documents under a `FOR UPDATE` row lock that
 /// serializes concurrent policy replacements until commit.
-const LOCK_POLICY_SQL: &str = r#"
+const LOCK_POLICY_SQL: &str = r"
     SELECT fallback, governance, capture
       FROM wyrd.gateway_policies
        FOR UPDATE
-"#;
+";
 
 /// Reads the tenant's fallback, governance, and capture documents without a lock.
-const POLICY_SQL: &str = r#"
+const POLICY_SQL: &str = r"
     SELECT fallback, governance, capture
       FROM wyrd.gateway_policies
-"#;
+";
 
 /// Overwrites all three policy documents on the tenant's locked policy row.
-const UPDATE_POLICY_SQL: &str = r#"
+const UPDATE_POLICY_SQL: &str = r"
     UPDATE wyrd.gateway_policies
        SET fallback = $1,
            governance = $2,
            capture = $3,
            updated_at = now()
-"#;
+";
 
 /// Lists every retained pricing version with its authoritative `active` flag.
-const PRICING_SQL: &str = r#"
+const PRICING_SQL: &str = r"
     SELECT active, entry
       FROM wyrd.gateway_model_pricing
      ORDER BY provider, model, effective_at
-"#;
+";
 
 /// Inserts a pricing version, or updates only the `active` flag and entry of an
 /// existing `(provider, model, version)`; callers reject changed version content.
-const UPSERT_PRICING_SQL: &str = r#"
+const UPSERT_PRICING_SQL: &str = r"
     INSERT INTO wyrd.gateway_model_pricing (
         data_tenant_id, provider, model, version, effective_at, active, entry
     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (data_tenant_id, provider, model, version) DO UPDATE SET
         active = EXCLUDED.active,
         entry = EXCLUDED.entry
-"#;
+";
 
 /// Appends one accounting entry; `ON CONFLICT DO NOTHING` fences replays so an
 /// entry is written at most once.
-const APPEND_ACCOUNTING_ENTRY_SQL: &str = r#"
+const APPEND_ACCOUNTING_ENTRY_SQL: &str = r"
     INSERT INTO wyrd.gateway_accounting_entries (
         data_tenant_id, entry_id, call_id, kind, provider, model, pricing_version, entry
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Takes the tenant's transaction-scoped admission advisory lock, serializing
 /// admission across every replica until the transaction ends.
-const LOCK_ADMISSION_SQL: &str = r#"
+const LOCK_ADMISSION_SQL: &str = r"
     SELECT pg_advisory_xact_lock(
         hashtextextended('wyrd.gateway_admission:' || wyrd.current_tenant()::text, 0)
     )
-"#;
+";
 
 /// Deletes limit windows that started before the cutoff minute.
-const PRUNE_WINDOWS_SQL: &str = r#"
+const PRUNE_WINDOWS_SQL: &str = r"
     DELETE FROM wyrd.gateway_limit_windows
      WHERE window_start < $1
-"#;
+";
 
 /// Deletes concurrency leases that expired at or before `now`.
-const PRUNE_LEASES_SQL: &str = r#"
+const PRUNE_LEASES_SQL: &str = r"
     DELETE FROM wyrd.gateway_call_leases
      WHERE expires_at <= $1
-"#;
+";
 
 /// Reads one limit's requests and tokens in a window and its unexpired lease count.
-const LIMIT_USAGE_SQL: &str = r#"
+const LIMIT_USAGE_SQL: &str = r"
     SELECT
         COALESCE((SELECT w.requests FROM wyrd.gateway_limit_windows w
                    WHERE w.limit_key = $1 AND w.window_start = $2), 0) AS requests,
@@ -202,35 +202,35 @@ const LIMIT_USAGE_SQL: &str = r#"
                    WHERE w.limit_key = $1 AND w.window_start = $2), 0) AS tokens,
         (SELECT count(*) FROM wyrd.gateway_call_leases l
           WHERE l.limit_key = $1 AND l.expires_at > $3) AS leases
-"#;
+";
 
 /// Adds request and signed token counts to one limit window, creating it on
 /// first charge; a token release never takes the window below zero.
-const CHARGE_WINDOW_SQL: &str = r#"
+const CHARGE_WINDOW_SQL: &str = r"
     INSERT INTO wyrd.gateway_limit_windows AS w (
         data_tenant_id, limit_key, window_start, requests, tokens
     ) VALUES ($1, $2, $3, $4, GREATEST($5, 0))
     ON CONFLICT (data_tenant_id, limit_key, window_start) DO UPDATE SET
         requests = w.requests + EXCLUDED.requests,
         tokens = GREATEST(w.tokens + $5, 0)
-"#;
+";
 
 /// Records one call's concurrency lease on a limit; a replay inserts nothing.
-const INSERT_LEASE_SQL: &str = r#"
+const INSERT_LEASE_SQL: &str = r"
     INSERT INTO wyrd.gateway_call_leases (data_tenant_id, limit_key, call_id, expires_at)
     VALUES ($1, $2, $3, $4)
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Deletes every concurrency lease a call holds.
-const RELEASE_LEASES_SQL: &str = r#"
+const RELEASE_LEASES_SQL: &str = r"
     DELETE FROM wyrd.gateway_call_leases
      WHERE call_id = $1
-"#;
+";
 
 /// Sums a budget subject's period spend: settled actual cost, or the reserved
 /// cost while a reservation is unsettled.
-const BUDGET_SPEND_SQL: &str = r#"
+const BUDGET_SPEND_SQL: &str = r"
     SELECT COALESCE(SUM(COALESCE(
                (s.entry -> 'budget_reservation_settled' ->> 'actual_cost')::numeric,
                (c.entry -> 'budget_reservation_created' ->> 'reserved_cost')::numeric
@@ -245,11 +245,11 @@ const BUDGET_SPEND_SQL: &str = r#"
        AND c.entry -> 'budget_reservation_created' ->> 'period_start' = $2
        AND c.entry -> 'budget_reservation_created' ->> 'period_end' = $3
        AND c.entry -> 'budget_reservation_created' -> 'subject' = $1
-"#;
+";
 
 /// Reads a bounded, oldest-first batch of expired reservations that have no
 /// settlement entry.
-const EXPIRED_RESERVATIONS_SQL: &str = r#"
+const EXPIRED_RESERVATIONS_SQL: &str = r"
     SELECT c.entry
       FROM wyrd.gateway_accounting_entries c
      WHERE c.kind = 'budget_reservation_created'
@@ -264,19 +264,19 @@ const EXPIRED_RESERVATIONS_SQL: &str = r#"
        )
      ORDER BY c.recorded_at
      LIMIT $2
-"#;
+";
 
 /// Reads every accounting entry of one call in recording order.
-const CALL_ENTRIES_SQL: &str = r#"
+const CALL_ENTRIES_SQL: &str = r"
     SELECT entry
       FROM wyrd.gateway_accounting_entries
      WHERE call_id = $1
      ORDER BY recorded_at, entry_id
-"#;
+";
 
 /// Reads deployments, credentials, policies, and pricing in one statement so
 /// admission observes one consistent tenant configuration.
-const SNAPSHOT_SQL: &str = r#"
+const SNAPSHOT_SQL: &str = r"
     SELECT
         COALESCE((
             SELECT jsonb_agg(d.deployment ORDER BY d.name)
@@ -307,7 +307,7 @@ const SNAPSHOT_SQL: &str = r#"
         (SELECT g.fallback FROM wyrd.gateway_policies g) AS fallback,
         (SELECT g.governance FROM wyrd.gateway_policies g) AS governance,
         (SELECT g.capture FROM wyrd.gateway_policies g) AS capture
-"#;
+";
 
 /// Column values for one credential create-or-replace.
 #[derive(Debug, Clone, Copy)]
@@ -831,78 +831,78 @@ pub async fn gateway_snapshot(conn: &mut TenantConn<'_>) -> Result<GatewaySnapsh
 }
 
 /// Records one uploaded batch input file.
-const INSERT_BATCH_FILE_SQL: &str = r#"
+const INSERT_BATCH_FILE_SQL: &str = r"
     INSERT INTO wyrd.gateway_batch_files (
         data_tenant_id, file_id, filename, size_bytes, sha256, content_type,
         endpoint, model, deployment, upstream_file_id
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     RETURNING file_id, filename, size_bytes, sha256, content_type, endpoint,
               model, deployment, upstream_file_id, created_at
-"#;
+";
 
 /// Reads one batch input file.
-const BATCH_FILE_SQL: &str = r#"
+const BATCH_FILE_SQL: &str = r"
     SELECT file_id, filename, size_bytes, sha256, content_type, endpoint,
            model, deployment, upstream_file_id, created_at
       FROM wyrd.gateway_batch_files
      WHERE file_id = $1
-"#;
+";
 
 /// Deletes one batch input file.
-const DELETE_BATCH_FILE_SQL: &str = r#"
+const DELETE_BATCH_FILE_SQL: &str = r"
     DELETE FROM wyrd.gateway_batch_files
      WHERE file_id = $1
-"#;
+";
 
 /// Claims the creation fence of one canonical create request; returns no row
 /// when the request was already claimed.
-const CLAIM_BATCH_SQL: &str = r#"
+const CLAIM_BATCH_SQL: &str = r"
     INSERT INTO wyrd.gateway_batches (
         data_tenant_id, batch_id, request_sha256, file_id, model, deployment
     ) VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (data_tenant_id, request_sha256) DO NOTHING
     RETURNING batch_id
-"#;
+";
 
 /// Reads the batch claimed under a create request digest.
-const BATCH_BY_REQUEST_SQL: &str = r#"
+const BATCH_BY_REQUEST_SQL: &str = r"
     SELECT batch_id, file_id, model, deployment, upstream_batch_id, batch
       FROM wyrd.gateway_batches
      WHERE request_sha256 = $1
-"#;
+";
 
 /// Reads one batch.
-const BATCH_SQL: &str = r#"
+const BATCH_SQL: &str = r"
     SELECT batch_id, file_id, model, deployment, upstream_batch_id, batch
       FROM wyrd.gateway_batches
      WHERE batch_id = $1
-"#;
+";
 
 /// Lists created batches newest first below an optional cursor, restricted,
 /// unless `$3` is NULL, to models of providers `$3` or exact models `$4`.
-const BATCHES_SQL: &str = r#"
+const BATCHES_SQL: &str = r"
     SELECT batch_id, file_id, model, deployment, upstream_batch_id, batch
       FROM wyrd.gateway_batches
      WHERE upstream_batch_id IS NOT NULL AND ($1::uuid IS NULL OR batch_id < $1)
        AND ($3::text[] IS NULL OR split_part(model, '/', 1) = ANY($3) OR model = ANY($4::text[]))
      ORDER BY batch_id DESC
      LIMIT $2
-"#;
+";
 
 /// Records the provider batch id, when first known, and the last observed
 /// provider batch object.
-const RECORD_BATCH_SQL: &str = r#"
+const RECORD_BATCH_SQL: &str = r"
     UPDATE wyrd.gateway_batches
        SET upstream_batch_id = $2, batch = $3
      WHERE batch_id = $1
        AND (upstream_batch_id IS NULL OR upstream_batch_id = $2)
-"#;
+";
 
 /// Releases a still-pending creation fence.
-const RELEASE_BATCH_SQL: &str = r#"
+const RELEASE_BATCH_SQL: &str = r"
     DELETE FROM wyrd.gateway_batches
      WHERE batch_id = $1 AND upstream_batch_id IS NULL
-"#;
+";
 
 /// Records one uploaded batch input file and returns its stored row.
 ///

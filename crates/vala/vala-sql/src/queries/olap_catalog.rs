@@ -36,7 +36,7 @@ pub async fn upsert_table(
     physical_layout: &serde_json::Value,
 ) -> Result<(), SqlError> {
     sqlx::query(
-        r#"
+        r"
         INSERT INTO vala.bifrost_tables
             (data_tenant_id, table_uid, fqn, fingerprint, physical_layout, origin, actor)
         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, 'system', 'system')
@@ -46,7 +46,7 @@ pub async fn upsert_table(
             fingerprint     = EXCLUDED.fingerprint,
             physical_layout = EXCLUDED.physical_layout,
             updated_at      = now()
-        "#,
+        ",
     )
     .bind(table_uid.as_slice())
     .bind(fqn)
@@ -82,12 +82,12 @@ pub async fn get_by_fqn(
     fqn: &str,
 ) -> Result<Option<BifrostTableRow>, SqlError> {
     sqlx::query_as::<_, BifrostTableRow>(
-        r#"
+        r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
                physical_layout, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
          WHERE fqn = $1
-        "#,
+        ",
     )
     .bind(fqn)
     .fetch_optional(&mut **conn.transaction())
@@ -103,11 +103,11 @@ pub async fn list_tables_for_tenant(
     conn: &mut TenantConn<'_>,
 ) -> Result<Vec<BifrostTableRow>, SqlError> {
     sqlx::query_as::<_, BifrostTableRow>(
-        r#"
+        r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
                physical_layout, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
-        "#,
+        ",
     )
     .fetch_all(&mut **conn.transaction())
     .await

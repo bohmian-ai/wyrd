@@ -22,6 +22,11 @@ pub use tonic_health;
 pub mod wyrd {
     /// Version 1 of the Wyrd gRPC surface.
     pub mod v1 {
+        #![allow(
+            clippy::allow_attributes_without_reason,
+            clippy::pedantic,
+            reason = "tonic-build output: generated code follows tonic's style, not ours"
+        )]
         tonic::include_proto!("wyrd.v1");
     }
 }
@@ -72,7 +77,7 @@ mod otlp_reexport_tests {
     // Each reference fails to compile if the corresponding re-export is removed.
     use super::otlp;
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "a compile-time assertion; it is never called")]
     fn _assert_service_traits_reexported<T, M, L>()
     where
         T: otlp::trace_service::trace_service_server::TraceService,
@@ -84,10 +89,10 @@ mod otlp_reexport_tests {
     #[test]
     fn otlp_proto_traits_reexported() {
         // One request message per signal, reached through the facade.
-        let _trace: Option<otlp::trace_service::ExportTraceServiceRequest> = None;
-        let _metrics: Option<otlp::metrics_service::ExportMetricsServiceRequest> = None;
-        let _logs: Option<otlp::logs_service::ExportLogsServiceRequest> = None;
+        let _: Option<otlp::trace_service::ExportTraceServiceRequest> = None;
+        let _: Option<otlp::metrics_service::ExportMetricsServiceRequest> = None;
+        let _: Option<otlp::logs_service::ExportLogsServiceRequest> = None;
         // One signal message type, proving the message modules re-export too.
-        let _spans: Option<otlp::trace::v1::ResourceSpans> = None;
+        let _: Option<otlp::trace::v1::ResourceSpans> = None;
     }
 }

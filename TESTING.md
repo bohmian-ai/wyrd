@@ -33,7 +33,12 @@ absorb the other, so both exist.
 ## Layout
 
 Both trees use the same shape: a capability directory whose `main.rs` is the
-`[[test]]` target and whose siblings are ordinary directory modules.
+`[[test]]` target and whose siblings are ordinary directory modules. Every other
+crate has exactly one integration target, `tests/integration/main.rs`, with one
+module per surface; lanes select a surface with `-E 'test(/^<module>::/)'`.
+Each target statically links the crate's whole dependency cone, so one target
+per crate keeps link time, linker memory, and `target/` size proportional to
+crates rather than to test files.
 
 ```
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/
@@ -112,7 +117,7 @@ For scoped verification (`gate` already includes its checks):
 ```bash
 mise run fmt lints                       # relevant Rust format and lint checks
 mise run codegen:check                   # contracts, schemas, stubs
-mise run check:client-tier | check:pyo3-scope | check:unwrap-audit
+mise run check:deps                      # crate boundaries on the dependency graph
 ```
 
 ## Family lanes vs. gated journeys

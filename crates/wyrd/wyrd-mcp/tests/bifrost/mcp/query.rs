@@ -11,6 +11,7 @@ use crate::connectivity::{McpJourneyError, client, discover, problem, structured
 /// The query journey's Postgres-backed cases.
 mod pg_tests {
     use super::{McpJourneyError, client, discover, problem, structured, transport};
+    use std::fmt::Write as _;
 
     use std::time::Duration;
 
@@ -708,9 +709,10 @@ mod pg_tests {
             .as_str()
             .ok_or("the attribute payload is a JSON string")?;
         let hex_of = |text: &str| {
-            text.bytes()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
+            text.bytes().fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
         };
         assert!(
             payload.contains(&hex_of(fixture::INPUT_MESSAGES))

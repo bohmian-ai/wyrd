@@ -96,7 +96,7 @@ async fn a_cluster_member_reaches_both_adapters(
     cluster: &PeerCluster,
     destination: &str,
 ) -> Result<(), PeerJourneyError> {
-    for adapter in ADAPTERS.iter() {
+    for adapter in &ADAPTERS {
         let before = cluster.peer_body_polls();
         cluster
             .probe(&PeerProbePlan::own(destination).against(adapter.clone()))

@@ -37,7 +37,7 @@ impl Cli {
     /// the derive-catalogued local CLI error.
     pub async fn dispatch(self) -> Result<std::process::ExitCode, crate::error::CliBoundaryError> {
         match self.command {
-            Command::Plan(args) => crate::card::dispatch_plan(args).await.map_err(Into::into),
+            Command::Plan(args) => crate::card::dispatch_plan(args).map_err(Into::into),
             Command::Apply(args) => crate::card::dispatch_apply(args).await.map_err(Into::into),
             Command::Get(args) => crate::card::dispatch_get(args).await.map_err(Into::into),
             Command::Latest(args) => crate::card::dispatch_latest(args).await.map_err(Into::into),

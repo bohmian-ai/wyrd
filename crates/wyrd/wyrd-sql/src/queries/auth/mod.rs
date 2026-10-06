@@ -53,8 +53,6 @@ pub use role_assignments::{
 pub use roles::{
     RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,
 };
-#[allow(deprecated)]
-pub use service_accounts::service_account_roles;
 pub use service_accounts::{
     ApiKeyLookupRow, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
     api_key_status_by_prefix, delete_service_account, insert_api_key, insert_refresh_token,

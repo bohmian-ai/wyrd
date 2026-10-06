@@ -132,7 +132,13 @@ impl BackendSigner {
     /// # Errors
     /// Returns a backend error when finalization fails or the payload does not
     /// match the active backend.
-    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
+    #[cfg_attr(
+        not(feature = "cloud"),
+        expect(
+            unused_variables,
+            reason = "only the `cloud` backend reads the upload id"
+        )
+    )]
     pub async fn complete_server_side(
         &self,
         path: &ValidatedPath,

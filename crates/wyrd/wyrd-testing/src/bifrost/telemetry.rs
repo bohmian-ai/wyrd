@@ -1,5 +1,6 @@
 //! Read-only parsing and validation of production Forge telemetry windows.
 
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,6 +111,10 @@ pub(crate) struct TelemetryBinding {
     /// Required window aggregation.
     aggregation: TelemetryAggregation,
     /// Closed workload requirement.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only the binding contract test reads it")
+    )]
     requirement: TelemetryRequirement,
     /// Closed categorical label domains.
     allowed_label_values: &'static [TelemetryLabelValues],
@@ -1314,7 +1319,7 @@ impl BifrostTelemetryCapture {
         rendered_values(&rendered)
             .ok()
             .into_iter()
-            .flat_map(|values| values.into_iter())
+            .flat_map(std::iter::IntoIterator::into_iter)
             .filter_map(|(series, value)| parse_sample(&series, value, &types).ok())
             .map(|sample| sample.family)
             .collect()
@@ -1467,16 +1472,7 @@ impl BifrostTelemetryCapture {
             }
             let prior = checkpoint.metrics.get(series).copied().unwrap_or(0.0);
             let parsed = parse_sample(series, *value, &current_types)?;
-            if parsed.kind != BifrostMetricKind::Gauge {
-                if *value < prior {
-                    return Err(BifrostTelemetryReportError::CounterRegression {
-                        series: series.clone(),
-                    });
-                }
-                let mut sample = parsed;
-                sample.value = *value - prior;
-                metrics.push(sample);
-            } else {
+            if parsed.kind == BifrostMetricKind::Gauge {
                 let baseline = parse_sample(series, prior, &current_types)?;
                 let end = parse_sample(series, *value, &current_types)?;
                 gauge_maxima.push(BifrostMetricSample {
@@ -1486,6 +1482,15 @@ impl BifrostTelemetryCapture {
                     kind: end.kind,
                 });
                 gauge_final.push(end);
+            } else {
+                if *value < prior {
+                    return Err(BifrostTelemetryReportError::CounterRegression {
+                        series: series.clone(),
+                    });
+                }
+                let mut sample = parsed;
+                sample.value = *value - prior;
+                metrics.push(sample);
             }
         }
         Ok(BifrostTelemetryDelta {
@@ -1509,16 +1514,16 @@ impl BifrostTelemetryCapture {
     ///
     /// Returns [`BifrostTelemetryReportError::Parse`] when the initial render is
     /// malformed. The sampler never receives fixture, SQL, or scenario values.
-    pub async fn begin_gauge_sampling(
+    pub fn begin_gauge_sampling(
         &self,
-        _checkpoint: &BifrostTelemetryCheckpoint,
+        checkpoint: &BifrostTelemetryCheckpoint,
     ) -> Result<BifrostTelemetrySampler, BifrostTelemetryReportError> {
         let initial_rendered = self.metrics.render();
         let initial = rendered_values(&initial_rendered)?;
         let initial_types = rendered_types(&initial_rendered)?;
         let mut initial_maxima = BTreeMap::new();
         merge_gauge_maxima(&mut initial_maxima, &initial, &initial_types)?;
-        let initial_process = process_sample(_checkpoint.process.epoch)?;
+        let initial_process = process_sample(checkpoint.process.epoch)?;
         let stop = tokio_util::sync::CancellationToken::new();
         let sampler_stop = stop.clone();
         let metrics = self.metrics.clone();
@@ -1543,17 +1548,17 @@ impl BifrostTelemetryCapture {
                         let types = rendered_types(&exposition)?;
                         merge_gauge_maxima(&mut snapshot.maxima, &rendered, &types)?;
                         let next = process_sample(snapshot.process.epoch)?;
-                        if next.identity != snapshot.process.identity {
-                            snapshot.process = ProcessSample { epoch: snapshot.process.epoch.checked_add(1).ok_or_else(|| BifrostTelemetryReportError::Parse { detail: "process epoch overflow".to_owned() })?, ..next };
-                            snapshot.peak_rss_bytes = snapshot.process.rss_bytes;
-                            snapshot.queue_peak = snapshot.process.queue_depth;
-                        } else {
+                        if next.identity == snapshot.process.identity {
                             if next.cpu_total < snapshot.process.cpu_total || next.tokio_busy_total < snapshot.process.tokio_busy_total {
                                 return Err(BifrostTelemetryReportError::CounterRegression { series: "process cumulative counters".to_owned() });
                             }
                             snapshot.peak_rss_bytes = snapshot.peak_rss_bytes.max(next.rss_bytes);
                             snapshot.queue_peak = snapshot.queue_peak.max(next.queue_depth);
                             snapshot.process = next;
+                        } else {
+                            snapshot.process = ProcessSample { epoch: snapshot.process.epoch.checked_add(1).ok_or_else(|| BifrostTelemetryReportError::Parse { detail: "process epoch overflow".to_owned() })?, ..next };
+                            snapshot.peak_rss_bytes = snapshot.process.rss_bytes;
+                            snapshot.queue_peak = snapshot.process.queue_depth;
                         }
                     },
                 }
@@ -1755,11 +1760,6 @@ fn evaluate_cluster_bindings_required(
     let mut evaluated = BTreeMap::new();
     for binding in CLUSTER_BINDINGS {
         validate_binding_labels(binding)?;
-        let _aggregation = binding.aggregation;
-        let _required = match binding.requirement {
-            TelemetryRequirement::Always => true,
-            TelemetryRequirement::Role(role) => !role.is_empty(),
-        };
         validate_binding_unit(binding)?;
         let source = match binding.aggregation {
             TelemetryAggregation::Delta | TelemetryAggregation::P99 => &delta.metrics,
@@ -1876,18 +1876,25 @@ fn evaluate_cluster_bindings_required(
             continue;
         }
         let value = match binding.aggregation {
-            TelemetryAggregation::Delta => EvaluatedBindingValue::Counter(
-                selected.iter().map(|sample| sample.value).sum::<f64>() as u64,
-            ),
+            TelemetryAggregation::Delta => EvaluatedBindingValue::Counter(whole_count(
+                binding,
+                selected.iter().map(|sample| sample.value).sum::<f64>(),
+            )?),
             TelemetryAggregation::Peak => EvaluatedBindingValue::Gauge {
                 final_value: 0,
-                peak: selected
-                    .iter()
-                    .map(|sample| sample.value)
-                    .fold(0.0, f64::max) as u64,
+                peak: whole_count(
+                    binding,
+                    selected
+                        .iter()
+                        .map(|sample| sample.value)
+                        .fold(0.0, f64::max),
+                )?,
             },
             TelemetryAggregation::Final => EvaluatedBindingValue::Gauge {
-                final_value: selected.iter().map(|sample| sample.value).sum::<f64>() as u64,
+                final_value: whole_count(
+                    binding,
+                    selected.iter().map(|sample| sample.value).sum::<f64>(),
+                )?,
                 peak: 0,
             },
             TelemetryAggregation::P99 => {
@@ -2253,7 +2260,7 @@ where
     Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
 {
     let checkpoint = capture.checkpoint()?;
-    let sampler = capture.begin_gauge_sampling(&checkpoint).await?;
+    let sampler = capture.begin_gauge_sampling(&checkpoint)?;
     let workload_result = workload().await;
     let telemetry_result = capture.delta_since_with_sampler(checkpoint, sampler).await;
     match (workload_result, telemetry_result) {
@@ -2290,6 +2297,19 @@ fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTeleme
 }
 
 /// Construct one stable binding failure without exposing metric values.
+/// Converts one aggregated metric sample to the whole count a binding reports.
+///
+/// Counters and gauges render as floats; the conversion truncates any fraction
+/// and refuses values that are negative, non-finite, or exceed `u64`.
+///
+/// # Errors
+/// Returns invalid binding when the value cannot be represented as `u64`.
+fn whole_count(binding: &TelemetryBinding, value: f64) -> Result<u64, BifrostTelemetryReportError> {
+    value
+        .to_u64()
+        .ok_or_else(|| invalid_binding(binding, "metric value is not a representable count"))
+}
+
 fn invalid_binding(binding: &TelemetryBinding, detail: &str) -> BifrostTelemetryReportError {
     BifrostTelemetryReportError::InvalidBinding {
         id: binding.id.0.to_owned(),
@@ -2585,14 +2605,12 @@ pub(crate) fn seconds_to_micros(
     binding_id: &str,
     seconds: f64,
 ) -> Result<u64, BifrostTelemetryReportError> {
-    let micros = seconds * 1_000_000.0;
-    if !micros.is_finite() || micros < 0.0 || micros.round() > u64::MAX as f64 {
-        return Err(BifrostTelemetryReportError::InvalidBinding {
+    (seconds * 1_000_000.0).round().to_u64().ok_or_else(|| {
+        BifrostTelemetryReportError::InvalidBinding {
             id: binding_id.to_owned(),
             detail: "duration cannot be represented in microseconds".to_owned(),
-        });
-    }
-    Ok(micros.round() as u64)
+        }
+    })
 }
 
 /// Estimate a histogram quantile after selecting one exact closed label.

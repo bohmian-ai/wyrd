@@ -30,22 +30,21 @@ pub fn pick_root(order: &TopoOrder) -> Result<RootPick, GraphError> {
         .map(|node| node.card_ref.clone())
         .collect::<Vec<_>>();
 
-    match candidates.as_slice() {
-        [root] => Ok(RootPick { root: root.clone() }),
-        _ => {
-            let services = candidates
-                .iter()
-                .filter(|candidate| candidate.kind == CardKind::Service)
-                .collect::<Vec<_>>();
-            if let [service] = services.as_slice() {
-                return Ok(RootPick {
-                    root: (*service).clone(),
-                });
-            }
-            let mut candidates = candidates;
-            candidates.sort_by_key(identity_key);
-            Err(GraphError::MultipleRoots { candidates })
+    if let [root] = candidates.as_slice() {
+        Ok(RootPick { root: root.clone() })
+    } else {
+        let services = candidates
+            .iter()
+            .filter(|candidate| candidate.kind == CardKind::Service)
+            .collect::<Vec<_>>();
+        if let [service] = services.as_slice() {
+            return Ok(RootPick {
+                root: (*service).clone(),
+            });
         }
+        let mut candidates = candidates;
+        candidates.sort_by_key(identity_key);
+        Err(GraphError::MultipleRoots { candidates })
     }
 }
 

@@ -198,7 +198,7 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(completion())
-                .set_delay(Duration::from_secs(60)),
+                .set_delay(Duration::from_mins(1)),
         )
         .mount(&journey.upstream)
         .await;

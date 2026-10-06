@@ -18,13 +18,12 @@ fn write<T: schemars::JsonSchema>(out: &Path, golden: &Path, name: &str) -> std:
 }
 
 fn main() -> std::io::Result<()> {
+    use wyrd_client::transport::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = manifest.join("schemas");
     let golden = manifest.join("tests/schemas");
     std::fs::create_dir_all(&out)?;
     std::fs::create_dir_all(&golden)?;
-
-    use wyrd_client::transport::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
 
     write::<TransportConfig>(&out, &golden, "transport_config_enum")?;
     write::<GrpcConfig>(&out, &golden, "transport_config_grpc")?;

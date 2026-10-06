@@ -113,7 +113,7 @@ fn negative_resource_spans(anchor: i64, invalid: &[usize]) -> Vec<ResourceSpans>
                     ],
                 },
             );
-            span.trace_state = (*marker).to_owned();
+            (*marker).clone_into(&mut span.trace_state);
             if invalid.contains(&index) {
                 span.name = String::new();
             }
@@ -138,7 +138,7 @@ fn negative_resource_logs(anchor: i64, invalid: &[usize]) -> Vec<ResourceLogs> {
         .enumerate()
         .map(|(index, marker)| {
             let mut record = support::maximal_log_record(anchor);
-            record.event_name = (*marker).to_owned();
+            (*marker).clone_into(&mut record.event_name);
             if invalid.contains(&index) {
                 record.severity_text = over_long_severity_text();
             }

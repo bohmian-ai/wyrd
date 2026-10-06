@@ -120,5 +120,4 @@ verbatim.
   Auth-plane route, not a third plane. The JWT (`principal.card_ref`)
   plus opaque client-generated `run_id` carry everything.
 - **Legacy server vocab** (former project names, `_delta_log`, Delta
-  transaction-log logic in new Vala paths). Enforced by
-  `check:no-legacy-server-vocab`.
+  transaction-log logic in new Vala paths).

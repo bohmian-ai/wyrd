@@ -114,8 +114,6 @@ impl PyWyrdState {
     ///
     #[staticmethod]
     #[pyo3(signature = (path, *, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
-    // justification: pyo3 boundary; the extractor produces an owned PathBuf, and the path is moved into the detached filesystem operation
-    #[allow(clippy::needless_pass_by_value)]
     fn from_path(
         py: Python<'_>,
         path: PathBuf,
@@ -161,8 +159,10 @@ impl PyWyrdState {
     /// undialable ingest channel, or a missing, unauthorized, or incompatible
     /// fixed observation table.
     #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, tenant=None, client_byte_limit_bytes=None))]
-    // justification: pyo3 boundary; each keyword argument of the Python signature is one Rust parameter
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 boundary; each keyword argument of the Python signature is one Rust parameter"
+    )]
     fn start_bifrost(
         &self,
         py: Python<'_>,
@@ -385,8 +385,6 @@ impl PyWyrdState {
     /// # Errors
     ///
     /// Returns the visitor's [`PyTraverseError`] as soon as a visit fails.
-    // justification: pyo3 GC callbacks receive their visitor by value.
-    #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         for value in self.envelopes.values() {
             visit.call(value)?;
@@ -1616,8 +1614,6 @@ impl PyCards {
     /// or the saved-login selection cannot be loaded.
     #[new]
     #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    // justification: pyo3 boundary; Python callers provide owned optional strings and credential is consumed into SecretString
-    #[allow(clippy::needless_pass_by_value)]
     fn __new__(
         server_url: Option<String>,
         credential: Option<String>,
@@ -1730,8 +1726,6 @@ impl PyCards {
     /// Returns a Wyrd error when the bundle is invalid, its artifacts cannot
     /// be read, or registration does not complete.
     #[pyo3(signature = (path))]
-    // justification: pyo3 boundary; the extractor produces an owned PathBuf, and the path is moved into the detached filesystem/network operation
-    #[allow(clippy::needless_pass_by_value)]
     fn register_from_path(
         &self,
         py: Python<'_>,

@@ -111,6 +111,10 @@ pub(crate) fn platform_administrator_grant() -> PermissionSet {
 /// [`InitError::Disclose`] when the credential cannot be written or flushed,
 /// and [`InitError::Store`] when a write or the commit fails. A failed
 /// initialization commits nothing and can be retried unchanged.
+///
+/// # Panics
+///
+/// Panics if the platform administrator grant fails JSON serialization, which it cannot.
 #[tracing::instrument(level = "info", skip(pool, disclosure), err)]
 pub async fn initialize_platform_root(
     pool: &OperatorPool,

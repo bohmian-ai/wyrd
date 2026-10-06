@@ -31,7 +31,6 @@ def test_model_dump_json_round_trips_through_rust_for_all_interfaces(tmp_path) -
         assert restored.interface.kind == card.interface.kind
 
 
-@pytest.mark.wyrd_covers("python:DataCard.model_validate_json")
 def test_model_validate_json_rehydrates_interface_from_metadata(tmp_path) -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
     restored = DataCard.model_validate_json(card.model_dump_json())
@@ -40,7 +39,6 @@ def test_model_validate_json_rehydrates_interface_from_metadata(tmp_path) -> Non
     assert restored.interface.has_source is False
 
 
-@pytest.mark.wyrd_covers("python:DataCard.model_dump_json")
 def test_serialized_datacard_contains_spec_interface_metadata_not_python_state(tmp_path) -> None:
     payload = json.loads(DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))).model_dump_json())
 

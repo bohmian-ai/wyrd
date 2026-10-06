@@ -126,15 +126,12 @@ fn evaluate_item_mode(
     task: &AssertionTask,
     observed: &Value,
 ) -> Result<(bool, Option<Value>, Value, Option<String>), EvalExecError> {
-    let items = match observed {
-        Value::Array(items) => items,
-        _ => {
-            return Err(EvalExecError::OperatorTypeMismatch {
-                task_id: task.id.clone(),
-                operator: format!("{:?}", task.operator),
-                reason: "item_context_path resolved to a non-array value".to_string(),
-            });
-        }
+    let Value::Array(items) = observed else {
+        return Err(EvalExecError::OperatorTypeMismatch {
+            task_id: task.id.clone(),
+            operator: format!("{:?}", task.operator),
+            reason: "item_context_path resolved to a non-array value".to_string(),
+        });
     };
 
     let mut failures = 0_usize;
@@ -170,7 +167,7 @@ fn evaluate_item_mode(
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
     let diff = Utc::now().signed_duration_since(start);
-    diff.num_milliseconds().max(0) as u64
+    u64::try_from(diff.num_milliseconds()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -417,7 +414,7 @@ mod assertion_stage {
         for outcome in &report.outcomes {
             match outcome {
                 TaskRunOutcome::Ran(result) => {
-                    assert!(result.passed, "{:?} failed", result.task_id)
+                    assert!(result.passed, "{:?} failed", result.task_id);
                 }
                 TaskRunOutcome::Skipped { .. } => panic!("no skips expected"),
             }

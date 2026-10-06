@@ -128,8 +128,10 @@ impl Agent {
         provider_api_key = None,
         output_type = None
     ))]
-    // justification: pyo3 #[new] signature must match the Python API surface; the params correspond 1:1 to the exposed Python constructor
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new] signature must match the Python API surface; the params correspond 1:1 to the exposed Python constructor"
+    )]
     pub fn __new__(
         py: Python<'_>,
         prompt: &Bound<'_, PyAny>,
@@ -993,8 +995,8 @@ fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<A
 /// Generic callable path: calls `cls(**structured_output_dict)`.
 ///
 /// Returns `WYRD_AGENT_422_STRUCTURED_DECODE` on instantiation failure.
-fn instantiate_parsed<'py>(
-    py: Python<'py>,
+fn instantiate_parsed(
+    py: Python<'_>,
     cls: &Py<PyAny>,
     output_text: &str,
     map: &serde_json::Map<String, serde_json::Value>,
@@ -1004,7 +1006,7 @@ fn instantiate_parsed<'py>(
     if bound.hasattr("model_validate_json").unwrap_or(false) {
         return bound
             .call_method1("model_validate_json", (output_text,))
-            .map(|r| r.unbind())
+            .map(pyo3::Bound::unbind)
             .map_err(|e| structured_decode_error(&e));
     }
 
@@ -1016,6 +1018,6 @@ fn instantiate_parsed<'py>(
         .map_err(|e| structured_decode_error(&e))?;
     bound
         .call((), Some(kwargs))
-        .map(|r| r.unbind())
+        .map(pyo3::Bound::unbind)
         .map_err(|e| structured_decode_error(&e))
 }

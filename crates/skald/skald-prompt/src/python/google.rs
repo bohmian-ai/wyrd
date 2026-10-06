@@ -13,7 +13,7 @@ use skald_spec::wire::google_generate::{
     GoogleFileData, GoogleFunctionCall, GoogleFunctionCallingConfig, GoogleFunctionDeclaration,
     GoogleFunctionResponse, GoogleGenerateContentRequest, GoogleGenerateContentResponse,
     GoogleGenerationConfig, GoogleInlineData, GooglePart, GoogleSafetyRating, GoogleSafetySetting,
-    GoogleThinkingConfig, GoogleTool, GoogleToolConfig, GoogleUsageMetadata,
+    GoogleThinkingConfig, GoogleTool, GoogleUsageMetadata,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_utils::py::WyrdPyResult;
@@ -573,15 +573,6 @@ impl PyGoogleFunctionDeclaration {
 #[pyclass(module = "wyrd.prompt", name = "GoogleToolConfig")]
 pub struct PyGoogleToolConfig {
     inner: Arc<ProviderRequest>,
-}
-impl PyGoogleToolConfig {
-    #[allow(dead_code)]
-    fn c(&self) -> &GoogleToolConfig {
-        google_request(&self.inner)
-            .tool_config
-            .as_ref()
-            .expect("guarded")
-    }
 }
 #[pymethods]
 impl PyGoogleToolConfig {

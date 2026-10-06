@@ -617,12 +617,9 @@ mod pg_tests {
         let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'auth.login' THEN
@@ -630,15 +627,15 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_login_audit
+            r"CREATE TRIGGER test_fail_login_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()",
         )
         .execute(&superuser)
         .await
@@ -816,12 +813,9 @@ mod pg_tests {
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let (hash, login) = pending_login(&fixture, state_hash(10), binding, "nonce").await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_roles_sync_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_roles_sync_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'auth.user.roles.sync' THEN
@@ -829,15 +823,15 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_roles_sync_audit
+            r"CREATE TRIGGER test_fail_roles_sync_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_roles_sync_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_roles_sync_audit()",
         )
         .execute(&superuser)
         .await
@@ -998,12 +992,9 @@ mod pg_tests {
             LoginInitiation::ConnectionTest(tester),
         )
         .await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_tested_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_tested_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'identity.oidc.candidate.tested' THEN
@@ -1011,15 +1002,15 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_candidate_tested_audit
+            r"CREATE TRIGGER test_fail_candidate_tested_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_tested_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_tested_audit()",
         )
         .execute(&superuser)
         .await
@@ -1274,7 +1265,7 @@ mod pg_tests {
             group_role_map,
             default_roles,
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 
@@ -1299,7 +1290,7 @@ mod pg_tests {
             group_role_map,
             default_roles,
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 

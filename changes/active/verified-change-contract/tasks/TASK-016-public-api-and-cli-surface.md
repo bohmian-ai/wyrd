@@ -124,7 +124,7 @@ Python exception hierarchy and catalog-completeness behavior remain owned by `ch
 
 **Behavior.** Tenant creation ensures every current canonical built-in before the tenant becomes active. Server startup lists active tenants and idempotently ensures the same inventory, backfilling additions. An unwritten built-in is therefore queryable and empty; first-write and describe paths no longer own creation (REQ-201, AC-055).
 
-**RED.** Add `platform_admin_e2e::new_and_existing_tenants_receive_every_builtin`; run `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=new_and_existing_tenants_receive_every_builtin)'"`.
+**RED.** Add `platform_admin_e2e::new_and_existing_tenants_receive_every_builtin`; run `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(=platform_admin_e2e::new_and_existing_tenants_receive_every_builtin)'"`.
 
 **GREEN.** Compose tenant provisioning and boot reconciliation with the existing catalog and `builtin_tables()` list. Treat failure as provisioning/startup failure rather than exposing a partially ready tenant or ready server.
 

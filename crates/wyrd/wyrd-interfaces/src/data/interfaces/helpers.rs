@@ -252,7 +252,6 @@ pub(super) fn parse_card_ref(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<O
 }
 
 #[cfg(feature = "python")]
-#[allow(dead_code)]
 pub(super) fn huggingface_dataset_id(data: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
     huggingface_optional_attr(data, &["dataset_id", "repo_id", "path"])
         .or_else(|| {
@@ -269,7 +268,6 @@ pub(super) fn huggingface_dataset_id(data: &Bound<'_, PyAny>) -> WyrdPyResult<St
 }
 
 #[cfg(feature = "python")]
-#[allow(dead_code)]
 pub(super) fn huggingface_optional_attr(data: &Bound<'_, PyAny>, names: &[&str]) -> Option<String> {
     for name in names {
         if let Ok(value) = data.getattr(*name) {
@@ -289,7 +287,6 @@ pub(super) fn huggingface_optional_attr(data: &Bound<'_, PyAny>, names: &[&str])
 macro_rules! impl_clone_for_handle {
     ($type:ty { $($field:ident),+ $(,)? }) => {
         impl $type {
-            #[allow(dead_code)]
             pub(super) fn clone_for_handle(&self, _py: Python<'_>) -> Self {
                 Self {
                     data: self.data.as_ref().map(Arc::clone),

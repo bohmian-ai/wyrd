@@ -478,12 +478,11 @@ fn evaluate_condition(
 
         acc = match (acc, pending) {
             (None, _) => Some(this),
-            (Some(prev), Some(ConditionCombinator::And)) => Some(prev && this),
+            (Some(prev), Some(ConditionCombinator::And) | None) => Some(prev && this),
             (Some(prev), Some(ConditionCombinator::Or)) => Some(prev || this),
             // Trailing link without a combinator: treat as conjunction. Chain
             // validation in `wyrd_spec` already rejects non-terminal links
             // missing a combinator.
-            (Some(prev), None) => Some(prev && this),
         };
         pending = node.combinator;
 

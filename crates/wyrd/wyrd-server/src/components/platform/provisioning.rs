@@ -54,8 +54,7 @@ const TENANT_ADMIN_ROLE: &str = "admin";
 /// not configure it immediately. Rotating it to something shorter-lived is the
 /// tenant administrator's first available action.
 /// Lifetime of the initial tenant-administrator credential.
-const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration =
-    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(8760);
 
 /// Tenant provisioning failure.
 #[derive(Debug, thiserror::Error)]
@@ -439,41 +438,38 @@ impl TenantProvisioning {
         // created by the failed one. Reusing it is what keeps the tenant's
         // identity stable across the retry; creating a second would leave the
         // first behind holding the same role.
-        let principal_id = match tenant_admin_principal_id(&mut conn)
+        let principal_id = if let Some(existing) = tenant_admin_principal_id(&mut conn)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
         {
-            Some(existing) => {
-                // The failed attempt may have committed a credential before it
-                // stopped, and its plaintext was never disclosed to anyone. A
-                // retry returns exactly one usable way in, so every credential
-                // this principal already holds is retired first rather than
-                // left live and unaccounted for.
-                for credential in list_api_key_metadata(&mut conn, existing)
-                    .await
-                    .map_err(|e| ProvisionError::Store(e.to_string()))?
-                {
-                    revoke_api_key(&mut conn, credential.id)
-                        .await
-                        .map_err(|e| ProvisionError::Store(e.to_string()))?;
-                }
-                existing
-            }
-            None => {
-                let principal_id = Uuid::now_v7();
-                insert_service_account(
-                    &mut conn,
-                    principal_id,
-                    "tenant_admin",
-                    None,
-                    "tenant-admin",
-                    Some("Tenant administrative principal"),
-                    created_by,
-                )
+            // The failed attempt may have committed a credential before it
+            // stopped, and its plaintext was never disclosed to anyone. A
+            // retry returns exactly one usable way in, so every credential
+            // this principal already holds is retired first rather than
+            // left live and unaccounted for.
+            for credential in list_api_key_metadata(&mut conn, existing)
                 .await
-                .map_err(|e| ProvisionError::Store(e.to_string()))?;
-                principal_id
+                .map_err(|e| ProvisionError::Store(e.to_string()))?
+            {
+                revoke_api_key(&mut conn, credential.id)
+                    .await
+                    .map_err(|e| ProvisionError::Store(e.to_string()))?;
             }
+            existing
+        } else {
+            let principal_id = Uuid::now_v7();
+            insert_service_account(
+                &mut conn,
+                principal_id,
+                "tenant_admin",
+                None,
+                "tenant-admin",
+                Some("Tenant administrative principal"),
+                created_by,
+            )
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+            principal_id
         };
 
         let role = role_by_name(&mut conn, TENANT_ADMIN_ROLE)

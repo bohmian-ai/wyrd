@@ -44,8 +44,8 @@ impl PoolConfig {
             max_connections: 32,
             min_connections: 2,
             acquire_timeout: Duration::from_secs(5),
-            idle_timeout: Some(Duration::from_secs(300)),
-            max_lifetime: Some(Duration::from_secs(1_800)),
+            idle_timeout: Some(Duration::from_mins(5)),
+            max_lifetime: Some(Duration::from_mins(30)),
             statement_cache_capacity: 256,
             test_before_acquire: true,
         }
@@ -73,8 +73,8 @@ impl PoolConfig {
             max_connections: 2,
             min_connections: 0,
             acquire_timeout: Duration::from_secs(5),
-            idle_timeout: Some(Duration::from_secs(60)),
-            max_lifetime: Some(Duration::from_secs(900)),
+            idle_timeout: Some(Duration::from_mins(1)),
+            max_lifetime: Some(Duration::from_mins(15)),
             statement_cache_capacity: 64,
             test_before_acquire: true,
         }
@@ -101,26 +101,34 @@ impl PoolConfig {
     /// Override a default pool config from `WYRD_DB_*{suffix}` env vars.
     #[must_use]
     pub fn from_env_with_suffix(defaults: Self, suffix: &str) -> Self {
+        Self::from_lookup(defaults, suffix, |name| env::var(name).ok())
+    }
+
+    /// Override a default pool config from `WYRD_DB_*{suffix}` values.
+    ///
+    /// `lookup` returns the value of a variable name; unset, unparseable, or
+    /// out-of-range values keep the matching field of `defaults`. Production
+    /// callers use [`PoolConfig::from_env_with_suffix`]; tests pass a map.
+    #[must_use]
+    pub fn from_lookup(
+        defaults: Self,
+        suffix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let value = |base: &str| lookup(&format!("{base}{suffix}"));
         Self {
-            max_connections: env_u32("WYRD_DB_MAX_CONNECTIONS", suffix, defaults.max_connections),
-            min_connections: env_u32("WYRD_DB_MIN_CONNECTIONS", suffix, defaults.min_connections),
-            acquire_timeout: env_secs(
-                "WYRD_DB_ACQUIRE_TIMEOUT_SECS",
-                suffix,
-                defaults.acquire_timeout,
-            ),
-            idle_timeout: env_opt_secs("WYRD_DB_IDLE_TIMEOUT_SECS", suffix, defaults.idle_timeout),
-            max_lifetime: env_opt_secs("WYRD_DB_MAX_LIFETIME_SECS", suffix, defaults.max_lifetime),
-            statement_cache_capacity: env_usize(
-                "WYRD_DB_STATEMENT_CACHE_CAPACITY",
-                suffix,
+            max_connections: parse_or(value("WYRD_DB_MAX_CONNECTIONS"), defaults.max_connections),
+            min_connections: parse_or(value("WYRD_DB_MIN_CONNECTIONS"), defaults.min_connections),
+            acquire_timeout: parse_secs(value("WYRD_DB_ACQUIRE_TIMEOUT_SECS"))
+                .unwrap_or(defaults.acquire_timeout),
+            idle_timeout: parse_opt_secs(value("WYRD_DB_IDLE_TIMEOUT_SECS"), defaults.idle_timeout),
+            max_lifetime: parse_opt_secs(value("WYRD_DB_MAX_LIFETIME_SECS"), defaults.max_lifetime),
+            statement_cache_capacity: parse_or(
+                value("WYRD_DB_STATEMENT_CACHE_CAPACITY"),
                 defaults.statement_cache_capacity,
             ),
-            test_before_acquire: env_bool(
-                "WYRD_DB_TEST_BEFORE_ACQUIRE",
-                suffix,
-                defaults.test_before_acquire,
-            ),
+            test_before_acquire: parse_bool(value("WYRD_DB_TEST_BEFORE_ACQUIRE"))
+                .unwrap_or(defaults.test_before_acquire),
         }
     }
 }
@@ -208,73 +216,47 @@ pub(crate) async fn connect_pool(
     pool.connect_with(options).await
 }
 
-fn env_name(base: &str, suffix: &str) -> String {
-    format!("{base}{suffix}")
-}
-
-fn env_u32(base: &str, suffix: &str, default: u32) -> u32 {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
+/// Parse `value` as `T`, keeping `default` when it is unset or invalid.
+fn parse_or<T: std::str::FromStr>(value: Option<String>, default: T) -> T {
+    value
+        .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
 
-fn env_usize(base: &str, suffix: &str, default: usize) -> usize {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn env_secs(base: &str, suffix: &str, default: Duration) -> Duration {
-    env::var(env_name(base, suffix))
-        .ok()
+/// Parse a finite, non-negative number of seconds.
+fn parse_secs(value: Option<String>) -> Option<Duration> {
+    value
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
         .map(Duration::from_secs_f64)
-        .unwrap_or(default)
 }
 
-fn env_opt_secs(base: &str, suffix: &str, default: Option<Duration>) -> Option<Duration> {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("off") {
-                Some(None)
-            } else {
-                value
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                    .map(Duration::from_secs_f64)
-                    .map(Some)
-            }
-        })
-        .unwrap_or(default)
+/// Parse an optional timeout where `off` disables it; invalid values keep
+/// `default`.
+fn parse_opt_secs(value: Option<String>, default: Option<Duration>) -> Option<Duration> {
+    match value {
+        Some(value) if value.eq_ignore_ascii_case("off") => None,
+        value => parse_secs(value).or(default),
+    }
 }
 
-fn env_bool(base: &str, suffix: &str, default: bool) -> bool {
-    env::var(env_name(base, suffix))
-        .ok()
-        .and_then(|value| match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
+/// Parse a boolean spelled `true/1/yes/on` or `false/0/no/off`.
+fn parse_bool(value: Option<String>) -> Option<bool> {
+    match value?.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use sqlx::postgres::PgPoolOptions;
 
     use super::{PoolConfig, VALIDATE_IDLE_AFTER, connect_pool};
     use crate::dsn::APP_DSN_ENV;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A connection killed while idle past the threshold is replaced, not
     /// handed out.
@@ -333,8 +315,8 @@ mod tests {
                 max_connections: 32,
                 min_connections: 2,
                 acquire_timeout: Duration::from_secs(5),
-                idle_timeout: Some(Duration::from_secs(300)),
-                max_lifetime: Some(Duration::from_secs(1_800)),
+                idle_timeout: Some(Duration::from_mins(5)),
+                max_lifetime: Some(Duration::from_mins(30)),
                 statement_cache_capacity: 256,
                 test_before_acquire: true,
             }
@@ -357,8 +339,8 @@ mod tests {
                 max_connections: 2,
                 min_connections: 0,
                 acquire_timeout: Duration::from_secs(5),
-                idle_timeout: Some(Duration::from_secs(60)),
-                max_lifetime: Some(Duration::from_secs(900)),
+                idle_timeout: Some(Duration::from_mins(1)),
+                max_lifetime: Some(Duration::from_mins(15)),
                 statement_cache_capacity: 64,
                 test_before_acquire: true,
             }
@@ -392,7 +374,6 @@ mod tests {
 
     #[test]
     fn pool_env_overrides_use_role_suffixes() {
-        let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");
         let vars = [
             ("WYRD_DB_MAX_CONNECTIONS_PLATFORM_ADMIN", Some("4")),
             ("WYRD_DB_MIN_CONNECTIONS_PLATFORM_ADMIN", Some("1")),
@@ -405,8 +386,12 @@ mod tests {
             ),
             ("WYRD_DB_TEST_BEFORE_ACQUIRE_PLATFORM_ADMIN", Some("false")),
         ];
-        with_env(&vars, || {
-            let cfg = PoolConfig::platform_admin_from_env();
+        {
+            let cfg = config(
+                PoolConfig::platform_admin_defaults(),
+                "_PLATFORM_ADMIN",
+                &vars,
+            );
 
             assert_eq!(cfg.max_connections, 4);
             assert_eq!(cfg.min_connections, 1);
@@ -415,12 +400,11 @@ mod tests {
             assert_eq!(cfg.max_lifetime, Some(Duration::from_secs(30)));
             assert_eq!(cfg.statement_cache_capacity, 12);
             assert!(!cfg.test_before_acquire);
-        });
+        }
     }
 
     #[test]
     fn pool_env_overrides_cover_app_and_migrator_roles() {
-        let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");
         let vars = [
             ("WYRD_DB_MAX_CONNECTIONS", Some("40")),
             ("WYRD_DB_MIN_CONNECTIONS", Some("3")),
@@ -438,8 +422,8 @@ mod tests {
             ("WYRD_DB_TEST_BEFORE_ACQUIRE_MIGRATOR", Some("true")),
         ];
 
-        with_env(&vars, || {
-            let app = PoolConfig::app_from_env();
+        {
+            let app = config(PoolConfig::app_defaults(), "", &vars);
             assert_eq!(app.max_connections, 40);
             assert_eq!(app.min_connections, 3);
             assert_eq!(app.acquire_timeout, Duration::from_millis(1_500));
@@ -448,7 +432,7 @@ mod tests {
             assert_eq!(app.statement_cache_capacity, 128);
             assert!(!app.test_before_acquire);
 
-            let migrator = PoolConfig::migrator_from_env();
+            let migrator = config(PoolConfig::migrator_defaults(), "_MIGRATOR", &vars);
             assert_eq!(migrator.max_connections, 3);
             assert_eq!(migrator.min_connections, 0);
             assert_eq!(migrator.acquire_timeout, Duration::from_secs(12));
@@ -456,12 +440,11 @@ mod tests {
             assert_eq!(migrator.max_lifetime, Some(Duration::from_secs(25)));
             assert_eq!(migrator.statement_cache_capacity, 0);
             assert!(migrator.test_before_acquire);
-        });
+        }
     }
 
     #[test]
     fn suffixed_pool_vars_fall_back_to_role_defaults_not_app_env() {
-        let _guard = ENV_LOCK.lock().expect("env lock is not poisoned");
         let vars = [
             ("WYRD_DB_MAX_CONNECTIONS", Some("99")),
             ("WYRD_DB_MIN_CONNECTIONS", Some("9")),
@@ -486,67 +469,26 @@ mod tests {
             ("WYRD_DB_TEST_BEFORE_ACQUIRE_PLATFORM_ADMIN", None),
         ];
 
-        with_env(&vars, || {
-            assert_eq!(
-                PoolConfig::migrator_from_env(),
-                PoolConfig::migrator_defaults()
-            );
-            assert_eq!(
-                PoolConfig::platform_admin_from_env(),
-                PoolConfig::platform_admin_defaults()
-            );
-        });
+        assert_eq!(
+            config(PoolConfig::migrator_defaults(), "_MIGRATOR", &vars),
+            PoolConfig::migrator_defaults()
+        );
+        assert_eq!(
+            config(
+                PoolConfig::platform_admin_defaults(),
+                "_PLATFORM_ADMIN",
+                &vars
+            ),
+            PoolConfig::platform_admin_defaults()
+        );
     }
 
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let previous = snapshot_env(&vars.iter().map(|(name, _)| *name).collect::<Vec<_>>());
-        for (name, value) in vars {
-            set_env(name, *value);
-        }
-        f();
-        restore_env(previous);
-    }
-
-    fn snapshot_env(names: &[&str]) -> Vec<(String, Option<std::ffi::OsString>)> {
-        names
-            .iter()
-            .map(|name| ((*name).to_owned(), std::env::var_os(name)))
-            .collect()
-    }
-
-    fn restore_env(values: Vec<(String, Option<std::ffi::OsString>)>) {
-        for (name, value) in values {
-            match value {
-                Some(value) => {
-                    // SAFETY: ENV_LOCK serializes all environment mutations in this test module.
-                    unsafe {
-                        std::env::set_var(name, value);
-                    }
-                }
-                None => {
-                    // SAFETY: ENV_LOCK serializes all environment mutations in this test module.
-                    unsafe {
-                        std::env::remove_var(name);
-                    }
-                }
-            }
-        }
-    }
-
-    fn set_env(name: &str, value: Option<&str>) {
-        match value {
-            Some(value) => {
-                // SAFETY: ENV_LOCK serializes all environment mutations in this test module.
-                unsafe {
-                    std::env::set_var(name, value);
-                }
-            }
-            None => {
-                // SAFETY: ENV_LOCK serializes all environment mutations in this test module.
-                unsafe {
-                    std::env::remove_var(name);
-                }
-            }
-        }
+    /// Build a pool config from `defaults` and exactly the `vars` given.
+    fn config(defaults: PoolConfig, suffix: &str, vars: &[(&str, Option<&str>)]) -> PoolConfig {
+        PoolConfig::from_lookup(defaults, suffix, |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.map(str::to_owned))
+        })
     }
 }

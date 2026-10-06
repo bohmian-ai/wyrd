@@ -169,7 +169,7 @@ impl AgentTool for QueryTool {
 
     /// The provider-visible description: one read-only SELECT over the
     /// caller's tenant, returning a complete, never truncated result.
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Run one read-only SELECT over this tenant's Bifrost tables and return the complete result as {columns, rows, terminal}."
     }
 
@@ -268,7 +268,7 @@ impl AgentTool for CardsTool {
 
     /// The provider-visible description: one exact Card read whose space
     /// defaults to the executing Agent's space.
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Read one registered Card by its exact kind, name, and version; space defaults to this Agent's space."
     }
 
@@ -377,8 +377,8 @@ mod tests {
     /// start.
     async fn state() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }

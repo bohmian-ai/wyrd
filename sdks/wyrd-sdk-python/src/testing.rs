@@ -97,8 +97,10 @@ fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<(
 
 /// Python context manager for the Wyrd in-process test server.
 #[pyclass(module = "wyrd._wyrd.testing")]
-// justification: preserve the established Python test-harness constructor flags
-#[allow(clippy::struct_excessive_bools)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "preserve the established Python test-harness constructor flags"
+)]
 pub struct WyrdTestServer {
     /// Retained from the Python constructor signature; teardown always runs.
     cleanup: bool,
@@ -152,8 +154,10 @@ impl WyrdTestServer {
     /// URL, or when it is combined with `live_providers`.
     #[new]
     #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false))]
-    // justification: PyO3 projects the existing Python test-harness flags directly
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "PyO3 projects the existing Python test-harness flags directly"
+    )]
     fn __new__(
         cleanup: bool,
         mutate_env: bool,
@@ -344,8 +348,6 @@ impl WyrdTestServer {
     /// # Errors
     /// Raises a Wyrd Python error when the context manager is inactive or
     /// bootstrap fails or yields a user.
-    // justification: pyo3 boundary; the extractor produces owned Python list and dict values
-    #[allow(clippy::needless_pass_by_value)]
     #[pyo3(signature = (roles, name = "svc"))]
     fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
         let server = self.started()?;
@@ -363,8 +365,6 @@ impl WyrdTestServer {
     ///
     /// # Errors
     /// Raises a harness error for an invalid Card identity or a missing principal.
-    // justification: PyO3 extracts the Python list into an owned Vec at the boundary
-    #[allow(clippy::needless_pass_by_value)]
     fn credential_registered_service(
         &self,
         card_ref: &str,
@@ -416,8 +416,6 @@ impl WyrdTestServer {
     /// Raises the harness error for an unparsable permission, and a Wyrd
     /// Python error when the context manager is inactive or role seeding or
     /// bootstrapping fails.
-    // justification: pyo3 boundary; the extractor produces owned Python list and dict values
-    #[allow(clippy::needless_pass_by_value)]
     fn scoped_api_key(
         &self,
         py: Python<'_>,
@@ -531,8 +529,6 @@ impl WyrdTestServer {
     /// Raises a Wyrd Python error when the context manager is inactive, the
     /// tenant id does not parse, bootstrapping fails, or the bootstrap is not a
     /// machine principal.
-    // justification: pyo3 boundary; the extractor produces owned Python list and dict values
-    #[allow(clippy::needless_pass_by_value)]
     #[pyo3(signature = (tenant_id, roles, name = "svc"))]
     fn bootstrap_service_in_tenant(
         &self,
@@ -684,8 +680,6 @@ impl WyrdTestServer {
     ///
     /// Raises the harness error for a malformed baseline and a Wyrd Python
     /// error when notification-backed release exceeds `shutdown.drain_ms`.
-    // justification: pyo3 boundary; the extractor produces owned Python list and dict values
-    #[allow(clippy::needless_pass_by_value)]
     fn wait_bifrost_query_resources_released(
         &self,
         py: Python<'_>,

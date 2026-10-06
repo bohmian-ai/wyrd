@@ -14,7 +14,7 @@ use wyrd_spec::reference::CardRef;
 use crate::queries::auth::{grant_role_to_service_account, role_by_name};
 use crate::tenant_conn::TenantConn;
 
-const UPSERT_SQL: &str = r#"
+const UPSERT_SQL: &str = r"
 INSERT INTO wyrd.auth_service_accounts
     (id, data_tenant_id, principal_kind, card_kind, card_uid,
      space, name, version, card_ref, description, status, created_by)
@@ -25,7 +25,7 @@ DO UPDATE SET card_ref = EXCLUDED.card_ref, space = EXCLUDED.space,
     name = EXCLUDED.name, version = EXCLUDED.version,
     description = EXCLUDED.description, updated_at = now()
 RETURNING id, (xmax = 0) AS inserted
-"#;
+";
 
 /// Upsert the principal row backing a newly registered Service or Agent card.
 ///

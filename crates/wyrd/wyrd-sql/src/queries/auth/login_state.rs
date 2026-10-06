@@ -28,10 +28,10 @@ use crate::TenantConn;
 use crate::row_types::auth::HumanConnectionBinding;
 
 /// Drop this tenant's rows that can no longer be consumed or redeemed.
-const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r#"
+const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r"
     DELETE FROM wyrd.auth_login_state
      WHERE expires_at <= statement_timestamp()
-"#;
+";
 
 /// Begin a login: record one unconsumed row owned by the RLS tenant.
 ///
@@ -39,7 +39,7 @@ const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r#"
 /// connection's tenant. `ON CONFLICT DO NOTHING` never overwrites: a reused
 /// state hash or device id inserts nothing, so one binding names at most one
 /// login. `PostgreSQL` derives `expires_at` from the bound lifetime in seconds.
-const INSERT_LOGIN_STATE_SQL: &str = r#"
+const INSERT_LOGIN_STATE_SQL: &str = r"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, connection_id, connection_revision, issuer,
         client_id, redirect_uri, code_verifier, nonce, oauth_client_id,
@@ -48,7 +48,7 @@ const INSERT_LOGIN_STATE_SQL: &str = r#"
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
               statement_timestamp() + ($17 * interval '1 second'))
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Consume a login's state exactly once at the callback, before provider IO.
 ///
@@ -56,7 +56,7 @@ const INSERT_LOGIN_STATE_SQL: &str = r#"
 /// setting `consumed_at` makes every replay of the same state match nothing.
 /// Returns the pinned connection, PKCE verifier, nonce, and initiation binding
 /// the callback needs to finish the exchange.
-const CONSUME_LOGIN_STATE_SQL: &str = r#"
+const CONSUME_LOGIN_STATE_SQL: &str = r"
     UPDATE wyrd.auth_login_state
        SET consumed_at = statement_timestamp()
      WHERE state_hash = $1
@@ -66,7 +66,7 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
               code_verifier, nonce, oauth_client_id, client_redirect_uri,
               code_challenge, client_state, device_id, tester_principal_id,
               tester_principal_kind
-"#;
+";
 
 /// Attach an authorization code and its principal to a consumed
 /// authorization-request login, once.
@@ -75,7 +75,7 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
 /// and has no code yet, so a code is issued at most once and never before
 /// consumption. Resets `expires_at` to the code's short `PostgreSQL`-derived
 /// lifetime.
-const ISSUE_AUTHORIZATION_CODE_SQL: &str = r#"
+const ISSUE_AUTHORIZATION_CODE_SQL: &str = r"
     UPDATE wyrd.auth_login_state
        SET code_hash = $2,
            principal_id = $3,
@@ -84,7 +84,7 @@ const ISSUE_AUTHORIZATION_CODE_SQL: &str = r#"
        AND consumed_at IS NOT NULL
        AND oauth_client_id IS NOT NULL
        AND code_hash IS NULL
-"#;
+";
 
 /// Redeem an authorization code once.
 ///
@@ -92,13 +92,13 @@ const ISSUE_AUTHORIZATION_CODE_SQL: &str = r#"
 /// client binding, principal, and connection, with whether it was still
 /// unexpired. Deletion is the one-use guarantee: a second redemption matches
 /// nothing, and an expired code is removed as it is refused.
-const REDEEM_AUTHORIZATION_CODE_SQL: &str = r#"
+const REDEEM_AUTHORIZATION_CODE_SQL: &str = r"
     DELETE FROM wyrd.auth_login_state
      WHERE code_hash = $1
     RETURNING oauth_client_id, client_redirect_uri, code_challenge, principal_id,
               connection_id, connection_revision,
               expires_at > statement_timestamp() AS live
-"#;
+";
 
 /// The stored binding columns of one initiation; exactly one binding is set,
 /// which is how the stored row records its kind.

@@ -22,13 +22,13 @@ pub async fn suspend_user_principal(
     id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.auth_users
            SET status = CASE WHEN status = 'active' THEN 'suspended' ELSE status END,
                updated_at = now()
          WHERE data_tenant_id = wyrd.current_tenant()
            AND id = $1
-        "#,
+        ",
     )
     .bind(id)
     .execute(&mut **conn.transaction())
@@ -49,14 +49,14 @@ pub async fn suspend_service_account_principal(
     id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.auth_service_accounts
            SET status = CASE WHEN status = 'active' THEN 'suspended' ELSE status END,
                updated_at = now()
          WHERE data_tenant_id = wyrd.current_tenant()
            AND id = $1
            AND principal_kind <> 'system'
-        "#,
+        ",
     )
     .bind(id)
     .execute(&mut **conn.transaction())

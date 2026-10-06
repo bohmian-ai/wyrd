@@ -58,7 +58,7 @@ use super::query::{ServerJourneyError, scheduled_context};
 /// The server's fixed Eval media ceiling; a body one byte larger is refused.
 const MEDIA_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 /// Upper bound on every wait for runs to settle.
-const WAIT: Duration = Duration::from_secs(120);
+const WAIT: Duration = Duration::from_mins(2);
 /// The image bytes the judge must receive natively.
 const IMAGE: &[u8] = b"\x89PNG\r\n\x1a\neval-journey-image";
 /// Trace whose spans land after the run first awaits them.
@@ -272,7 +272,7 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
     .expect("the local provider registers");
     let runtime = VerificationRuntime::builder(server.state())
         .limits(RuntimeLimits {
-            lease: Duration::from_secs(60),
+            lease: Duration::from_mins(1),
             execution_timeout: Duration::from_secs(20),
             drain_grace: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
@@ -456,9 +456,8 @@ async fn assert_completed(
     (items, skipped): (usize, usize),
     dispatches: i64,
 ) -> Result<(), ServerJourneyError> {
-    let result = match (run.state.status.as_str(), run.state.result_id) {
-        ("completed", Some(result)) => result,
-        _ => return Err(format!("{} did not complete: {run:?}", run.verifier).into()),
+    let ("completed", Some(result)) = (run.state.status.as_str(), run.state.result_id) else {
+        return Err(format!("{} did not complete: {run:?}", run.verifier).into());
     };
     let verdicts = texts(
         &query(
@@ -1057,7 +1056,7 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
 
     let record = uuid::Uuid::now_v7().to_string();
     let batch = uuid::Uuid::now_v7();
-    let superuser = server.pg_fixture().superuser_pool().await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
     let mut lock = superuser.begin().await?;
     sqlx::query("LOCK TABLE wyrd.verifier_runs IN SHARE MODE")
         .execute(&mut *lock)
@@ -1066,7 +1065,7 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     let emitted = chrono::Utc::now();
     let frame = answered_observation(&subject, &record, emitted);
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
-    scribe.shift_receipt_clock_for_test(Duration::from_secs(86_400));
+    scribe.shift_receipt_clock_for_test(Duration::from_hours(24));
     let (first, second) = tokio::join!(
         ingest.insert(OBSERVATIONS, batch, frame.clone()),
         ingest.insert(OBSERVATIONS, batch, frame),
@@ -1224,7 +1223,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
     state.shutdown().await?;
     let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client).await?;
 
-    let superuser = server.pg_fixture().superuser_pool().await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
     sqlx::query("CREATE SEQUENCE wyrd.eval_journey_attempts")
         .execute(&superuser)
         .await?;
@@ -1323,7 +1322,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
 
 /// One UTC day, the receipt-clock step the matrix and trace-window journeys
 /// move by.
-const DAY: Duration = Duration::from_secs(86_400);
+const DAY: Duration = Duration::from_hours(24);
 /// Trace whose committed spans the evidence Verifier asserts over.
 const EVIDENCE_TRACE: &str = "7d0a111920253035a5b5c5d5e5f50515";
 /// Trace the evidence trace's first span links to.
@@ -2191,7 +2190,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let superuser = server.pg_fixture().superuser_pool().await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION wyrd.eval_errors_refuse() RETURNS boolean LANGUAGE plpgsql AS \
          $$BEGIN RAISE EXCEPTION '{SQL_SENTINEL}'; END$$"
@@ -2370,7 +2369,7 @@ async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> 
     let (bundle_a, bundle_b) = (root.path().join("bundle-a"), root.path().join("bundle-b"));
     let server = Box::pin(WyrdTestServer::start_bound()).await?;
     let tenant = server.data_tenant_id();
-    let superuser = server.pg_fixture().superuser_pool().await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
     let admin = connect(
         &server,
         &api_key(

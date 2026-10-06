@@ -160,8 +160,10 @@ fn is_valid_commit_sha(value: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-// justification: serde skip_serializing_if predicate signature requires fn(&T) -> bool
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicate signature requires fn(&T) -> bool"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }

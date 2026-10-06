@@ -49,6 +49,10 @@ impl RunId {
     ///
     /// SHA-256 over the id bytes; the first eight digest bytes are read
     /// big-endian as a `u64` and reduced modulo `buckets`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a remainder exceeds its `u32` divisor, which arithmetic rules out.
     #[must_use]
     pub fn hash_bucket(&self, buckets: u32) -> u32 {
         use sha2::{Digest, Sha256};
@@ -60,7 +64,7 @@ impl RunId {
         let mut prefix = [0_u8; 8];
         prefix.copy_from_slice(&digest[..8]);
         let value = u64::from_be_bytes(prefix);
-        (value % u64::from(buckets)) as u32
+        u32::try_from(value % u64::from(buckets)).expect("a remainder is below its u32 divisor")
     }
 }
 

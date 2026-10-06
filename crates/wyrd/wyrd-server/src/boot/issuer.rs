@@ -43,7 +43,7 @@ use wyrd_spec::auth::IssuerTokenPolicy;
 use crate::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry};
 
 /// Default JWKS key-cache TTL applied when an entry omits `jwks_ttl_secs`.
-const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
+const DEFAULT_JWKS_TTL: Duration = Duration::from_hours(1);
 
 /// Maximum number of OIDC discovery attempts per issuer (initial try + retries).
 const DISCOVERY_MAX_ATTEMPTS: u32 = 3;

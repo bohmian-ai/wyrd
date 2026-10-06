@@ -374,7 +374,17 @@ enum ParameterizedComparisonOperator {
 
 impl ParameterizedComparisonOperator {
     fn from_operator(operator: &ComparisonOperator) -> Option<Self> {
-        use ComparisonOperator::*;
+        use ComparisonOperator::{
+            AllOf, AnyOf, ApproximatelyEquals, BetweenPercentiles, Contains, ContainsIgnoreCase,
+            CosineSimilarityAtLeast, DivergenceLessThan, EndsWith, Equals, GreaterThan,
+            GreaterThanOrEquals, HasMaxLength, HasMinLength, In, InRange, IsBoolean, IsDisjoint,
+            IsEmail, IsEmpty, IsFalsy, IsIpv4, IsIpv6, IsJson, IsNegative, IsNonEmpty, IsNotNull,
+            IsNull, IsNumber, IsObject, IsPositive, IsString, IsSubset, IsSuperset, IsTruthy,
+            IsType, IsUrl, IsUuid, IsZero, Length, LengthGreaterThan, LengthLessThan, LessThan,
+            LessThanOrEquals, MatchesRegex, NoneOf, NotContains, NotEquals, NotIn, NotInRange,
+            NotMatchesRegex, StartsWith, UniqueValues, WithinAbsTolerance, WithinPctTolerance,
+            WithinStdDev,
+        };
 
         Some(match operator {
             InRange {
@@ -579,7 +589,17 @@ impl ComparisonOperator {
     /// requiring a serialization round-trip.
     #[must_use]
     pub fn discriminator(&self) -> &'static str {
-        use ComparisonOperator::*;
+        use ComparisonOperator::{
+            AllOf, AnyOf, ApproximatelyEquals, BetweenPercentiles, Contains, ContainsIgnoreCase,
+            CosineSimilarityAtLeast, DivergenceLessThan, EndsWith, Equals, GreaterThan,
+            GreaterThanOrEquals, HasMaxLength, HasMinLength, In, InRange, IsBoolean, IsDisjoint,
+            IsEmail, IsEmpty, IsFalsy, IsIpv4, IsIpv6, IsJson, IsNegative, IsNonEmpty, IsNotNull,
+            IsNull, IsNumber, IsObject, IsPositive, IsString, IsSubset, IsSuperset, IsTruthy,
+            IsType, IsUrl, IsUuid, IsZero, Length, LengthGreaterThan, LengthLessThan, LessThan,
+            LessThanOrEquals, MatchesRegex, NoneOf, NotContains, NotEquals, NotIn, NotInRange,
+            NotMatchesRegex, StartsWith, UniqueValues, WithinAbsTolerance, WithinPctTolerance,
+            WithinStdDev,
+        };
 
         match self {
             Equals => "equals",
@@ -655,7 +675,13 @@ impl ComparisonOperator {
     /// Returns [`WyrdError::Validation`] when the discriminator is unknown or
     /// names a parameterized variant that requires the full serde-tagged form.
     pub fn from_discriminator_parameterless(s: &str) -> Result<Self, WyrdError> {
-        use ComparisonOperator::*;
+        use ComparisonOperator::{
+            AllOf, AnyOf, Contains, ContainsIgnoreCase, EndsWith, Equals, GreaterThan,
+            GreaterThanOrEquals, In, IsBoolean, IsDisjoint, IsEmail, IsEmpty, IsFalsy, IsIpv4,
+            IsIpv6, IsJson, IsNegative, IsNonEmpty, IsNotNull, IsNull, IsNumber, IsObject,
+            IsPositive, IsString, IsSubset, IsSuperset, IsTruthy, IsUrl, IsUuid, IsZero, LessThan,
+            LessThanOrEquals, NoneOf, NotContains, NotEquals, NotIn, StartsWith, UniqueValues,
+        };
 
         Ok(match s {
             "equals" => Equals,

@@ -1237,12 +1237,7 @@ pub(crate) mod pg_tests {
             .expect("second tenant seed commits");
         sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
             .bind(unadmitted_tenant.as_uuid())
-            .execute(
-                &fixture
-                    .superuser_pool()
-                    .await
-                    .expect("superuser pool opens"),
-            )
+            .execute(&fixture.superuser_pool().expect("superuser pool opens"))
             .await
             .expect("second tenant suspends");
         (unadmitted_tenant, unadmitted)
@@ -1801,7 +1796,7 @@ pub(crate) mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
             .execute(&admin)
             .await

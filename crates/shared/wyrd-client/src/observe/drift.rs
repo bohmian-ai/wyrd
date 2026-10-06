@@ -166,8 +166,9 @@ fn projected_value(
                     json!({ "series": series.as_str(), "value": number }),
                 ));
             }
+            let exact = *number as f64;
             Ok((
-                json!(*number as f64),
+                json!(exact),
                 json!(canonical_string(
                     Arc::new(Int64Array::from(vec![*number])),
                     series

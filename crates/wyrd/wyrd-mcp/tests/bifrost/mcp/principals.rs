@@ -298,7 +298,7 @@ mod pg_tests {
 
         // Listing an unknown principal is the stable, non-enumerating refusal,
         // and the permission it evaluated is still recorded.
-        let superuser = server.pg_fixture().superuser_pool().await?;
+        let superuser = server.pg_fixture().superuser_pool()?;
         let listed_decisions = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM vala.audit_staging

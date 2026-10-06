@@ -2,7 +2,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
 from wyrd.prompt import Prompt, PromptCard
 
 
@@ -15,8 +14,6 @@ def make_card() -> PromptCard:
     )
 
 
-@pytest.mark.wyrd_covers("python:PromptCard.save")
-@pytest.mark.wyrd_covers("python:PromptCard.load")
 def test_save_then_load_json_roundtrip(tmp_path: Path) -> None:
     card = make_card()
     path = tmp_path / "prompt.json"
@@ -27,8 +24,6 @@ def test_save_then_load_json_roundtrip(tmp_path: Path) -> None:
     assert json.loads(loaded.model_dump_json()) == json.loads(card.model_dump_json())
 
 
-@pytest.mark.wyrd_covers("python:PromptCard.save")
-@pytest.mark.wyrd_covers("python:PromptCard.from_path")
 def test_save_then_from_path_yaml_roundtrip_and_no_type_field(tmp_path: Path) -> None:
     card = make_card()
     path = tmp_path / "prompt.yaml"
@@ -40,8 +35,6 @@ def test_save_then_from_path_yaml_roundtrip_and_no_type_field(tmp_path: Path) ->
     assert "type: Prompt" not in path.read_text()
 
 
-@pytest.mark.wyrd_covers("python:PromptCard.model_dump_json")
-@pytest.mark.wyrd_covers("python:PromptCard.model_validate_json")
 def test_model_dump_json_then_model_validate_json_roundtrip() -> None:
     card = make_card()
 

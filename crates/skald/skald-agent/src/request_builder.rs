@@ -255,15 +255,6 @@ pub fn rebuild_request_messages(
             }
             req.input = items.into();
         }
-        ProviderRequest::OpenAiEmbeddings(_)
-        | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::VertexPredict(_)
-        | ProviderRequest::RawV1 { .. } => {
-            return Err(AgentError::Prompt {
-                agent: "<run_prompt>".to_owned(),
-                detail: "request shape does not support tool-loop dispatch".to_owned(),
-            });
-        }
         _ => {
             return Err(AgentError::Prompt {
                 agent: "<run_prompt>".to_owned(),

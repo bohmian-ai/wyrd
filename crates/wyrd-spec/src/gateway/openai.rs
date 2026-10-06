@@ -548,7 +548,7 @@ pub(crate) mod openapi {
     /// Root schema of `T` and its named definitions, referenced as components.
     pub(crate) fn component<T: JsonSchema>() -> (RefOr<Schema>, Components) {
         let mut settings = SchemaSettings::draft2019_09();
-        settings.definitions_path = "#/components/schemas/".to_owned();
+        "#/components/schemas/".clone_into(&mut settings.definitions_path);
         settings.meta_schema = None;
         let root = settings.into_generator().into_root_schema_for::<T>();
         let definitions = root
@@ -641,8 +641,10 @@ pub(crate) mod openapi {
     fn plain(schema: &SchemaObject, description: Option<String>) -> Schema {
         let schema_type = match &schema.instance_type {
             None => SchemaType::AnyValue,
-            Some(SingleOrVec::Single(kind)) => SchemaType::Type(type_of(kind)),
-            Some(SingleOrVec::Vec(kinds)) => SchemaType::Array(kinds.iter().map(type_of).collect()),
+            Some(SingleOrVec::Single(kind)) => SchemaType::Type(type_of(**kind)),
+            Some(SingleOrVec::Vec(kinds)) => {
+                SchemaType::Array(kinds.iter().copied().map(type_of).collect())
+            }
         };
         if let Some(array) = &schema.array {
             let items = match &array.items {
@@ -687,7 +689,7 @@ pub(crate) mod openapi {
     }
 
     /// The `OpenAPI` type of a JSON Schema instance type.
-    fn type_of(kind: &InstanceType) -> Type {
+    fn type_of(kind: InstanceType) -> Type {
         match kind {
             InstanceType::Null => Type::Null,
             InstanceType::Boolean => Type::Boolean,

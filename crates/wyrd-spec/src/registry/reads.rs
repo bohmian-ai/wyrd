@@ -96,6 +96,10 @@ mod metadata_query_option {
     use super::MetadataQuery;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's serialize_with passes the field by reference"
+    )]
     pub fn serialize<S>(value: &Option<MetadataQuery>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

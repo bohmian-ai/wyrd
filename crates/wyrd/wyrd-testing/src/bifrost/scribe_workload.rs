@@ -1489,7 +1489,7 @@ impl crate::bifrost::WyrdTestCluster {
         // on. Checking it against the live owner before any operation is what
         // makes a cache-off/cache-on comparison a comparison of two
         // compositions rather than of one composition run twice.
-        let composed = running_pod(&cluster)?
+        let composed = running_pod(cluster.as_ref())?
             .state()
             .bifrost_storage()
             .ok_or_else(|| {
@@ -1505,8 +1505,8 @@ impl crate::bifrost::WyrdTestCluster {
                  metadata_cache_enabled={composed}"
             )));
         }
-        let node = running_pod(&cluster)?.node_id();
-        let bindings = running_pod(&cluster)?
+        let node = running_pod(cluster.as_ref())?.node_id();
+        let bindings = running_pod(cluster.as_ref())?
             .seed_scribe_workload_owners_for_test(workload)
             .await?;
         // One event time for every row of the run, including its replay, so
@@ -1547,7 +1547,7 @@ impl crate::bifrost::WyrdTestCluster {
                 } => {
                     let binding = binding_at(&bindings, *tenant)?;
                     let declared = table_at(workload, *tenant, *table)?;
-                    running_pod(&cluster)?
+                    running_pod(cluster.as_ref())?
                         .append_workload_batch_for_test(
                             binding.tenant,
                             &declared.fqn(),
@@ -1559,7 +1559,7 @@ impl crate::bifrost::WyrdTestCluster {
                     acknowledged += rows.len() as u64;
                 }
                 ScribeWorkloadOperationV1::Seal => {
-                    running_pod(&cluster)?
+                    running_pod(cluster.as_ref())?
                         .seal_bifrost_writable_for_test()
                         .await?;
                 }
@@ -1569,12 +1569,12 @@ impl crate::bifrost::WyrdTestCluster {
                     // record, even though the pod flush that follows covers
                     // every bucket the pod holds regardless of tenant.
                     binding_at(&bindings, *tenant)?;
-                    running_pod(&cluster)?.flush_bifrost().await?;
+                    running_pod(cluster.as_ref())?.flush_bifrost().await?;
                 }
                 ScribeWorkloadOperationV1::Read { tenant, table } => {
                     let binding = binding_at(&bindings, *tenant)?;
                     let declared = table_at(workload, *tenant, *table)?;
-                    for value in running_pod(&cluster)?
+                    for value in running_pod(cluster.as_ref())?
                         .read_workload_table_for_test(binding.tenant, &declared.fqn())
                         .await?
                     {
@@ -1591,8 +1591,7 @@ impl crate::bifrost::WyrdTestCluster {
                         .stop_node(node)
                         .await
                         .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-                    owner
-                        .restart_node(node)
+                    Box::pin(owner.restart_node(node))
                         .await
                         .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
                     restarted = true;
@@ -1601,7 +1600,7 @@ impl crate::bifrost::WyrdTestCluster {
                     // Rows either side of the replay, read through the public
                     // route. The replay's whole claim is that this count does
                     // not move, and it is only observable by reading twice.
-                    let before = running_pod(&cluster)?
+                    let before = running_pod(cluster.as_ref())?
                         .read_scribe_workload_rows_for_test(workload, &bindings)
                         .await?
                         .len() as u64;
@@ -1616,7 +1615,7 @@ impl crate::bifrost::WyrdTestCluster {
                         {
                             let binding = binding_at(&bindings, *tenant)?;
                             let declared = table_at(workload, *tenant, *table)?;
-                            running_pod(&cluster)?
+                            running_pod(cluster.as_ref())?
                                 .append_workload_batch_for_test(
                                     binding.tenant,
                                     &declared.fqn(),
@@ -1628,7 +1627,7 @@ impl crate::bifrost::WyrdTestCluster {
                             replayed += 1;
                         }
                     }
-                    let after = running_pod(&cluster)?
+                    let after = running_pod(cluster.as_ref())?
                         .read_scribe_workload_rows_for_test(workload, &bindings)
                         .await?
                         .len() as u64;
@@ -1675,7 +1674,7 @@ impl crate::bifrost::WyrdTestCluster {
                     let published = match published_at_drain.take() {
                         Some(observed) => observed,
                         None => {
-                            running_pod(&cluster)?
+                            running_pod(cluster.as_ref())?
                                 .observe_scribe_workload_publication_for_test(workload, &bindings)
                                 .await?
                         }
@@ -1721,16 +1720,13 @@ impl crate::bifrost::WyrdTestCluster {
 /// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the cluster
 /// has already been drained, or when it holds no pod at index zero.
 fn running_pod(
-    cluster: &Option<crate::bifrost::WyrdTestCluster>,
+    cluster: Option<&crate::bifrost::WyrdTestCluster>,
 ) -> Result<&crate::WyrdTestServer, crate::WyrdTestServerError> {
-    cluster
-        .as_ref()
-        .and_then(|owner| owner.server(0))
-        .ok_or_else(|| {
-            crate::WyrdTestServerError::Start(
-                "the record needs a running pod, but the cluster has been drained".to_owned(),
-            )
-        })
+    cluster.and_then(|owner| owner.server(0)).ok_or_else(|| {
+        crate::WyrdTestServerError::Start(
+            "the record needs a running pod, but the cluster has been drained".to_owned(),
+        )
+    })
 }
 
 #[cfg(test)]

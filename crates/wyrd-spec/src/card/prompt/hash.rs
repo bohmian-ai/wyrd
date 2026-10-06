@@ -7,6 +7,10 @@ use skald_spec::{Prompt, ProviderName, ProviderRequest, ResponseType};
 use crate::card::prompt::PromptSpec;
 
 /// Computes `sha256:<hex64>` over native prompt JSON excluding `prompt.version`.
+///
+/// # Panics
+///
+/// Panics if the prompt cannot be canonicalized, which a typed prompt rules out.
 pub fn compute(spec: &PromptSpec) -> String {
     let projection = HashProjection::from(&spec.prompt);
     let bytes = match serde_json::to_vec(&projection) {

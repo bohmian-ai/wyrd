@@ -527,8 +527,9 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
             .await
             .map_err(|e| match e {
                 OidcError::JwksUnavailable { .. } => AuthError::VerifyUnavailable,
-                OidcError::UnknownKid { .. } => AuthError::InvalidToken,
-                _ => AuthError::InvalidToken,
+                OidcError::UnknownKid { .. } | OidcError::ClaimMissing { .. } => {
+                    AuthError::InvalidToken
+                }
             })?;
 
         let mut validation = Validation::new(header.alg);
@@ -779,8 +780,10 @@ impl AccessTokenClaims {
         )
         .with_credential_id(self.cid.as_deref().and_then(|cid| cid.parse().ok()));
         let delegation_chain = flatten_act_chain(self.act.as_deref())?;
-        let exp =
-            DateTime::<Utc>::from_timestamp(self.exp as i64, 0).ok_or(AuthError::InvalidToken)?;
+        let exp = i64::try_from(self.exp)
+            .ok()
+            .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0))
+            .ok_or(AuthError::InvalidToken)?;
 
         Ok(VerifiedToken {
             principal,
@@ -832,13 +835,12 @@ fn wire_kind_into_principal_kind(
         // A platform-scope kind can never become a tenant-scope principal. This
         // is the type-level half of the control-plane boundary: even a validly
         // signed token cannot smuggle a platform identity into a tenant.
-        (PrincipalKindTag::GlobalAdmin, _) => Err(AuthError::InvalidToken),
         // The tenant SYSTEM principal is an attribution identity only; it is
         // never issued a token, so no signed claim set may name it.
-        (PrincipalKindTag::System, _) => Err(AuthError::InvalidToken),
-        (PrincipalKindTag::TenantAdmin, Some(_)) => Err(AuthError::InvalidCardRef),
+        (PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System, _) => {
+            Err(AuthError::InvalidToken)
+        }
         (PrincipalKindTag::TenantAdmin, None) => Ok(PrincipalKind::TenantAdmin),
-        (PrincipalKindTag::User, Some(_)) => Err(AuthError::InvalidCardRef),
         (PrincipalKindTag::User, None) => Ok(PrincipalKind::User),
         (PrincipalKindTag::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
             Ok(PrincipalKind::Service {
@@ -861,7 +863,10 @@ fn wire_kind_into_principal_kind(
                 card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
             })
         }
-        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(AuthError::InvalidCardRef),
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_))
+        | (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => {
+            Err(AuthError::InvalidCardRef)
+        }
     }
 }
 
@@ -1827,10 +1832,11 @@ mod tests {
     }
 
     fn now() -> usize {
-        std::time::SystemTime::now()
+        let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock is after unix epoch")
-            .as_secs() as usize
+            .as_secs();
+        usize::try_from(secs).expect("unix seconds fit in usize")
     }
 
     fn act_chain(depth: usize) -> ActClaim {
@@ -1934,7 +1940,7 @@ mod tests {
         wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
         Arc::new(JwksCache::new(
             wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(5),
         ))
     }
@@ -1964,7 +1970,7 @@ mod tests {
             group_role_map: std::collections::HashMap::new(),
             default_roles: Vec::new(),
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: Duration::from_secs(3600),
+            jwks_ttl: Duration::from_hours(1),
         }
     }
 

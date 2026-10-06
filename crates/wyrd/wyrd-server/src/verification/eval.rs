@@ -162,10 +162,13 @@ impl EvalEngine {
                 )
                 .await
                 .map_err(ReadStart::Authority)?;
-                let record = reader
-                    .record(&run.subject_card_uid.to_string(), record_id, *event_time)
-                    .await
-                    .map_err(ReadStart::Record)?;
+                let record = Box::pin(reader.record(
+                    &run.subject_card_uid.to_string(),
+                    record_id,
+                    *event_time,
+                ))
+                .await
+                .map_err(ReadStart::Record)?;
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
@@ -202,12 +205,11 @@ impl EvalEngine {
         }
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
-            match telemetry
-                .phase(
-                    Phase::InputRead,
-                    reader.spans(trace_id, *event_time, self.trace_window),
-                )
-                .await
+            match Box::pin(telemetry.phase(
+                Phase::InputRead,
+                reader.spans(trace_id, *event_time, self.trace_window),
+            ))
+            .await
             {
                 Ok(spans) if spans.is_empty() => {
                     return EngineOutcome::AwaitingTrace(failure(
@@ -531,18 +533,17 @@ impl BifrostReader {
     #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
-        self.waits
-            .wait(self.caller.run_with(
-                BifrostQueryRequest {
-                    sql,
-                    deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
-                },
-                |batch| {
-                    batches.push(batch);
-                    Ok(())
-                },
-            ))
-            .await?;
+        Box::pin(self.waits.wait(self.caller.run_with(
+            BifrostQueryRequest {
+                sql,
+                deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
+            },
+            |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )))
+        .await?;
         Ok(batches)
     }
 
@@ -560,18 +561,17 @@ impl BifrostReader {
         event_time: DateTime<Utc>,
     ) -> Result<EvalRecordObservation, ReadError> {
         let (start, end) = utc_day(event_time);
-        let batches = self
-            .query(format!(
-                "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
+        let batches = Box::pin(self.query(format!(
+            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
                    AND wyrd_event_time >= TIMESTAMP '{start}' \
                    AND wyrd_event_time < TIMESTAMP '{end}' \
                  LIMIT 1",
-                quoted(subject),
-                quoted(record_id),
-            ))
-            .await?;
+            quoted(subject),
+            quoted(record_id),
+        )))
+        .await?;
         let batch = batches
             .iter()
             .find(|batch| batch.num_rows() > 0)
@@ -641,9 +641,8 @@ impl BifrostReader {
                 .checked_add_signed(window)
                 .ok_or("the trace window is out of range")?,
         );
-        let batches = match self
-            .query(format!(
-                "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
+        let batches = match Box::pin(self.query(format!(
+            "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
                         start_time_unix_nano, end_time_unix_nano, status_code, status_message, \
                         attributes, dropped_attributes_count, events, dropped_events_count, \
                         links, dropped_links_count, scope_name, service_name \
@@ -653,10 +652,10 @@ impl BifrostReader {
                    AND wyrd_event_time < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
-                trace_id.to_hex(),
-                TRACE_SPAN_LIMIT + 1,
-            ))
-            .await
+            trace_id.to_hex(),
+            TRACE_SPAN_LIMIT + 1,
+        )))
+        .await
         {
             Ok(batches) => batches,
             // A tenant's span table is created by its first export, so its
@@ -1481,7 +1480,7 @@ mod tests {
             StorageSettings {
                 backend,
                 require_encryption: false,
-                presign_ttl: std::time::Duration::from_secs(600),
+                presign_ttl: std::time::Duration::from_mins(10),
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
             },

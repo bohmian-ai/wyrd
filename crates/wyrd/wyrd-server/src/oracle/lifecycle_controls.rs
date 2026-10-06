@@ -394,7 +394,7 @@ mod tests {
 
     /// A deadline far enough away that no test reaches it.
     fn later() -> Instant {
-        Instant::now() + Duration::from_secs(3_600)
+        Instant::now() + Duration::from_hours(1)
     }
 
     /// A cancellation owner slower than the query's remaining deadline is

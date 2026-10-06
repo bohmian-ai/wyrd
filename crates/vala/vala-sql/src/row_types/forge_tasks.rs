@@ -217,11 +217,6 @@ impl ForgeTaskTableIdentity {
         namespace: impl Into<String>,
         table: impl Into<String>,
     ) -> Result<Self, SqlError> {
-        let value = Self {
-            catalog: catalog.into(),
-            namespace: namespace.into(),
-            table: table.into(),
-        };
         const NAMESPACES: &[&str] = &[
             "vala.system",
             "vala.bifrost",
@@ -235,6 +230,11 @@ impl ForgeTaskTableIdentity {
             "vala.datasets",
             "vala.gateway",
         ];
+        let value = Self {
+            catalog: catalog.into(),
+            namespace: namespace.into(),
+            table: table.into(),
+        };
         if value.catalog != "wyrd-redux"
             || !NAMESPACES.contains(&value.namespace.as_str())
             || !safe_identity(&value.table)
@@ -491,6 +491,7 @@ impl OrphanCleanupPayload {
     /// `persisted`, for a non-object value, unknown or missing fields, an
     /// unknown version, a wrong `kind`, or a negative cutoff.
     pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 3] = ["version", "kind", "age_cutoff_ms"];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -502,7 +503,6 @@ impl OrphanCleanupPayload {
         let object = value
             .as_object()
             .ok_or_else(|| fail("orphan cleanup payload is not an object"))?;
-        const FIELDS: [&str; 3] = ["version", "kind", "age_cutoff_ms"];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail("orphan cleanup payload has unknown or missing fields"));
         }
@@ -575,6 +575,7 @@ impl OrphanCleanupCursor {
         prefix: &str,
         persisted: bool,
     ) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 2] = ["version", "start_after"];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -586,7 +587,6 @@ impl OrphanCleanupCursor {
         let object = value
             .as_object()
             .ok_or_else(|| fail("orphan cleanup cursor is not an object"))?;
-        const FIELDS: [&str; 2] = ["version", "start_after"];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail("orphan cleanup cursor has unknown or missing fields"));
         }
@@ -808,6 +808,15 @@ impl ExpiredCleanupPayload {
     /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
     /// `persisted`, for any departure from the closed shape.
     pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 7] = [
+            "version",
+            "kind",
+            "source_task_id",
+            "committed_snapshot_id",
+            "committed_metadata_location",
+            "committed_metadata_digest",
+            "cleanup_candidates",
+        ];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -819,15 +828,6 @@ impl ExpiredCleanupPayload {
         let object = value
             .as_object()
             .ok_or_else(|| fail("expired cleanup payload is not an object"))?;
-        const FIELDS: [&str; 7] = [
-            "version",
-            "kind",
-            "source_task_id",
-            "committed_snapshot_id",
-            "committed_metadata_location",
-            "committed_metadata_digest",
-            "cleanup_candidates",
-        ];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail(
                 "expired cleanup payload has unknown or missing fields",

@@ -279,7 +279,7 @@ mod tests {
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: Duration::from_secs(3600),
+            jwks_ttl: Duration::from_hours(1),
         }
     }
 

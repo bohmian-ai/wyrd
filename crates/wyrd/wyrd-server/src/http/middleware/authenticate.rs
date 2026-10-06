@@ -67,6 +67,7 @@ async fn authenticate_on(
 #[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
+    use wyrd_spec::reference::CardRefScope;
 
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -241,7 +242,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
             card_ref: None,
-            card_ref_scope: Default::default(),
+            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth

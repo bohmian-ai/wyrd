@@ -383,7 +383,7 @@ async fn workflow_cli_contract() {
         request
             .headers
             .get("x-review-secret")
-            .map(|value| value.as_bytes())
+            .map(axum::http::HeaderValue::as_bytes)
             == Some(SECRET.as_bytes())
     }));
     assert!(!streams(&external).contains(SECRET));
@@ -679,9 +679,7 @@ impl Journey {
             runner,
             home: tempfile::tempdir().expect("config home"),
         };
-        journey
-            .deploy("openai", "authorization", "gpt-5-5", &["chat_completions"])
-            .await;
+        journey.deploy("openai", "authorization", "gpt-5-5", &["chat_completions"]);
         journey
     }
 
@@ -729,7 +727,7 @@ impl Journey {
     ///
     /// # Panics
     /// Panics when either administration command fails.
-    async fn deploy(&self, provider: &str, header: &str, model: &str, capabilities: &[&str]) {
+    fn deploy(&self, provider: &str, header: &str, model: &str, capabilities: &[&str]) {
         let credential = format!("{provider}-key");
         let adapter = if provider == "vertex" {
             json!({ "vertex": { "project": "acme", "location": "us-central1" } })
@@ -1212,38 +1210,30 @@ async fn workflow_server_detach_status_cancel() {
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn workflow_registered_route_protocol_matrix() {
     let journey = Journey::start().await;
-    journey
-        .deploy(
-            "anthropic",
-            "x-api-key",
-            "claude-sonnet-5",
-            &["chat_completions"],
-        )
-        .await;
-    journey
-        .deploy(
-            "gemini",
-            "x-goog-api-key",
-            "gemini-2.5-flash",
-            &["chat_completions"],
-        )
-        .await;
-    journey
-        .deploy(
-            "openai",
-            "authorization",
-            "gpt-5-4",
-            &["chat_completions", "responses"],
-        )
-        .await;
-    journey
-        .deploy(
-            "vertex",
-            "authorization",
-            "gemini-2.5-pro",
-            &["chat_completions"],
-        )
-        .await;
+    journey.deploy(
+        "anthropic",
+        "x-api-key",
+        "claude-sonnet-5",
+        &["chat_completions"],
+    );
+    journey.deploy(
+        "gemini",
+        "x-goog-api-key",
+        "gemini-2.5-flash",
+        &["chat_completions"],
+    );
+    journey.deploy(
+        "openai",
+        "authorization",
+        "gpt-5-4",
+        &["chat_completions", "responses"],
+    );
+    journey.deploy(
+        "vertex",
+        "authorization",
+        "gemini-2.5-pro",
+        &["chat_completions"],
+    );
     let gateway = "    kind: wyrd_gateway";
     let external = format!(
         "    kind: ext_gateway\n    protocol: openai_chat\n    base_url: {}/v1\n    credential_binding: review-gateway",

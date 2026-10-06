@@ -36,7 +36,7 @@ language, or domain references.
 
 ## Client-Tier Constraints
 
-Enforced by `check:client-tier`:
+Dependency rules below are enforced by `check:deps`:
 
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`,
   or `iceberg`.

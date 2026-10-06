@@ -71,6 +71,10 @@ impl FrameDecoder {
     /// # Errors
     /// Returns an oversize or malformed-prefix error before allocating its
     /// declared payload, or a decode error for invalid complete protobuf.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a payload is buffered before its length is known, which the decoder state rules out.
     pub fn push<M>(&mut self, chunk: &[u8]) -> Result<Vec<M>, FrameCodecError>
     where
         M: Message + Default,

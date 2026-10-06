@@ -71,12 +71,12 @@ pub async fn get(
     body_sha256: &[u8],
 ) -> Result<Option<CachedSeed>, SqlError> {
     let row = sqlx::query_as::<_, IdempotencyRow>(
-        r#"
+        r"
         SELECT body_sha256, response_status, response_body
         FROM wyrd.storage_idempotency_keys
         WHERE idempotency_key = $1
           AND expires_at > now()
-        "#,
+        ",
     )
     .bind(idempotency_key)
     .fetch_optional(&mut **conn.transaction())
@@ -123,7 +123,7 @@ pub async fn store(
         })?;
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.storage_idempotency_keys (
             data_tenant_id,
             idempotency_key,
@@ -141,13 +141,13 @@ pub async fn store(
             now() + ($5::text || ' seconds')::interval
         )
         ON CONFLICT (data_tenant_id, idempotency_key) DO NOTHING
-        "#,
+        ",
     )
     .bind(idempotency_key)
     .bind(body_sha256)
     .bind(response_status)
     .bind(response_body)
-    .bind(ttl.as_secs() as i64)
+    .bind(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;

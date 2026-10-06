@@ -34,6 +34,10 @@ pub struct SeededBifrostQuery {
 ///
 /// Returns a [`WyrdTestServerError`] when bootstrap, table registration, Arrow
 /// encoding, ingest, flush, endpoint discovery, or token exchange fails.
+///
+/// # Panics
+///
+/// Panics if the server was started without the Bifrost catalog.
 pub async fn seed_query_fixture(
     server: &WyrdTestServer,
     name: &str,

@@ -16,6 +16,7 @@ pub mod cards;
 pub mod client;
 pub mod config;
 pub(crate) mod credentials_file;
+pub mod environment;
 pub mod error;
 pub mod gateway;
 pub mod gateway_credential;
@@ -40,12 +41,3 @@ pub use platform::Platform;
 pub use principals::Principals;
 pub use verification::Verification;
 pub use workflow::{PublicWyrdGatewayCaller, Workflow, WorkflowCards, Workflows};
-
-/// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
-/// environment variables. `ClientConfig::from_env` and
-/// `CredentialChain::from_env` read ambient env, so env-touching tests across
-/// modules in this lib binary must hold this lock for their full duration —
-/// otherwise they race under the parallel workspace test runner. Recover from
-/// poisoning so one failing test does not cascade.
-#[cfg(test)]
-pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

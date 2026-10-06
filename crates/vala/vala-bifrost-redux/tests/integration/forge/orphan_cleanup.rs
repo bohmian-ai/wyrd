@@ -853,11 +853,7 @@ impl ProtectionSource {
         // The operator role may insert into these tables but does not own the
         // right to delete from every one of them, so the fixture teardown uses
         // the database owner rather than widening a production grant.
-        let superuser = fixture
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
+        let superuser = fixture.database.superuser_pool().expect("superuser pool");
         sqlx::query(statement)
             .bind(fixture.tenant.as_uuid())
             .execute(&superuser)

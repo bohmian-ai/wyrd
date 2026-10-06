@@ -92,7 +92,7 @@ async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
@@ -139,8 +139,8 @@ mod tests {
                 bump: None,
                 space: Some("default".parse().expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

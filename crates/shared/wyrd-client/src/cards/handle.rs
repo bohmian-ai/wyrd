@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::WyrdClient;
+use crate::environment::Environment;
 use futures_util::StreamExt;
 use reqwest::Method;
 use secrecy::SecretString;
@@ -94,13 +95,13 @@ impl CardSelector {
     #[must_use]
     pub fn with_version(mut self, version: VersionBlock) -> Self {
         match &mut self {
-            Self::Named {
-                version: selected, ..
-            } => *selected = Some(version),
             Self::Exact(CardRef {
                 version: selected, ..
             }) => *selected = version,
-            Self::Uid {
+            Self::Named {
+                version: selected, ..
+            }
+            | Self::Uid {
                 version: selected, ..
             } => *selected = Some(version),
         }
@@ -164,7 +165,8 @@ impl Cards {
         credential: Option<SecretString>,
         tenant: Option<&str>,
     ) -> Result<Self, WyrdError> {
-        let client = config::load(server_url, credential, tenant).map_err(WyrdError::from)?;
+        let client = config::load(Environment::Process, server_url, credential, tenant)
+            .map_err(WyrdError::from)?;
         Ok(Self {
             engine: RegistryEngine::new(client),
         })

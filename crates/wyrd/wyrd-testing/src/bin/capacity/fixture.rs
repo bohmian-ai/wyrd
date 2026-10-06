@@ -12,6 +12,7 @@
 //! Registration gives each Service principal the `workload` role, so its
 //! Card-bound key emits; the administrator runs and executes Verifiers.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +56,7 @@ const SPC_FEATURES: usize = 4;
 const PADDING: usize = 1_980;
 
 /// How long a baseline fit or the seeded window may take to settle.
-const SETTLE: Duration = Duration::from_secs(300);
+const SETTLE: Duration = Duration::from_mins(5);
 
 /// The five measured verifier workloads, in report order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,7 +116,7 @@ impl Kind {
             (0..SAMPLES)
                 .map(|row| {
                     Some(DriftSample::Number(
-                        value(row + sequence as u32, feature) + shift,
+                        value(u64::from(row) + sequence, feature) + shift,
                     ))
                 })
                 .collect()
@@ -171,8 +172,8 @@ pub fn context(kind: Kind, failing: bool) -> serde_json::Map<String, serde_json:
 
 /// Baseline value of `feature` at `row`: a permutation spreading every
 /// feature evenly over `[0, 100)`, so a later sample window matches it.
-fn value(row: u32, feature: usize) -> f64 {
-    let index = (u64::from(row) * 7_919 + feature as u64 * 104_729) % u64::from(BASELINE_ROWS);
+fn value(row: u64, feature: usize) -> f64 {
+    let index = (row * 7_919 + feature as u64 * 104_729) % u64::from(BASELINE_ROWS);
     index as f64 / 100.0
 }
 
@@ -236,14 +237,14 @@ impl Tenant {
             (Kind::Judge, "judge.yaml"),
         ] {
             let root = register(name).await?.root;
-            verifiers.push((kind, uid(&root.uid)?));
+            verifiers.push((kind, uid(root.uid.as_ref())?));
             if matches!(kind, Kind::Psi | Kind::Spc) {
                 fits.push((kind, root));
             }
         }
         verifiers.push((
             Kind::Assertion,
-            uid(&register("assert.yaml").await?.root.uid)?,
+            uid(register("assert.yaml").await?.root.uid.as_ref())?,
         ));
         let service = register("service.yaml").await?;
 
@@ -268,8 +269,9 @@ impl Tenant {
         .await
         .map_err(|error| format!("hydrating the Service bundle: {error}"))?;
         let state = WyrdState::from_path(&bundle)?;
-        let component =
-            |alias: &str| -> Result<CardUid> { uid(&state.run_for_card(alias)?.card_ref().uid) };
+        let component = |alias: &str| -> Result<CardUid> {
+            uid(state.run_for_card(alias)?.card_ref().uid.as_ref())
+        };
         let model_uid = component("model")?;
         let mut targets = Vec::new();
         for (kind, verifier) in verifiers {
@@ -383,7 +385,7 @@ impl Tenant {
         for row in 0..SAMPLES {
             let mut features = serde_json::Map::new();
             for feature in 0..FEATURES {
-                features.insert(format!("f{feature}"), value(row, feature).into());
+                features.insert(format!("f{feature}"), value(u64::from(row), feature).into());
             }
             features.insert("score".to_owned(), 1.2.into());
             let features = serde_json::Value::Object(features);
@@ -450,8 +452,8 @@ async fn await_fit(cards: &Cards, kind: Kind, root: CardRef) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error when it carries none.
-fn uid(uid: &Option<CardUid>) -> Result<CardUid> {
-    uid.clone()
+fn uid(uid: Option<&CardUid>) -> Result<CardUid> {
+    uid.cloned()
         .ok_or_else(|| "a registered Card carries its UID".into())
 }
 
@@ -482,7 +484,7 @@ fn write_baseline(directory: &Path) -> Result<Vec<u8>> {
     let columns: Vec<ArrayRef> = (0..FEATURES)
         .map(|feature| {
             Arc::new(Float64Array::from_iter_values(
-                (0..BASELINE_ROWS).map(|row| value(row, feature)),
+                (0..BASELINE_ROWS).map(|row| value(u64::from(row), feature)),
             )) as ArrayRef
         })
         .collect();
@@ -542,9 +544,10 @@ fn write_graph(directory: &Path) -> Result<()> {
     let bytes = write_baseline(directory)?;
     let hex = format!("{:x}", sha2::Sha256::digest(&bytes));
     let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
-    let columns: String = (0..FEATURES)
-        .map(|feature| format!("      - name: f{feature}\n        dtype: float64\n"))
-        .collect();
+    let columns = (0..FEATURES).fold(String::new(), |mut columns, feature| {
+        let _ = writeln!(columns, "      - name: f{feature}\n        dtype: float64");
+        columns
+    });
     files.push((
             "baseline.yaml".to_owned(),
             format!(

@@ -79,6 +79,5 @@ wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["client", "server"] }
 
-[[test]]
-name = "pg_bifrost_e2e"
-required-features = ["test-support"]
+[lints]
+workspace = true

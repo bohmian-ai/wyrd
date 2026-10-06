@@ -508,12 +508,10 @@ impl From<OpenAiResponsesUsage> for TokenUsage {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: u
                 .input_tokens_details
-                .map(|details| details.cached_tokens)
-                .unwrap_or(0),
+                .map_or(0, |details| details.cached_tokens),
             reasoning_tokens: u
                 .output_tokens_details
-                .map(|details| details.reasoning_tokens)
-                .unwrap_or(0),
+                .map_or(0, |details| details.reasoning_tokens),
         }
     }
 }

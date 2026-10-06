@@ -666,16 +666,17 @@ impl AuthMiddleware {
         credential: ResolvedCredential,
     ) -> Result<Arc<Self>, WyrdClientError> {
         let credentials = if config.token_cache == TokenCacheMode::Disk {
-            CredentialsFile::locate()
+            config.environment.config_dir().map(CredentialsFile::at)
         } else {
             None
         };
         Self::build(config, credential, credentials)
     }
 
-    /// Construct over a resolved credential file. `new` locates the user's
-    /// `credentials.toml`; tests inject one in a temporary directory so they
-    /// never touch the process environment (and stay parallel-safe).
+    /// Construct over a resolved credential file. `new` locates
+    /// `credentials.toml` in the configuration directory of
+    /// [`ClientConfig::environment`]; tests inject one in a temporary
+    /// directory.
     ///
     /// # Errors
     ///
@@ -1639,7 +1640,7 @@ mod tests {
 
     impl AccessTokenSource for CountingSource {
         /// Names the fixed test identity.
-        fn identity(&self) -> &str {
+        fn identity(&self) -> &'static str {
             "test-system-producer"
         }
 

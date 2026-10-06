@@ -70,8 +70,7 @@ impl WyrdQueueError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::QueueFull => "WYRD_CLIENT_429_QUEUE_FULL",
-            Self::Backpressure => "WYRD_CLIENT_429_QUEUE_FULL",
+            Self::QueueFull | Self::Backpressure => "WYRD_CLIENT_429_QUEUE_FULL",
             Self::FlushTimeout => "WYRD_CLIENT_504_FLUSH_TIMEOUT",
             Self::PayloadTooLarge => "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
             Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",

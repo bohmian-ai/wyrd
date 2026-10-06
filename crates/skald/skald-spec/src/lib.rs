@@ -53,10 +53,8 @@ pub use wire::vertex_predict::{VertexPredictRequest, VertexPredictResponse, Vert
 
 #[cfg(test)]
 pub(crate) mod common {
-    #![allow(dead_code)]
-
     use serde::de::DeserializeOwned;
-    use serde_json::{Value, json, value::RawValue};
+    use serde_json::{Value, json};
 
     use crate::wire::anthropic_messages::*;
     use crate::wire::google_generate::*;
@@ -67,10 +65,6 @@ pub(crate) mod common {
 
     pub(crate) fn typed<T: DeserializeOwned>(value: Value) -> T {
         serde_json::from_value(value).expect("fixture should match skald-spec wire type")
-    }
-
-    pub(crate) fn raw_value(value: Value) -> Box<RawValue> {
-        RawValue::from_string(value.to_string()).expect("fixture should produce raw JSON")
     }
 
     pub(crate) fn openai_chat_request() -> OpenAiChatRequest {
@@ -107,7 +101,7 @@ pub(crate) mod common {
         typed(json!({
             "id": "chatcmpl_123",
             "object": "chat.completion",
-            "created": 1740000000,
+            "created": 1_740_000_000,
             "model": "gpt-4o",
             "choices": [{
                 "index": 0,
@@ -164,7 +158,7 @@ pub(crate) mod common {
             "object": "response",
             "model": "gpt-4o",
             "status": "completed",
-            "created_at": 1740000001,
+            "created_at": 1_740_000_001,
             "output": [
                 {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "{\"answer\":\"hello\"}"}]},
                 {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"hello\"}"}

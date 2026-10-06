@@ -114,7 +114,7 @@ pub async fn query_cards(
     push_card_filters(&mut qb, query)?;
     push_keyset_cursor(&mut qb, &cursor);
     qb.push(" ORDER BY created_at ASC, card_uid ASC LIMIT ");
-    qb.push_bind(cursor.limit as i64 + 1);
+    qb.push_bind(i64::from(cursor.limit) + 1);
 
     let rows = qb
         .build_query_as::<CardRow>()

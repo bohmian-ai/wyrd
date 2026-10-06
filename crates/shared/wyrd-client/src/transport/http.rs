@@ -794,12 +794,11 @@ impl HttpTransport {
         let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
         let generated_key;
-        let idempotency_key = match key {
-            Some(key) => key,
-            None => {
-                generated_key = Uuid::now_v7().to_string();
-                &generated_key
-            }
+        let idempotency_key = if let Some(key) = key {
+            key
+        } else {
+            generated_key = Uuid::now_v7().to_string();
+            &generated_key
         };
         let body_bytes = serde_json::to_vec(body).map_err(|err| WyrdError::Internal {
             message: format!("request serialization failed: {err}"),
@@ -944,7 +943,6 @@ impl HttpTransport {
                     )))
                     .await;
                     attempt += 1;
-                    continue;
                 }
                 // A timeout is ambiguous: the server may have processed the
                 // request. Only retry when replay-safe.
@@ -954,7 +952,6 @@ impl HttpTransport {
                     )))
                     .await;
                     attempt += 1;
-                    continue;
                 }
                 Err(err) => {
                     return Err(WyrdError::Internal {

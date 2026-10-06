@@ -393,7 +393,7 @@ fn visit_resource_metrics(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => {
                 facts
                     .output
@@ -422,7 +422,7 @@ fn visit_scope_metrics(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<(),
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => {
                 facts.output.open(facts.decode_bytes, size_of::<Metric>());
                 facts.add_decode_bytes(size_of::<Metric>())?;
@@ -498,7 +498,7 @@ fn visit_metric_data(
                 facts.visit_record::<SummaryDataPoint>(body, visit_summary_point)?;
             }
             (7 | 9 | 10, 2, WireValue::Varint(_)) | (7, 3, WireValue::Varint(_)) => {}
-            (5, 1, _) | (7, 1..=3, _) | (9 | 10, 1..=2, _) | (11, 1, _) => {
+            (5 | 11, 1, _) | (7, 1..=3, _) | (9 | 10, 1..=2, _) => {
                 return Err(wrong_wire("metric aggregation"));
             }
             _ => {}
@@ -578,8 +578,9 @@ fn visit_exponential_point(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result
                 facts.add_exemplar()?;
                 visit_exemplar(exemplar, facts)?;
             }
-            (8 | 9, WireValue::Bytes(_)) => {}
-            (2..=5 | 7 | 12..=14, WireValue::Fixed64(_)) | (6 | 10, WireValue::Varint(_)) => {}
+            (8 | 9, WireValue::Bytes(_))
+            | (2..=5 | 7 | 12..=14, WireValue::Fixed64(_))
+            | (6 | 10, WireValue::Varint(_)) => {}
             (1..=14, _) => return Err(wrong_wire("exponential histogram data point")),
             _ => {}
         }
@@ -675,8 +676,7 @@ fn visit_exemplar(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<(), Inge
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (7, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (4 | 5, WireValue::Bytes(_)) => {}
-            (2 | 3 | 6, WireValue::Fixed64(_)) => {}
+            (4 | 5, WireValue::Bytes(_)) | (2 | 3 | 6, WireValue::Fixed64(_)) => {}
             (2..=7, _) => return Err(wrong_wire("metric exemplar")),
             _ => {}
         }
@@ -1035,7 +1035,7 @@ fn decode_resource_metrics(bytes: &[u8]) -> Result<ResourceMetrics, IngestError>
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => scope_metrics.push(decode_scope_metrics(body)?),
             (1..=3, _) => return Err(wrong_wire("resource metrics")),
             _ => {}
@@ -1061,7 +1061,7 @@ fn decode_scope_metrics(bytes: &[u8]) -> Result<ScopeMetrics, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => metrics.push(decode_metric(body)?),
             (1..=3, _) => return Err(wrong_wire("scope metrics")),
             _ => {}
@@ -1177,11 +1177,9 @@ fn merge_metric_data(bytes: &[u8], data: &mut metric::Data) -> Result<(), Ingest
             (metric::Data::Summary(summary), 1, WireValue::Bytes(body)) => {
                 summary.data_points.push(decode_summary_point(body)?);
             }
-            (metric::Data::Gauge(_), 1, _)
+            (metric::Data::Gauge(_) | metric::Data::Summary(_), 1, _)
             | (metric::Data::Sum(_), 1..=3, _)
-            | (metric::Data::Histogram(_), 1 | 2, _)
-            | (metric::Data::ExponentialHistogram(_), 1 | 2, _)
-            | (metric::Data::Summary(_), 1, _) => {
+            | (metric::Data::Histogram(_) | metric::Data::ExponentialHistogram(_), 1 | 2, _) => {
                 return Err(wrong_wire("metric aggregation"));
             }
             _ => {}
@@ -1326,7 +1324,7 @@ fn decode_merged_buckets(
                 (1, WireValue::Varint(value)) => buckets.offset = decode_zigzag_i32(value),
                 (2, WireValue::Varint(value)) => buckets.bucket_counts.push(value),
                 (2, WireValue::Bytes(packed)) => {
-                    extend_varints(packed, &mut buckets.bucket_counts)?
+                    extend_varints(packed, &mut buckets.bucket_counts)?;
                 }
                 (1 | 2, _) => return Err(wrong_wire("exponential histogram buckets")),
                 _ => {}

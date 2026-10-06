@@ -36,7 +36,7 @@ pub const DEFAULT_INACTIVITY_TIMEOUT_SECONDS: i64 = 86_400;
 /// The no-op `DO UPDATE` exists only so `RETURNING` yields the stored
 /// `binding_id` for an existing key; the owner Card is immutable, so a
 /// conflicting row always carries the same frozen targets.
-const PROJECT_BINDING_SQL: &str = r#"
+const PROJECT_BINDING_SQL: &str = r"
     INSERT INTO wyrd.verification_bindings (
         binding_id, data_tenant_id, owner_card_uid, owner_card_kind,
         subject_occurrence_key, subject_card_uid, verifier_uid,
@@ -46,15 +46,15 @@ const PROJECT_BINDING_SQL: &str = r#"
     ON CONFLICT ON CONSTRAINT verification_bindings_natural_key
     DO UPDATE SET binding_id = wyrd.verification_bindings.binding_id
     RETURNING binding_id
-"#;
+";
 
 /// List one owner Card version's binding identities in identity order.
-const OWNER_BINDING_IDS_SQL: &str = r#"
+const OWNER_BINDING_IDS_SQL: &str = r"
     SELECT binding_id
       FROM wyrd.verification_bindings
      WHERE owner_card_uid = $1
      ORDER BY binding_id
-"#;
+";
 
 /// Stamp a qualifying exchange on an active Card-bound Service or Agent.
 ///
@@ -64,7 +64,7 @@ const OWNER_BINDING_IDS_SQL: &str = r#"
 /// moves activity backward (`GREATEST` ignores a stored NULL). Returns the
 /// owner Card UID beside the database time that was stamped, or no row for a
 /// Card-free, inactive, or non-machine principal.
-const RECORD_AUTHENTICATION_SQL: &str = r#"
+const RECORD_AUTHENTICATION_SQL: &str = r"
     UPDATE wyrd.auth_service_accounts
        SET last_authenticated_at = GREATEST(last_authenticated_at, statement_timestamp())
      WHERE id = $1
@@ -72,10 +72,10 @@ const RECORD_AUTHENTICATION_SQL: &str = r#"
        AND card_uid IS NOT NULL
        AND status = 'active'
     RETURNING card_uid, statement_timestamp()
-"#;
+";
 
 /// Lock and list one owner's `schedule` bindings whose cursor is still null.
-const UNARMED_SCHEDULES_SQL: &str = r#"
+const UNARMED_SCHEDULES_SQL: &str = r"
     SELECT binding_id, schedule_cron, schedule_tz
       FROM wyrd.verification_bindings
      WHERE owner_card_uid = $1
@@ -83,15 +83,15 @@ const UNARMED_SCHEDULES_SQL: &str = r#"
        AND next_run_at IS NULL
      ORDER BY binding_id
        FOR UPDATE
-"#;
+";
 
 /// Arm one cursor, only while it is still null so an armed cursor never moves.
-const ARM_SCHEDULE_SQL: &str = r#"
+const ARM_SCHEDULE_SQL: &str = r"
     UPDATE wyrd.verification_bindings
        SET next_run_at = $2
      WHERE binding_id = $1
        AND next_run_at IS NULL
-"#;
+";
 
 /// Read one binding's owner principal state and derived admission gate.
 ///
@@ -99,7 +99,7 @@ const ARM_SCHEDULE_SQL: &str = r#"
 /// PostgreSQL's own `statement_timestamp()`, the same clock the stamp was
 /// written on. The principal join is left so a binding whose owner has no
 /// Card-bound principal still reads as inactive.
-const BINDING_ACTIVITY_SQL: &str = r#"
+const BINDING_ACTIVITY_SQL: &str = r"
     SELECT b.binding_id, b.owner_card_uid, p.id AS principal_id,
            p.last_authenticated_at, b.next_run_at,
            (p.status = 'active'
@@ -114,7 +114,7 @@ const BINDING_ACTIVITY_SQL: &str = r#"
         ON p.card_uid = b.owner_card_uid
        AND p.card_kind = b.owner_card_kind
      WHERE b.binding_id = $1
-"#;
+";
 
 /// Why a Trigger schedule cannot be armed.
 #[derive(Debug, thiserror::Error)]

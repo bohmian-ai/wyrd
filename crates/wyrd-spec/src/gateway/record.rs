@@ -5,6 +5,13 @@
 //! projections of the same evidence. None of these records carries a
 //! credential; only the call payload may carry redacted request or response
 //! content, and only when capture policy selects it.
+#![cfg_attr(
+    feature = "server",
+    expect(
+        clippy::large_stack_arrays,
+        reason = "utoipa's ToSchema derive for GatewayAccountingEntryV1 builds its variant schema array on the stack"
+    )
+)]
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};

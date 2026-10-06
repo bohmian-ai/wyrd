@@ -129,7 +129,7 @@ impl Drop for OracleReadBarriers {
 /// Diagnostic limit for a scheduler pass; never the production ticker interval.
 const PASS_BOUND: Duration = Duration::from_secs(15);
 /// Production-sized rewrites may spend several minutes encoding physical bytes.
-const REWRITE_BOUND: Duration = Duration::from_secs(600);
+const REWRITE_BOUND: Duration = Duration::from_mins(10);
 /// Environment flag selecting the standard production geometry profile.
 ///
 /// Journey-only: it changes nothing but the sizes this test's own setup
@@ -250,7 +250,7 @@ impl CloseoutJourney {
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
         let worker_node = spec.nodes[1].node_id;
-        spec.nodes[3].roles = spec.nodes[0].roles.clone();
+        spec.nodes[3].roles = std::mem::take(&mut spec.nodes[0].roles);
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
         // Only the qualification profile needs an oversized worker pod: its
@@ -1097,10 +1097,7 @@ impl GeometryWorkload {
 /// when a row group escapes its physical file.
 fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, target: u64) {
     let output_sizes: Vec<_> = outputs.values().map(DataFile::file_size_in_bytes).collect();
-    eprintln!(
-        "Forge physical bytes: {output_sizes:?}; exact rows: {}",
-        rows
-    );
+    eprintln!("Forge physical bytes: {output_sizes:?}; exact rows: {rows}");
     let residues = output_sizes.iter().filter(|size| **size < target).count();
     assert_eq!(
         residues, 1,
@@ -1154,6 +1151,10 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
 /// Panics on any route, geometry, exactness, tenancy, or convergence violation.
 #[tokio::test]
 #[ignore = "requires Postgres and production-sized object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let mut journey = CloseoutJourney::start().await;
     let tenant = journey.cluster.data_tenant_id();

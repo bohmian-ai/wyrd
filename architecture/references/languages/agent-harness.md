@@ -77,7 +77,7 @@ stable and fail on drift:
 The OpenAPI document is not a generated artifact: `utoipa` builds it from the
 server's handlers and the server serves it at `GET /openapi.json`, so OpenAPI
 changes are proved against the served document by the assembled-server
-contract suite (`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`, run by
+contract suite (`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`, run by
 `mise run test:principals:integration`) rather than by a drift snapshot.
 
 If a schema, stub, or declaration is wrong, fix the source or generator

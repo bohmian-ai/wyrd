@@ -294,8 +294,6 @@ impl NativeWyrdState {
     /// Returns a napi error when `table` is not one serialized `TableConfig`;
     /// a second start, a closed state, and credential, byte-budget, dial, and
     /// fixed-table failures are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; generated object and string arguments arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn start_bifrost(
         &self,
@@ -472,9 +470,6 @@ impl NativeRun {
     }
 
     /// An immutable sibling view scoped to a registered alias.
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn for_card(&self, alias: String) -> NativeRunOpen {
         NativeRunOpen::outcome(self.run.for_card(&alias))
@@ -487,8 +482,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; a
     /// malformed feature map, the lifecycle refusals, and queue saturation are
     /// returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn drift(
         &self,
@@ -513,8 +506,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; malformed
     /// identifiers, a span without its trace, the lifecycle refusals, and queue
     /// saturation are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn eval(
         &self,
@@ -547,8 +538,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; a
     /// reserved, unknown, or unauthorized table and the lifecycle refusals are
     /// returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn record(&self, table: String, row_json: String) -> Result<NativeLifecycleResult> {
         NativeLifecycleResult::outcome(

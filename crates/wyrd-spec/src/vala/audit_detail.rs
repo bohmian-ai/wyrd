@@ -1,4 +1,11 @@
 //! Typed, redacted detail carried by the staged audit event.
+#![cfg_attr(
+    feature = "server",
+    expect(
+        clippy::large_stack_arrays,
+        reason = "utoipa's ToSchema derive for the audit detail enum builds its variant schema array on the stack"
+    )
+)]
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -986,6 +993,10 @@ pub enum StorageBackend {
 }
 
 /// Serialize detail into the deterministic JSON string used as the audit hash preimage.
+///
+/// # Panics
+///
+/// Panics if `AuditDetail` fails JSON serialization, which it cannot.
 #[must_use]
 pub fn audit_detail_canonical_json(detail: &AuditDetail) -> String {
     serde_jcs::to_string(detail).expect("AuditDetail is always JSON-serializable")

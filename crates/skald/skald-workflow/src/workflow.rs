@@ -768,7 +768,7 @@ mod tests {
             .add(agent("first", "first static", None))
             .and_then(|b| b.add_after(agent("second", "second static", None), ["first"]))
             .and_then(|b| b.with_outputs(bindings(&[("text", "steps.second.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("prepared workflow builds");
         let provider = ScriptedProvider::new();
         provider.on("first static", vec![Reply::Text("one".to_owned())]);
@@ -885,7 +885,7 @@ mod tests {
                     ("topic", "input.topic"),
                 ]))
             })
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("explicit workflow builds");
 
         let provider = ScriptedProvider::new();
@@ -949,7 +949,7 @@ mod tests {
                 )
             })
             .and_then(|b| b.with_outputs(bindings(&[("report", "steps.final.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("missing-field workflow builds");
         let provider = ScriptedProvider::new();
         provider.on(
@@ -981,7 +981,7 @@ mod tests {
             .and_then(|b| b.add(agent("z_last", "last peer", None)))
             .and_then(|b| b.add_after(agent("after", "after peers", None), ["a_first", "z_last"]))
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.after.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("peer workflow builds");
         let provider = ScriptedProvider::new();
         let remote = |code: &str| {
@@ -1035,7 +1035,7 @@ mod tests {
         let first = format!("steps.{}.output.text", prompts[0].0);
         builder
             .with_outputs(bindings(&[("out", first.as_str())]))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("independent workflow builds")
     }
 
@@ -1313,9 +1313,9 @@ mod tests {
         // Saturating exponential backoff with a 30 s cap; zero is immediate.
         assert_eq!(backoff(0, 5), Duration::ZERO);
         assert_eq!(backoff(250, 1), Duration::from_millis(250));
-        assert_eq!(backoff(250, 3), Duration::from_millis(1_000));
-        assert_eq!(backoff(1_000, 10), Duration::from_millis(30_000));
-        assert_eq!(backoff(u64::MAX, u32::MAX), Duration::from_millis(30_000));
+        assert_eq!(backoff(250, 3), Duration::from_secs(1));
+        assert_eq!(backoff(1_000, 10), Duration::from_secs(30));
+        assert_eq!(backoff(u64::MAX, u32::MAX), Duration::from_secs(30));
 
         // The step attempt timeout wins over a hanging call and is retryable.
         let workflow = with_policy(
@@ -1352,7 +1352,7 @@ mod tests {
             .and_then(|b| b.add(agent("slow_ok", "slow ok", None)))
             .and_then(|b| b.add_after(agent("later", "later call", None), ["slow_ok"]))
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.later.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("drain workflow builds");
         let provider = ScriptedProvider::new();
         provider.on("fail fast", vec![status(400)]);
@@ -1383,7 +1383,7 @@ mod tests {
             .and_then(|b| b.add(agent("quick", "quick call", None)))
             .and_then(|b| b.add_after(agent("next", "next call", None), ["held"]))
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.next.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("cancel workflow builds");
         let provider = ScriptedProvider::new();
         provider.on("held call", vec![Reply::Hang]);
@@ -1588,7 +1588,7 @@ mod tests {
                 .and_then(|b| b.with_inputs(string_inputs(&[("topic", "rust")])))
                 .and_then(|b| b.with_step_inputs("flaky", bindings(&[("topic", "input.topic")])))
                 .and_then(|b| b.with_outputs(bindings(&[("out", "steps.flaky.output.text")])))
-                .and_then(|b| b.build())
+                .and_then(super::super::workflow_surface::WorkflowBuilder::build)
                 .expect("traced workflow builds"),
             "flaky",
             1,
@@ -1755,7 +1755,7 @@ mod tests {
             Workflow::builder("held_settlement")
                 .add(held)
                 .and_then(|b| b.with_outputs(bindings(&[("out", "steps.settle.output.text")])))
-                .and_then(|b| b.build())
+                .and_then(super::super::workflow_surface::WorkflowBuilder::build)
                 .expect("held settlement workflow builds"),
             "settle",
             1,
@@ -1852,12 +1852,12 @@ mod tests {
     #[async_trait::async_trait]
     impl skald_tool::AgentTool for PanickingTool {
         /// Name the model calls.
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "explode"
         }
 
         /// Fixed description.
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "panics on invocation"
         }
 
@@ -1895,7 +1895,7 @@ mod tests {
             Workflow::builder("panicking")
                 .add(boom)
                 .and_then(|b| b.with_outputs(bindings(&[("out", "steps.boom.output.text")])))
-                .and_then(|b| b.build())
+                .and_then(super::super::workflow_surface::WorkflowBuilder::build)
                 .expect("panicking workflow builds"),
             "boom",
             2,
@@ -2015,7 +2015,7 @@ mod tests {
                 )
             })
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.routed.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("route workflow builds");
         let fallback = GatewayFallbackOverride {
             candidates: vec![ModelRef::from_projection("openai/gpt-backup").expect("model ref")],
@@ -2234,7 +2234,7 @@ mod tests {
             let mut workflow = Workflow::builder("external")
                 .add(agent("ext", "external call", None))
                 .and_then(|b| b.with_outputs(bindings(&[("out", "steps.ext.output.text")])))
-                .and_then(|b| b.build())
+                .and_then(super::super::workflow_surface::WorkflowBuilder::build)
                 .expect("external workflow builds");
             workflow.spec.steps[0].llm_route = Some(LlmRoute::ExtGateway {
                 protocol,
@@ -2550,7 +2550,7 @@ mod tests {
             .and_then(|b| b.with_inputs(string_inputs(&[("topic", "rust")])))
             .and_then(|b| b.with_step_inputs("writer", bindings(&[("topic", "input.topic")])))
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.writer.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .expect("budget workflow builds");
         let run_with = |limits: WorkflowExecutionLimits,
                         cancellation: CancellationToken,

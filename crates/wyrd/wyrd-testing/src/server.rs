@@ -1,5 +1,6 @@
 //! Real-socket Wyrd server test harness.
 
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -147,6 +148,10 @@ fn serve_task_outcome(
 }
 
 /// Wyrd server test harness supporting in-process and real-socket modes.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag records one independent opt-in the harness started with"
+)]
 pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
@@ -197,7 +202,7 @@ struct WyrdTestServerInner {
     /// Lifetime guard of the generated Operator key directory, when used.
     operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
-    _storage_root: Option<Arc<tempfile::TempDir>>,
+    storage_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
     _bifrost_data_dir: Arc<tempfile::TempDir>,
     /// Exclusive owner of this server's one Bifrost data root.
@@ -320,7 +325,8 @@ impl AuditCommitFailures {
             .lines()
             .find_map(|line| line.strip_prefix("outbox_write_failures_total{outbox=\"audit\"} "))
             .and_then(|value| value.trim().parse::<f64>().ok())
-            .map_or(0, |value| value as u64)
+            .and_then(|value| value.to_u64())
+            .unwrap_or(0)
     }
 
     /// Waits up to `budget` until at least one audit write attempt has failed,
@@ -473,6 +479,10 @@ enum Mode {
 }
 
 /// Builder for [`WyrdTestServer`].
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent builder opt-in"
+)]
 pub struct WyrdTestServerBuilder {
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
@@ -662,7 +672,7 @@ impl Default for WyrdTestServerBuilder {
             sealing_keyring: None,
             public_origin: None,
             ui_client_secret_hash: None,
-            forge_interval: Duration::from_secs(60),
+            forge_interval: Duration::from_mins(1),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -819,7 +829,7 @@ impl WyrdTestServer {
     /// # Errors
     /// Returns an error when database, storage, auth, or router state cannot be created.
     pub async fn start_in_process() -> Result<Self, WyrdTestServerError> {
-        Self::builder().start_in_process().await
+        Box::pin(Self::builder().start_in_process()).await
     }
 
     /// Start a Wyrd server bound to a real OS-assigned TCP socket.
@@ -827,7 +837,7 @@ impl WyrdTestServer {
     /// # Errors
     /// Returns an error when startup or socket binding fails.
     pub async fn start_bound() -> Result<Self, WyrdTestServerError> {
-        Self::builder().start_bound().await
+        Box::pin(Self::builder().start_bound()).await
     }
 
     /// Shut down the server, settling its lifecycle owners before dropping fixtures.
@@ -887,8 +897,8 @@ impl WyrdTestServer {
         self.inner.state.shutdown_token.cancel();
         let mut outcome = Ok(());
         if let Some(mut handle) = self.serve_handle.take() {
-            match tokio::time::timeout(budget, &mut handle).await {
-                Ok(join) => match serve_task_outcome(join) {
+            if let Ok(join) = tokio::time::timeout(budget, &mut handle).await {
+                match serve_task_outcome(join) {
                     Ok(Ok(_report)) => {
                         self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
                     }
@@ -896,17 +906,16 @@ impl WyrdTestServer {
                         tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
                     }
                     Err(error) => outcome = Err(error),
-                },
-                Err(_) => {
-                    tracing::warn!("serve task did not drain within the teardown budget; aborting");
-                    handle.abort();
-                    if let Err(error) = handle.await
-                        && error.is_panic()
-                    {
-                        outcome = Err(WyrdTestServerError::Join(format!(
-                            "bound serve task: {error}"
-                        )));
-                    }
+                }
+            } else {
+                tracing::warn!("serve task did not drain within the teardown budget; aborting");
+                handle.abort();
+                if let Err(error) = handle.await
+                    && error.is_panic()
+                {
+                    outcome = Err(WyrdTestServerError::Join(format!(
+                        "bound serve task: {error}"
+                    )));
                 }
             }
         }
@@ -948,13 +957,12 @@ impl WyrdTestServer {
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
-        let storage_root = self.inner._storage_root.clone();
+        let storage_root = self.inner.storage_root.clone();
         self.shutdown().await?;
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        builder
-            .start_with_resources(fixture, storage, storage_root)
+        Box::pin(builder.start_with_resources(fixture, storage, storage_root))
             .await?
             .bind()
             .await
@@ -975,13 +983,12 @@ impl WyrdTestServer {
         &self,
         builder: WyrdTestServerBuilder,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
-        builder
-            .start_with_resources(
-                Arc::clone(&self.inner.fixture),
-                Arc::clone(&self.inner.state.storage),
-                self.inner._storage_root.clone(),
-            )
-            .await
+        Box::pin(builder.start_with_resources(
+            Arc::clone(&self.inner.fixture),
+            Arc::clone(&self.inner.state.storage),
+            self.inner.storage_root.clone(),
+        ))
+        .await
     }
 
     /// Start `builder` as a second replica like
@@ -997,7 +1004,7 @@ impl WyrdTestServer {
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        self.start_replica(builder).await?.bind().await
+        Box::pin(self.start_replica(builder)).await?.bind().await
     }
 
     /// Cancel the serve task, join it in place, and return its drain outcome.
@@ -1489,7 +1496,7 @@ impl WyrdTestServer {
             .inner
             .state
             .bifrost_resources()
-            .and_then(|resources| resources.oracle())
+            .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
             .ok_or_else(|| WyrdTestServerError::Start("Oracle role is not hosted".to_owned()))?
             .memory_hold())
     }
@@ -1710,7 +1717,7 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND state IN ('ready', 'claimed', 'running', 'prepared')",
         )
@@ -1739,7 +1746,7 @@ impl WyrdTestServer {
         namespace: &str,
         table_name: &str,
     ) -> Result<Vec<PublishedHotFileInspection>, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let rows: Vec<PublishedHotFileRow> = sqlx::query_as(
             "SELECT id,file_path,file_size,row_count,file_ordinal,file_checksum,promotion_record,\
              wal_lsn_min,wal_lsn_max \
@@ -2073,7 +2080,7 @@ impl WyrdTestServer {
                  {RETAINED_AUDIT_BUDGET:?}"
             )));
         }
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
         loop {
             let head = sqlx::query_as::<_, (i64, i64)>(
@@ -2160,7 +2167,7 @@ impl WyrdTestServer {
     /// or the audit query fails.
     pub async fn table_describe_count(&self, fqn: &str) -> Result<i64, WyrdTestServerError> {
         self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 \
              AND operation = 'vala.bifrost.describe' AND resource = $2 AND outcome = 'allowed'",
@@ -2186,7 +2193,7 @@ impl WyrdTestServer {
         &self,
         owner: &CardUid,
     ) -> Result<Option<DateTime<Utc>>, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar(
             "SELECT last_authenticated_at FROM wyrd.auth_service_accounts \
              WHERE data_tenant_id = $1 AND card_uid = $2",
@@ -2214,7 +2221,7 @@ impl WyrdTestServer {
         &self,
         fqn: &str,
     ) -> Result<(), WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let changed = sqlx::query(
             "UPDATE vala.bifrost_tables SET fingerprint = sha256(fingerprint), updated_at = now() \
              WHERE data_tenant_id = $1 AND fqn = $2",
@@ -2669,7 +2676,7 @@ impl WyrdTestServer {
     ) -> Result<ForgeWorkflowInspection, WyrdTestServerError> {
         let namespace = table.namespace.as_str();
         let table = table.name.as_str();
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let has_demand = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
         )
@@ -3022,7 +3029,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            Some(Duration::from_secs(365 * 24 * 60 * 60)),
+            Some(Duration::from_hours(8760)),
         )
         .await
         .map_err(sql)?;
@@ -3347,6 +3354,10 @@ impl WyrdTestServer {
     ///
     /// # Errors
     /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a generated UUIDv7 fails `CardUid` validation.
     pub async fn seed_card_principal_in_tenant(
         &self,
         tenant_id: DataTenantId,
@@ -3483,7 +3494,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            Some(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+            Some(std::time::Duration::from_hours(8760)),
         )
         .await
         .map_err(sql)?;
@@ -4404,30 +4415,28 @@ impl WyrdTestServerBuilder {
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {
             (None, handle)
         } else {
-            let (root, settings) = match self.storage_settings.take() {
-                Some(settings) => (None, settings),
-                None => {
-                    let root = tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-                    let settings = StorageSettings {
-                        backend: BackendConfig::Local {
-                            root: root.path().to_path_buf(),
-                        },
-                        require_encryption: false,
-                        presign_ttl: Duration::from_secs(600),
-                        part_size_bytes: 16 * 1024 * 1024,
-                        multipart_threshold_bytes: 100 * 1024 * 1024,
-                    };
-                    (Some(Arc::new(root)), settings)
-                }
+            let (root, settings) = if let Some(settings) = self.storage_settings.take() {
+                (None, settings)
+            } else {
+                let root = tempfile::tempdir()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                let settings = StorageSettings {
+                    backend: BackendConfig::Local {
+                        root: root.path().to_path_buf(),
+                    },
+                    require_encryption: false,
+                    presign_ttl: Duration::from_mins(10),
+                    part_size_bytes: 16 * 1024 * 1024,
+                    multipart_threshold_bytes: 100 * 1024 * 1024,
+                };
+                (Some(Arc::new(root)), settings)
             };
             let handle = fixture_storage_handle(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
         };
-        self.start_with_resources(fixture, storage, storage_root)
-            .await
+        Box::pin(self.start_with_resources(fixture, storage, storage_root)).await
     }
 
     /// Start a server over shared cluster resources.
@@ -4523,7 +4532,7 @@ impl WyrdTestServerBuilder {
         let external_verifier = Arc::new(ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
                 Duration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
@@ -4823,7 +4832,7 @@ impl WyrdTestServerBuilder {
             inner: WyrdTestServerInner {
                 fixture,
                 operator_keys_dir,
-                _storage_root: storage_root,
+                storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,
                 _managed_secret_key_root: managed_secret_key_root,
@@ -4881,8 +4890,8 @@ impl WyrdTestServerBuilder {
         if self.bind_addrs.is_none() {
             self.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        let srv = self.start_in_process().await?;
-        srv.bind().await
+        let srv = Box::pin(self.start_in_process()).await?;
+        Box::pin(srv.bind()).await
     }
 }
 
@@ -4891,7 +4900,7 @@ impl WyrdTestServerBuilder {
 /// A flush that cannot settle is a wedged Scribe, not a slow one: without this
 /// bound a journey polling for published rows blocks its caller forever and
 /// reports nothing, so the harness names the failure instead.
-const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Operator binding every test server declares for `Environment` gateway credentials.
 pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
@@ -5114,11 +5123,11 @@ fn reservation_band() -> Option<Range<u16>> {
 /// [`RESERVATION_ATTEMPTS`], when the port claim directory is unusable, or
 /// when loopback binding or address lookup fails.
 pub(crate) fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
+    /// Process-wide offset into the band so successive reservations probe fresh ports.
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
     let Some(band) = reservation_band() else {
         return bound_loopback_addr(0);
     };
-    /// Process-wide offset into the band so successive reservations probe fresh ports.
-    static CURSOR: AtomicU32 = AtomicU32::new(0);
     let span = u32::from(band.end - band.start);
     let seed = std::process::id().wrapping_mul(2_654_435_761);
     let mut last = None;
@@ -5386,7 +5395,7 @@ async fn insert_fixture_card(
         .ok_or_else(|| WyrdTestServerError::Auth("machine CardRef must carry a uid".to_owned()))?;
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.cards (
             card_uid,
             data_tenant_id,
@@ -5417,7 +5426,7 @@ async fn insert_fixture_card(
             'active',
             $8
         )
-        "#,
+        ",
     )
     .bind(uid.as_uuid())
     .bind(card_ref.kind.wire_name())
@@ -5652,11 +5661,13 @@ mod teardown_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain() {
         let aborted = Arc::new(AtomicBool::new(false));
-        let server = WyrdTestServer::builder()
-            .with_stalled_drain_for_test(Arc::clone(&aborted))
-            .start_bound()
-            .await
-            .expect("bound test server starts");
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_stalled_drain_for_test(Arc::clone(&aborted))
+                .start_bound(),
+        )
+        .await
+        .expect("bound test server starts");
 
         server
             .shutdown()
@@ -5705,7 +5716,7 @@ mod teardown_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dropping_an_in_process_server_with_live_storage_work_awaits_abort_before_fixture_release()
      {
-        let server = WyrdTestServer::start_in_process()
+        let server = Box::pin(WyrdTestServer::start_in_process())
             .await
             .expect("in-process test server starts");
         let storage = Arc::clone(

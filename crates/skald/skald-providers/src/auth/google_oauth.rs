@@ -151,10 +151,10 @@ impl GoogleOAuth {
         {
             return Self::from_credentials_file(path);
         }
-        let base_url = std::env::var("GCE_METADATA_HOST")
-            .map(|host| format!("http://{host}"))
-            // GCE metadata uses plain HTTP by design; no https enforcement here.
-            .unwrap_or_else(|_| "http://metadata.google.internal".to_owned());
+        let base_url = std::env::var("GCE_METADATA_HOST").map_or_else(
+            |_| "http://metadata.google.internal".to_owned(),
+            |host| format!("http://{host}"),
+        );
         let parsed = Url::parse(&base_url).map_err(|_| {
             ProviderError::auth("google", "GCE_METADATA_HOST produced an invalid base URL")
         })?;

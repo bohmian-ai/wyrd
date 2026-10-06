@@ -30,7 +30,7 @@ use crate::load::{Lane, MAX_IN_FLIGHT, Op, Tally, TenantClients, Work, mix};
 use crate::profile::{Capture, Profile};
 
 /// How long every backlog may take to drain after load stops (REQ-171).
-pub const DRAIN_LIMIT: Duration = Duration::from_secs(60);
+pub const DRAIN_LIMIT: Duration = Duration::from_mins(1);
 
 /// How often the drain re-reads the backlogs.
 const POLL: Duration = Duration::from_millis(250);
@@ -571,7 +571,7 @@ mod tests {
     /// Panics when a read is judged wrongly.
     #[test]
     fn a_backlog_drains_only_within_the_limit() {
-        let below = DRAIN_LIMIT - Duration::from_millis(100);
+        let below = DRAIN_LIMIT.checked_sub(Duration::from_millis(100)).unwrap();
         assert_eq!(
             Drain::judge(below, true),
             Drain::Drained(below.as_secs_f64())

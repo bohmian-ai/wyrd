@@ -22,42 +22,42 @@ use crate::TenantConn;
 use crate::row_types::auth::HumanConnectionBinding;
 
 /// Drop this tenant's device authorizations that can no longer be redeemed.
-const PURGE_EXPIRED_DEVICE_AUTHORIZATIONS_SQL: &str = r#"
+const PURGE_EXPIRED_DEVICE_AUTHORIZATIONS_SQL: &str = r"
     DELETE FROM wyrd.auth_device_authorizations
      WHERE expires_at <= statement_timestamp()
-"#;
+";
 
 /// Record one device authorization owned by the RLS tenant; `PostgreSQL`
 /// derives its expiry from the bound lifetime in seconds.
-const INSERT_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const INSERT_DEVICE_AUTHORIZATION_SQL: &str = r"
     INSERT INTO wyrd.auth_device_authorizations (
         device_id, data_tenant_id, device_code_hash, user_code, expires_at
     ) VALUES ($1, $2, $3, $4, statement_timestamp() + ($5 * interval '1 second'))
-"#;
+";
 
 /// The id of the unexpired, undecided device authorization with this user
 /// code.
-const PENDING_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const PENDING_DEVICE_AUTHORIZATION_SQL: &str = r"
     SELECT device_id FROM wyrd.auth_device_authorizations
      WHERE user_code = $1
        AND NOT denied
        AND principal_id IS NULL
        AND expires_at > statement_timestamp()
-"#;
+";
 
 /// Mark the unexpired, unapproved device authorization with this user code
 /// denied.
-const DENY_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const DENY_DEVICE_AUTHORIZATION_SQL: &str = r"
     UPDATE wyrd.auth_device_authorizations
        SET denied = true
      WHERE user_code = $1
        AND principal_id IS NULL
        AND expires_at > statement_timestamp()
-"#;
+";
 
 /// Record the approval of the unexpired, undecided device authorization with
 /// this id.
-const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r"
     UPDATE wyrd.auth_device_authorizations
        SET principal_id = $2,
            connection_id = $3,
@@ -66,11 +66,11 @@ const APPROVE_DEVICE_AUTHORIZATION_SQL: &str = r#"
        AND NOT denied
        AND principal_id IS NULL
        AND expires_at > statement_timestamp()
-"#;
+";
 
 /// Lock the device authorization this code hash names and record this poll,
 /// returning its state and whether the previous poll was within the interval.
-const POLL_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const POLL_DEVICE_AUTHORIZATION_SQL: &str = r"
     WITH device AS (
         SELECT device_id, denied, principal_id, connection_id, connection_revision,
                expires_at <= statement_timestamp() AS expired,
@@ -86,11 +86,11 @@ const POLL_DEVICE_AUTHORIZATION_SQL: &str = r#"
      WHERE polled.device_id = device.device_id
     RETURNING device.device_id, device.denied, device.principal_id, device.connection_id,
               device.connection_revision, device.expired, device.too_fast
-"#;
+";
 
 /// Delete the device authorization with this id and any login state still
 /// bound to it.
-const DELETE_DEVICE_AUTHORIZATION_SQL: &str = r#"
+const DELETE_DEVICE_AUTHORIZATION_SQL: &str = r"
     WITH device AS (
         DELETE FROM wyrd.auth_device_authorizations
          WHERE device_id = $1
@@ -98,7 +98,7 @@ const DELETE_DEVICE_AUTHORIZATION_SQL: &str = r#"
     )
     DELETE FROM wyrd.auth_login_state
      WHERE device_id IN (SELECT device_id FROM device)
-"#;
+";
 
 /// A device authorization as one token poll found it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]

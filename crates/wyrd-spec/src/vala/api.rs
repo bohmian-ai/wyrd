@@ -2602,7 +2602,7 @@ mod bifrost_wire_tests {
             name: "value".to_string(),
             data_type: DataTypeSpec::Int64,
             nullable: false,
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
         };
         bifrost_wire_round_trip(&spec);
 
@@ -2625,7 +2625,7 @@ mod bifrost_wire_tests {
             name: "card_ref".to_string(),
             data_type: DataTypeSpec::Utf8,
             nullable: true,
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
         };
         spec.metadata
             .insert("wyrd:column_class".to_string(), "correlation".to_string());
@@ -2705,7 +2705,7 @@ mod bifrost_wire_tests {
                         )]),
                     })),
                     nullable: true,
-                    metadata: Default::default(),
+                    metadata: BTreeMap::default(),
                 },
                 FieldSpec {
                     name: "ts".to_string(),
@@ -2714,11 +2714,11 @@ mod bifrost_wire_tests {
                         tz: Some("UTC".to_string()),
                     },
                     nullable: false,
-                    metadata: Default::default(),
+                    metadata: BTreeMap::default(),
                 },
             ]),
             nullable: true,
-            metadata: Default::default(),
+            metadata: BTreeMap::default(),
         };
         bifrost_wire_round_trip(&spec);
     }
@@ -2740,7 +2740,7 @@ mod bifrost_wire_tests {
                 name: "value".to_string(),
                 data_type: DataTypeSpec::Int64,
                 nullable: false,
-                metadata: Default::default(),
+                metadata: BTreeMap::default(),
             }],
             correlation_fields: vec![
                 FieldSpec {

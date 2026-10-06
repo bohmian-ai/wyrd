@@ -438,12 +438,9 @@ impl ReadyOracleForwarder {
             let mut converter = QueryStreamConverter::new();
             let mut ipc = ForwardedQueryIpc::new();
             while let Some(frame) = wire.next().await {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        yield Err(BifrostError::QueryExecutionFailed);
-                        break;
-                    }
+                let Ok(frame) = frame else {
+                    yield Err(BifrostError::QueryExecutionFailed);
+                    break;
                 };
                 let counted = match frame.frame.as_ref() {
                     Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(schema)) => {

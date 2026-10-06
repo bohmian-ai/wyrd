@@ -203,6 +203,7 @@ mod tests {
     use crate::reference::CardRef;
     use crate::registry::CardSubmission;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use wyrd_semver::{VersionBlock, VersionSpec};
 
     fn card_ref(kind: CardKind, name: &str) -> CardRef {
@@ -225,8 +226,8 @@ mod tests {
                 bump: None,
                 space: card_ref.space.clone(),
                 uid: card_ref.uid.clone(),
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

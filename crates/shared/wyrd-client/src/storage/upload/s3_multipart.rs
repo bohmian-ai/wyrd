@@ -73,7 +73,7 @@ pub(crate) async fn upload(
                 .next_chunk(part_size)
                 .await?
                 .ok_or(StorageClientError::SizeMismatch {
-                    expected: total.unwrap_or(*part_count as u64 * *part_size_bytes),
+                    expected: total.unwrap_or(u64::from(*part_count) * *part_size_bytes),
                     actual: uploaded,
                 })?;
         let e_tag =
@@ -85,7 +85,7 @@ pub(crate) async fn upload(
     }
     if reader.has_more().await? {
         return Err(StorageClientError::SizeMismatch {
-            expected: total.unwrap_or(*part_count as u64 * *part_size_bytes),
+            expected: total.unwrap_or(u64::from(*part_count) * *part_size_bytes),
             actual: uploaded + 1,
         });
     }

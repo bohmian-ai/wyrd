@@ -178,6 +178,7 @@ mod tests {
     use crate::envelope::{CardKind, Metadata};
     use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind, RelativeArtifactPath};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// Build a stable artifact entry for canonical-manifest tests.
     fn artifact(path: &str) -> ArtifactManifestEntry {
@@ -211,8 +212,8 @@ mod tests {
                 bump: None,
                 space: Some("default".parse().expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

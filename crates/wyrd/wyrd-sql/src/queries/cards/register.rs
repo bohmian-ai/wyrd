@@ -143,12 +143,12 @@ pub async fn lookup_existing_operation(
     idempotency_key: &str,
 ) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
     sqlx::query_as::<_, CardRegistrationOperationRow>(
-        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+        r"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
             WHERE status <> 'expired'
-              AND principal_id = $1 AND idempotency_key = $2"#,
+              AND principal_id = $1 AND idempotency_key = $2",
     )
     .bind(principal_id.as_uuid())
     .bind(idempotency_key)
@@ -164,12 +164,12 @@ pub async fn lookup_expired_operation(
     idempotency_key: &str,
 ) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
     sqlx::query_as::<_, CardRegistrationOperationRow>(
-        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+        r"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
             WHERE status = 'expired'
-              AND principal_id = $1 AND idempotency_key = $2"#,
+              AND principal_id = $1 AND idempotency_key = $2",
     )
     .bind(principal_id.as_uuid())
     .bind(idempotency_key)
@@ -184,11 +184,11 @@ pub async fn lookup_operation_by_id(
     operation_id: RegistrationOperationId,
 ) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
     sqlx::query_as::<_, CardRegistrationOperationRow>(
-        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+        r"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
-            WHERE operation_id = $1"#,
+            WHERE operation_id = $1",
     )
     .bind(operation_id.as_uuid())
     .fetch_optional(&mut **conn.transaction())
@@ -202,11 +202,11 @@ pub async fn insert_registration_operation(
     operation: NewRegistrationOperation<'_>,
 ) -> Result<bool, WyrdError> {
     let inserted = sqlx::query(
-        r#"INSERT INTO wyrd.card_registration_operations
+        r"INSERT INTO wyrd.card_registration_operations
                (operation_id, data_tenant_id, principal_id, idempotency_key,
                 request_hash, stored_response, status)
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, NULL, 'pending')
-           ON CONFLICT (data_tenant_id, principal_id, idempotency_key) DO NOTHING"#,
+           ON CONFLICT (data_tenant_id, principal_id, idempotency_key) DO NOTHING",
     )
     .bind(operation.operation_id.as_uuid())
     .bind(operation.principal_id.as_uuid())
@@ -229,17 +229,14 @@ pub async fn insert_card_row(
         .space
         .as_ref()
         .ok_or_else(|| WyrdError::registry_invalid_card_spec("metadata.space is required"))?;
-    let version = match input.card.metadata.version.as_ref() {
-        Some(VersionSpec::Pin(version)) => version,
-        _ => {
-            return Err(WyrdError::registry_invalid_version_block(
-                "registration requires a resolved version",
-            ));
-        }
+    let Some(VersionSpec::Pin(version)) = input.card.metadata.version.as_ref() else {
+        return Err(WyrdError::registry_invalid_version_block(
+            "registration requires a resolved version",
+        ));
     };
     let pending_since = (input.status == CardStatus::Pending).then(Utc::now);
     let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
-        r#"INSERT INTO wyrd.cards
+        r"INSERT INTO wyrd.cards
                (card_uid, data_tenant_id, kind, space, name, version, spec,
         spec_hash, artifact_hash, labels, annotations, status, created_by,
                 registration_operation_id, pending_since,
@@ -248,7 +245,7 @@ pub async fn insert_card_row(
                    $9, $10, $11, $12, $13, $14,
                    CASE WHEN $11 = 'pending' THEN 'pending' ELSE 'idle' END,
                    CASE WHEN $11 = 'pending' THEN statement_timestamp() ELSE NULL END)
-           RETURNING created_at"#,
+           RETURNING created_at",
     )
     .bind(input.card_uid.as_uuid())
     .bind(input.card.kind.wire_name())
@@ -301,7 +298,10 @@ pub async fn insert_artifact_manifest_rows(
         .iter()
         .map(|artifact| {
             let size = i64::try_from(artifact.size_bytes).map_err(|_| {
-                WyrdError::registry_spec_too_large(artifact.size_bytes as usize, i64::MAX as usize)
+                WyrdError::registry_spec_too_large(
+                    usize::try_from(artifact.size_bytes).unwrap_or(usize::MAX),
+                    usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+                )
             })?;
             Ok((artifact, size))
         })
@@ -336,12 +336,12 @@ pub async fn manifest_rows_for_init(
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
     sqlx::query_as::<_, CardArtifactManifestRow>(
-        r#"SELECT card_uid, manifest_id, relative_path, expected_sha256, size_bytes,
+        r"SELECT card_uid, manifest_id, relative_path, expected_sha256, size_bytes,
                   content_type, upload_status, upload_id
              FROM wyrd.card_artifact_manifest
             WHERE card_uid = $1
               AND upload_status = 'awaiting_init'
-            ORDER BY relative_path"#,
+            ORDER BY relative_path",
     )
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())
@@ -357,10 +357,10 @@ pub async fn mark_manifest_upload_initialized(
     upload_id: Uuid,
 ) -> Result<(), WyrdError> {
     sqlx::query(
-        r#"UPDATE wyrd.card_artifact_manifest
+        r"UPDATE wyrd.card_artifact_manifest
               SET upload_status = 'pending', upload_id = $3
             WHERE card_uid = $1
-              AND relative_path = $2 AND upload_status IN ('awaiting_init', 'pending')"#,
+              AND relative_path = $2 AND upload_status IN ('awaiting_init', 'pending')",
     )
     .bind(card_uid.as_uuid())
     .bind(relative_path)
@@ -379,9 +379,9 @@ pub async fn commit_registration_operation(
 ) -> Result<(), WyrdError> {
     let stored_response = serde_json::to_value(seed).map_err(WyrdError::from_spec_serialization)?;
     let result = sqlx::query(
-        r#"UPDATE wyrd.card_registration_operations
+        r"UPDATE wyrd.card_registration_operations
               SET stored_response = $1, status = 'committed', updated_at = now()
-            WHERE operation_id = $2 AND status = 'pending'"#,
+            WHERE operation_id = $2 AND status = 'pending'",
     )
     .bind(stored_response)
     .bind(operation_id.as_uuid())
@@ -398,6 +398,10 @@ pub async fn commit_registration_operation(
 }
 
 /// Resolve exact references to non-terminal cards in one tenant-scoped query.
+///
+/// # Panics
+///
+/// Panics if a reference lacks the space validated earlier in this function.
 pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],

@@ -25,8 +25,10 @@ fn issued_key(stdout: &str) -> String {
     stdout
         .lines()
         .find_map(|line| line.strip_prefix("key:"))
-        .map(|value| value.trim().to_owned())
-        .unwrap_or_else(|| panic!("issue-key printed no key: line: {stdout}"))
+        .map_or_else(
+            || panic!("issue-key printed no key: line: {stdout}"),
+            |value| value.trim().to_owned(),
+        )
 }
 
 /// An administrator issues a card-bound API key through the CLI, and the key

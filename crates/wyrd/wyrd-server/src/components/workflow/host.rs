@@ -127,14 +127,8 @@ impl WorkflowRunHost {
     /// Returns the permission errors of [`audit::authorize`], and
     /// `WYRD_WORKFLOW_404_RUN_NOT_FOUND` for a malformed id or a run the
     /// caller cannot see.
-    pub(crate) async fn get(
-        &self,
-        caller: &Caller,
-        run_id: &str,
-    ) -> Result<WorkflowRun, WyrdError> {
-        let run_id = self
-            .authorize_run(caller, "workflow.run.read", run_id)
-            .await?;
+    pub(crate) fn get(&self, caller: &Caller, run_id: &str) -> Result<WorkflowRun, WyrdError> {
+        let run_id = self.authorize_run(caller, "workflow.run.read", run_id)?;
         self.state
             .workflows
             .get(caller.data_tenant_id, caller.principal.id, run_id)
@@ -156,9 +150,7 @@ impl WorkflowRunHost {
         caller: &Caller,
         run_id: &str,
     ) -> Result<WorkflowRun, WyrdError> {
-        let run_id = self
-            .authorize_run(caller, "workflow.run.cancel", run_id)
-            .await?;
+        let run_id = self.authorize_run(caller, "workflow.run.cancel", run_id)?;
         let mut snapshots =
             self.state
                 .workflows
@@ -180,7 +172,7 @@ impl WorkflowRunHost {
     /// # Errors
     /// Returns the permission errors of [`audit::authorize`], and
     /// `WYRD_WORKFLOW_404_RUN_NOT_FOUND` for a malformed id.
-    async fn authorize_run(
+    fn authorize_run(
         &self,
         caller: &Caller,
         operation: &str,

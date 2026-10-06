@@ -297,7 +297,7 @@ mod tests {
             .and_then(|b| b.add(beta))
             .and_then(|b| b.add(inline))
             .and_then(|b| b.with_outputs(bindings(&[("text", "steps.gamma.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::super::workflow_surface::WorkflowBuilder::build)
             .and_then(|workflow| Ok(workflow.to_card()?))
             .expect("fixture Workflow builds");
         let tool_for: BTreeMap<&str, &str> = [

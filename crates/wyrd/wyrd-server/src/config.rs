@@ -2,6 +2,7 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{self, Debug, Formatter};
@@ -756,11 +757,10 @@ fn checked_floor_u32(value: f64, name: &str) -> Result<u32, String> {
     if !value.is_finite() || value < 0.0 {
         return Err(format!("{name} must be finite and non-negative"));
     }
-    let floored = value.floor();
-    if floored > f64::from(u32::MAX) {
-        return Err(format!("{name} exceeds u32"));
-    }
-    u32::try_from(floored as u64).map_err(|_| format!("{name} exceeds u32"))
+    value
+        .floor()
+        .to_u32()
+        .ok_or_else(|| format!("{name} exceeds u32"))
 }
 
 /// Converts and validates one measured class minimum.
@@ -801,9 +801,9 @@ fn proposal_u64(table: &toml::Table, path: &str) -> Result<u64, String> {
     let value = calibration_evidence_value(table, path)?;
     value
         .as_integer()
-        .or_else(|| value.as_float().map(|value| value as i64))
+        .or_else(|| value.as_float().and_then(|value| value.to_i64()))
         .filter(|value| *value > 0)
-        .map(|value| value as u64)
+        .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| format!("proposal.{path}.value must be positive"))
 }
 
@@ -1950,11 +1950,10 @@ impl OperatorKeysConfig {
             );
         }
         match self.source {
-            OperatorKeySource::Env => Ok(()),
             OperatorKeySource::File if self.dir.is_none() => {
                 invalid("source = \"file\" requires dir (WYRD_OPERATOR_KEK_DIR)")
             }
-            OperatorKeySource::File => Ok(()),
+            OperatorKeySource::Env | OperatorKeySource::File => Ok(()),
             OperatorKeySource::Vault => {
                 let Some(vault) = &self.vault else {
                     return invalid(
@@ -2074,8 +2073,7 @@ impl MetricsConfig {
     #[must_use]
     pub fn is_public_bind(&self, http_bind: SocketAddr) -> bool {
         self.resolved_bind(http_bind)
-            .map(|addr| !addr.ip().is_loopback())
-            .unwrap_or(false)
+            .is_some_and(|addr| !addr.ip().is_loopback())
     }
 }
 
@@ -3689,17 +3687,15 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    env_opt(key)?
-        .map(|value| {
-            value
-                .parse::<T>()
-                .map(Some)
-                .map_err(|error| ConfigError::BadEnvVar {
-                    key: key.to_owned(),
-                    message: error.to_string(),
-                })
-        })
-        .unwrap_or(Ok(current))
+    env_opt(key)?.map_or(Ok(current), |value| {
+        value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|error| ConfigError::BadEnvVar {
+                key: key.to_owned(),
+                message: error.to_string(),
+            })
+    })
 }
 
 /// Load Wyrd's own signing-key PEM from the environment.
@@ -4028,7 +4024,7 @@ mod tests {
     /// `config.forge`.
     #[test]
     fn forge_operational_fields_parse_from_toml() {
-        let toml = r#"
+        let toml = r"
 [forge]
 per_tenant_active_cap = 2
 snapshot_retention_secs = 7200
@@ -4039,7 +4035,7 @@ maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
 maintenance_interval_secs = 45
-"#;
+";
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, Some(2));
@@ -4400,6 +4396,7 @@ maintenance_interval_secs = 45
 
     /// Builds one complete schema-v2 profile for activation-policy tests.
     fn complete_oracle_calibration(status: &str) -> String {
+        use std::fmt::Write as _;
         let mut profile = format!(
             r#"schema_version = 2
 status = "{status}"
@@ -4439,8 +4436,9 @@ minimum_slots = 2
 "#
         );
         for path in ORACLE_CALIBRATION_PROPOSALS {
-            profile.push_str(&format!(
-                "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"\n",
+            let _ = writeln!(
+                profile,
+                "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"",
                 // The Analytical per-tenant cap is one Analytical query's slot
                 // cost, which is the smallest value the class can grant.
                 if *path == "distribution.max_workers_per_query"
@@ -4450,12 +4448,13 @@ minimum_slots = 2
                 } else {
                     1
                 }
-            ));
+            );
         }
         for path in ORACLE_CALIBRATION_MEASUREMENTS {
-            profile.push_str(&format!(
-                "\n[measurements.{path}]\nvalue = 1\nevidence_case_id = \"case-{path}\"\n"
-            ));
+            let _ = writeln!(
+                profile,
+                "\n[measurements.{path}]\nvalue = 1\nevidence_case_id = \"case-{path}\""
+            );
         }
         profile
     }
@@ -4824,7 +4823,7 @@ minimum_slots = 2
         assert_eq!(geometry.shard_count(), 1);
         assert_eq!(geometry.shard_generation_rotation_bytes(), 512 * MIB);
         assert_eq!(geometry.wal_segment_bytes(), 512 * MIB);
-        assert_eq!(geometry.generation_max_age(), Duration::from_secs(600));
+        assert_eq!(geometry.generation_max_age(), Duration::from_mins(10));
         assert_eq!(geometry.staging_target_file_size_bytes(), 512 * MIB);
 
         // Staging assembles to the smaller of the on-disk size and Forge's
@@ -4955,9 +4954,9 @@ minimum_slots = 2
 
     #[test]
     fn unknown_toml_field_fails_parse_toml() {
-        let toml = r#"
+        let toml = r"
             port = 9090
-        "#;
+        ";
         let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
         assert!(
             matches!(err, ConfigError::ParseToml { .. }),
@@ -5049,10 +5048,10 @@ minimum_slots = 2
 
     #[test]
     fn shutdown_drain_ms_over_cap_invalid() {
-        let toml = r#"
+        let toml = r"
             [shutdown]
             drain_ms = 999999
-        "#;
+        ";
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
@@ -5079,10 +5078,10 @@ minimum_slots = 2
 
     #[test]
     fn tick_ms_too_low_invalid() {
-        let toml = r#"
+        let toml = r"
             [readiness]
             tick_ms = 10
-        "#;
+        ";
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
@@ -6275,17 +6274,17 @@ api_key = "plaintext"
                 c.max_dependency_edges_per_run = 0;
             }),
             ("max_resolved_graph_bytes", |c| {
-                c.max_resolved_graph_bytes = 0
+                c.max_resolved_graph_bytes = 0;
             }),
             ("max_input_bytes", |c| c.max_input_bytes = 0),
             ("max_step_result_bytes", |c| c.max_step_result_bytes = 0),
             ("max_run_bytes", |c| c.max_run_bytes = 0),
             ("default_timeout_seconds", |c| {
-                c.default_timeout_seconds = 7201
+                c.default_timeout_seconds = 7201;
             }),
             ("max_active_per_tenant", |c| c.max_active_per_tenant = 33),
             ("max_retained_per_tenant", |c| {
-                c.max_retained_per_tenant = 129
+                c.max_retained_per_tenant = 129;
             }),
             ("max_step_result_bytes", |c| c.max_run_bytes = 1024),
         ];

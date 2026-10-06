@@ -104,8 +104,10 @@ impl OidcIssuerFixture {
     /// # Panics
     /// Panics when the login flow cannot be completed or the return omits
     /// `code` or `state`.
-    // justification: test fixture mirrors the OIDC authorization-code login flow inputs (client_id, username, password, redirect_uri, state, code_challenge, nonce) 1:1; wrapping in a struct would add indirection for a single call site
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test fixture mirrors the OIDC authorization-code login flow inputs (client_id, username, password, redirect_uri, state, code_challenge, nonce) 1:1; wrapping in a struct would add indirection for a single call site"
+    )]
     pub async fn human_login(
         &self,
         client_id: &str,

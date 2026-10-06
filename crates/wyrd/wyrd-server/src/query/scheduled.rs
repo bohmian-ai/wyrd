@@ -324,7 +324,7 @@ impl ScheduledQueryCaller {
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
-                        .map_err(|error| super::service::arrow_decode_error(&error))?;
+                        .map_err(super::service::arrow_decode_error)?;
                     *observed = Some(terminal.clone());
                     settled = Some(ScheduledQueryOutcome { rows, terminal });
                 }
@@ -594,20 +594,6 @@ mod tests {
     /// cancellation yields an outcome.
     #[tokio::test]
     async fn scheduled_sink_folds_batches_and_refusal_ends_the_stream() {
-        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
-        let frames = || {
-            let mut frames = vec![QueryStreamFrame::Schema(QuerySchemaFrame {
-                schema_fingerprint: "test".to_owned(),
-                arrow_ipc_schema: prefix.clone(),
-            })];
-            frames.extend(fragments.iter().map(|fragment| {
-                QueryStreamFrame::Batch(QueryBatchFrame {
-                    arrow_ipc_batch: fragment.clone(),
-                })
-            }));
-            frames.push(QueryStreamFrame::Terminal(success_terminal(3, eos.clone())));
-            futures_util::stream::iter(frames.into_iter().map(Ok::<_, BifrostError>))
-        };
         /// Consumes `stream` into `sink` under `cancellation` and a live deadline.
         async fn consume<S, F>(
             mut stream: S,
@@ -627,6 +613,20 @@ mod tests {
             )
             .await
         }
+        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
+        let frames = || {
+            let mut frames = vec![QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "test".to_owned(),
+                arrow_ipc_schema: prefix.clone(),
+            })];
+            frames.extend(fragments.iter().map(|fragment| {
+                QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: fragment.clone(),
+                })
+            }));
+            frames.push(QueryStreamFrame::Terminal(success_terminal(3, eos.clone())));
+            futures_util::stream::iter(frames.into_iter().map(Ok::<_, BifrostError>))
+        };
 
         let mut seen = Vec::new();
         let outcome = consume(frames(), CancellationToken::new(), |batch: RecordBatch| {

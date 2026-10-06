@@ -29,9 +29,9 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            default_timeout: Duration::from_secs(120),
+            default_timeout: Duration::from_mins(2),
             cache_capacity: 1024,
-            cache_default_ttl: Duration::from_secs(60 * 60),
+            cache_default_ttl: Duration::from_hours(1),
             max_retries: 2,
             default_google_model: "gemini-2.5-flash".to_owned(),
         }

@@ -443,7 +443,7 @@ pub(crate) mod pg_tests {
 
         // Remove the runtime role's write privilege so the revocation statement
         // fails exactly as an unavailable or misconfigured store would.
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE UPDATE ON wyrd.auth_service_accounts FROM wyrd_app")
             .execute(&admin)
             .await

@@ -10,8 +10,6 @@ from test_modelcard_save_load import _sklearn_model
 from wyrd.model import ModelCard, SklearnInterface, WyrdError
 
 
-@pytest.mark.wyrd_covers("python:ModelCard.model_dump_json")
-@pytest.mark.wyrd_covers("python:ModelCard.model_validate_json")
 def test_model_dump_json_round_trips_through_public_validator() -> None:
     card = ModelCard(
         SklearnInterface(model=_sklearn_model()),

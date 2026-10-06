@@ -73,11 +73,11 @@ pub(crate) async fn append_audit_events(
     let data_tenant_id = conn.data_tenant_id().as_uuid();
     let conn = &mut **conn.transaction();
     sqlx::query(
-        r#"
+        r"
         INSERT INTO vala.audit_chain_head (data_tenant_id)
         VALUES ($1)
         ON CONFLICT (data_tenant_id) DO NOTHING
-        "#,
+        ",
     )
     .bind(data_tenant_id)
     .execute(&mut *conn)
@@ -85,11 +85,11 @@ pub(crate) async fn append_audit_events(
     .map_err(SqlError::from)?;
 
     let (mut seq, mut prev_hash): (i64, Vec<u8>) = sqlx::query_as(
-        r#"
+        r"
         SELECT last_seq, head_hash
           FROM vala.audit_chain_head
         FOR UPDATE
-        "#,
+        ",
     )
     .fetch_one(&mut *conn)
     .await
@@ -128,7 +128,7 @@ pub(crate) async fn append_audit_events(
     }
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO vala.audit_staging
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
@@ -138,7 +138,7 @@ pub(crate) async fn append_audit_events(
                       $6::text[], $7::text[], $8::text[], $9::text[],
                       $10::uuid[], $11::text[], $12::uuid[], $13::text[],
                       $14::text[], $15::text[]) AS row
-        "#,
+        ",
     )
     .bind(data_tenant_id)
     .bind(&rows.seq)
@@ -160,10 +160,10 @@ pub(crate) async fn append_audit_events(
     .map_err(SqlError::from)?;
 
     sqlx::query(
-        r#"
+        r"
         UPDATE vala.audit_chain_head
            SET last_seq = $1, head_hash = $2, updated_at = now()
-        "#,
+        ",
     )
     .bind(seq)
     .bind(prev_hash.as_slice())
@@ -247,7 +247,7 @@ pub async fn list_audit_events_for_resource(
     limit: i64,
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
-        r#"
+        r"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
@@ -256,7 +256,7 @@ pub async fn list_audit_events_for_resource(
            AND seq > $2
          ORDER BY seq
          LIMIT $3
-        "#,
+        ",
     )
     .bind(resource)
     .bind(after_seq)
@@ -280,14 +280,14 @@ pub async fn list_publication_batch(
     limit: i64,
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
-        r#"
+        r"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
          ORDER BY seq
          LIMIT $1
-        "#,
+        ",
     )
     .bind(limit)
     .fetch_all(&mut **conn.transaction())
@@ -342,12 +342,12 @@ pub async fn freeze_publication_range(
 ) -> Result<Option<AuditPublicationRange>, SqlError> {
     let data_tenant_id = conn.data_tenant_id().as_uuid();
     sqlx::query(
-        r#"
+        r"
         INSERT INTO vala.audit_publication (data_tenant_id)
         SELECT $1
          WHERE EXISTS (SELECT 1 FROM vala.audit_staging)
         ON CONFLICT (data_tenant_id) DO NOTHING
-        "#,
+        ",
     )
     .bind(data_tenant_id)
     .execute(&mut **conn.transaction())
@@ -355,7 +355,7 @@ pub async fn freeze_publication_range(
     .map_err(SqlError::from)?;
 
     let frozen: Option<(i64, Option<i64>, bool)> = sqlx::query_as(
-        r#"
+        r"
         WITH progress AS (
             SELECT published_seq, publishing_seq_hi
               FROM vala.audit_publication
@@ -375,7 +375,7 @@ pub async fn freeze_publication_range(
                ),
                progress.publishing_seq_hi IS NOT NULL
           FROM progress
-        "#,
+        ",
     )
     .bind(limit)
     .fetch_optional(&mut **conn.transaction())
@@ -387,10 +387,10 @@ pub async fn freeze_publication_range(
     };
     if !already_frozen {
         sqlx::query(
-            r#"
+            r"
             UPDATE vala.audit_publication
                SET publishing_seq_hi = $1, updated_at = now()
-            "#,
+            ",
         )
         .bind(seq_hi)
         .execute(&mut **conn.transaction())
@@ -413,14 +413,14 @@ pub async fn list_publication_range(
     range: AuditPublicationRange,
 ) -> Result<Vec<AuditStagingRow>, SqlError> {
     sqlx::query_as::<_, AuditStagingRow>(
-        r#"
+        r"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
                credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
          WHERE seq BETWEEN $1 AND $2
          ORDER BY seq
-        "#,
+        ",
     )
     .bind(range.seq_lo)
     .bind(range.seq_hi)
@@ -450,7 +450,7 @@ pub async fn list_publication_range(
 /// rejects the range.
 pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Result<u64, SqlError> {
     sqlx::query(
-        r#"
+        r"
         INSERT INTO vala.audit_publication AS progress (data_tenant_id, published_seq)
         VALUES ($2, $1)
         ON CONFLICT (data_tenant_id) DO UPDATE
@@ -460,7 +460,7 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
                    ELSE progress.publishing_seq_hi
                END,
                updated_at = now()
-        "#,
+        ",
     )
     .bind(seq_hi)
     .bind(conn.data_tenant_id().as_uuid())
@@ -468,13 +468,13 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
     .await
     .map_err(SqlError::from)?;
     let result = sqlx::query(
-        r#"
+        r"
         DELETE FROM vala.audit_staging
          WHERE seq <= (
                SELECT published_seq
                  FROM vala.audit_publication
            )
-        "#,
+        ",
     )
     .execute(&mut **conn.transaction())
     .await

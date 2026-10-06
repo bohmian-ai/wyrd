@@ -108,8 +108,8 @@ impl SlotValue<'_> {
     #[must_use]
     pub fn as_path(&self) -> Option<&std::path::Path> {
         match self {
-            Self::Durable(Ref::Path(path)) => Some(path),
-            Self::InlineablePrompt(InlineableRef::Path(path))
+            Self::Durable(Ref::Path(path))
+            | Self::InlineablePrompt(InlineableRef::Path(path))
             | Self::InlineableAgent(InlineableRef::Path(path))
             | Self::InlineableTrigger(InlineableRef::Path(path))
             | Self::InlineableOperator(InlineableRef::Path(path)) => Some(path),
@@ -141,18 +141,15 @@ impl ReferenceSlotVisitor {
             Spec::Data(data) => data.visit(&mut f),
             Spec::Model(model) => model.visit(&mut f),
             Spec::Experiment(experiment) => experiment.visit(&mut f),
-            Spec::Prompt(_) => {}
+            Spec::Prompt(_) | Spec::Policy(_) | Spec::Trigger(_) | Spec::Source(_) => {}
             Spec::Agent(agent) => agent.visit(&mut f),
             Spec::Workflow(workflow) => workflow.visit(&mut f),
             Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
-            Spec::Policy(_) => {}
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),
-            Spec::Trigger(_) => {}
             Spec::Operator(operator) => operator.visit(&mut f),
-            Spec::Source(_) => {}
         }
     }
 }
@@ -173,14 +170,14 @@ impl Visit for DataSpec {
     {
         for (i, card_ref) in self.card_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.card_refs[{}]", i),
+                path: format!("spec.card_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
         for (label, split) in &mut self.splits {
             if let SplitStrategy::Materialized(card_ref) = &mut split.strategy {
                 f(SlotEntry {
-                    path: format!("spec.splits[{}].strategy.Materialized", label),
+                    path: format!("spec.splits[{label}].strategy.Materialized"),
                     value: SlotValue::Durable(card_ref),
                 });
             }
@@ -215,7 +212,7 @@ impl Visit for ModelSpec {
     {
         for (i, card_ref) in self.card_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.card_refs[{}]", i),
+                path: format!("spec.card_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
@@ -229,13 +226,13 @@ impl Visit for ExperimentSpec {
     {
         for (i, card_ref) in self.target_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.target_refs[{}]", i),
+                path: format!("spec.target_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
         for (i, card_ref) in self.card_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.card_refs[{}]", i),
+                path: format!("spec.card_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
@@ -259,7 +256,7 @@ impl Visit for WorkflowSpec {
         if let Some(governance) = &mut self.governance {
             for (index, policy_ref) in governance.policy_refs.iter_mut().enumerate() {
                 f(SlotEntry {
-                    path: format!("spec.governance.policy_refs[{}]", index),
+                    path: format!("spec.governance.policy_refs[{index}]"),
                     value: SlotValue::Durable(policy_ref),
                 });
             }
@@ -273,7 +270,7 @@ impl Visit for WorkflowSpec {
         if let Some(observation_hooks) = &mut self.observation_hooks {
             for (index, route_ref) in observation_hooks.route_refs.iter_mut().enumerate() {
                 f(SlotEntry {
-                    path: format!("spec.observation_hooks.route_refs[{}]", index),
+                    path: format!("spec.observation_hooks.route_refs[{index}]"),
                     value: SlotValue::Durable(route_ref),
                 });
             }
@@ -281,7 +278,7 @@ impl Visit for WorkflowSpec {
 
         for (step_idx, step) in self.steps.iter_mut().enumerate() {
             let WorkflowAction::Agent(agent_ref) = &mut step.action;
-            let path = format!("spec.steps[{}].action.Agent", step_idx);
+            let path = format!("spec.steps[{step_idx}].action.Agent");
             f(SlotEntry {
                 path: path.clone(),
                 value: SlotValue::InlineableAgent(agent_ref),
@@ -319,7 +316,7 @@ impl EvalSpec {
             });
         }
 
-        for (task_id, task) in self.tasks.iter_mut() {
+        for (task_id, task) in &mut self.tasks {
             if let EvalTask::LlmJudge(llm_judge_task) = task {
                 let path = format!("{prefix}.tasks[{}].LlmJudge.judge_ref", task_id.as_str());
                 f(SlotEntry {
@@ -410,7 +407,7 @@ impl Visit for McpSpec {
     {
         for (i, card_ref) in self.tool_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.tool_refs[{}]", i),
+                path: format!("spec.tool_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
@@ -424,19 +421,19 @@ impl Visit for AuditSpec {
     {
         for (i, card_ref) in self.subject_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.subject_refs[{}]", i),
+                path: format!("spec.subject_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
         for (i, card_ref) in self.policy_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.policy_refs[{}]", i),
+                path: format!("spec.policy_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }
         for (i, card_ref) in self.evidence_refs.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.evidence_refs[{}]", i),
+                path: format!("spec.evidence_refs[{i}]"),
                 value: SlotValue::Durable(card_ref),
             });
         }

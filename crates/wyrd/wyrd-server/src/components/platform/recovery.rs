@@ -32,8 +32,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 /// Matches the credential issued at provisioning: recovery restores the same
 /// kind of access, not a lesser or more urgent one.
 /// Lifetime of a recovery-issued tenant-administrator credential.
-const RECOVERY_CREDENTIAL_LIFETIME: std::time::Duration =
-    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+const RECOVERY_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(8760);
 
 /// Restores administrative access to tenants that have lost it.
 #[derive(Clone)]

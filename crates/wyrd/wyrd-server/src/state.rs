@@ -512,6 +512,10 @@ impl Oracle {
     ///
     /// Returns [`wyrd_spec::vala::error::BifrostError`] when the retained role
     /// composition cannot be completed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Oracle engine lacks its distributed dispatcher, which production composition requires.
     pub fn new(inputs: OracleBuildInputs) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
         let OracleBuildInputs {
             engine,
@@ -904,6 +908,10 @@ impl Scribe {
     ///
     /// The projection shares Scribe's bounded ingress CPU lane, while an
     /// optional runtime keeps server-created coordination consumers alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the constructed Scribe has no valid stream identity.
     #[must_use]
     pub fn new(inputs: ScribeBuildInputs) -> Self {
         let ScribeBuildInputs {
@@ -1549,7 +1557,7 @@ pub struct Bifrost {
     ///
     /// `None` only for the ownerless unit-test shell, which composes no role and
     /// therefore performs no object I/O at all.
-    bifrost_storage: Option<Arc<vala_bifrost_redux::storage::BifrostStorage>>,
+    storage: Option<Arc<vala_bifrost_redux::storage::BifrostStorage>>,
     /// Process-wide encoded-body admission shared by every transport edge.
     transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
@@ -1636,7 +1644,7 @@ impl Bifrost {
             scribe,
             forge,
             oracle,
-            bifrost_storage: Some(bifrost_storage),
+            storage: Some(bifrost_storage),
             transport,
             token_verifier,
             query_forwarder,
@@ -1655,7 +1663,7 @@ impl Bifrost {
     #[must_use]
     pub fn test_shell(token_verifier: Arc<TokenVerifier>) -> Arc<Self> {
         Arc::new(Self {
-            bifrost_storage: None,
+            storage: None,
             gate: ServerGate::without_scribe(
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
@@ -1690,7 +1698,7 @@ impl Bifrost {
         catalog: Arc<BifrostCatalog>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            bifrost_storage: None,
+            storage: None,
             gate: ServerGate::without_scribe(
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
@@ -1869,7 +1877,7 @@ impl Bifrost {
     /// per-role.
     #[must_use]
     pub fn bifrost_storage(&self) -> Option<&Arc<vala_bifrost_redux::storage::BifrostStorage>> {
-        self.bifrost_storage.as_ref()
+        self.storage.as_ref()
     }
 
     /// Borrows the shared role-resource graph retained by the selected owners.
@@ -2032,7 +2040,7 @@ impl Bifrost {
         } else {
             false
         };
-        if let Some(storage) = &self.bifrost_storage
+        if let Some(storage) = &self.storage
             && !storage.close(deadline).await
         {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
@@ -2071,7 +2079,7 @@ impl Bifrost {
         if let Some(forge) = &self.forge {
             forge.begin_shutdown();
         }
-        if let Some(storage) = &self.bifrost_storage {
+        if let Some(storage) = &self.storage {
             storage.abort().await;
         }
     }
@@ -2806,7 +2814,7 @@ mod tests {
         let limits = LimitsConfig {
             body_bytes: 2048,
             audio_upload_bytes: 4096,
-            timeout: std::time::Duration::from_millis(1000),
+            timeout: std::time::Duration::from_secs(1),
             concurrency: 10,
         };
         let state = state.with_limits(limits);

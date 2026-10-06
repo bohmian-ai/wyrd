@@ -176,9 +176,9 @@ where
     C: FnOnce() -> CFut,
     CFut: std::future::Future<Output = bool>,
 {
-    match timeout_at(deadline, before_cancel()).await {
-        Ok(()) => {}
-        Err(_) => tracing::warn!("readiness removal hook exceeded shutdown deadline"),
+    if let Ok(()) = timeout_at(deadline, before_cancel()).await {
+    } else {
+        tracing::warn!("readiness removal hook exceeded shutdown deadline");
     }
     shutdown.cancel();
     if Instant::now() < deadline && timeout_at(deadline, after_cancel()).await.unwrap_or(false) {
@@ -252,7 +252,7 @@ fn log_drain(joined: Result<TaskExit, tokio::task::JoinError>) {
             id,
             outcome: Err(msg),
         }) => {
-            tracing::warn!(?id, error = %msg, "task errored during drain")
+            tracing::warn!(?id, error = %msg, "task errored during drain");
         }
         Err(e) if e.is_cancelled() => {}
         Err(e) => tracing::warn!(error = %e, "task panicked during drain"),

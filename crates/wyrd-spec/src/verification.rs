@@ -392,7 +392,7 @@ pub const MAX_EVAL_CONTEXT_BYTES: usize = 256 * 1024;
 ///
 /// Clients wait at least this long for an execute response so the server's
 /// timeout, not the client's, decides a slow judgment.
-pub const EXECUTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+pub const EXECUTION_DEADLINE: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// The closed `kind` of a Verifier execution.
 ///

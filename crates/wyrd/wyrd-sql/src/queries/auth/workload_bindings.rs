@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::TenantConn;
 use crate::row_types::auth::WorkloadBindingRow;
 
-const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r#"
+const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
@@ -22,9 +22,9 @@ const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r#"
        AND (audience = $3 OR audience IS NULL)
      ORDER BY CASE WHEN audience IS NOT NULL THEN 0 ELSE 1 END
      LIMIT 1
-"#;
+";
 
-const UPSERT_WORKLOAD_BINDING_SQL: &str = r#"
+const UPSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
         data_tenant_id, issuer_url, subject, audience, card_ref
     ) VALUES ($1, $2, $3, $4, $5)
@@ -32,24 +32,24 @@ const UPSERT_WORKLOAD_BINDING_SQL: &str = r#"
         audience = EXCLUDED.audience,
         card_ref = EXCLUDED.card_ref,
         updated_at = now()
-"#;
+";
 
-const INSERT_WORKLOAD_BINDING_SQL: &str = r#"
+const INSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
         data_tenant_id, issuer_url, subject, audience, card_ref
     ) VALUES ($1, $2, $3, $4, $5)
-"#;
+";
 
-const WORKLOAD_BINDING_BY_KEY_SQL: &str = r#"
+const WORKLOAD_BINDING_BY_KEY_SQL: &str = r"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
        AND issuer_url = $1
        AND subject = $2
-"#;
+";
 
-const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r#"
+const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r"
     SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
@@ -57,20 +57,20 @@ const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r#"
        AND ($1::text IS NULL OR issuer_url = $1)
        AND ($2::text IS NULL OR subject = $2)
      ORDER BY issuer_url, subject
-"#;
+";
 
-const DELETE_WORKLOAD_BINDING_SQL: &str = r#"
+const DELETE_WORKLOAD_BINDING_SQL: &str = r"
     DELETE FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
        AND issuer_url = $1
        AND subject = $2
-"#;
+";
 
-const DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL: &str = r#"
+const DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL: &str = r"
     DELETE FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
        AND issuer_url = $1
-"#;
+";
 
 /// Owned column values for an upsert into `wyrd.auth_workload_bindings`.
 ///

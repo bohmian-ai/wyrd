@@ -22,13 +22,13 @@ pub async fn list_active_tables_for_operator(
     op: &OperatorPool,
 ) -> Result<Vec<BifrostTableRow>, SqlError> {
     sqlx::query_as::<_, BifrostTableRow>(
-        r#"
+        r"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
                physical_layout, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
          WHERE status = 'active'
          ORDER BY data_tenant_id, fqn
-        "#,
+        ",
     )
     .fetch_all(op.pool())
     .await

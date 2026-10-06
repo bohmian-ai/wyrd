@@ -76,8 +76,9 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
         for (table_ordinal, (_, table)) in tables.iter().enumerate() {
             let owner = index * TABLES_PER_TENANT + table_ordinal;
             for batch in 0..BATCHES_PER_TABLE {
-                let first = ((owner * BATCHES_PER_TABLE + batch) * ROWS_PER_BATCH) as i64;
-                let rows: Vec<i64> = (first..first + ROWS_PER_BATCH as i64).collect();
+                let first = i64::try_from((owner * BATCHES_PER_TABLE + batch) * ROWS_PER_BATCH)
+                    .expect("test row ordinals fit i64");
+                let rows: Vec<i64> = (first..).take(ROWS_PER_BATCH).collect();
                 append_values(client, table, uuid::Uuid::now_v7(), &rows)
                     .await
                     .unwrap_or_else(|error| {

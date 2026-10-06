@@ -1,0 +1,1937 @@
+//! Served-contract coverage for `GET /openapi.json`.
+//!
+//! Every case drives [`WyrdTestServer`], so the document under assertion is the
+//! one the composed production router actually serves rather than a rendering
+//! of the document type in isolation. Routing and documentation come out of one
+//! `utoipa-axum` registration in the owning route modules, so the suite asserts
+//! what that registration cannot make true by construction: the document is
+//! served as JSON and nothing else is, the composed surface carries its nesting
+//! prefix, every problem body names a real catalog code under its own status,
+//! the operations that clear the document-wide security requirement are exactly
+//! the ones an anonymous caller can reach, and a refusal produced at runtime
+//! carries a stable code that the owning operation already documents.
+
+use axum::response::Response;
+use std::collections::BTreeSet;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header};
+use secrecy::ExposeSecret as _;
+use serde_json::Value;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::storage::ids::UploadId;
+use wyrd_testing::WyrdTestServer;
+
+/// Media type RFC 9457 problem bodies are served with.
+const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
+
+/// Name the contract gives the one Wyrd authentication scheme.
+const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
+
+/// The served contract's name for confidential OAuth client HTTP Basic.
+const OAUTH_CLIENT_BASIC_SCHEME: &str = "oauthClientBasic";
+
+/// The OAuth client endpoints: each identifies its client by the public
+/// form's `client_id` or by confidential HTTP Basic.
+const OAUTH_CLIENT_OPERATIONS: [&str; 3] =
+    ["/auth/token", "/auth/device_authorization", "/auth/revoke"];
+
+/// The HTTP methods an `OpenAPI` path item may key an operation by.
+const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
+
+/// Fetch and parse the document the assembled server serves.
+///
+/// Asserts the transport contract alongside the payload — status, media type,
+/// and JSON shape — because a caller that cannot identify the media type cannot
+/// use the document regardless of its contents.
+///
+/// # Panics
+/// Panics when the request fails, the response is not a `200 application/json`,
+/// or the body is not JSON.
+async fn served_document(server: &WyrdTestServer) -> Value {
+    let response = server
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the contract is served as JSON"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    serde_json::from_slice(&body).expect("the served contract is JSON")
+}
+
+/// Collect a response body and parse it as the Wyrd problem+json envelope.
+///
+/// # Panics
+/// Panics when the body cannot be collected or is not valid JSON.
+async fn problem_json(response: Response) -> Value {
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    serde_json::from_slice(&body).expect("problem JSON")
+}
+
+/// The RFC 8693 form body that exchanges a Wyrd API key for an access token.
+fn api_key_exchange(api_key: &str) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        )
+        .append_pair("subject_token", api_key)
+        .append_pair("subject_token_type", "urn:wyrd:oauth:token-type:api_key")
+        .finish()
+}
+
+/// Pull every `WYRD_…` stable code named in a response description.
+///
+/// Descriptions are prose with codes in parentheses rather than a structured
+/// field, so the codes are recovered by scanning for the one prefix the catalog
+/// uses and taking the identifier that follows.
+fn stable_codes(description: &str) -> Vec<String> {
+    description
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.starts_with("WYRD_"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The HTTP status the catalog declares for one stable code.
+///
+/// [`WyrdError::from_code`] reconstructs only the variants whose fields are
+/// `{ message, details }`, which leaves the delegated sub-catalogs — storage and
+/// Bifrost — unreachable through it. Those codes carry their status in their own
+/// second segment, which is written beside the `status = N` the derive reads, so
+/// a code that disagrees with the response it is documented under is caught
+/// either way.
+fn catalog_status(code: &str) -> Option<u16> {
+    WyrdError::from_code(code, "documented refusal".to_owned(), serde_json::json!({}))
+        .map(|error| error.status())
+        .or_else(|| code.split('_').nth(2)?.parse().ok())
+}
+
+/// The served document describes the routes the server mounts.
+///
+/// Routing and documentation come out of one `utoipa-axum` registration for
+/// every route registered through `routes!`. What is pinned here is that the
+/// composition actually ran: that the nesting prefix reached the operations and
+/// that the surfaces mounted on both planes are present. It also pins that
+/// platform connection configuration, which discovers the issuer before
+/// storing it, publishes that discovery's
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json.
+#[tokio::test]
+async fn the_served_document_describes_the_composed_surface() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+
+    for path in [
+        "/v1/cards",
+        "/v1/cards/by-uid/{kind}/{card_uid}",
+        "/v1/cards/by-ref",
+        "/v1/cards/{kind}/{space}/{name}/latest",
+        "/v1/cards/{kind}/{space}/{name}/versions",
+        "/v1/cards/{card_uid}/artifacts",
+        "/v1/cards/{card_uid}/complete",
+        "/v1/cards/download/init",
+        "/v1/principals/{principal_id}/credentials/{credential_id}",
+        "/v1/verification/bindings/{binding_id}",
+        "/v1/verification/runs",
+        "/v1/verification/runs/{run_id}",
+        "/v1/bifrost/tables",
+        "/v1/bifrost/tables/{namespace}/{name}",
+        "/auth/token",
+        "/auth/device_authorization",
+        "/auth/device",
+        "/auth/revoke",
+        "/platform/tenants",
+        "/v1/admin/gateway/provider-credentials",
+        "/v1/admin/gateway/provider-credentials/{name}",
+        "/v1/admin/gateway/provider-credentials/{name}/revoke",
+        "/v1/admin/gateway/provider-deployments",
+        "/v1/admin/gateway/provider-deployments/{name}",
+        "/v1/admin/gateway/fallback-policy",
+        "/v1/admin/gateway/governance-policy",
+        "/v1/admin/gateway/capture-policy",
+        "/v1/gateway/payload-objects/{digest}",
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1beta/models/{target}",
+    ] {
+        assert!(paths.contains_key(path), "missing {path}");
+    }
+    for (path, method) in [
+        ("/v1/workflow-runs", "post"),
+        ("/v1/workflow-runs/{run_id}", "get"),
+        ("/v1/workflow-runs/{run_id}/cancel", "post"),
+    ] {
+        assert!(paths[path][method].is_object(), "missing {method} {path}");
+    }
+    assert!(
+        !paths.contains_key("/v1/cards/{card_uid}/abort"),
+        "a route the server does not mount is not documented"
+    );
+    assert!(
+        !paths.contains_key("/mcp"),
+        "the MCP endpoint speaks its own protocol and is not an OpenAPI operation"
+    );
+    let configure = &document["paths"]["/platform/oidc/connection"]["put"]["responses"]["503"];
+    assert_eq!(
+        configure["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+        "#/components/schemas/WyrdProblem",
+        "platform connection configuration publishes its discovery 503 as problem+json"
+    );
+    assert!(
+        configure["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("WYRD_AUTH_503_DISCOVERY_UNAVAILABLE")),
+        "the 503 names the stable discovery code: {configure}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The tenant human-connection administration surface is served with its typed
+/// contract and no secret-bearing or unsupported shape.
+///
+/// Each of the six operations publishes its route-specific refusals as
+/// problem+json; the redacted view and list shapes expose no secret field; the
+/// input schema offers exactly the three supported client-authentication
+/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
+/// its request body; and activation requires the recovery key.
+#[tokio::test]
+async fn identity_connection_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let operations: [(&str, &str, &[&str]); 6] = [
+        ("/v1/identity/oidc/connections", "get", &["403", "503"]),
+        (
+            "/v1/identity/oidc/candidate",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/test",
+            "post",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/activate",
+            "post",
+            &["403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/active/deactivate",
+            "post",
+            &["403", "404", "503"],
+        ),
+        (
+            "/v1/identity/oidc/connections/{id}",
+            "delete",
+            &["403", "404", "503"],
+        ),
+    ];
+    for (path, method, statuses) in operations {
+        let operation = &document["paths"][path][method];
+        assert!(operation.is_object(), "missing {method} {path}");
+        assert!(
+            operation.get("security").is_none(),
+            "{method} {path} must require the Wyrd access token"
+        );
+        for status in statuses {
+            assert_eq!(
+                operation["responses"][*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+                "#/components/schemas/WyrdProblem",
+                "{method} {path} must publish {status} as problem+json"
+            );
+        }
+    }
+
+    assert_eq!(
+        document["paths"]["/v1/identity/oidc/candidate"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ConnectionInput",
+        "the candidate PUT publishes its typed body although it reads raw bytes"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let view_fields = schemas["HumanConnectionView"]["properties"]
+        .as_object()
+        .expect("HumanConnectionView publishes its properties");
+    assert!(
+        view_fields.keys().all(|field| !field.contains("secret")),
+        "the redacted view must not carry a secret field: {:?}",
+        view_fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        schemas["HumanClientAuth"]["enum"],
+        serde_json::json!(["SecretBasic", "SecretPost", "Public"]),
+        "only supported client authentication methods are offered"
+    );
+    let activate = &schemas["ConnectionActivate"]["required"];
+    assert!(
+        activate
+            .as_array()
+            .is_some_and(|required| required.contains(&"recovery_api_key".into())),
+        "activation requires the recovery key: {activate}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Tenant human login publishes its OAuth authorization-server contract.
+///
+/// The browser begins at `GET /auth/authorize`, which answers `303`; the
+/// retired `/auth/login` is not served. The common callback publishes the
+/// browser's `303` back to the client (with its `Location`) and the CLI's
+/// `text/html` page, never a token body. The token endpoint takes an RFC 6749
+/// form body that offers the authorization-code grant, and RFC 8414 metadata
+/// is served. The token, device authorization, and revocation forms publish
+/// the public client's optional `client_id`, and each operation accepts
+/// either that public form or confidential RFC 7617 Basic client
+/// authentication.
+#[tokio::test]
+async fn tenant_login_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    assert!(
+        document["paths"]["/auth/login"].is_null(),
+        "/auth/login is retired"
+    );
+    let authorize = &document["paths"]["/auth/authorize"]["get"];
+    assert_eq!(authorize["security"], serde_json::json!([{}]));
+    assert!(
+        authorize["responses"]["303"].is_object(),
+        "authorize redirects: {authorize}"
+    );
+    assert!(
+        document["paths"]["/.well-known/oauth-authorization-server"]["get"].is_object(),
+        "RFC 8414 metadata is published"
+    );
+
+    let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
+    assert!(
+        callback["303"]["headers"]["Location"].is_object(),
+        "the browser completion redirect publishes its Location: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["text/html"].is_object(),
+        "the CLI completion page is HTML: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["application/json"].is_null(),
+        "the callback never returns a token body: {callback}"
+    );
+    let token = &document["paths"]["/auth/token"]["post"]["requestBody"]["content"];
+    assert!(
+        token["application/x-www-form-urlencoded"].is_object(),
+        "the token endpoint takes a form body: {token}"
+    );
+    assert!(
+        document["components"]["schemas"]["TokenRequest"]
+            .to_string()
+            .contains("authorization_code"),
+        "the token endpoint offers the authorization-code grant"
+    );
+
+    let basic = &document["components"]["securitySchemes"][OAUTH_CLIENT_BASIC_SCHEME];
+    assert_eq!(basic["type"], "http", "{basic}");
+    assert_eq!(basic["scheme"], "basic", "{basic}");
+    for path in OAUTH_CLIENT_OPERATIONS {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]),
+            "{path} accepts the public form or confidential Basic"
+        );
+        let form = resolve_schema(
+            &document,
+            &operation["requestBody"]["content"]["application/x-www-form-urlencoded"]["schema"],
+        );
+        let client_id = form["allOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|part| resolve_schema(&document, part))
+            .find(|part| part["properties"]["client_id"].is_object())
+            .unwrap_or_else(|| panic!("{path} form publishes client_id: {form}"));
+        assert!(
+            !client_id["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&"client_id".into())),
+            "{path} client_id is optional: {client_id}"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The local backend's byte-transfer operations are public Wyrd operations and
+/// are published with their real contract.
+///
+/// Upload initialization and download initialization hand these URLs out and
+/// the shared client dispatches to them, so an independent client needs their
+/// method, typed locator, binary body, authentication, and stable refusals from
+/// the same document as every other operation. The in-process test server runs
+/// the local backend, so both are mounted here.
+#[tokio::test]
+async fn local_transfer_operations_publish_their_binary_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let problem_ref = "#/components/schemas/WyrdProblem";
+    let octets = "application/octet-stream";
+
+    let upload = &document["paths"]["/v1/cards/upload/local/{id}"]["put"];
+    assert!(upload.is_object(), "the local upload is a documented PUT");
+    let id = upload["parameters"]
+        .as_array()
+        .and_then(|params| params.iter().find(|param| param["name"] == "id"))
+        .expect("the upload names its identifier");
+    assert_eq!(id["in"], "path");
+    assert_eq!(id["required"], true);
+    assert_eq!(
+        id["schema"]["$ref"], "#/components/schemas/UploadId",
+        "the upload locator is the typed upload identifier"
+    );
+    assert!(
+        upload["requestBody"]["content"][octets].is_object(),
+        "the upload body is raw bytes: {}",
+        upload["requestBody"]
+    );
+    assert_eq!(
+        upload["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/LocalBlobUploadResponse"
+    );
+
+    let download = &document["paths"]["/v1/cards/download/local"]["get"];
+    assert!(
+        download.is_object(),
+        "the local download is a documented GET"
+    );
+    let path = download["parameters"]
+        .as_array()
+        .and_then(|params| params.iter().find(|param| param["name"] == "path"))
+        .expect("the download names its object");
+    assert_eq!(
+        path["in"], "query",
+        "a slash-bearing object path is one query value"
+    );
+    assert_eq!(path["required"], true);
+    assert!(
+        download["responses"]["200"]["content"][octets].is_object(),
+        "the download answers with raw bytes: {}",
+        download["responses"]["200"]
+    );
+
+    for (operation, specific) in [
+        (upload, ["400", "404", "409"].as_slice()),
+        (download, &["400", "404"]),
+    ] {
+        assert!(
+            operation.get("security").is_none(),
+            "a local transfer inherits the document's authentication requirement"
+        );
+        for status in ["401", "403", "500", "503"].iter().chain(specific) {
+            let response = &operation["responses"][*status];
+            assert_eq!(
+                response["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"], problem_ref,
+                "{status} is published as WyrdProblem problem+json"
+            );
+            assert!(
+                !stable_codes(response["description"].as_str().unwrap_or_default()).is_empty(),
+                "{status} names its stable codes"
+            );
+        }
+    }
+    assert!(
+        document["paths"]
+            .as_object()
+            .expect("paths object")
+            .keys()
+            .all(|key| !key.contains('*')),
+        "no wildcard route template reaches the document"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every documented problem body is served as `application/problem+json` and
+/// names real catalog codes for its status.
+///
+/// A generated client branches on the media type and on the code; declaring a
+/// problem as plain `application/json`, or naming a code that disagrees with the
+/// status it is documented under, breaks that branch silently.
+///
+/// Every operation is held to this, not a chosen subset of tags: a caller
+/// reaching the storage, evaluation, authorization, or OTLP surface branches on
+/// refusals exactly the way an operator branches on an administrative one.
+#[tokio::test]
+async fn every_problem_response_declares_its_media_type_and_stable_code() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let catalog: BTreeSet<&'static str> = WyrdError::codes().into_iter().collect();
+    let mut problems = 0_usize;
+    let mut defects = Vec::new();
+
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let responses = operation["responses"]
+                .as_object()
+                .expect("an operation declares responses");
+            for (status, response) in responses {
+                let content = &response["content"];
+                if content["application/json"]["schema"]["$ref"]
+                    .as_str()
+                    .is_some_and(|reference| reference.ends_with("/WyrdProblem"))
+                {
+                    defects.push(format!(
+                        "{method} {path} {status} is problem+json as plain JSON"
+                    ));
+                    continue;
+                }
+                if !content[PROBLEM_MEDIA_TYPE].is_object() {
+                    continue;
+                }
+                problems += 1;
+                let description = response["description"].as_str().unwrap_or_default();
+                let codes = stable_codes(description);
+                if codes.is_empty() {
+                    defects.push(format!(
+                        "{method} {path} {status} names no code: {description}"
+                    ));
+                    continue;
+                }
+                // `default` is the catch-all arm rather than one status, so its
+                // codes are checked for existence and nothing more.
+                let expected: Option<u16> = status.parse().ok();
+                for code in codes {
+                    if !catalog.contains(code.as_str()) {
+                        defects.push(format!(
+                            "{method} {path} {status} names {code}, absent from the catalog"
+                        ));
+                        continue;
+                    }
+                    let Some(declared) = catalog_status(&code) else {
+                        continue;
+                    };
+                    if expected.is_some_and(|expected| declared != expected) {
+                        defects.push(format!(
+                            "{method} {path} documents {code} under {status}, but the catalog \
+                             gives it {declared}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+    assert!(
+        problems > 0,
+        "the contract declares no problem responses at all"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The contract names one authentication scheme and requires it by default.
+///
+/// Authentication is a property of the whole surface, so the requirement is
+/// declared once on the document and inherited. An operation a caller reaches
+/// before it can have a session clears the requirement beside its own handler
+/// with `security(())`, which is the only override the contract permits: a
+/// per-operation requirement naming some *other* caller scheme would be a
+/// second authentication story, and there is only one header. The one
+/// exception is OAuth client authentication: the OAuth client endpoints offer
+/// confidential HTTP Basic beside the empty requirement.
+#[tokio::test]
+async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let scheme = &document["components"]["securitySchemes"][WYRD_ACCESS_TOKEN_SCHEME];
+    assert_eq!(scheme["type"], "apiKey");
+    assert_eq!(scheme["in"], "header");
+    assert_eq!(scheme["name"], "X-Wyrd-Access-Token");
+    assert_eq!(
+        document["security"],
+        serde_json::json!([{ WYRD_ACCESS_TOKEN_SCHEME: [] }]),
+        "the document requires the scheme by default"
+    );
+
+    let mut cleared = BTreeSet::new();
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let Some(overridden) = operation.get("security") else {
+                continue;
+            };
+            // utoipa renders `security(())` as one empty requirement object,
+            // which is OpenAPI's way of saying the operation needs nothing.
+            let oauth_client = OAUTH_CLIENT_OPERATIONS.contains(&path.as_str())
+                && overridden == &serde_json::json!([{}, { OAUTH_CLIENT_BASIC_SCHEME: [] }]);
+            assert!(
+                oauth_client
+                    || overridden == &serde_json::json!([])
+                    || overridden == &serde_json::json!([{}]),
+                "{method} {path} overrides the document requirement with a second scheme"
+            );
+            cleared.insert(path.clone());
+        }
+    }
+    assert!(
+        !cleared.is_empty(),
+        "sign-in and credential exchange cannot themselves require a session"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// A protected tenant operation documents only the refusals its local verifier
+/// can reach.
+///
+/// Tenant access tokens are five-minute permission snapshots verified without
+/// a database, so a request can be unauthenticated, invalid, or expired, but
+/// never `WYRD_AUTH_401_CREDENTIAL_REVOKED`: revocation refuses the next
+/// issuance instead. Operations that clear the document requirement (issuance)
+/// and the platform plane, which revalidates current state, are excluded.
+#[tokio::test]
+async fn protected_tenant_operations_document_no_revocation_refusal() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    let mut protected = 0;
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        if path.starts_with("/platform") {
+            continue;
+        }
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            if !METHODS.contains(&method.as_str()) || operation.get("security").is_some() {
+                continue;
+            }
+            protected += 1;
+            let description = operation["responses"]["401"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !stable_codes(description).contains(&"WYRD_AUTH_401_CREDENTIAL_REVOKED".to_owned()),
+                "{method} {path} documents a revocation refusal its verifier cannot emit"
+            );
+        }
+    }
+    assert!(
+        protected > 0,
+        "the document serves protected tenant operations"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// No operation documents a refusal caused by audit.
+///
+/// Permissions block and audits do not: every decision is staged on the
+/// non-blocking process audit outbox, so no response can be an audit failure.
+/// A response description that pairs audit with unavailability or failure
+/// would tell a caller to handle a refusal the server never emits.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or any response description names an
+/// audit-caused failure.
+#[tokio::test]
+async fn no_operation_documents_an_audit_caused_refusal() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let mut defects = Vec::new();
+
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let Some(responses) = operation["responses"].as_object() else {
+                continue;
+            };
+            for (status, response) in responses {
+                let description = response["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if description.contains("audit")
+                    && ["unavailable", "could not", "cannot", "fail"]
+                        .iter()
+                        .any(|failure| description.contains(failure))
+                {
+                    defects.push(format!("{method} {path} {status}: {description}"));
+                }
+            }
+        }
+    }
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every public Bifrost table, query, and lifecycle operation publishes its
+/// pre-stream refusals as typed `WyrdProblem` bodies.
+#[tokio::test]
+async fn bifrost_operations_publish_typed_problem_refusals() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let problem_ref = "#/components/schemas/WyrdProblem";
+    let operations: [(&str, &str, &[&str]); 7] = [
+        ("/v1/bifrost/tables", "post", &["400", "409", "503"]),
+        ("/v1/bifrost/tables", "get", &["503"]),
+        (
+            "/v1/bifrost/tables/{namespace}/{name}",
+            "get",
+            &["400", "404", "503"],
+        ),
+        ("/v1/query", "post", &["400", "503"]),
+        ("/v1/query/running", "get", &["409", "503"]),
+        (
+            "/v1/query/{request_id}",
+            "get",
+            &["400", "404", "409", "503"],
+        ),
+        (
+            "/v1/query/{request_id}",
+            "delete",
+            &["400", "404", "409", "503"],
+        ),
+    ];
+    for (path, method, specific) in operations {
+        let responses = &document["paths"][path][method]["responses"];
+        for status in ["401", "403", "default"].iter().chain(specific) {
+            assert_eq!(
+                responses[*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"], problem_ref,
+                "{method} {path} must publish {status} as WyrdProblem problem+json"
+            );
+            assert!(
+                responses[*status]["content"]["application/json"].is_null(),
+                "{method} {path} must not publish {status} as plain JSON"
+            );
+        }
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Follow `schema` to the component it names in the served `document`.
+///
+/// Resolves a `$ref`, and unwraps the single non-null alternative utoipa emits
+/// for an optional reference (`oneOf`/`anyOf`/`allOf` with a `null` arm), so a
+/// caller can walk a property chain without caring how optionality is encoded.
+///
+/// # Panics
+/// Panics when a `$ref` is not a local component reference.
+fn resolve_schema<'a>(document: &'a Value, schema: &'a Value) -> &'a Value {
+    if let Some(reference) = schema["$ref"].as_str() {
+        let name = reference
+            .strip_prefix("#/components/schemas/")
+            .expect("schema references are local components");
+        return resolve_schema(document, &document["components"]["schemas"][name]);
+    }
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(arms) = schema[combinator].as_array() {
+            let mut concrete = arms.iter().filter(|arm| arm["type"] != "null");
+            if let (Some(arm), None) = (concrete.next(), concrete.next()) {
+                return resolve_schema(document, arm);
+            }
+        }
+    }
+    schema
+}
+
+/// Every gateway administration operation publishes its common and
+/// route-specific refusals as `application/problem+json` `WyrdProblem` bodies,
+/// and only the credential routes that can conflict publish a 409.
+#[tokio::test]
+async fn gateway_operations_publish_problem_json_refusals() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let credential = "/v1/admin/gateway/provider-credentials/{name}";
+    let deployment = "/v1/admin/gateway/provider-deployments/{name}";
+    let operations: [(&str, &str, &[&str]); 17] = [
+        (credential, "put", &["400", "409"]),
+        (credential, "get", &["400", "404"]),
+        ("/v1/admin/gateway/provider-credentials", "get", &[]),
+        (
+            "/v1/admin/gateway/provider-credentials/{name}/revoke",
+            "post",
+            &["400", "404"],
+        ),
+        (credential, "delete", &["400", "409"]),
+        (deployment, "put", &["400"]),
+        (deployment, "get", &["400", "404"]),
+        ("/v1/admin/gateway/provider-deployments", "get", &[]),
+        (deployment, "delete", &["400"]),
+        ("/v1/admin/gateway/fallback-policy", "put", &["400"]),
+        ("/v1/admin/gateway/fallback-policy", "get", &[]),
+        ("/v1/admin/gateway/fallback-policy", "delete", &[]),
+        ("/v1/admin/gateway/governance-policy", "put", &["400"]),
+        ("/v1/admin/gateway/governance-policy", "get", &[]),
+        ("/v1/admin/gateway/governance-policy", "delete", &[]),
+        ("/v1/admin/gateway/capture-policy", "put", &["400"]),
+        ("/v1/admin/gateway/capture-policy", "get", &[]),
+    ];
+    for (path, method, specific) in operations {
+        let responses = &document["paths"][path][method]["responses"];
+        assert_eq!(
+            responses.get("409").is_some(),
+            path == credential && specific.contains(&"409"),
+            "{method} {path} publishes 409 only for reachable credential conflicts"
+        );
+        for status in ["401", "403", "503", "default"].iter().chain(specific) {
+            assert_eq!(
+                responses[*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+                "#/components/schemas/WyrdProblem",
+                "{method} {path} must publish {status} as problem+json"
+            );
+        }
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The public gateway inference ingress publishes typed request, success, and
+/// native error contracts.
+///
+/// Chat completions publishes both JSON and `text/event-stream` success; every
+/// media route publishes its request media type; every `OpenAI`-compatible
+/// route publishes typed bodies and the `OpenAI` error envelope; the batch list
+/// `limit` carries the bounds the runtime enforces; payload retrieval publishes
+/// a binary string; and the Anthropic Messages and Gemini `GenerateContent`
+/// routes publish open, typed native bodies and their own error envelopes.
+#[tokio::test]
+async fn gateway_ingress_publishes_typed_contracts() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let reference = |name: &str| format!("#/components/schemas/{name}");
+
+    let content = &document["paths"]["/v1/chat/completions"]["post"]["responses"]["200"]["content"];
+    for media in ["application/json", "text/event-stream"] {
+        assert!(
+            content.get(media).is_some(),
+            "200 must publish {media}: {content}"
+        );
+    }
+
+    for (path, method, media, request, success) in [
+        (
+            "/v1/chat/completions",
+            "post",
+            "application/json",
+            Some("GatewayChatCompletionsRequest"),
+            Some("GatewayChatCompletion"),
+        ),
+        (
+            "/v1/responses",
+            "post",
+            "application/json",
+            Some("GatewayResponsesRequest"),
+            Some("GatewayResponse"),
+        ),
+        (
+            "/v1/embeddings",
+            "post",
+            "application/json",
+            Some("GatewayEmbeddingsRequest"),
+            Some("GatewayEmbeddings"),
+        ),
+        (
+            "/v1/images/generations",
+            "post",
+            "application/json",
+            Some("GatewayImageGenerationRequest"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/images/edits",
+            "post",
+            "multipart/form-data",
+            Some("GatewayImageEditForm"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/images/variations",
+            "post",
+            "multipart/form-data",
+            Some("GatewayImageVariationForm"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/audio/speech",
+            "post",
+            "application/json",
+            Some("GatewaySpeechRequest"),
+            None,
+        ),
+        (
+            "/v1/audio/transcriptions",
+            "post",
+            "multipart/form-data",
+            Some("GatewayTranscriptionForm"),
+            Some("GatewayTranscription"),
+        ),
+        (
+            "/v1/audio/translations",
+            "post",
+            "multipart/form-data",
+            Some("GatewayTranslationForm"),
+            Some("GatewayTranscription"),
+        ),
+        ("/v1/models", "get", "", None, Some("GatewayModelList")),
+        (
+            "/v1/files",
+            "post",
+            "multipart/form-data",
+            Some("GatewayFileUploadForm"),
+            Some("GatewayFile"),
+        ),
+        ("/v1/files/{file_id}", "get", "", None, Some("GatewayFile")),
+        (
+            "/v1/files/{file_id}",
+            "delete",
+            "",
+            None,
+            Some("GatewayFileDeleted"),
+        ),
+        (
+            "/v1/batches",
+            "post",
+            "application/json",
+            Some("GatewayBatchCreateRequest"),
+            Some("GatewayBatch"),
+        ),
+        ("/v1/batches", "get", "", None, Some("GatewayBatchList")),
+        (
+            "/v1/batches/{batch_id}",
+            "get",
+            "",
+            None,
+            Some("GatewayBatch"),
+        ),
+        (
+            "/v1/batches/{batch_id}/cancel",
+            "post",
+            "",
+            None,
+            Some("GatewayBatch"),
+        ),
+    ] {
+        let operation = &document["paths"][path][method];
+        if let Some(request) = request {
+            assert_eq!(
+                operation["requestBody"]["content"][media]["schema"]["$ref"],
+                reference(request),
+                "{method} {path} request"
+            );
+        }
+        if let Some(success) = success {
+            assert_eq!(
+                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                reference(success),
+                "{method} {path} success"
+            );
+        }
+        assert_eq!(
+            operation["responses"]["default"]["content"]["application/json"]["schema"]["$ref"],
+            reference("OpenAiErrorEnvelope"),
+            "{method} {path} error envelope"
+        );
+    }
+    for (component, fields) in [
+        (
+            "GatewayChatCompletionsRequest",
+            &["model", "messages", "temperature"][..],
+        ),
+        (
+            "GatewayImageEditForm",
+            &["model", "image", "mask", "prompt"],
+        ),
+        ("GatewayTranscriptionForm", &["model", "file", "language"]),
+        (
+            "GatewayBatchCreateRequest",
+            &["input_file_id", "endpoint", "completion_window"],
+        ),
+        (
+            "GatewayBatchList",
+            &["object", "data", "first_id", "last_id", "has_more"],
+        ),
+        ("OpenAiError", &["message", "type", "param", "code"]),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[component]["properties"].get(*field).is_some(),
+                "{component} must publish {field}"
+            );
+        }
+    }
+    assert_eq!(schemas["GatewayFormFile"]["type"], "string");
+    assert_eq!(schemas["GatewayFormFile"]["format"], "binary");
+    assert_eq!(
+        document["paths"]["/v1/gateway/payload-objects/{digest}"]["get"]["responses"]["200"]["content"]
+            ["application/octet-stream"]["schema"]["$ref"],
+        reference("GatewayFormFile"),
+        "payload object retrieval publishes a binary string"
+    );
+    let limit = document["paths"]["/v1/batches"]["get"]["parameters"]
+        .as_array()
+        .expect("batch list parameters")
+        .iter()
+        .find(|parameter| parameter["name"] == "limit")
+        .expect("limit parameter");
+    assert_eq!(
+        (&limit["schema"]["minimum"], &limit["schema"]["maximum"]),
+        (&serde_json::json!(1), &serde_json::json!(100))
+    );
+
+    for (path, request, success, error) in [
+        (
+            "/v1/messages",
+            "GatewayAnthropicMessagesRequest",
+            "GatewayAnthropicMessage",
+            "AnthropicErrorEnvelope",
+        ),
+        (
+            "/v1beta/models/{target}",
+            "GatewayGeminiGenerateContentRequest",
+            "GatewayGeminiGenerateContentResponse",
+            "GoogleErrorEnvelope",
+        ),
+    ] {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(
+            (
+                &operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                &operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                &operation["responses"]["default"]["content"]["application/json"]["schema"]["$ref"],
+            ),
+            (
+                &serde_json::json!(reference(request)),
+                &serde_json::json!(reference(success)),
+                &serde_json::json!(reference(error)),
+            ),
+            "{path}"
+        );
+    }
+    for (component, fields) in [
+        (
+            "GatewayAnthropicMessagesRequest",
+            &["model", "max_tokens", "messages", "stream"][..],
+        ),
+        (
+            "GatewayAnthropicMessage",
+            &["id", "type", "content", "stop_reason", "usage"],
+        ),
+        ("GatewayGeminiGenerateContentRequest", &["contents"]),
+        (
+            "GatewayGeminiGenerateContentResponse",
+            &["candidates", "usageMetadata"],
+        ),
+    ] {
+        let schema = &schemas[component];
+        for field in fields {
+            assert!(
+                schema["properties"].get(*field).is_some(),
+                "{component} must publish {field}: {schema}"
+            );
+        }
+        assert_ne!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "{component} must accept native extensions"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every public inference ingress publishes the optional
+/// `wyrd-gateway-fallback` header with its encoding, size limits, and refusal
+/// code, while ingresses that ignore it publish no such parameter.
+///
+/// # Panics
+/// Panics when the server fails to start or stop or a published header
+/// contract differs.
+#[tokio::test]
+async fn gateway_inference_ingress_publishes_the_fallback_header() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let fallback = |path: &str| {
+        document["paths"][path]["post"]["parameters"]
+            .as_array()
+            .and_then(|parameters| {
+                parameters
+                    .iter()
+                    .find(|parameter| parameter["name"] == "wyrd-gateway-fallback")
+            })
+            .cloned()
+    };
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/messages",
+        "/v1beta/models/{target}",
+    ] {
+        let header = fallback(path).unwrap_or_else(|| panic!("{path} publishes the header"));
+        assert_eq!(header["in"], "header", "{path}");
+        assert_ne!(header["required"], true, "{path} header is optional");
+        let description = header["description"].as_str().unwrap_or_default();
+        for term in [
+            "unpadded base64url",
+            "JCS",
+            "8 KiB",
+            "4 KiB",
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+        ] {
+            assert!(description.contains(term), "{path} documents {term}");
+        }
+    }
+    assert!(
+        fallback("/v1/embeddings").is_none(),
+        "embeddings ignores the header"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The card surface publishes its typed lifecycle, parameter, and problem
+/// shapes.
+///
+/// Also walks the served `Card -> Status -> verification -> binding_ids`
+/// chain, proving the read-side binding identities are a UUID array.
+///
+/// # Panics
+/// Panics when the server fails to start or stop or any published shape
+/// differs.
+#[tokio::test]
+async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+
+    let parameters = paths["/v1/cards"]["get"]["parameters"]
+        .as_array()
+        .expect("list parameters");
+    let parameter_names: BTreeSet<&str> = parameters
+        .iter()
+        .filter_map(|parameter| parameter["name"].as_str())
+        .collect();
+    assert_eq!(
+        parameter_names,
+        BTreeSet::from([
+            "kind",
+            "space",
+            "name",
+            "version_range",
+            "status",
+            "filter",
+            "include_prerelease",
+            "limit",
+            "cursor",
+        ])
+    );
+
+    let card = &document["components"]["schemas"]["Card"];
+    let required = card["required"].as_array().expect("Card required fields");
+    assert!(required.iter().any(|field| field == "apiVersion"));
+    assert_eq!(
+        document["components"]["schemas"]["Spec"]["oneOf"]
+            .as_array()
+            .expect("typed spec alternatives")
+            .len(),
+        15,
+        "one typed spec per registrable native Card kind"
+    );
+
+    let status = resolve_schema(&document, &card["properties"]["status"]);
+    let verification = resolve_schema(&document, &status["properties"]["verification"]);
+    assert_eq!(
+        verification, &document["components"]["schemas"]["VerificationStatus"],
+        "Card status carries the named verification status"
+    );
+    let binding_ids = resolve_schema(&document, &verification["properties"]["binding_ids"]);
+    assert_eq!(binding_ids["type"], "array", "binding IDs are an array");
+    let binding_id = resolve_schema(&document, &binding_ids["items"]);
+    assert_eq!(binding_id["type"], "string");
+    assert_eq!(binding_id["format"], "uuid", "each binding ID is a UUID");
+
+    let problem = &document["components"]["schemas"]["WyrdProblem"];
+    let problem_required: BTreeSet<&str> = problem["required"]
+        .as_array()
+        .expect("problem required fields")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        problem_required,
+        BTreeSet::from([
+            "type",
+            "title",
+            "status",
+            "detail",
+            "code",
+            "details",
+            "remediation",
+        ])
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The Verification surface is exactly four typed operations.
+///
+/// Binding status, manual run request, run status, and direct execution
+/// publish their typed request and response schemas, the manual request
+/// answers `202 Accepted`, direct execution answers `200` with its judgment
+/// and documents its stable refusals, and no result or other Verification
+/// operation is routed: queued verdicts are read from Bifrost by `result_id`.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when a Verification path,
+/// method, status, or schema reference differs.
+#[tokio::test]
+async fn verification_contract_publishes_exactly_four_typed_operations() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+
+    let verification: BTreeSet<(&str, &str)> = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with("/v1/verification"))
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .expect("path item object")
+                .keys()
+                .filter(|key| ["get", "post", "put", "patch", "delete"].contains(&key.as_str()))
+                .map(move |method| (path.as_str(), method.as_str()))
+        })
+        .collect();
+    assert_eq!(
+        verification,
+        BTreeSet::from([
+            ("/v1/verification/bindings/{binding_id}", "get"),
+            ("/v1/verification/execute", "post"),
+            ("/v1/verification/runs", "post"),
+            ("/v1/verification/runs/{run_id}", "get"),
+        ])
+    );
+
+    let schema_ref = |operation: &Value, status: &str| {
+        operation["responses"][status]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let start = &paths["/v1/verification/runs"]["post"];
+    assert_eq!(
+        start["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/StartVerificationRunRequest"
+    );
+    assert_eq!(
+        schema_ref(start, "202").as_deref(),
+        Some("#/components/schemas/StartVerificationRunResponse")
+    );
+    assert_eq!(
+        schema_ref(
+            &paths["/v1/verification/bindings/{binding_id}"]["get"],
+            "200"
+        )
+        .as_deref(),
+        Some("#/components/schemas/VerificationBindingStatus")
+    );
+    assert_eq!(
+        schema_ref(&paths["/v1/verification/runs/{run_id}"]["get"], "200").as_deref(),
+        Some("#/components/schemas/VerificationRunStatus")
+    );
+    let execute = &paths["/v1/verification/execute"]["post"];
+    assert_eq!(
+        execute["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ExecuteVerificationRequest"
+    );
+    assert_eq!(
+        schema_ref(execute, "200").as_deref(),
+        Some("#/components/schemas/ExecuteVerificationResponse")
+    );
+    let documented: BTreeSet<&str> = execute["responses"]
+        .as_object()
+        .expect("execute responses object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        ["400", "403", "404", "409", "413", "422", "502", "504"]
+            .iter()
+            .all(|status| documented.contains(status)),
+        "{documented:?}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Operator connection management publishes exactly its five typed
+/// operations: the provider-tagged create and update bodies, the redacted
+/// view, and a UUID `connection_id` path parameter.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when an operation,
+/// schema reference, or path parameter differs.
+#[tokio::test]
+async fn operator_connection_contract_publishes_five_typed_operations() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+    let operations: BTreeSet<(&str, &str)> = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with("/v1/operator-connections"))
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .expect("path item object")
+                .keys()
+                .filter(|key| ["get", "post", "put", "patch", "delete"].contains(&key.as_str()))
+                .map(move |method| (path.as_str(), method.as_str()))
+        })
+        .collect();
+    let item = "/v1/operator-connections/{connection_id}";
+    assert_eq!(
+        operations,
+        BTreeSet::from([
+            ("/v1/operator-connections", "get"),
+            ("/v1/operator-connections", "post"),
+            (item, "delete"),
+            (item, "get"),
+            (item, "patch"),
+        ])
+    );
+    let body_ref = |path: &str, method: &str| {
+        paths[path][method]["requestBody"]["content"]["application/json"]["schema"]["$ref"].clone()
+    };
+    assert_eq!(
+        body_ref("/v1/operator-connections", "post"),
+        "#/components/schemas/CreateOperatorConnectionRequest"
+    );
+    assert_eq!(
+        body_ref(item, "patch"),
+        "#/components/schemas/UpdateOperatorConnectionRequest"
+    );
+    assert_eq!(
+        paths["/v1/operator-connections"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/OperatorConnectionView"
+    );
+    for method in ["get", "patch", "delete"] {
+        let schema = path_parameter_schema(&document, item, method, "connection_id");
+        assert_eq!(schema["format"], "uuid", "{method} connection_id: {schema}");
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Issued and listed credential ids publish the same UUID contract the revoke
+/// path parameter and the MCP tools use, so no surface advertises free text.
+///
+/// Covers the principal credential routes and the Card-bound
+/// `POST /auth/issue-key` response, whose `key_id` is the same credential id.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or a credential id is not published
+/// with the `uuid` format.
+#[tokio::test]
+async fn credential_ids_publish_their_uuid_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    for component in ["IssuedCredential", "CredentialMetadata"] {
+        let id = &document["components"]["schemas"][component]["properties"]["id"];
+        assert_eq!(id["format"], "uuid", "{component}.id is a UUID: {id}");
+    }
+    let key_id = &document["components"]["schemas"]["IssueKeyResponse"]["properties"]["key_id"];
+    assert_eq!(
+        key_id["format"], "uuid",
+        "IssueKeyResponse.key_id is a UUID: {key_id}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// `GET /openapi.json` is the whole contract: no YAML projection is routed, and
+/// the served document identifies itself as `OpenAPI` and describes real paths.
+#[tokio::test]
+async fn no_yaml_projection_is_routed() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+
+    let document = served_document(&server).await;
+    assert!(
+        document["openapi"]
+            .as_str()
+            .is_some_and(|v| v.starts_with('3')),
+        "the served document declares its OpenAPI version"
+    );
+    assert!(document["info"]["title"].is_string());
+    assert!(
+        document["paths"]
+            .as_object()
+            .is_some_and(|paths| !paths.is_empty()),
+        "the served document describes the server's routes"
+    );
+
+    // The edge answers an anonymous caller 401 for any unmatched path, so the
+    // probe carries a credential: only a genuinely unrouted path reaches the
+    // router's own not-found.
+    let reader = server
+        .bootstrap_service("openapi-yaml-probe", &["reader"])
+        .await
+        .expect("service bootstraps");
+    let token = server
+        .exchange_api_key(reader.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+    let response = server
+        .oneshot_authenticated(
+            &token,
+            Request::builder()
+                .uri("/openapi.yaml")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "no YAML projection of the document is routed"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The operations that carry their own `security` key are exactly the ones an
+/// anonymous caller can reach.
+///
+/// This is the behavioural replacement for the hand-written anonymous-path
+/// list: each operation's own declaration is the input, and the assembled
+/// server's answer to a credential-free request is the proof. Every other
+/// operation must refuse with `WYRD_AUTH_401_UNAUTHENTICATED`, which is also
+/// what proves it is mounted behind the default-deny layer.
+#[tokio::test]
+async fn unauthenticated_requests_match_each_operation_declared_security() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    let mut cleared = 0_usize;
+    let mut defects: Vec<String> = Vec::new();
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for method in METHODS {
+            let Some(operation) = item.get(method) else {
+                continue;
+            };
+            let uri = template_to_uri(path);
+            let response = server
+                .oneshot(
+                    Request::builder()
+                        .method(method.to_uppercase().as_str())
+                        .uri(&uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            let status = response.status();
+            let code = if status == StatusCode::UNAUTHORIZED {
+                refusal_code(&problem_json(response).await)
+            } else {
+                String::new()
+            };
+
+            if operation.get("security").is_some() {
+                cleared += 1;
+                if code == "WYRD_AUTH_401_UNAUTHENTICATED" {
+                    defects.push(format!(
+                        "{method} {path} clears the security requirement but refused an \
+                         anonymous caller as unauthenticated"
+                    ));
+                }
+            } else if code != "WYRD_AUTH_401_UNAUTHENTICATED" {
+                defects.push(format!(
+                    "{method} {path} inherits the document-wide security requirement but \
+                     answered {status} ({code}) without a token"
+                ));
+            }
+        }
+    }
+
+    assert!(cleared > 0, "some operations clear the requirement");
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The stable Wyrd code a refusal body carries, whatever envelope it uses.
+///
+/// Wyrd surfaces answer with problem+json, whose `code` names it. The public
+/// gateway inference ingress answers in the calling SDK's own envelope instead:
+/// `OpenAI` and Anthropic carry the code in `error.code`, and Google carries it
+/// as the `reason` of its `ErrorInfo` detail. Returns an empty string when the
+/// body names no code.
+fn refusal_code(body: &Value) -> String {
+    body["code"]
+        .as_str()
+        .or_else(|| body["error"]["code"].as_str())
+        .or_else(|| body["error"]["details"][0]["reason"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Replace every `{template}` segment with a probe value so the path routes.
+///
+/// The value never reaches a handler in these probes — authentication refuses
+/// first — so any non-empty segment that survives URI parsing will do.
+fn template_to_uri(path: &str) -> String {
+    let mut uri = String::with_capacity(path.len());
+    let mut depth = 0_usize;
+    for ch in path.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth == 1 {
+                    uri.push_str("probe");
+                }
+            }
+            '}' => depth -= 1,
+            _ if depth == 0 => uri.push(ch),
+            _ => {}
+        }
+    }
+    uri
+}
+
+/// Return the description the document publishes for one operation's status.
+///
+/// # Panics
+/// Panics when the operation or the status is absent, which means the runtime
+/// answered with a refusal the contract does not describe at all.
+fn documented_description(document: &Value, path: &str, method: &str, status: u16) -> String {
+    document["paths"][path][method]["responses"][status.to_string()]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{method} {path} documents a {status} response"))
+        .to_owned()
+}
+
+/// A storage lookup that finds nothing must answer with the stable code its own
+/// operation documents, not with an undocumented shape.
+#[tokio::test]
+async fn an_unknown_upload_answers_with_a_code_the_operation_documents() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let writer = server
+        .bootstrap_service("openapi-storage", &["writer"])
+        .await
+        .expect("service bootstraps");
+    let token = server
+        .exchange_api_key(writer.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+
+    let response = server
+        .oneshot_authenticated(
+            &token,
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/cards/upload/{}/part-url?part_number=1",
+                    UploadId::new()
+                ))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let problem = problem_json(response).await;
+    let code = problem["code"].as_str().expect("problem carries a code");
+    assert_eq!(code, "WYRD_STORAGE_404_UPLOAD_NOT_FOUND");
+    assert!(
+        documented_description(&document, "/v1/cards/upload/{id}/part-url", "post", 404)
+            .contains(code),
+        "the owning operation names {code} on its 404"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// A local transfer whose locator cannot be extracted answers with the
+/// canonical problem response and a code its own operation documents.
+///
+/// A missing or undecodable download `path` query and an undecodable upload
+/// identifier are refused by the route's extractor before the handler body
+/// runs, so this drives each through the assembled authenticated router and
+/// checks status, problem media type, envelope shape, and the documented code.
+///
+/// # Panics
+/// Panics when the server cannot start, a request fails, or a refusal is not
+/// the documented problem response.
+#[tokio::test]
+async fn an_unextractable_local_transfer_locator_answers_with_a_documented_problem() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let writer = server
+        .bootstrap_service("openapi-local-transfer", &["writer"])
+        .await
+        .expect("service bootstraps");
+    let token = server
+        .exchange_api_key(writer.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+
+    let cases = [
+        (
+            "GET",
+            "/v1/cards/download/local",
+            "/v1/cards/download/local",
+            "get",
+            "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        ),
+        (
+            "GET",
+            "/v1/cards/download/local?path=a&path=b",
+            "/v1/cards/download/local",
+            "get",
+            "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        ),
+        (
+            "PUT",
+            "/v1/cards/upload/local/%FF",
+            "/v1/cards/upload/local/{id}",
+            "put",
+            "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+        ),
+    ];
+    for (method, uri, path, operation, expected) in cases {
+        let response = server
+            .oneshot_authenticated(
+                &token,
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROBLEM_MEDIA_TYPE),
+            "{method} {uri} is a problem response"
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["status"], 400, "{method} {uri}: {problem}");
+        assert!(problem["title"].is_string(), "{method} {uri}: {problem}");
+        assert_eq!(problem["code"], expected, "{method} {uri}: {problem}");
+        assert!(
+            documented_description(&document, path, operation, 400).contains(expected),
+            "{method} {path} names {expected} on its 400"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Resolve one operation's path-parameter schema, following a component `$ref`.
+///
+/// # Panics
+/// Panics when the operation does not publish the named path parameter.
+fn path_parameter_schema(document: &Value, path: &str, method: &str, name: &str) -> Value {
+    let schema = document["paths"][path][method]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name && parameter["in"] == "path")
+        })
+        .unwrap_or_else(|| panic!("{method} {path} publishes path parameter {name}"))["schema"]
+        .clone();
+    match schema["$ref"].as_str() {
+        Some(reference) => {
+            let component = reference.trim_start_matches("#/components/schemas/");
+            document["components"]["schemas"][component].clone()
+        }
+        None => schema,
+    }
+}
+
+/// A malformed administrative path identifier is excluded by the published
+/// typed parameter and refused at runtime with the problem that operation
+/// documents.
+///
+/// Covers one tenant principal path, one platform principal path, and one
+/// platform tenant path through the assembled authenticated router: each
+/// publishes a UUID-formatted parameter, and a non-UUID segment answers `400`
+/// `application/problem+json` with `WYRD_SPEC_400_VALIDATION`, which the
+/// operation lists under its `400`.
+///
+/// # Panics
+/// Panics when the server cannot start, a credential cannot be exchanged, or a
+/// refusal disagrees with the published contract.
+#[tokio::test]
+async fn a_malformed_administrative_identifier_answers_with_a_documented_problem() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let tenant = server
+        .bootstrap_service("openapi-malformed-id", &["reader"])
+        .await
+        .expect("service bootstraps");
+    let tenant_token = server
+        .exchange_api_key(tenant.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+    let root = server
+        .initialize_platform_root()
+        .await
+        .expect("platform root initializes");
+    let exchanged = server
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/platform/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(root.expose_secret())))
+                .expect("request builds"),
+        )
+        .await
+        .expect("platform token route responds");
+    assert_eq!(exchanged.status(), StatusCode::OK);
+    let platform_token = problem_json(exchanged).await["access_token"]
+        .as_str()
+        .expect("platform session token")
+        .to_owned();
+
+    let cases = [
+        (
+            tenant_token.as_str(),
+            "/v1/principals/not-a-uuid/credentials",
+            "/v1/principals/{principal_id}/credentials",
+            "principal_id",
+        ),
+        (
+            platform_token.as_str(),
+            "/platform/admins/not-a-uuid/credentials",
+            "/platform/admins/{principal_id}/credentials",
+            "principal_id",
+        ),
+        (
+            platform_token.as_str(),
+            "/platform/tenants/not-a-uuid",
+            "/platform/tenants/{tenant_id}",
+            "tenant_id",
+        ),
+    ];
+    for (token, uri, path, parameter) in cases {
+        let schema = path_parameter_schema(&document, path, "get", parameter);
+        assert_eq!(
+            schema["format"], "uuid",
+            "{path} publishes a typed {parameter}: {schema}"
+        );
+
+        let response = server
+            .oneshot_authenticated(
+                token,
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "GET {uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROBLEM_MEDIA_TYPE),
+            "GET {uri} is a problem response"
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["status"], 400, "GET {uri}: {problem}");
+        assert_eq!(
+            problem["code"], "WYRD_SPEC_400_VALIDATION",
+            "GET {uri}: {problem}"
+        );
+        assert!(
+            documented_description(&document, path, "get", 400)
+                .contains("WYRD_SPEC_400_VALIDATION"),
+            "GET {path} lists WYRD_SPEC_400_VALIDATION on its 400"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// A credential exchange whose audit cannot be staged still grants a token.
+///
+/// `/auth/token` is the one operation every caller reaches before it has a
+/// session. Its decision is staged on the non-blocking audit outbox, so a
+/// staging insert refused at the store costs the grant nothing: the exchange
+/// answers `200`, the failed audit write is counted, and the retried decision
+/// commits exactly once after the store accepts it again.
+///
+/// The failure is injected at the store with a trigger scoped to the exchange
+/// operation, so no handler seam is stubbed.
+///
+/// # Panics
+/// Panics when the exchange is refused, the failure is not counted, or the
+/// decision does not commit once after recovery.
+#[tokio::test]
+async fn an_unstageable_exchange_audit_still_grants_a_token() {
+    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let service = server
+        .bootstrap_service("openapi-token-audit", &["reader"])
+        .await
+        .expect("service bootstraps");
+    let api_key = service
+        .api_key()
+        .expect("machine bootstraps with a key")
+        .expose_secret()
+        .to_owned();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let exchanges = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.token.exchange'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("exchange decisions read")
+    };
+    server
+        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await
+        .expect("audit outbox settles");
+    let exchanges_before = exchanges().await;
+    sqlx::raw_sql(
+        r"CREATE OR REPLACE FUNCTION vala.test_fail_token_exchange_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'auth.token.exchange' THEN
+               RAISE EXCEPTION 'injected token exchange audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;
+         DROP TRIGGER IF EXISTS test_fail_token_exchange_audit ON vala.audit_staging;
+         CREATE TRIGGER test_fail_token_exchange_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_token_exchange_audit();",
+    )
+    .execute(&pool)
+    .await
+    .expect("token exchange audit failure installs");
+
+    let response = server
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(api_key_exchange(&api_key)))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    let status = response.status();
+    let body = problem_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    failures
+        .await_failure(std::time::Duration::from_secs(30))
+        .await
+        .expect("the failed audit write is counted");
+    sqlx::query("DROP TRIGGER test_fail_token_exchange_audit ON vala.audit_staging")
+        .execute(&pool)
+        .await
+        .expect("token exchange audit failure drops");
+    assert_eq!(
+        server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await
+            .expect("audit outbox settles"),
+        0,
+        "the retried decision drains"
+    );
+    assert_eq!(
+        exchanges().await,
+        exchanges_before + 1,
+        "the decision commits exactly once after recovery"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}

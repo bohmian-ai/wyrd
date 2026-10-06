@@ -41,8 +41,7 @@ use utoipa_axum::routes;
 
 /// Lifetime of a credential issued to tenant automation.
 /// Lifetime of an automation principal's first credential.
-const AUTOMATION_CREDENTIAL_LIFETIME: std::time::Duration =
-    std::time::Duration::from_secs(90 * 24 * 60 * 60);
+const AUTOMATION_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(2160);
 
 /// Permission every operation on this surface requires.
 const REQUIRED_PERMISSION: &str = "service_accounts:write";

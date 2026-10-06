@@ -162,7 +162,6 @@ impl IssuingKey {
         signing
             .verifying_key()
             .to_public_key_pem(LineEnding::LF)
-            .map(|pem| pem.to_string())
             .map_err(|e| IssueError::PublicKeyDerivation(e.to_string()))
     }
 
@@ -481,12 +480,12 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
         (PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System, _) => {
             Err(IssueError::InvalidPrincipalKind)
         }
-        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None) => Ok(()),
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None)
+        | (PrincipalKindTag::Service, Some(CardKind::Service) | None)
+        | (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
         (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
             Err(IssueError::InvalidCardRef)
         }
-        (PrincipalKindTag::Service, Some(CardKind::Service) | None) => Ok(()),
-        (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
         (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
     }
 }

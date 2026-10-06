@@ -31,7 +31,7 @@ use wyrd_testing::bifrost::ForgeFixture;
 /// role supervisor.
 pub(crate) async fn start_engine_fixture_server() -> WyrdTestServer {
     let server = WyrdTestServer::builder()
-        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_interval(Duration::from_hours(1))
         .with_forge_process_role_for_test(BifrostTarget::Server)
         .start_in_process()
         .await

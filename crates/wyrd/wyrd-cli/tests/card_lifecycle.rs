@@ -590,7 +590,7 @@ mod pg_tests {
                     root: storage_root.path().to_path_buf(),
                 },
                 require_encryption: false,
-                presign_ttl: std::time::Duration::from_secs(600),
+                presign_ttl: std::time::Duration::from_mins(10),
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
             })
@@ -796,8 +796,7 @@ mod pg_tests {
                 let card = state.card(alias).expect("Card envelope resolves");
                 assert!(
                     unresolved_card_ref_paths(&card.spec).is_empty(),
-                    "{} contains unresolved paths",
-                    card_ref
+                    "{card_ref} contains unresolved paths"
                 );
             }
         }
@@ -1113,7 +1112,6 @@ mod pg_tests {
         let superuser = server
             .pg_fixture()
             .superuser_pool()
-            .await
             .expect("superuser pool opens");
         let original_storage_path: String = sqlx::query_scalar(
             "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
@@ -1188,7 +1186,7 @@ mod pg_tests {
         sqlx::query(
             "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, storage_path = $2 WHERE card_uid = $3",
         )
-        .bind(b"cli-card-artifact".len() as i64)
+        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
         .bind("../escape")
         .bind(&uid)
         .execute(&superuser)
@@ -1220,7 +1218,7 @@ mod pg_tests {
         sqlx::query(
             "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, sha256 = $2, storage_path = $3 WHERE card_uid = $4",
         )
-        .bind(b"cli-card-artifact".len() as i64)
+        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
         .bind(&correct_digest)
         .bind(&original_storage_path)
         .bind(&uid)
@@ -1711,7 +1709,6 @@ mod pg_tests {
         let superuser = server
             .pg_fixture()
             .superuser_pool()
-            .await
             .expect("superuser pool opens");
         let blob_uri: String =
             sqlx::query_scalar("SELECT card_blob_uri FROM wyrd.cards WHERE card_uid = $1")
@@ -2083,10 +2080,9 @@ mod pg_tests {
         let superuser = server
             .pg_fixture()
             .superuser_pool()
-            .await
             .expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_cli_card_completion_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_cli_card_completion_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'card.registration.complete' THEN
@@ -2094,15 +2090,15 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_cli_card_completion_audit
+            r"CREATE TRIGGER test_fail_cli_card_completion_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_cli_card_completion_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_cli_card_completion_audit()",
         )
         .execute(&superuser)
         .await

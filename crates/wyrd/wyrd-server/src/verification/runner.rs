@@ -350,19 +350,18 @@ impl VerifierRunner {
             telemetry.classify(VerifierKind::of(&verifier.implementation));
         }
         let fresh;
-        let staged = match &run.staged {
-            Some(staged) => staged,
-            None => {
-                let verifier = match verifier {
-                    Ok(verifier) => verifier,
-                    Err(error) => return Transition::Terminate(TerminalStatus::Errored, error),
-                };
-                fresh = match self.produce(tenant, run, &verifier, telemetry).await {
-                    Ok(staged) => staged,
-                    Err(transition) => return transition,
-                };
-                &fresh
-            }
+        let staged = if let Some(staged) = &run.staged {
+            staged
+        } else {
+            let verifier = match verifier {
+                Ok(verifier) => verifier,
+                Err(error) => return Transition::Terminate(TerminalStatus::Errored, error),
+            };
+            fresh = match self.produce(tenant, run, &verifier, telemetry).await {
+                Ok(staged) => staged,
+                Err(transition) => return transition,
+            };
+            &fresh
         };
         let replayed = run.staged.is_some();
         telemetry

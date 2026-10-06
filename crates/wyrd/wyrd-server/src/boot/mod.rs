@@ -69,7 +69,7 @@ use crate::state::{
 };
 use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
-const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 const ORACLE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Number of listing entries the production Forge object store groups into one
@@ -450,27 +450,24 @@ fn resolve_forge_config(
     let config = ForgeConfig {
         snapshot_retention: forge_runtime
             .snapshot_retention_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.snapshot_retention),
+            .map_or(base.snapshot_retention, std::time::Duration::from_secs),
         retain_last: forge_runtime.retain_last.unwrap_or(base.retain_last),
         orphan_gc_ttl: forge_runtime
             .orphan_gc_ttl_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.orphan_gc_ttl),
+            .map_or(base.orphan_gc_ttl, std::time::Duration::from_secs),
         maintenance_trigger_snapshot_count: forge_runtime
             .maintenance_trigger_snapshot_count
             .unwrap_or(base.maintenance_trigger_snapshot_count),
-        maintenance_trigger_interval: forge_runtime
-            .maintenance_trigger_interval_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.maintenance_trigger_interval),
+        maintenance_trigger_interval: forge_runtime.maintenance_trigger_interval_secs.map_or(
+            base.maintenance_trigger_interval,
+            std::time::Duration::from_secs,
+        ),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
         orphan_gc_run_budget: forge_runtime
             .orphan_gc_run_budget_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.orphan_gc_run_budget),
+            .map_or(base.orphan_gc_run_budget, std::time::Duration::from_secs),
         default_target_file_size_bytes: forge_runtime
             .target_file_size_bytes
             .unwrap_or(base.default_target_file_size_bytes),
@@ -478,8 +475,7 @@ fn resolve_forge_config(
     };
     let maintenance_interval = forge_runtime
         .maintenance_interval_secs
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
+        .map_or(DEFAULT_MAINTENANCE_INTERVAL, std::time::Duration::from_secs);
     (config, maintenance_interval)
 }
 
@@ -635,6 +631,10 @@ async fn build_bifrost_external_dependencies(
 ///
 /// Returns [`ServerBootError`] when Scribe, Forge, Oracle, role fencing, or
 /// request-boundary construction fails before publication.
+///
+/// # Panics
+///
+/// Panics if a compaction owner built around a live runtime reports no handle.
 pub async fn compose_bifrost(
     inputs: crate::state::BifrostBuildInputs,
 ) -> Result<crate::state::ComposedBifrost, ServerBootError> {
@@ -815,14 +815,14 @@ pub async fn compose_bifrost(
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
             event_time_window: EventTimeWindow {
-                past: scribe_config
-                    .event_time_past_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
-                future: scribe_config
-                    .event_time_future_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
+                past: scribe_config.event_time_past_window_secs.map_or_else(
+                    || std::time::Duration::from_hours(720),
+                    std::time::Duration::from_secs,
+                ),
+                future: scribe_config.event_time_future_window_secs.map_or_else(
+                    || std::time::Duration::from_hours(24),
+                    std::time::Duration::from_secs,
+                ),
             },
         };
         #[cfg(feature = "test-support")]
@@ -1299,8 +1299,7 @@ pub async fn build_state(
         config,
         &signing_key,
         sealing_key.clone(),
-    )
-    .await?;
+    )?;
     let verifier = auth
         .token_verifier
         .clone()
@@ -1561,7 +1560,7 @@ pub async fn rewrap_sealed_secrets(
 /// # Errors
 /// Returns [`ServerBootError::SigningKey`] when production profile lacks a
 /// signing key, or when key material is invalid.
-async fn install_auth(
+fn install_auth(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
     signing_key: &SecretString,
@@ -1684,7 +1683,7 @@ struct OracleRoleBuilder<'a> {
     shutdown: CancellationToken,
 }
 
-impl<'a> OracleRoleBuilder<'a> {
+impl OracleRoleBuilder<'_> {
     /// Constructs the combined fenced API-serving follower without publishing a partial peer.
     ///
     /// # Errors
@@ -2330,13 +2329,13 @@ fn build_bifrost_peer_tls(
 pub fn check_card_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
     check_card_recovery_pool_inner(
         state.postgres.operator_pool().is_some(),
-        &state.deployment_profile,
+        state.deployment_profile,
     )
 }
 
 fn check_card_recovery_pool_inner(
     has_operator_pool: bool,
-    profile: &crate::config::DeploymentProfile,
+    profile: crate::config::DeploymentProfile,
 ) -> Result<(), ServerBootError> {
     if !has_operator_pool {
         if profile.is_production() {
@@ -2622,14 +2621,14 @@ mod tests {
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
         assert_eq!(
             config.snapshot_retention,
-            std::time::Duration::from_secs(7_200)
+            std::time::Duration::from_hours(2)
         );
         assert_eq!(config.retain_last, 3);
-        assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
+        assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_hours(1));
         assert_eq!(config.maintenance_trigger_snapshot_count, 8);
         assert_eq!(
             config.maintenance_trigger_interval,
-            std::time::Duration::from_secs(900)
+            std::time::Duration::from_mins(15)
         );
         assert_eq!(config.orphan_gc_max_list_pages, 64);
         assert_eq!(
@@ -2764,8 +2763,8 @@ pub(crate) mod pg_tests {
     /// Builds the shared non-Bifrost application shell for focused boot tests.
     async fn make_test_state() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -2856,10 +2855,7 @@ mod sealing_boot_pg_tests {
             .await
             .expect("connection seeds");
         conn.commit().await.expect("seed commits");
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
             "UPDATE wyrd.auth_human_connections \
              SET client_auth = 'SecretPost', client_secret_enc = '\\x0102'::bytea \

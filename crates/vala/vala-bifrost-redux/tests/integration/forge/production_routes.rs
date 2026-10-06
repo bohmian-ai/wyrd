@@ -1197,7 +1197,6 @@ async fn scheduler_publishes_complete_cycle_inventory() {
     let admin = fixture
         .database
         .superuser_pool()
-        .await
         .expect("fixture administrator");
     sqlx::query("UPDATE vala.bifrost_tables SET status='deprecated'")
         .execute(&admin)
@@ -1619,7 +1618,6 @@ async fn scheduler_open_cycle_tracks_roster_changes() {
     let admin = fixture
         .database
         .superuser_pool()
-        .await
         .expect("fixture administrator");
     sqlx::query(
         "UPDATE vala.bifrost_tables SET status='deprecated' WHERE fqn='vala.bifrost.a_disappears'",

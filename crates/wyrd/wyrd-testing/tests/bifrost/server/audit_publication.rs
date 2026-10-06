@@ -431,7 +431,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // settlement back and the staged tail stays out of every in-flight batch.
     tokio::time::timeout(
         PUBLICATION_BUDGET,
-        crashing_appended.wait_for(|appended| appended.is_some()),
+        crashing_appended.wait_for(std::option::Option::is_some),
     )
     .await
     .map_err(|_| "the crashing cycle never reported its durable append")??;
@@ -468,7 +468,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     survivor_release.add_permits(1);
     tokio::time::timeout(
         PUBLICATION_BUDGET,
-        survivor_appended.wait_for(|appended| appended.is_some()),
+        survivor_appended.wait_for(std::option::Option::is_some),
     )
     .await
     .map_err(|_| "the surviving cycle never replayed its durable append")??;
@@ -1212,7 +1212,7 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
         .retained_audit_operation_count(tenant, "verification.run.start")
         .await?;
 
-    let superuser = server.pg_fixture().superuser_pool().await?;
+    let superuser = server.pg_fixture().superuser_pool()?;
     server.pg_fixture().fail_audit_staging().await?;
 
     writer.insert(

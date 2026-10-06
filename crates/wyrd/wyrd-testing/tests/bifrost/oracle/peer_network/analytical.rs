@@ -1252,6 +1252,10 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
 /// # Panics
 ///
 /// Panics when an emitted fact disagrees with the ending the client observed.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn assert_remote_query_telemetry(
     cluster: &PeerCluster,
     window: &BifrostTelemetryCheckpoint,
@@ -1428,7 +1432,9 @@ async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let api_key = cluster.provision_public_api_key("window-reader").await?;
     let table = format!("window_live_{}", uuid::Uuid::now_v7().simple());
     cluster.register_table(SCRIBE, &table).await?;
-    for start in (0..WINDOW_ROWS).step_by(INGEST_CHUNK as usize) {
+    for start in
+        (0..WINDOW_ROWS).step_by(usize::try_from(INGEST_CHUNK).expect("ingest chunk fits usize"))
+    {
         cluster
             .ingest_live_rows(SCRIBE, &table, start, INGEST_CHUNK, INGEST_GROUPS)
             .await?;

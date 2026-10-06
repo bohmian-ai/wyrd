@@ -50,7 +50,7 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// Two release slots can start `wyrd-server migrate` at once; the loser waits
 /// this long for the winner, then fails instead of queueing indefinitely. A
 /// retry after the winner finishes or fails acquires the lease normally.
-pub const MIGRATION_LEASE_WAIT: Duration = Duration::from_secs(60);
+pub const MIGRATION_LEASE_WAIT: Duration = Duration::from_mins(1);
 
 /// Database-wide advisory key serializing every Wyrd and Vala migration.
 const MIGRATION_LEASE_KEY: i64 = 0x0057_5952_4453_514c;
@@ -310,7 +310,9 @@ mod tests {
                 "migration file {file_name} must start with its version {prefix}"
             );
             assert!(
-                file_name.ends_with(".sql"),
+                std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql")),
                 "migration file {file_name} must be forward-only .sql"
             );
             assert!(
@@ -752,7 +754,11 @@ mod tests {
                     .into_string()
                     .expect("migration filename is utf-8")
             })
-            .filter(|file_name| file_name.ends_with(".sql"))
+            .filter(|file_name| {
+                std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+            })
             .collect::<Vec<_>>();
         files.sort();
         files

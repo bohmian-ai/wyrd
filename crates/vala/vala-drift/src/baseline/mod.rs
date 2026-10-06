@@ -87,30 +87,24 @@ pub fn fit_baseline_until(
         DriftMethod::Psi => {
             let features = match &spec.signal {
                 DriftSignal::Distribution { features, .. } => features.as_slice(),
-                other => {
+                other @ DriftSignal::Metric { .. } => {
                     return Err(DriftFitError::SignalShapeMismatch {
                         got: signal_variant(other),
                     });
                 }
             };
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Psi(profile)) => profile,
-                _ => {
-                    return Err(DriftFitError::PsiInternal {
-                        message: "PSI method requires DriftProfile::Psi".to_string(),
-                    });
-                }
+            let Some(DriftProfile::Psi(profile)) = spec.profile.as_ref() else {
+                return Err(DriftFitError::PsiInternal {
+                    message: "PSI method requires DriftProfile::Psi".to_string(),
+                });
             };
             fit_psi_baseline_until(batch, profile, features, cancelled).map(FittedBaseline::Psi)
         }
         DriftMethod::Spc => {
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Spc(profile)) => profile,
-                _ => {
-                    return Err(DriftFitError::SpcInternal {
-                        message: "SPC method requires DriftProfile::Spc".to_string(),
-                    });
-                }
+            let Some(DriftProfile::Spc(profile)) = spec.profile.as_ref() else {
+                return Err(DriftFitError::SpcInternal {
+                    message: "SPC method requires DriftProfile::Spc".to_string(),
+                });
             };
             let features = match &spec.signal {
                 DriftSignal::Distribution { features, .. } => features.as_slice(),
@@ -144,13 +138,10 @@ pub fn score_drift(
                     message: "PSI method requires FittedBaseline::Psi".to_string(),
                 });
             };
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Psi(profile)) => profile,
-                _ => {
-                    return Err(DriftScoreError::PsiInternal {
-                        message: "PSI method requires DriftProfile::Psi".to_string(),
-                    });
-                }
+            let Some(DriftProfile::Psi(profile)) = spec.profile.as_ref() else {
+                return Err(DriftScoreError::PsiInternal {
+                    message: "PSI method requires DriftProfile::Psi".to_string(),
+                });
             };
             score_psi(baseline, target, profile)
         }
@@ -168,13 +159,10 @@ pub fn score_drift(
                     message: "Custom method requires FittedBaseline::Custom".to_string(),
                 });
             }
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Custom(profile)) => profile,
-                _ => {
-                    return Err(DriftScoreError::CustomInternal {
-                        message: "Custom method requires DriftProfile::Custom".to_string(),
-                    });
-                }
+            let Some(DriftProfile::Custom(profile)) = spec.profile.as_ref() else {
+                return Err(DriftScoreError::CustomInternal {
+                    message: "Custom method requires DriftProfile::Custom".to_string(),
+                });
             };
             score_custom(target, profile)
         }
@@ -634,6 +622,10 @@ mod aggregate_inputs {
     /// # Panics
     /// Panics when equality drifts, excess does not, or a non-finite mean scores.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn custom_mean_equality_is_no_drift() {
         let profile = CustomProfile {
             metric_name: "latency".to_owned(),

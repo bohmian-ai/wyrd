@@ -56,7 +56,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 /// Default JWKS key-cache TTL when a create request omits `jwks_ttl_secs`.
-const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
+const DEFAULT_JWKS_TTL: Duration = Duration::from_hours(1);
 
 /// Build the tenant-admin CRUD routes for the `/v1` group.
 pub fn admin_router() -> OpenApiRouter<AppState> {
@@ -1126,7 +1126,7 @@ mod pg_tests {
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
             principal_kind: IssuerTokenPolicy::Workload,
-            jwks_ttl: Duration::from_secs(3600),
+            jwks_ttl: Duration::from_hours(1),
         };
         let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -1595,7 +1595,7 @@ mod pg_tests {
                 group_role_map: HashMap::new(),
                 default_roles: Vec::new(),
                 principal_kind: IssuerTokenPolicy::Workload,
-                jwks_ttl: Duration::from_secs(3600),
+                jwks_ttl: Duration::from_hours(1),
             };
             let write = issuer_write_from_trusted(&trusted, None).expect("issuer encodes");
             let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

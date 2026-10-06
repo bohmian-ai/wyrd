@@ -354,7 +354,7 @@ fn visit_resource_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), In
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(scope)) => {
                 facts
                     .output
@@ -486,9 +486,8 @@ fn visit_scope(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), IngestErro
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (4, WireValue::Varint(_)) => {}
+            (1 | 2, WireValue::Bytes(_)) | (4, WireValue::Varint(_)) => {}
             (1..=4, _) => return Err(wrong_wire("instrumentation scope")),
             _ => {}
         }
@@ -518,11 +517,11 @@ fn visit_log_record(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), Inges
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 11, WireValue::Fixed64(_)) => {}
-            (2 | 7, WireValue::Varint(_)) => {}
-            (3 | 5 | 9 | 10 | 12, WireValue::Bytes(_)) => {}
             (6, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (8, WireValue::Fixed32(_)) => {}
+            (1 | 11, WireValue::Fixed64(_))
+            | (2 | 7, WireValue::Varint(_))
+            | (3 | 5 | 9 | 10 | 12, WireValue::Bytes(_))
+            | (8, WireValue::Fixed32(_)) => {}
             (1..=12, _) => return Err(wrong_wire("log record")),
             _ => {}
         }
@@ -673,7 +672,7 @@ fn decode_resource_logs(bytes: &[u8]) -> Result<ResourceLogs, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(scope)) => scope_logs.push(decode_scope_logs(scope)?),
             (1..=3, _) => return Err(wrong_wire("resource logs")),
             _ => {}
@@ -724,10 +723,10 @@ fn merge_resource(bytes: &[u8], resource: &mut Resource) -> Result<(), IngestErr
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (1, WireValue::Bytes(attribute)) => {
-                resource.attributes.push(decode_key_value(attribute)?)
+                resource.attributes.push(decode_key_value(attribute)?);
             }
             (2, WireValue::Varint(value)) => {
-                resource.dropped_attributes_count = protobuf_u32(value)
+                resource.dropped_attributes_count = protobuf_u32(value);
             }
             (3, WireValue::Bytes(entity)) => resource.entity_refs.push(decode_entity_ref(entity)?),
             (1..=3, _) => return Err(wrong_wire("resource")),
@@ -784,7 +783,7 @@ fn decode_scope_logs(bytes: &[u8]) -> Result<ScopeLogs, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(record)) => log_records.push(decode_log_record(record)?),
             (1..=3, _) => return Err(wrong_wire("scope logs")),
             _ => {}
@@ -886,7 +885,7 @@ fn decode_log_record(bytes: &[u8]) -> Result<LogRecord, IngestError> {
             (2, WireValue::Varint(value)) => record.severity_number = protobuf_i32(value),
             (3 | 5 | 9 | 10 | 12, WireValue::Bytes(_)) => {}
             (6, WireValue::Bytes(attribute)) => {
-                record.attributes.push(decode_key_value(attribute)?)
+                record.attributes.push(decode_key_value(attribute)?);
             }
             (7, WireValue::Varint(value)) => record.dropped_attributes_count = protobuf_u32(value),
             (8, WireValue::Fixed32(value)) => record.flags = value,

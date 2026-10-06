@@ -1483,7 +1483,7 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
     ];
     configure(&replicas[0], tenant, limits, budgets, "allow_unpriced").await;
 
-    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let superuser = fixture.superuser_pool().expect("superuser pool");
     let mut barrier = superuser.begin().await.expect("barrier begins");
     sqlx::query("LOCK TABLE wyrd.gateway_accounting_entries IN SHARE MODE")
         .execute(&mut *barrier)
@@ -1588,6 +1588,15 @@ async fn gateway_simultaneous_admissions_across_replicas_never_oversubscribe() {
 /// or when a call, stream, refusal, rejection, or accounting assertion differs.
 #[tokio::test]
 async fn gateway_onboards_compatible_provider_at_runtime() {
+    // Every JSON family refuses a missing or mistyped required member with
+    // the stable error envelope before dispatch.
+    type Handler = fn(
+        State<AppState>,
+        Result<Caller, WyrdErrorResponse>,
+        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
+    >;
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let upstream = MockServer::start().await;
@@ -1892,15 +1901,6 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         assert_eq!(received, expected, "the Responses body round-trips");
     }
 
-    // Every JSON family refuses a missing or mistyped required member with
-    // the stable error envelope before dispatch.
-    type Handler = fn(
-        State<AppState>,
-        Result<Caller, WyrdErrorResponse>,
-        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
-    >;
     let model_name = "deepseek/deepseek-chat";
     let cases: [(Handler, Value, &str); 8] = [
         (
@@ -3465,7 +3465,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .expect("a self-referencing link makes the object unreadable");
     unavailable(fetch(reader.clone(), digest.clone()).await).await;
     std::fs::remove_file(&unreadable).expect("the unreadable link is removed");
-    let owner = fixture.superuser_pool().await.expect("superuser pool");
+    let owner = fixture.superuser_pool().expect("superuser pool");
     sqlx::query("ALTER TABLE vala.bifrost_tables RENAME TO bifrost_tables_offline")
         .execute(&owner)
         .await
@@ -4015,7 +4015,12 @@ impl<'a> MakeWriter<'a> for TraceBuffer {
 /// Panics when a fixture fails or a leak, label, gauge, correlation, capture,
 /// or terminal-result assertion differs.
 #[tokio::test]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn gateway_observations_are_bounded_correlated_and_secret_free() {
+    use std::fmt::Write as _;
     const CANARY: &str = "sk-gateway-canary-5e1d";
     let recorder = SeriesRecorder::default();
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -4297,7 +4302,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             .await
             .expect("a non-JSON refusal is relayed");
         assert_eq!(refusal.status, 401);
-        encoded_refusals.push_str(&format!("{:?}", refusal.body));
+        let _ = write!(encoded_refusals, "{:?}", refusal.body);
     }
     assert!(
         encoded_refusals.contains("HTTP 401") && !encoded_refusals.contains(&encoded),
@@ -4375,7 +4380,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     .into_iter()
     .chain(streams.iter().copied())
     {
-        ledger.push_str(&format!("{:?}", entries(&fixture, tenant, call_id).await));
+        let _ = write!(ledger, "{:?}", entries(&fixture, tenant, call_id).await);
     }
     let series = recorder
         .series
@@ -5054,7 +5059,7 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         }
     });
     dispatch.entered.notified().await;
-    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let superuser = fixture.superuser_pool().expect("superuser pool");
     sqlx::query(
         "ALTER TABLE wyrd.gateway_accounting_entries ADD CONSTRAINT attempt_accounting_fault \
          CHECK (kind <> 'attempt_accounted') NOT VALID",

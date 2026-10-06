@@ -218,6 +218,7 @@ impl ObservationWindow {
     /// Returns a description when `edges` has fewer than two entries or an
     /// inner edge is not finite.
     pub fn psi_numeric(&self, series: &str, edges: &[f64]) -> Result<String, String> {
+        use std::fmt::Write as _;
         let bins = edges
             .len()
             .checked_sub(1)
@@ -228,9 +229,9 @@ impl ObservationWindow {
             if !upper.is_finite() {
                 return Err("a fitted inner PSI edge is not finite".to_owned());
             }
-            case.push_str(&format!(" WHEN num_value <= {upper:e} THEN {index}"));
+            let _ = write!(case, " WHEN num_value <= {upper:e} THEN {index}");
         }
-        case.push_str(&format!(" ELSE {} END", bins - 1));
+        let _ = write!(case, " ELSE {} END", bins - 1);
         Ok(Self::count_bins(&case, &self.rows(series)))
     }
 
@@ -241,14 +242,12 @@ impl ObservationWindow {
     /// rows; a null category lands in [`INVALID_BIN`].
     #[must_use]
     pub fn psi_categorical(&self, series: &str, labels: &[&str], other: usize) -> String {
+        use std::fmt::Write as _;
         let mut case = format!("CASE WHEN str_value IS NULL THEN {INVALID_BIN}");
         for (index, label) in labels.iter().enumerate() {
-            case.push_str(&format!(
-                " WHEN str_value = {} THEN {index}",
-                Self::text(label)
-            ));
+            let _ = write!(case, " WHEN str_value = {} THEN {index}", Self::text(label));
         }
-        case.push_str(&format!(" ELSE {other} END"));
+        let _ = write!(case, " ELSE {other} END");
         Self::count_bins(&case, &self.rows(series))
     }
 
@@ -351,7 +350,7 @@ impl ObservationWindow {
         let names = baseline
             .features
             .keys()
-            .map(|name| name.as_str())
+            .map(wyrd_spec::card::FeatureName::as_str)
             .collect::<Vec<_>>();
         let incomplete = self.incomplete(&names, &[])?;
         let features = names
@@ -679,7 +678,7 @@ impl DriftEngine {
         spec: &DriftSpec,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        match self.try_verify(tenant, run, spec, telemetry).await {
+        match Box::pin(self.try_verify(tenant, run, spec, telemetry)).await {
             Ok(report) => EngineOutcome::Completed(VerifierReport::Drift(report)),
             Err(outcome) => outcome,
         }
@@ -719,9 +718,7 @@ impl DriftEngine {
                     .prepare(async { window.custom(&profile.metric_name) })
                     .await;
                 let mut row = None;
-                reader
-                    .fold(sql, |batch| fold_custom(batch, &mut row))
-                    .await?;
+                Box::pin(reader.fold(sql, |batch| fold_custom(batch, &mut row))).await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 match row.flatten() {
                     Some(mean) => scored(score_custom_mean(mean, profile)),
@@ -743,7 +740,7 @@ impl DriftEngine {
                     })
                     .await?;
                 let mut fold = DistributionFold::psi(&baseline, profile);
-                reader.fold(sql, |batch| fold.fold(batch)).await?;
+                Box::pin(reader.fold(sql, |batch| fold.fold(batch))).await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
@@ -762,7 +759,7 @@ impl DriftEngine {
                     })
                     .await?;
                 let mut fold = DistributionFold::spc(&baseline);
-                reader.fold(sql, |batch| fold.fold(batch)).await?;
+                Box::pin(reader.fold(sql, |batch| fold.fold(batch))).await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
@@ -1080,8 +1077,8 @@ mod tests {
                 match field.name().as_str() {
                     "card_uid" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
                     "series" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
-                    "num_value" => Arc::new(Float64Array::from_iter(rows.iter().map(|r| r.2))),
-                    "str_value" => Arc::new(StringArray::from_iter(rows.iter().map(|r| r.3))),
+                    "num_value" => Arc::new(rows.iter().map(|r| r.2).collect::<Float64Array>()),
+                    "str_value" => Arc::new(rows.iter().map(|r| r.3).collect::<StringArray>()),
                     "wyrd_event_time" => Arc::new(
                         TimestampMicrosecondArray::from_iter_values(
                             rows.iter().map(|r| micros(r.4)),

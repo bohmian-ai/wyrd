@@ -65,7 +65,7 @@ pub(crate) async fn upload(
         != expected
     {
         return Err(StorageClientError::SizeMismatch {
-            expected: *block_count_planned as u64,
+            expected: u64::from(*block_count_planned),
             actual,
         });
     }

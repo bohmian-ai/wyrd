@@ -45,6 +45,10 @@ pub(crate) const MAX_ANY_VALUE_DEPTH: usize = 8;
 
 /// Exact final and temporary allocation facts for one JSON decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "every field is a byte count; the shared suffix names the unit"
+)]
 pub(crate) struct JsonDecodePlan {
     /// Encoded request bytes inspected by the schema-aware preflight.
     pub(crate) wire_bytes: usize,
@@ -767,64 +771,98 @@ fn field_spec(kind: MessageKind, field: Field) -> FieldSpec {
             S::Messages(K::ResourceLogs, size_of::<ResourceLogs>())
         }
 
-        (K::ResourceSpans, F::Resource)
-        | (K::ResourceMetrics, F::Resource)
-        | (K::ResourceLogs, F::Resource) => S::Message(K::Resource),
+        (K::ResourceSpans | K::ResourceMetrics | K::ResourceLogs, F::Resource) => {
+            S::Message(K::Resource)
+        }
         (K::ResourceSpans, F::ScopeSpans) => S::Messages(K::ScopeSpans, size_of::<ScopeSpans>()),
         (K::ResourceMetrics, F::ScopeMetrics) => {
             S::Messages(K::ScopeMetrics, size_of::<ScopeMetrics>())
         }
         (K::ResourceLogs, F::ScopeLogs) => S::Messages(K::ScopeLogs, size_of::<ScopeLogs>()),
-        (K::ResourceSpans | K::ResourceMetrics | K::ResourceLogs, F::SchemaUrl) => S::String,
+        (
+            K::ResourceSpans
+            | K::ResourceMetrics
+            | K::ResourceLogs
+            | K::ScopeSpans
+            | K::ScopeMetrics
+            | K::ScopeLogs,
+            F::SchemaUrl,
+        )
+        | (K::Scope, F::Name | F::Version)
+        | (K::EntityRef, F::SchemaUrl | F::Type)
+        | (K::KeyValue, F::Key)
+        | (K::Span, F::TraceState | F::Name)
+        | (K::Event, F::Name)
+        | (K::Link, F::TraceState)
+        | (K::Status, F::Message)
+        | (K::Metric, F::Name | F::Description | F::Unit)
+        | (K::LogRecord, F::SeverityText | F::EventName) => S::String,
 
         (K::ScopeSpans | K::ScopeMetrics | K::ScopeLogs, F::Scope) => S::Message(K::Scope),
         (K::ScopeSpans, F::Spans) => S::Messages(K::Span, size_of::<Span>()),
         (K::ScopeMetrics, F::Metrics) => S::Messages(K::Metric, size_of::<Metric>()),
         (K::ScopeLogs, F::LogRecords) => S::Messages(K::LogRecord, size_of::<LogRecord>()),
-        (K::ScopeSpans | K::ScopeMetrics | K::ScopeLogs, F::SchemaUrl) => S::String,
-
-        (K::Resource, F::Attributes) | (K::Scope, F::Attributes) => {
-            S::Messages(K::KeyValue, size_of::<KeyValue>())
-        }
-        (K::Resource, F::EntityRefs) => S::Messages(K::EntityRef, size_of::<EntityRef>()),
-        (K::Resource | K::Scope, F::DroppedAttributesCount) => S::Scalar,
-        (K::Scope, F::Name | F::Version) => S::String,
-        (K::EntityRef, F::SchemaUrl | F::Type) => S::String,
-        (K::EntityRef, F::IdKeys | F::DescriptionKeys) => S::Strings,
-
-        (K::KeyValue, F::Key) => S::String,
-        (K::KeyValue, F::Value) => S::Message(K::AnyValue),
-        (K::ArrayValue, F::Values) => S::Messages(K::AnyValue, size_of::<AnyValue>()),
-        (K::KeyValueList, F::Values) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-
-        (K::Span, F::TraceId | F::SpanId | F::ParentSpanId) => S::Hex,
-        (K::Span, F::TraceState | F::Name) => S::String,
-        (K::Span, F::StartTimeUnixNano | F::EndTimeUnixNano) => S::Integer,
-        (K::Span, F::Attributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (K::Span, F::Events) => S::Messages(K::Event, size_of::<span::Event>()),
-        (K::Span, F::Links) => S::Messages(K::Link, size_of::<span::Link>()),
-        (K::Span, F::Status) => S::Message(K::Status),
         (
+            K::Resource
+            | K::Scope
+            | K::Span
+            | K::Event
+            | K::Link
+            | K::NumberPoint
+            | K::HistogramPoint
+            | K::ExponentialHistogramPoint
+            | K::SummaryPoint
+            | K::LogRecord,
+            F::Attributes,
+        )
+        | (K::KeyValueList, F::Values)
+        | (K::Metric, F::Metadata)
+        | (K::Exemplar, F::FilteredAttributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
+        (K::Resource, F::EntityRefs) => S::Messages(K::EntityRef, size_of::<EntityRef>()),
+        (K::Resource | K::Scope | K::Event, F::DroppedAttributesCount)
+        | (
             K::Span,
             F::Flags
             | F::Kind
             | F::DroppedAttributesCount
             | F::DroppedEventsCount
             | F::DroppedLinksCount,
-        ) => S::Scalar,
-        (K::Event, F::TimeUnixNano) => S::Integer,
-        (K::Event, F::Name) => S::String,
-        (K::Event, F::Attributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (K::Event, F::DroppedAttributesCount) => S::Scalar,
-        (K::Link, F::TraceId | F::SpanId) => S::Hex,
-        (K::Link, F::TraceState) => S::String,
-        (K::Link, F::Attributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (K::Link, F::DroppedAttributesCount | F::Flags) => S::Scalar,
-        (K::Status, F::Message) => S::String,
-        (K::Status, F::Code) => S::Scalar,
+        )
+        | (K::Link, F::DroppedAttributesCount | F::Flags)
+        | (K::Status, F::Code)
+        | (K::Sum, F::AggregationTemporality | F::IsMonotonic)
+        | (K::Histogram | K::ExponentialHistogram, F::AggregationTemporality)
+        | (K::NumberPoint, F::AsDouble | F::Flags)
+        | (K::HistogramPoint, F::Sum | F::Min | F::Max | F::Flags)
+        | (
+            K::ExponentialHistogramPoint,
+            F::Sum | F::Scale | F::Flags | F::Min | F::Max | F::ZeroThreshold,
+        )
+        | (K::Buckets, F::Offset)
+        | (K::SummaryPoint, F::Sum | F::Flags)
+        | (K::Quantile, F::Quantile | F::Value)
+        | (K::Exemplar, F::AsDouble)
+        | (K::LogRecord, F::SeverityNumber | F::DroppedAttributesCount | F::Flags) => S::Scalar,
+        (K::EntityRef, F::IdKeys | F::DescriptionKeys) => S::Strings,
 
-        (K::Metric, F::Name | F::Description | F::Unit) => S::String,
-        (K::Metric, F::Metadata) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
+        (K::KeyValue, F::Value) | (K::LogRecord, F::Body) => S::Message(K::AnyValue),
+        (K::ArrayValue, F::Values) => S::Messages(K::AnyValue, size_of::<AnyValue>()),
+        (K::Span, F::TraceId | F::SpanId | F::ParentSpanId)
+        | (K::Link | K::Exemplar | K::LogRecord, F::TraceId | F::SpanId) => S::Hex,
+        (K::Span, F::StartTimeUnixNano | F::EndTimeUnixNano)
+        | (K::Event, F::TimeUnixNano)
+        | (
+            K::NumberPoint | K::HistogramPoint | K::ExponentialHistogramPoint | K::SummaryPoint,
+            F::StartTimeUnixNano | F::TimeUnixNano,
+        )
+        | (K::NumberPoint, F::AsInt)
+        | (K::HistogramPoint | K::SummaryPoint, F::Count)
+        | (K::ExponentialHistogramPoint, F::Count | F::ZeroCount)
+        | (K::Exemplar, F::TimeUnixNano | F::AsInt)
+        | (K::LogRecord, F::TimeUnixNano | F::ObservedTimeUnixNano) => S::Integer,
+        (K::Span, F::Events) => S::Messages(K::Event, size_of::<span::Event>()),
+        (K::Span, F::Links) => S::Messages(K::Link, size_of::<span::Link>()),
+        (K::Span, F::Status) => S::Message(K::Status),
         (K::Metric, F::Gauge) => S::Message(K::Gauge),
         (K::Metric, F::Sum) => S::Message(K::Sum),
         (K::Metric, F::Histogram) => S::Message(K::Histogram),
@@ -841,51 +879,16 @@ fn field_spec(kind: MessageKind, field: Field) -> FieldSpec {
             size_of::<ExponentialHistogramDataPoint>(),
         ),
         (K::Summary, F::DataPoints) => S::Messages(K::SummaryPoint, size_of::<SummaryDataPoint>()),
-        (K::Sum, F::AggregationTemporality | F::IsMonotonic)
-        | (K::Histogram | K::ExponentialHistogram, F::AggregationTemporality) => S::Scalar,
-
-        (
-            K::NumberPoint | K::HistogramPoint | K::ExponentialHistogramPoint | K::SummaryPoint,
-            F::Attributes,
-        ) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (
-            K::NumberPoint | K::HistogramPoint | K::ExponentialHistogramPoint | K::SummaryPoint,
-            F::StartTimeUnixNano | F::TimeUnixNano,
-        ) => S::Integer,
         (K::NumberPoint | K::HistogramPoint | K::ExponentialHistogramPoint, F::Exemplars) => {
             S::Messages(K::Exemplar, size_of::<Exemplar>())
         }
-        (K::NumberPoint, F::AsInt) => S::Integer,
-        (K::NumberPoint, F::AsDouble | F::Flags) => S::Scalar,
-        (K::HistogramPoint, F::Count) => S::Integer,
-        (K::HistogramPoint, F::BucketCounts) => S::U64s,
+        (K::HistogramPoint | K::Buckets, F::BucketCounts) => S::U64s,
         (K::HistogramPoint, F::ExplicitBounds) => S::F64s,
-        (K::HistogramPoint, F::Sum | F::Min | F::Max | F::Flags) => S::Scalar,
-        (K::ExponentialHistogramPoint, F::Count | F::ZeroCount) => S::Integer,
         (K::ExponentialHistogramPoint, F::Positive | F::Negative) => S::Message(K::Buckets),
-        (
-            K::ExponentialHistogramPoint,
-            F::Sum | F::Scale | F::Flags | F::Min | F::Max | F::ZeroThreshold,
-        ) => S::Scalar,
-        (K::Buckets, F::BucketCounts) => S::U64s,
-        (K::Buckets, F::Offset) => S::Scalar,
-        (K::SummaryPoint, F::Count) => S::Integer,
         (K::SummaryPoint, F::QuantileValues) => S::Messages(
             K::Quantile,
             size_of::<summary_data_point::ValueAtQuantile>(),
         ),
-        (K::SummaryPoint, F::Sum | F::Flags) | (K::Quantile, F::Quantile | F::Value) => S::Scalar,
-        (K::Exemplar, F::FilteredAttributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (K::Exemplar, F::TimeUnixNano | F::AsInt) => S::Integer,
-        (K::Exemplar, F::SpanId | F::TraceId) => S::Hex,
-        (K::Exemplar, F::AsDouble) => S::Scalar,
-
-        (K::LogRecord, F::TimeUnixNano | F::ObservedTimeUnixNano) => S::Integer,
-        (K::LogRecord, F::SeverityText | F::EventName) => S::String,
-        (K::LogRecord, F::Body) => S::Message(K::AnyValue),
-        (K::LogRecord, F::Attributes) => S::Messages(K::KeyValue, size_of::<KeyValue>()),
-        (K::LogRecord, F::TraceId | F::SpanId) => S::Hex,
-        (K::LogRecord, F::SeverityNumber | F::DroppedAttributesCount | F::Flags) => S::Scalar,
         _ => S::Unknown,
     }
 }
@@ -1240,9 +1243,9 @@ fn scan_any_value(
 ///
 /// Returns [`JsonDecodeError`] for malformed array framing or separators,
 /// array-length overflow, or an element decoder failure.
-pub(crate) fn decode_message_array<T>(
-    cursor: &mut JsonCursor<'_>,
-    mut decode: impl FnMut(&mut JsonCursor<'_>) -> Result<T, JsonDecodeError>,
+pub(crate) fn decode_message_array<'input, T>(
+    cursor: &mut JsonCursor<'input>,
+    mut decode: impl FnMut(&mut JsonCursor<'input>) -> Result<T, JsonDecodeError>,
 ) -> Result<Vec<T>, JsonDecodeError> {
     let count = cursor.array_len()?;
     let mut values = Vec::with_capacity(count);
@@ -1322,13 +1325,12 @@ pub(crate) fn decode_resource(cursor: &mut JsonCursor<'_>) -> Result<Resource, J
         mark_seen(&mut seen, field)?;
         match field {
             Field::Attributes => {
-                output.attributes = decode_message_array(cursor, decode_key_value)?
+                output.attributes = decode_message_array(cursor, decode_key_value)?;
             }
             Field::DroppedAttributesCount => output.dropped_attributes_count = decode_u32(cursor)?,
             Field::EntityRefs => {
-                output.entity_refs = decode_message_array(cursor, decode_entity_ref)?
+                output.entity_refs = decode_message_array(cursor, decode_entity_ref)?;
             }
-            Field::Unknown => cursor.skip_value(0)?,
             _ => cursor.skip_value(0)?,
         }
     }
@@ -1362,7 +1364,7 @@ pub(crate) fn decode_scope(
             Field::Name => output.name = cursor.owned_string()?,
             Field::Version => output.version = cursor.owned_string()?,
             Field::Attributes => {
-                output.attributes = decode_message_array(cursor, decode_key_value)?
+                output.attributes = decode_message_array(cursor, decode_key_value)?;
             }
             Field::DroppedAttributesCount => output.dropped_attributes_count = decode_u32(cursor)?,
             _ => cursor.skip_value(0)?,
@@ -1437,7 +1439,7 @@ fn decode_key_value_at(
         match field {
             Field::Key => output.key = cursor.owned_string()?,
             Field::Value => {
-                output.value = decode_optional(cursor, |cursor| decode_any_value(cursor, depth))?
+                output.value = decode_optional(cursor, |cursor| decode_any_value(cursor, depth))?;
             }
             _ => cursor.skip_value(0)?,
         }
@@ -1563,7 +1565,7 @@ fn decode_key_value_list(
         match field {
             Field::Values => {
                 output.values =
-                    decode_message_array(cursor, |cursor| decode_key_value_at(cursor, depth))?
+                    decode_message_array(cursor, |cursor| decode_key_value_at(cursor, depth))?;
             }
             _ => cursor.skip_value(0)?,
         }
@@ -1577,9 +1579,9 @@ fn decode_key_value_list(
 ///
 /// Returns [`JsonDecodeError`] when the null literal is malformed or `decode`
 /// rejects a present value.
-pub(crate) fn decode_optional<T>(
-    cursor: &mut JsonCursor<'_>,
-    decode: impl FnOnce(&mut JsonCursor<'_>) -> Result<T, JsonDecodeError>,
+pub(crate) fn decode_optional<'input, T>(
+    cursor: &mut JsonCursor<'input>,
+    decode: impl FnOnce(&mut JsonCursor<'input>) -> Result<T, JsonDecodeError>,
 ) -> Result<Option<T>, JsonDecodeError> {
     if cursor.peek() == Some(b'n') {
         cursor.literal(b"null")?;
@@ -1596,7 +1598,7 @@ pub(crate) fn decode_optional<T>(
 /// Returns [`JsonDecodeError`] for malformed array framing or separators,
 /// invalid Unicode/escapes, or array-length overflow.
 fn decode_string_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<String>, JsonDecodeError> {
-    decode_message_array(cursor, |cursor| cursor.owned_string())
+    decode_message_array(cursor, JsonCursor::owned_string)
 }
 
 /// Decodes repeated quoted-or-unquoted uint64 values with exact capacity.
@@ -1606,7 +1608,7 @@ fn decode_string_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<String>, JsonD
 /// Returns [`JsonDecodeError`] for malformed array framing or separators,
 /// invalid or out-of-range unsigned integers, or array-length overflow.
 pub(crate) fn decode_u64_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<u64>, JsonDecodeError> {
-    decode_message_array(cursor, |cursor| cursor.u64())
+    decode_message_array(cursor, JsonCursor::u64)
 }
 
 /// Decodes repeated double values with exact capacity.
@@ -1616,7 +1618,7 @@ pub(crate) fn decode_u64_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<u64>, 
 /// Returns [`JsonDecodeError`] for malformed array framing or separators,
 /// invalid floating-point values, or array-length overflow.
 pub(crate) fn decode_f64_array(cursor: &mut JsonCursor<'_>) -> Result<Vec<f64>, JsonDecodeError> {
-    decode_message_array(cursor, |cursor| cursor.f64())
+    decode_message_array(cursor, JsonCursor::f64)
 }
 
 /// Decodes a protobuf uint32 with checked range conversion.
@@ -3189,7 +3191,7 @@ mod tests {
         let limits = small_limits();
         for (preflight, root, _) in signals() {
             let few = format!(r#"{{"{root}":[{}]}}"#, ["{}"; 8].join(","));
-            let many = format!(r#"{{"{root}":[{}]}}"#, ["{}"; 1300].join(","));
+            let many = format!(r#"{{"{root}":[{}]}}"#, vec!["{}"; 1300].join(","));
             assert!(many.len() <= limits.request_bytes);
             assert!(preflight(few.as_bytes(), limits).is_ok());
             assert!(matches!(
@@ -3265,7 +3267,7 @@ mod tests {
     #[test]
     fn syntax_preflight_rejects_malformed_and_trailing_input() {
         assert!(preflight_json_syntax(br#"{"a":"\uD800"}"#).is_err());
-        assert!(preflight_json_syntax(br#"{} true"#).is_err());
+        assert!(preflight_json_syntax(br"{} true").is_err());
     }
 
     /// Proves the fixed syntax stack rejects a 129th nested container.

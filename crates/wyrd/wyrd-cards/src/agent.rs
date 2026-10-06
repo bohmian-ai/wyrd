@@ -98,8 +98,10 @@ impl PyAgentCard {
     /// Create an Agent Card from a Python `PromptReference`.
     #[new]
     #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None))]
-    // justification: pyo3 #[new] signature mirrors the complete Python AgentCard constructor
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new] signature mirrors the complete Python AgentCard constructor"
+    )]
     pub fn __new__(
         prompt: &Bound<'_, PromptReference>,
         space: Option<&str>,
@@ -247,8 +249,6 @@ impl PyAgentCard {
         )
     }
 
-    // justification: PyO3 requires owned Python objects for the GC visitor
-    #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(prompt_ref) = self.prompt_ref.as_ref() {
             visit.call(prompt_ref)?;

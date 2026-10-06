@@ -156,7 +156,7 @@ impl OraclePeerGrpc {
     /// reservation authority, `Unauthenticated` when no context is presented,
     /// and `PermissionDenied` for a context that is malformed, misbound,
     /// or expired. The refusal is staged for audit before it returns.
-    async fn authorize_reservation<T: Message>(
+    fn authorize_reservation<T: Message>(
         &self,
         operation: ReservationOperationV1,
         context_free: &T,
@@ -482,8 +482,7 @@ impl OraclePeerService for OraclePeerGrpc {
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
-        )
-        .await?;
+        )?;
         let worker = self
             .bifrost
             .oracle_peer_service()
@@ -543,17 +542,16 @@ impl OraclePeerService for OraclePeerGrpc {
                 tracing::warn!("Oracle-target fragment refused: Oracle peers run no fragments");
                 Err(DispatchError::Terminal)
             }
-            ClusterRole::Scribe => match self.bifrost.scribe() {
-                Some(scribe) => {
+            ClusterRole::Scribe => {
+                if let Some(scribe) = self.bifrost.scribe() {
                     ScribeFragmentExecutor::new(Arc::clone(scribe))
                         .execute(request)
                         .await
-                }
-                None => {
+                } else {
                     tracing::error!("Scribe fragment reached a process without the Scribe owner");
                     Err(DispatchError::Terminal)
                 }
-            },
+            }
         }
         .map_err(dispatch_status)?;
         let shutdown = self.shutdown.clone();

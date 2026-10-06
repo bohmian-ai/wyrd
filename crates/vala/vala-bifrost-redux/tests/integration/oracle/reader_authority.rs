@@ -275,11 +275,7 @@ impl AuthorityFixture {
     ///
     /// Panics when the update fails.
     async fn expire_lease(&self) {
-        let pool = self
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
+        let pool = self.database.superuser_pool().expect("superuser pool");
         sqlx::query(
             "UPDATE vala.oracle_reader_epochs \
                 SET acquired_at = statement_timestamp() - interval '2 minutes', \
@@ -310,11 +306,7 @@ impl AuthorityFixture {
     ///
     /// Panics when either count cannot be read.
     async fn protection_counts_at(&self, fence: i64) -> (i64, i64) {
-        let pool = self
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
+        let pool = self.database.superuser_pool().expect("superuser pool");
         let headers: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.oracle_table_protections \
               WHERE node_id = $1 AND fencing_token = $2",
@@ -351,11 +343,7 @@ impl AuthorityFixture {
     /// Panics when the epoch row is gone or when no waiter appears within
     /// [`SETTLE_BUDGET`].
     async fn settle_blocked_epoch_delete(&self) {
-        let pool = self
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
+        let pool = self.database.superuser_pool().expect("superuser pool");
         sqlx::query_scalar::<_, i32>(
             "SELECT 1 FROM vala.oracle_reader_epochs \
               WHERE node_id = $1 AND fencing_token = $2",
@@ -548,11 +536,7 @@ async fn refuse_uncommittable_release(
 ) {
     // A release that cannot commit retains the prior header. Corrupting the
     // stored digest is the same fail-closed path a poisoned row takes.
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let intact = fixture.header(events).await.expect("still protected");
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $2 WHERE data_tenant_id = $1",
@@ -913,11 +897,7 @@ async fn stalled_loss_verification_terminates_at_the_caller_deadline() {
 
     // Hold the epoch table so retirement's verification read blocks. A row
     // lock would not: the verification is a plain `SELECT`.
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let mut gate = pool.begin().await.expect("epoch gate transaction begins");
     sqlx::query("LOCK TABLE vala.oracle_reader_epochs IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *gate)
@@ -1000,11 +980,7 @@ async fn blocked_loss_settlement_terminates_at_the_caller_deadline() {
         .await;
 
     // Hold the epoch row so the audited loss edge cannot commit.
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let mut gate = pool.begin().await.expect("epoch gate transaction begins");
     sqlx::query(
         "SELECT state_revision FROM vala.oracle_reader_epochs \
@@ -1619,11 +1595,7 @@ async fn retirement_refuses_every_later_publication() {
 async fn seed_unreleasable_predecessor(
     fixture: &AuthorityFixture,
 ) -> (i64, TableAuthorityIdentity) {
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let stale_fence = i64::try_from(fixture.fence).expect("fence fits") + 1_000;
     sqlx::query(
         "INSERT INTO vala.oracle_reader_epochs \
@@ -1694,11 +1666,7 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
     .await
     .expect("epoch acquires");
 
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let (stale_fence, _events) = seed_unreleasable_predecessor(&fixture).await;
 
     let recovery = OracleEpochRecovery::new(
@@ -1996,11 +1964,7 @@ async fn promotion_between_prepare_and_guard_restarts_whole_cut() {
     // A committed snapshot is what protection has to cover.
     commit_one_snapshot(&fixture).await;
     let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-race:5002", 1).await;
-    let pool = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
+    let pool = fixture.database.superuser_pool().expect("superuser pool");
     let mut blocker = pool.begin().await.expect("blocker opens");
     sqlx::query(
         "SELECT 1 FROM vala.bifrost_table_maintenance_authority \

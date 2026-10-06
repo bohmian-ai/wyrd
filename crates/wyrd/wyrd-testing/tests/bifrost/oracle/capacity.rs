@@ -109,7 +109,7 @@ const INTERACTIVE_DEADLINE_MS: i64 = 60_000;
 const ANALYTICAL_WARMUP_FRAMES: usize = 4096;
 
 /// Bound on how long one awaited observation may take before it is a failure.
-const OBSERVATION_DEADLINE: Duration = Duration::from_secs(60);
+const OBSERVATION_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Bound on polls waiting for a released query's gauge to settle.
 const PHYSICAL_EVIDENCE_POLLS: usize = 300;
@@ -1385,7 +1385,7 @@ async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Res
     loop {
         match stream.next_batch().await {
             Ok(Some(batch)) => {
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
             }
             Ok(None) => break,
             Err(error) => {
@@ -1465,7 +1465,7 @@ async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
     let health = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.oracle())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
         .ok_or("node hosts no Oracle")?
         .health();
     let reader = client(&server, "memory-failure-reader").await?;
@@ -1714,10 +1714,6 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
         );
     }
     let borrowed = class_gauge(&cluster, "interactive")?;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "four concurrent queries is exact in f64"
-    )]
     let expected = SCHEDULING_HOLDS as f64;
     if (borrowed - expected).abs() > f64::EPSILON {
         return Err(format!(
@@ -1740,10 +1736,6 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     prove_rotation_serves_both_tenants(&clients, &tables).await?;
 
     for (index, envelope) in held.into_iter().enumerate() {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "at most four concurrent queries is exact in f64"
-        )]
         let remaining = (SCHEDULING_HOLDS - 2 - index) as f64;
         release_envelope(&cluster, envelope, "interactive", remaining).await?;
     }
@@ -2275,7 +2267,7 @@ async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
 
-    let superuser = cluster.pg_fixture().superuser_pool().await?;
+    let superuser = cluster.pg_fixture().superuser_pool()?;
     let mut lock = superuser.begin().await?;
     sqlx::query("LOCK TABLE iceberg_catalog.iceberg_tables IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
@@ -2376,6 +2368,10 @@ async fn saturated_query_waits_on_http_and_grpc() {
 ///
 /// Panics when a production queue, active, wait, or admission series
 /// disagrees with the admission owner or the queries' observed endings.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()

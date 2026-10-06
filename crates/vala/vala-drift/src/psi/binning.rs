@@ -1,6 +1,7 @@
 //! PSI numeric binning.
 
 use crate::error::DriftFitError;
+use num_traits::ToPrimitive;
 
 /// Ordered bin edges.
 ///
@@ -42,9 +43,9 @@ pub fn compute_edges_equal_width(values: &[f64], n_bins: u32) -> Result<BinEdges
         return Ok(BinEdges { edges });
     }
 
-    let width = (max - min) / n as f64;
-    for i in 1..n {
-        edges.push(min + width * i as f64);
+    let width = (max - min) / f64::from(n_bins);
+    for i in 1..n_bins {
+        edges.push(min + width * f64::from(i));
     }
     edges.push(f64::INFINITY);
 
@@ -52,6 +53,10 @@ pub fn compute_edges_equal_width(values: &[f64], n_bins: u32) -> Result<BinEdges
 }
 
 /// Compute quantile PSI edges with the R-7 Hyndman-Fan estimator.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "standard quantile notation: n bins, i index, q quantile"
+)]
 pub fn compute_edges_quantile(values: &[f64], n_bins: u32) -> Result<BinEdges, DriftFitError> {
     if values.is_empty() {
         return Err(DriftFitError::PsiInternal {
@@ -81,11 +86,16 @@ pub fn compute_edges_quantile(values: &[f64], n_bins: u32) -> Result<BinEdges, D
     let mut edges = Vec::with_capacity(n + 1);
     edges.push(f64::NEG_INFINITY);
 
-    for i in 1..n {
-        let p = i as f64 / n as f64;
+    for i in 1..n_bins {
+        let p = f64::from(i) / f64::from(n_bins);
         let m = 1.0 - p;
         let np_plus_m = count as f64 * p + m;
-        let j = np_plus_m.floor() as usize;
+        let j = np_plus_m
+            .floor()
+            .to_usize()
+            .ok_or_else(|| DriftFitError::PsiInternal {
+                message: "compute_edges_quantile: quantile index out of range".to_string(),
+            })?;
         let h = np_plus_m - j as f64;
         let j_zero = j.saturating_sub(1);
         let j_zero_next = (j_zero + 1).min(count - 1);

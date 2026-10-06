@@ -71,3 +71,6 @@ wyrd-server = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-testing = { workspace = true }
+
+[lints]
+workspace = true

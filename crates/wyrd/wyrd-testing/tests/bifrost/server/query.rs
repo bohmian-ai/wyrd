@@ -4,6 +4,7 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
+use wyrd_client::bifrost::Correlation;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -288,10 +289,10 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup() {
-    prove_shared_query_surfaces()
+    Box::pin(prove_shared_query_surfaces())
         .await
         .expect("shared gRPC and scheduled query journey");
-    prove_scheduled_analytical_peer_loss()
+    Box::pin(prove_scheduled_analytical_peer_loss())
         .await
         .expect("scheduled Analytical peer-loss journey");
 }
@@ -1129,7 +1130,7 @@ async fn prove_scoped_bearer_over_grpc(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn service_b_acts_for_service_a_with_only_a_table_authority() {
-    prove_service_b_acts_for_service_a()
+    Box::pin(prove_service_b_acts_for_service_a())
         .await
         .expect("service B acts for service A with only A's table authority");
 }
@@ -1289,7 +1290,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let described = wyrd_client::bifrost::TableConfig::describe(&b_client, events).await?;
     let delegated_writer =
         wyrd_client::Bifrost::connect_with_table(&delegated, described.clone()).await?;
-    delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Default::default())?;
+    delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Correlation::default())?;
     let denied_write = delegated_writer
         .flush()
         .await
@@ -1303,7 +1304,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "the delegated native write is refused for A's missing record write: {denied_write}"
     );
     let own_writer = wyrd_client::Bifrost::connect_with_table(&b_client, described).await?;
-    own_writer.insert(br#"{"value": 2}"#.to_vec(), Default::default())?;
+    own_writer.insert(br#"{"value": 2}"#.to_vec(), Correlation::default())?;
     own_writer.flush().await?;
     server.flush_bifrost().await?;
     let written = own_writer

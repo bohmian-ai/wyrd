@@ -17,7 +17,7 @@
 //! `ManagedSecret` mutation. Leaving that module off the list below is the whole
 //! enforcement: [`Gateway`] has no mutation method to call, so a caller here
 //! reads redacted credentials, administers deployments and policies, and
-//! invokes the gateway. `check:sdk-client-tier` fails if the module is added
+//! invokes the gateway. `check:deps` fails if the module is added
 //! back. Add a module to this list only after deciding it belongs on a public
 //! SDK.
 

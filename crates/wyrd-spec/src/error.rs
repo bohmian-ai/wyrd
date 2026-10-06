@@ -3927,6 +3927,10 @@ pub enum WyrdError {
 
 impl WyrdError {
     /// Return the typed RFC 9457 problem value for this error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the problem document does not round-trip, which the derive guarantees.
     #[must_use]
     pub fn problem(&self) -> WyrdProblem {
         serde_json::from_value(self.as_problem_json())

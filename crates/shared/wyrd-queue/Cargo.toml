@@ -33,3 +33,6 @@ arrow-schema = { workspace = true }
 serde_json = { workspace = true }
 wyrd-spec = { workspace = true }
 async-trait = { workspace = true }
+
+[lints]
+workspace = true

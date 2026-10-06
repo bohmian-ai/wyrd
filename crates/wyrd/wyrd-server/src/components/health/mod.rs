@@ -173,8 +173,8 @@ pub async fn readiness_loop(
         let snapshot = compute_snapshot(&state, probe_timeout).await;
         state.readiness.store(Arc::new(snapshot));
         tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = tokio::time::sleep(tick) => {}
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(tick) => {}
         }
     }
 }
@@ -292,12 +292,7 @@ fn probe_oracle(state: &AppState) -> ProbeOutcome {
             reason: ProbeReason::Ok,
             elapsed_ms: 0,
         },
-        Some(_) if selected => ProbeOutcome {
-            ok: false,
-            reason: ProbeReason::OracleStartup,
-            elapsed_ms: 0,
-        },
-        None if selected => ProbeOutcome {
+        Some(_) | None if selected => ProbeOutcome {
             ok: false,
             reason: ProbeReason::OracleStartup,
             elapsed_ms: 0,
@@ -748,8 +743,8 @@ mod pg_tests {
         use crate::verification::health::RuntimeCapability;
 
         let state = crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         );
         state.verification.require(RuntimeCapability::Scheduler);

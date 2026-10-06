@@ -26,3 +26,6 @@ wyrd-runtime = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }
+
+[lints]
+workspace = true

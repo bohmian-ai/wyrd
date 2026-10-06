@@ -494,10 +494,9 @@ not use a positional filter that can pass after selecting no test.
   `utoipa-axum` registrations that mount the routes, and is not a checked-in
   artifact: prove an OpenAPI change against the served document with
   `mise run test:principals:integration`
-  (`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`).
-- Boundary-sensitive change: run the matching boundary check, such as
-  `mise run check:client-tier`, `mise run check:pyo3-scope`, or
-  `mise run check:unwrap-audit`.
+  (`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`).
+- Boundary-sensitive change: run `mise run check:deps` for crate and
+  dependency boundaries, or `mise run check:tenant-isolation` for SQL tenancy.
 - Docs-site change under `docs/`: run `mise run docs:check`.
 - Example change: run the touched example task, or `mise run check:examples`
   when the change affects shared example behavior.
@@ -540,9 +539,8 @@ mise run py:test:unit  # all Python tests
 
 ```bash
 mise run codegen:check              # generated contract drift
-mise run check:client-tier          # client-tier boundary
-mise run check:pyo3-scope           # PyO3 boundary
-mise run check:unwrap-audit         # unwrap/expect audit
+mise run check:deps                 # crate and dependency boundaries
+mise run check:tenant-isolation     # SQL tenant isolation
 ```
 
 ## 12. Completion Standard
@@ -622,10 +620,8 @@ Skills are referenced by name; each harness resolves a named skill from its
 own skill directory. Do not hard-code harness-specific skill paths in plans,
 task packets, or documentation.
 
-The shared workflow skill source is `.agents/skills`; `.claude/skills` is its
-generated Claude discovery mirror. Run `mise run skills:sync` after editing a
-shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
-`agents/openai.yaml` metadata remains only in the canonical source.
+The shared workflow skill source is `.agents/skills`; `.claude/skills` is a
+symlink to it for Claude discovery, so there is no copy to keep in sync.
 
 - `$wyrd-spec` fixes intent, externally observable behavior, constraints, and
   expensive-to-reverse decisions. Only explicit human approval makes a revision

@@ -859,7 +859,6 @@ impl PromotionIntegrationFixture {
         let admin = self
             .database
             .superuser_pool()
-            .await
             .expect("fixture administrator");
         sqlx::query("CREATE FUNCTION vala.fail_episode_terminal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='succeeded' THEN RAISE EXCEPTION 'held terminal settlement'; END IF; RETURN NEW; END $$")
         .execute(&admin).await.expect("terminal fault");
@@ -2512,7 +2511,7 @@ async fn register_scribe_fence(
     database: &wyrd_dev_fixtures::pg::PgFixture,
     node_id: vala_bifrost_redux::scribe::stream_identity::NodeId,
 ) {
-    let superuser = database.superuser_pool().await.expect("superuser pool");
+    let superuser = database.superuser_pool().expect("superuser pool");
     sqlx::query(
         "INSERT INTO vala.cluster_nodes \
          (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) \

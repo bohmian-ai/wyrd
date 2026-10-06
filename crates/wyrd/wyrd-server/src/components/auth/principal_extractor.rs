@@ -100,9 +100,11 @@ mod pg_tests {
         Kid, TokenPrincipalRef, TokenVerifier, VerifiedToken, WyrdAuthVerifySettings,
         public_key_from_pem,
     };
+    use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::reference::CardRefScope;
 
     use super::AuthenticatedPrincipal;
 
@@ -147,7 +149,7 @@ mod pg_tests {
                 kind: PrincipalKind::User,
                 tenant_id: tenant,
                 roles: Vec::new(),
-                effective_permissions: Default::default(),
+                effective_permissions: PermissionSet::default(),
                 credential_id: None,
             },
             delegation_chain: Vec::new(),
@@ -264,7 +266,7 @@ mod pg_tests {
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
             card_ref: None,
-            card_ref_scope: Default::default(),
+            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -303,7 +305,7 @@ mod pg_tests {
                 kind: PrincipalKindTag::User,
                 tenant_id: tenant,
                 card_ref: None,
-                card_ref_scope: Default::default(),
+                card_ref_scope: CardRefScope::default(),
             },
             act: None,
         };
@@ -319,7 +321,7 @@ mod pg_tests {
                         kind: PrincipalKindTag::User,
                         tenant_id: tenant,
                         card_ref: None,
-                        card_ref_scope: Default::default(),
+                        card_ref_scope: CardRefScope::default(),
                     },
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),

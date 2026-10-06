@@ -57,6 +57,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+num-traits = { workspace = true }
 rcgen = { workspace = true }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
@@ -153,3 +154,6 @@ rmcp = { workspace = true, features = [
 name = "capacity"
 path = "src/bin/capacity/main.rs"
 bench = false
+
+[lints]
+workspace = true

@@ -23,6 +23,7 @@ use wyrd_spec::error::WyrdError;
 use crate::WyrdClient;
 use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
 use crate::config::ClientConfig;
+use crate::environment::Environment;
 use crate::global_config::{GlobalConfig, LocalWorkflowConfig};
 use local::SelectedRoutes;
 
@@ -42,6 +43,10 @@ pub struct Workflow {
     /// Client that loaded registered Cards, reused for `wyrd_gateway` calls
     /// so its connection overrides stay in effect.
     client: Option<WyrdClient>,
+    /// Where a run reads the shared configuration directory and the ambient
+    /// credential for a client-less `wyrd_gateway` step; the process
+    /// environment for every public constructor.
+    environment: Environment,
 }
 
 impl Workflow {
@@ -94,7 +99,11 @@ impl Workflow {
             client = Some(cards.engine.client.clone());
         }
         let inner = bodies.hydrate(workflow)?;
-        Ok(Self { inner, client })
+        Ok(Self {
+            inner,
+            client,
+            environment: Environment::Process,
+        })
     }
 
     /// Run on the process-default native provider registry.
@@ -148,8 +157,9 @@ impl Workflow {
         let routes = SelectedRoutes::of(self.inner.spec());
         let (needs_config, needs_gateway) = (routes.needs_config(), routes.needs_gateway());
         let loaded = self.client.clone();
+        let environment = self.environment.clone();
         let (config, gateway) = tokio::task::spawn_blocking(move || {
-            load_local_setup(needs_config, needs_gateway, loaded)
+            load_local_setup(&environment, needs_config, needs_gateway, loaded)
         })
         .await
         .map_err(|error| blocking_task_failed("workflow_local_setup", &error))??;
@@ -208,12 +218,13 @@ impl Workflow {
 /// cannot be read, and `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when a gateway
 /// client is needed and none can be built.
 fn load_local_setup(
+    environment: &Environment,
     needs_config: bool,
     needs_gateway: bool,
     loaded: Option<WyrdClient>,
 ) -> Result<(LocalWorkflowConfig, Option<WyrdClient>), WyrdError> {
     let global = if needs_config || (needs_gateway && loaded.is_none()) {
-        GlobalConfig::load().map_err(WyrdError::from)?
+        GlobalConfig::load_in(environment).map_err(WyrdError::from)?
     } else {
         GlobalConfig::default()
     };
@@ -222,12 +233,13 @@ fn load_local_setup(
     } else if let Some(client) = loaded {
         Some(client)
     } else {
-        let client = WyrdClient::with_config(ClientConfig::from_global_with_env(&global)).map_err(
-            |error| WyrdError::WorkflowBindingUnavailable {
+        let config = ClientConfig::from_environment(environment.clone(), &global, None, None);
+        let client = WyrdClient::with_config(config).map_err(|error| {
+            WyrdError::WorkflowBindingUnavailable {
                 message: format!("no Wyrd gateway client is available: {error}"),
                 details: serde_json::json!({ "route": "wyrd_gateway" }),
-            },
-        )?;
+            }
+        })?;
         Some(client)
     };
     let config = if needs_config {
@@ -277,6 +289,7 @@ impl From<SkaldWorkflow> for Workflow {
         Self {
             inner,
             client: None,
+            environment: Environment::Process,
         }
     }
 }
@@ -344,6 +357,7 @@ impl WorkflowCards<'_> {
         Ok(Workflow {
             inner,
             client: Some(self.cards.engine.client.clone()),
+            environment: Environment::Process,
         })
     }
 }
@@ -600,239 +614,231 @@ mod tests {
     /// any dispatch. A `wyrd_gateway` Workflow selects no configuration and
     /// calls the public ingress through the client it carries. A client-less
     /// Workflow selecting both routes takes its binding and its gateway
-    /// client from the one ambient configuration file read at run start.
-    ///
-    /// The test holds `ENV_MUTEX` for its whole body, so it drives its own
-    /// runtime instead of awaiting while the lock is held.
+    /// client from the one configuration file its environment names, read at
+    /// run start.
     ///
     /// # Panics
     /// Panics when a run, refusal, or upstream request differs from the
     /// asserted behavior.
-    #[test]
-    fn selected_local_dependencies_use_shared_config() {
-        let _env = crate::ENV_MUTEX
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime builds");
-        runtime.block_on(async {
-            let server = wiremock::MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/v1/chat/completions"))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                    "id": "resp",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": "gpt-5-5",
-                    "choices": [{
-                        "index": 0,
-                        "message": { "role": "assistant", "content": "REVIEWED" },
-                        "finish_reason": "stop"
-                    }]
-                })))
-                .mount(&server)
-                .await;
-            let route = format!(
-                "    kind: ext_gateway\n    protocol: openai_chat\n    base_url: {}/v1\n    credential_binding: review-gateway",
-                server.uri()
-            );
-            let external = edited_bundle(|yaml| yaml.replacen("    kind: wyrd_gateway", &route, 1));
-            let workflow = Workflow::from_path(external.path().join("workflow.yaml"))
+    #[tokio::test]
+    async fn selected_local_dependencies_use_shared_config() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5-5",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "REVIEWED" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let route = format!(
+            "    kind: ext_gateway\n    protocol: openai_chat\n    base_url: {}/v1\n    credential_binding: review-gateway",
+            server.uri()
+        );
+        let external = edited_bundle(|yaml| yaml.replacen("    kind: wyrd_gateway", &route, 1));
+        let workflow = Workflow::from_path(external.path().join("workflow.yaml"))
+            .await
+            .expect("ext_gateway bundle loads");
+        assert!(
+            server
+                .received_requests()
                 .await
-                .expect("ext_gateway bundle loads");
-            assert!(
-                server
-                    .received_requests()
-                    .await
-                    .unwrap_or_default()
-                    .is_empty(),
-                "loading makes no call"
-            );
+                .unwrap_or_default()
+                .is_empty(),
+            "loading makes no call"
+        );
 
-            let secret = secret_file(external.path(), "s3cret");
-            let configured = workflow_config(&format!(
+        let secret = secret_file(external.path(), "s3cret");
+        let configured = workflow_config(&format!(
+            r#"
+            [workflow.external_gateway_bindings.review-gateway]
+            protocol = "openai_chat"
+            origin = "{origin}"
+            secret_headers = {{ x-review-secret = {{ source = "file", path = "{secret}" }} }}
+
+            [workflow.external_gateway_bindings.unused]
+            protocol = "openai_chat"
+            origin = "{origin}"
+            secret_headers = {{ x-unused = {{ source = "file", path = "{missing}" }} }}
+            "#,
+            origin = server.uri(),
+            secret = secret.display(),
+            missing = external.path().join("missing").display(),
+        ));
+        let run = run_selected(&workflow, &configured)
+            .await
+            .expect("configured binding runs");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(run.outputs["review"], json!("REVIEWED"));
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| {
+            request
+                .headers
+                .get("x-review-secret")
+                .map(oauth2::http::HeaderValue::as_bytes)
+                == Some(b"s3cret".as_slice())
+                && !request.headers.contains_key("x-unused")
+        }));
+        assert!(
+            !serde_json::to_string(&run)
+                .unwrap_or_default()
+                .contains("s3cret")
+        );
+
+        for (config, code) in [
+            (
+                LocalWorkflowConfig::default(),
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+            ),
+            (
+                workflow_config(&format!(
+                    "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"anthropic_messages\"\norigin = \"{}\"\n",
+                    server.uri()
+                )),
+                "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
+            ),
+            (
+                workflow_config(&format!(
+                    "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"openai_chat\"\norigin = \"{}\"\nsecret_headers = {{ x-review-secret = {{ source = \"file\", path = \"{}\" }} }}\n",
+                    server.uri(),
+                    external.path().join("missing").display()
+                )),
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+            ),
+        ] {
+            let error = run_selected(&workflow, &config)
+                .await
+                .expect_err("unusable binding is refused");
+            assert_eq!(error.code(), code);
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            3,
+            "refused runs dispatch nothing"
+        );
+
+        // A wyrd_gateway Workflow calls the public ingress through the client
+        // it carries, with the Prompt's model and no ext_gateway preparation.
+        let wyrd = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::to_value(match chat_text("REVIEWED") {
+                        ProviderResponse::OpenAiChatCompletion(response) => response,
+                        _ => unreachable!("chat_text builds a chat completion"),
+                    })
+                    .expect("completion serializes"),
+                ),
+            )
+            .mount(&wyrd)
+            .await;
+        let loaded = Workflow::from_path(bundle().join("workflow.yaml"))
+            .await
+            .expect("local bundle loads");
+        let routes = SelectedRoutes::of(loaded.as_skald().spec());
+        assert!(routes.needs_gateway() && !routes.needs_config());
+        let gateway = Workflow {
+            inner: loaded.into_skald(),
+            client: Some(bearer_client(&wyrd.uri())),
+            environment: Environment::from([]),
+        };
+        let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
+        let run = gateway
+            .run_with(&ProviderRegistry::new(), input)
+            .await
+            .expect("gateway run starts");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        let requests = wyrd.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            body["model"] == json!("openai/gpt-5-5")
+                && request
+                    .headers
+                    .get("x-wyrd-access-token")
+                    .map(oauth2::http::HeaderValue::as_bytes)
+                    == Some(b"Bearer test-bearer".as_slice())
+        }));
+
+        // A client-less Workflow selecting both route families reads the
+        // ambient configuration once at run start: the security step's
+        // binding and the other steps' public gateway client both come from
+        // that one file.
+        let config_home = TempDir::new().expect("config home creates");
+        let secret = secret_file(config_home.path(), "s3cret");
+        std::fs::write(
+            config_home.path().join("config.toml"),
+            format!(
                 r#"
+                [client]
+                http_url = "{wyrd}"
+
                 [workflow.external_gateway_bindings.review-gateway]
                 protocol = "openai_chat"
                 origin = "{origin}"
                 secret_headers = {{ x-review-secret = {{ source = "file", path = "{secret}" }} }}
-
-                [workflow.external_gateway_bindings.unused]
-                protocol = "openai_chat"
-                origin = "{origin}"
-                secret_headers = {{ x-unused = {{ source = "file", path = "{missing}" }} }}
                 "#,
+                wyrd = wyrd.uri(),
                 origin = server.uri(),
                 secret = secret.display(),
-                missing = external.path().join("missing").display(),
-            ));
-            let run = run_selected(&workflow, &configured)
-                .await
-                .expect("configured binding runs");
-            assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-            assert_eq!(run.outputs["review"], json!("REVIEWED"));
-            let requests = server.received_requests().await.unwrap_or_default();
-            assert_eq!(requests.len(), 3);
-            assert!(requests.iter().all(|request| {
-                request
-                    .headers
-                    .get("x-review-secret")
-                    .map(|value| value.as_bytes())
-                    == Some(b"s3cret".as_slice())
-                    && !request.headers.contains_key("x-unused")
-            }));
-            assert!(
-                !serde_json::to_string(&run)
-                    .unwrap_or_default()
-                    .contains("s3cret")
-            );
-
-            for (config, code) in [
-                (
-                    LocalWorkflowConfig::default(),
-                    "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
-                ),
-                (
-                    workflow_config(&format!(
-                        "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"anthropic_messages\"\norigin = \"{}\"\n",
-                        server.uri()
-                    )),
-                    "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED",
-                ),
-                (
-                    workflow_config(&format!(
-                        "[workflow.external_gateway_bindings.review-gateway]\nprotocol = \"openai_chat\"\norigin = \"{}\"\nsecret_headers = {{ x-review-secret = {{ source = \"file\", path = \"{}\" }} }}\n",
-                        server.uri(),
-                        external.path().join("missing").display()
-                    )),
-                    "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
-                ),
-            ] {
-                let error = run_selected(&workflow, &config)
-                    .await
-                    .expect_err("unusable binding is refused");
-                assert_eq!(error.code(), code);
-            }
-            assert_eq!(
-                server.received_requests().await.unwrap_or_default().len(),
-                3,
-                "refused runs dispatch nothing"
-            );
-
-            // A wyrd_gateway Workflow calls the public ingress through the client
-            // it carries, with the Prompt's model and no ext_gateway preparation.
-            let wyrd = wiremock::MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/v1/chat/completions"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(
-                        serde_json::to_value(match chat_text("REVIEWED") {
-                            ProviderResponse::OpenAiChatCompletion(response) => response,
-                            _ => unreachable!("chat_text builds a chat completion"),
-                        })
-                        .expect("completion serializes"),
-                    ),
-                )
-                .mount(&wyrd)
-                .await;
-            let loaded = Workflow::from_path(bundle().join("workflow.yaml"))
-                .await
-                .expect("local bundle loads");
-            let routes = SelectedRoutes::of(loaded.as_skald().spec());
-            assert!(routes.needs_gateway() && !routes.needs_config());
-            let gateway = Workflow {
-                inner: loaded.into_skald(),
-                client: Some(bearer_client(&wyrd.uri())),
-            };
-            let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
-            let run = gateway
-                .run_with(&ProviderRegistry::new(), input)
-                .await
-                .expect("gateway run starts");
-            assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-            let requests = wyrd.received_requests().await.unwrap_or_default();
-            assert_eq!(requests.len(), 3);
-            assert!(requests.iter().all(|request| {
-                let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
-                body["model"] == json!("openai/gpt-5-5")
-                    && request
-                        .headers
-                        .get("x-wyrd-access-token")
-                        .map(|value| value.as_bytes())
-                        == Some(b"Bearer test-bearer".as_slice())
-            }));
-
-            // A client-less Workflow selecting both route families reads the
-            // ambient configuration once at run start: the security step's
-            // binding and the other steps' public gateway client both come from
-            // that one file.
-            let config_home = TempDir::new().expect("config home creates");
-            let secret = secret_file(config_home.path(), "s3cret");
-            std::fs::write(
-                config_home.path().join("config.toml"),
-                format!(
-                    r#"
-                    [client]
-                    http_url = "{wyrd}"
-
-                    [workflow.external_gateway_bindings.review-gateway]
-                    protocol = "openai_chat"
-                    origin = "{origin}"
-                    secret_headers = {{ x-review-secret = {{ source = "file", path = "{secret}" }} }}
-                    "#,
-                    wyrd = wyrd.uri(),
-                    origin = server.uri(),
-                    secret = secret.display(),
-                ),
-            )
-            .expect("config writes");
-            let step_route = format!(
-                "      llm_route:\n        kind: ext_gateway\n        protocol: openai_chat\n        base_url: {}/v1\n        credential_binding: review-gateway\n      timeout_seconds: 60",
-                server.uri()
-            );
-            let mixed = edited_bundle(|yaml| yaml.replacen("      timeout_seconds: 60", &step_route, 1));
-            let mixed = Workflow::from_path(mixed.path().join("workflow.yaml"))
-                .await
-                .expect("mixed-route bundle loads");
-            let routes = SelectedRoutes::of(mixed.as_skald().spec());
-            assert!(routes.needs_gateway() && routes.needs_config() && mixed.client.is_none());
-            // SAFETY: ENV_MUTEX, held for this test, serializes environment
-            // mutation in this test binary.
-            unsafe {
-                std::env::set_var("WYRD_CONFIG_HOME", config_home.path());
-                std::env::set_var("WYRD_ACCESS_TOKEN", "test-bearer");
-            }
-            let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
-            let run = mixed.run_with(&ProviderRegistry::new(), input).await;
-            // SAFETY: ENV_MUTEX, held for this test, serializes environment
-            // mutation in this test binary.
-            unsafe {
-                std::env::remove_var("WYRD_CONFIG_HOME");
-                std::env::remove_var("WYRD_ACCESS_TOKEN");
-            }
-            let run = run.expect("mixed-route run starts");
-            assert_eq!(run.status, WorkflowRunStatus::Succeeded);
-            let upstream = server.received_requests().await.unwrap_or_default();
-            assert_eq!(upstream.len(), 4, "only the security step uses the binding");
-            assert_eq!(
-                upstream[3]
-                    .headers
-                    .get("x-review-secret")
-                    .map(|value| value.as_bytes()),
-                Some(b"s3cret".as_slice())
-            );
-            let gateway = wyrd.received_requests().await.unwrap_or_default();
-            assert_eq!(gateway.len(), 5, "the other two steps use the configured gateway");
-            assert!(gateway[3..].iter().all(|request| {
-                request
-                    .headers
-                    .get("x-wyrd-access-token")
-                    .map(|value| value.as_bytes())
-                    == Some(b"Bearer test-bearer".as_slice())
-            }));
-        });
+            ),
+        )
+        .expect("config writes");
+        let step_route = format!(
+            "      llm_route:\n        kind: ext_gateway\n        protocol: openai_chat\n        base_url: {}/v1\n        credential_binding: review-gateway\n      timeout_seconds: 60",
+            server.uri()
+        );
+        let mixed =
+            edited_bundle(|yaml| yaml.replacen("      timeout_seconds: 60", &step_route, 1));
+        let mut mixed = Workflow::from_path(mixed.path().join("workflow.yaml"))
+            .await
+            .expect("mixed-route bundle loads");
+        let routes = SelectedRoutes::of(mixed.as_skald().spec());
+        assert!(routes.needs_gateway() && routes.needs_config() && mixed.client.is_none());
+        mixed.environment = Environment::from([
+            (
+                "WYRD_CONFIG_HOME",
+                config_home.path().to_str().expect("utf-8 path"),
+            ),
+            ("WYRD_ACCESS_TOKEN", "test-bearer"),
+        ]);
+        let input = serde_json::Map::from_iter([("code".to_owned(), json!("diff"))]);
+        let run = mixed
+            .run_with(&ProviderRegistry::new(), input)
+            .await
+            .expect("mixed-route run starts");
+        assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+        let upstream = server.received_requests().await.unwrap_or_default();
+        assert_eq!(upstream.len(), 4, "only the security step uses the binding");
+        assert_eq!(
+            upstream[3]
+                .headers
+                .get("x-review-secret")
+                .map(oauth2::http::HeaderValue::as_bytes),
+            Some(b"s3cret".as_slice())
+        );
+        let gateway = wyrd.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            gateway.len(),
+            5,
+            "the other two steps use the configured gateway"
+        );
+        assert!(gateway[3..].iter().all(|request| {
+            request
+                .headers
+                .get("x-wyrd-access-token")
+                .map(oauth2::http::HeaderValue::as_bytes)
+                == Some(b"Bearer test-bearer".as_slice())
+        }));
     }
 
     /// A bearer-authenticated client pointed at `base_url`.

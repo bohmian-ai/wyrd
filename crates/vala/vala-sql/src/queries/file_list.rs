@@ -162,7 +162,7 @@ impl HotFileCatalog {
     ) -> Result<Vec<PromotableHotFileRow>, SqlError> {
         let rows: Vec<(uuid::Uuid, String, Option<String>, i64, serde_json::Value)> =
             sqlx::query_as(
-                r#"
+                r"
             SELECT id, file_path, file_checksum, file_size, promotion_record
               FROM vala.file_list
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -172,7 +172,7 @@ impl HotFileCatalog {
                AND committed_snapshot_id IS NULL
                AND forge_publication_operation_id IS NULL
              ORDER BY created_at, file_ordinal, id
-            "#,
+            ",
             )
             .bind(&self.namespace)
             .bind(&self.table_name)
@@ -224,7 +224,7 @@ impl HotFileCatalog {
     ) -> Result<Vec<PlannedHotFileRow>, SqlError> {
         // raw-query grep allowlist: this tenant-scoped file-list read post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote it to a macro. It remains bound to `TenantConn` and `wyrd.current_tenant()` and introduces no tenant-boundary exception.
         sqlx::query_as::<_, PlannedHotFileRow>(
-            r#"
+            r"
             SELECT id, file_path, committed_snapshot_id, forge_publication_operation_id, compacted
               FROM vala.file_list
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -232,7 +232,7 @@ impl HotFileCatalog {
                AND table_name = $2
                AND id = ANY($3)
              ORDER BY created_at, file_ordinal, id
-            "#,
+            ",
         )
         .bind(&self.namespace)
         .bind(&self.table_name)
@@ -265,7 +265,7 @@ impl HotFileCatalog {
         operation_id: uuid::Uuid,
     ) -> Result<u64, SqlError> {
         sqlx::query(
-            r#"
+            r"
             UPDATE vala.file_list
                SET compacted = true,
                    committed_snapshot_id = $4,
@@ -278,7 +278,7 @@ impl HotFileCatalog {
                      (committed_snapshot_id IS NULL AND forge_publication_operation_id IS NULL)
                   OR (committed_snapshot_id = $4 AND forge_publication_operation_id = $5)
                )
-            "#,
+            ",
         )
         .bind(&self.namespace)
         .bind(&self.table_name)
@@ -312,7 +312,7 @@ pub async fn list_nonterminal_file_paths(
     path: Option<&str>,
 ) -> Result<Vec<String>, SqlError> {
     sqlx::query_scalar(
-        r#"
+        r"
         SELECT file_path
           FROM vala.file_list
          WHERE data_tenant_id = wyrd.current_tenant()
@@ -321,7 +321,7 @@ pub async fn list_nonterminal_file_paths(
            AND (NOT compacted OR committed_snapshot_id IS NULL)
            AND ($3::text IS NULL OR file_path = $3)
          ORDER BY file_path
-        "#,
+        ",
     )
     .bind(namespace)
     .bind(table_name)
@@ -449,7 +449,7 @@ mod pg_tests {
     #[tokio::test]
     async fn unresolved_hot_cut_projects_bounds_without_migration() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let pool = fixture.superuser_pool().expect("superuser pool");
         let tenant = fixture.data_tenant_id();
         let lower = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
             .expect("fixture lower bound is representable");
@@ -533,7 +533,7 @@ mod pg_tests {
     #[tokio::test]
     async fn promotable_hot_files_are_exact_and_settlement_is_idempotent() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let pool = fixture.superuser_pool().expect("superuser pool");
         let tenant = fixture.data_tenant_id();
         let start = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
             .expect("fixture partition start is representable");

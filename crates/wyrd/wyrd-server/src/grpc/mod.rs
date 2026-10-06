@@ -308,14 +308,11 @@ where
                 .into_status()
                 .into_http());
             }
-            let _lease = match admission.try_acquire(declared.unwrap_or(0)) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    return Ok(Status::resource_exhausted(
-                        "gRPC encoded-body capacity is occupied",
-                    )
-                    .into_http());
-                }
+            let Ok(_lease) = admission.try_acquire(declared.unwrap_or(0)) else {
+                return Ok(
+                    Status::resource_exhausted("gRPC encoded-body capacity is occupied")
+                        .into_http(),
+                );
             };
             inner
                 .call(Request::from_parts(parts, head.replay(body)))

@@ -48,10 +48,10 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 use super::query::{ServerJourneyError, audit_rows, scheduled_context};
 
 /// Upper bound on the wait for the remote runner to settle the run.
-const WAIT: Duration = Duration::from_secs(60);
+const WAIT: Duration = Duration::from_mins(1);
 
 /// One day, the receipt-clock shift that moves an ACK onto the next UTC day.
-const DAY: Duration = Duration::from_secs(86_400);
+const DAY: Duration = Duration::from_hours(24);
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
 /// result through the gateway capture writer's peer ingest RPC and completes
@@ -124,9 +124,8 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     };
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
-    let result = match (row.status.as_str(), row.result_id) {
-        ("completed", Some(result)) => result,
-        _ => return Err(format!("the run settled {row:?}").into()),
+    let ("completed", Some(result)) = (row.status.as_str(), row.result_id) else {
+        return Err(format!("the run settled {row:?}").into());
     };
 
     scribe.flush_bifrost().await?;

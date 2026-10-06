@@ -46,7 +46,7 @@ pub async fn expired_uploads_batch(
     init_grace: Duration,
 ) -> Result<Vec<ExpiredUpload>, SqlError> {
     let rows = sqlx::query_as::<_, ExpiredUpload>(
-        r#"
+        r"
         SELECT
             id,
             data_tenant_id,
@@ -66,7 +66,7 @@ pub async fn expired_uploads_batch(
                 ELSE created_at + ($2::text || ' seconds')::interval
             END ASC
         LIMIT $1
-        "#,
+        ",
     )
     .bind(limit)
     .bind(init_grace.as_secs().cast_signed())

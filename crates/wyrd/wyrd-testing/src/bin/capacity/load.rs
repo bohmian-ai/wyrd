@@ -297,7 +297,9 @@ impl Lane {
                 continue;
             };
             tally.started += 1;
-            let replica = (sequence % replicas) as usize;
+            let replica = usize::try_from(sequence % replicas).expect(
+                "invariant: the replica index is below the replica count, which fits usize",
+            );
             let (clients, request) = (Arc::clone(&clients), request.clone());
             running.spawn(async move {
                 let sent = Instant::now();
@@ -424,7 +426,7 @@ impl Request {
             Self::Ingest => {
                 let features: serde_json::Map<String, serde_json::Value> = (0..INGEST_FEATURES)
                     .map(|feature| {
-                        let value = (sequence as usize + feature * 7) % 100;
+                        let value = (sequence + feature as u64 * 7) % 100;
                         (format!("f{feature}"), (value as f64).into())
                     })
                     .collect();

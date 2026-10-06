@@ -95,7 +95,7 @@ struct RetryEntry {
     /// Earliest instant the batch may be resent.
     due: Instant,
     /// Counts the entry in the handle's retry metric until it settles.
-    _permit: RetryPermit,
+    permit: RetryPermit,
 }
 
 /// One send attempt whose ownership state determines retry-slot reuse.
@@ -431,14 +431,14 @@ impl RecordQueue {
     fn retain_retry(&self, entry: SendEntry) {
         let (batch, attempts, permit) = match entry {
             SendEntry::Fresh(batch) => (batch, 0, self.budget.reserve_retry()),
-            SendEntry::Retained(entry) => (entry.batch, entry.attempts, entry._permit),
+            SendEntry::Retained(entry) => (entry.batch, entry.attempts, entry.permit),
         };
         let due = Instant::now() + retry_backoff(batch.batch_id, attempts);
         self.retained().push(RetryEntry {
             batch,
             attempts: attempts.saturating_add(1),
             due,
-            _permit: permit,
+            permit,
         });
     }
 
@@ -503,7 +503,7 @@ impl RecordQueue {
         match result {
             Ok(Ok(DurableBatchAck { batch_id, rows })) => {
                 outcome.batch_ids.push(batch_id);
-                outcome.rows_flushed += rows as usize;
+                outcome.rows_flushed += usize::try_from(rows).unwrap_or(usize::MAX);
                 Settled::Acked
             }
             Ok(Err(SinkError::Retryable(error))) => {
@@ -883,7 +883,10 @@ mod tests {
     #[tokio::test]
     async fn retained_retry_backoff_is_deterministic_and_capped() {
         let delays = (0..12)
-            .map(|attempt| retry_backoff([0; 16], attempt).as_millis() as u64)
+            .map(|attempt| {
+                u64::try_from(retry_backoff([0; 16], attempt).as_millis())
+                    .expect("backoff is capped at one second")
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             delays,
@@ -891,7 +894,7 @@ mod tests {
         );
         for (attempt, delay) in delays.iter().enumerate() {
             let ceiling = 10_u64
-                .checked_shl((attempt as u32).min(63))
+                .checked_shl(u32::try_from(attempt).expect("twelve attempts").min(63))
                 .unwrap_or(u64::MAX)
                 .min(1_000);
             assert!(*delay >= ceiling / 2);

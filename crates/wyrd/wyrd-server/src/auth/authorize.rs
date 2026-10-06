@@ -320,12 +320,7 @@ mod pg_tests {
         )
         .bind(&issuer)
         .bind(binding.connection_id)
-        .execute(
-            &fixture
-                .superuser_pool()
-                .await
-                .expect("superuser pool opens"),
-        )
+        .execute(&fixture.superuser_pool().expect("superuser pool opens"))
         .await
         .expect("connection points at the mock provider");
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");

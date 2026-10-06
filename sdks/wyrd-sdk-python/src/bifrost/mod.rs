@@ -309,8 +309,10 @@ impl Bifrost {
     /// failure to dial the ingest channel.
     #[new]
     #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None, tenant=None, client_byte_limit_bytes=None))]
-    // justification: pyo3 boundary; each keyword argument of the Python signature is one Rust parameter
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 boundary; each keyword argument of the Python signature is one Rust parameter"
+    )]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,

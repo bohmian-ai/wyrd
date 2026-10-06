@@ -2548,7 +2548,7 @@ mod tests {
             let node_id = crate::scribe::stream_identity::NodeId::generate();
             let stream =
                 StreamIdentity::new(node_id, crate::scribe::stream_identity::WriterEpoch::new(1));
-            let superuser = database.superuser_pool().await.expect("superuser pool");
+            let superuser = database.superuser_pool().expect("superuser pool");
             sqlx::query(
                 "INSERT INTO vala.cluster_nodes (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at) VALUES ($1,$2,'scribe','127.0.0.1:1',$3,now(),now()) ON CONFLICT (data_tenant_id,node_id,role) DO UPDATE SET fencing_token=EXCLUDED.fencing_token,heartbeat_at=now()",
             )

@@ -23,8 +23,7 @@ pub async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
     let path = req
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_else(|| UNMATCHED_PATH.to_owned());
+        .map_or_else(|| UNMATCHED_PATH.to_owned(), |m| m.as_str().to_owned());
     let method = req.method().clone();
 
     let response = next.run(req).await;

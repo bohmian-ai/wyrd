@@ -101,7 +101,7 @@ pub async fn insert(
     let backend = row.backend.to_string();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.storage_artifact_metadata (
             data_tenant_id,
             storage_path,
@@ -129,7 +129,7 @@ pub async fn insert(
             content_type = EXCLUDED.content_type,
             sse_marker = EXCLUDED.sse_marker,
             backend = EXCLUDED.backend
-        "#,
+        ",
     )
     .bind(row.storage_path)
     .bind(row.card_uid)
@@ -154,7 +154,7 @@ pub async fn get(
     storage_path: &str,
 ) -> Result<Option<ArtifactMetadataRow>, SqlError> {
     let row = sqlx::query_as::<_, ArtifactMetadataRowDb>(
-        r#"
+        r"
         SELECT
             data_tenant_id,
             storage_path,
@@ -167,7 +167,7 @@ pub async fn get(
             created_at
         FROM wyrd.storage_artifact_metadata
         WHERE storage_path = $1
-        "#,
+        ",
     )
     .bind(storage_path)
     .fetch_optional(&mut **conn.transaction())

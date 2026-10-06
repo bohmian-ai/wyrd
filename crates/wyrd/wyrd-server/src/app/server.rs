@@ -310,20 +310,17 @@ impl WyrdServer {
         // public sockets. Binding it here is what lets a bind failure surface
         // as a boot error and what lets readiness wait on the address the
         // listener actually holds rather than the configured one.
-        let (peer_listener, peer_addr) = match self.peer_router.is_some() {
-            true => {
-                let bind = self.config.bifrost.peer.bind;
-                let listener = TcpListener::bind(bind).await.map_err(|e| {
-                    BootExit::Other(
-                        format!("Bifrost peer listener failed to bind {bind}: {e}").into(),
-                    )
-                })?;
-                let addr = listener
-                    .local_addr()
-                    .map_err(|e| BootExit::Other(Box::new(e)))?;
-                (Some(listener), Some(addr))
-            }
-            false => (None, None),
+        let (peer_listener, peer_addr) = if self.peer_router.is_some() {
+            let bind = self.config.bifrost.peer.bind;
+            let listener = TcpListener::bind(bind).await.map_err(|e| {
+                BootExit::Other(format!("Bifrost peer listener failed to bind {bind}: {e}").into())
+            })?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            (Some(listener), Some(addr))
+        } else {
+            (None, None)
         };
 
         Ok(BoundServer {
@@ -496,6 +493,10 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error, a Bifrost
     /// lifecycle failure, or if the process-global metrics recorder fails to
     /// install.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a bound peer listener lacks its peer router, which binding rules out.
     pub async fn run(mut self) -> Result<BifrostShutdownReport, BootExit> {
         // A production deployment without the Wyrd operator pool cannot run the
         // Card recovery sweep, so stale precommits would leak indefinitely.
@@ -561,7 +562,7 @@ impl BoundServer {
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
-                            _ = scanner_shutdown.cancelled() => break,
+                            () = scanner_shutdown.cancelled() => break,
                             _ = ticks.tick() => scanner.check_age(std::time::Instant::now()),
                         }
                     }
@@ -578,9 +579,9 @@ impl BoundServer {
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
-                            _ = shutdown.cancelled() => break,
+                            () = shutdown.cancelled() => break,
                             _ = ticks.tick() => tokio::select! {
-                                _ = shutdown.cancelled() => break,
+                                () = shutdown.cancelled() => break,
                                 result = scribe.publish_due() => if let Err(error) = result {
                                     tracing::warn!(%error, "Scribe due publication failed; next tick retries");
                                 },
@@ -941,7 +942,7 @@ mod pg_tests {
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
 
-    async fn test_state_with_auth() -> AppState {
+    fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
@@ -1000,7 +1001,7 @@ mod pg_tests {
             // readiness, transport, Oracle, and Scribe shutdown phases.
             config.role = BifrostTarget::Server;
             let probe = ShutdownTestProbe::new(stall);
-            let server = WyrdServer::new(config, test_state_with_auth().await)
+            let server = WyrdServer::new(config, test_state_with_auth())
                 .expect("test server builds")
                 .with_shutdown_probe(probe.clone())
                 .spawn_worker("shutdown_trigger", async {});
@@ -1036,11 +1037,11 @@ mod pg_tests {
         let mut config = WyrdServerConfig::default();
         config.metrics.enabled = false;
 
-        let state1 = test_state_with_auth().await;
+        let state1 = test_state_with_auth();
         let server1 = WyrdServer::new(config.clone(), state1)
             .expect("first WyrdServer construction succeeds");
 
-        let state2 = test_state_with_auth().await;
+        let state2 = test_state_with_auth();
         let server2 =
             WyrdServer::new(config, state2).expect("second WyrdServer construction succeeds");
 

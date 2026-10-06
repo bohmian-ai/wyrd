@@ -176,10 +176,8 @@ facade mechanics; bindings must not publish or assemble them as sibling clients.
   transaction without ending it.
 - Cross-tenant operator work uses `OperatorPool` under explicit administrative
   authority and preserves tenant-qualified identities at every durable seam.
-- Card registry writes stay inside the caller's `TenantConn` transaction
-  (enforced by `check:registry-tx-coupling`).
-- Single `wyrd.cards` table; no per-kind shadow tables (enforced by
-  `check:registry-single-table`).
+- Card registry writes stay inside the caller's `TenantConn` transaction.
+- Single `wyrd.cards` table; no per-kind shadow tables.
 - Use local fixtures + emulators for storage tests; real cloud
   integration tests run separately.
 

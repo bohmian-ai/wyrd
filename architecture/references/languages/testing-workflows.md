@@ -162,7 +162,7 @@ mise run codegen:regen   # regenerate everything from source
 The OpenAPI document is served at runtime from `GET /openapi.json` and is not
 part of that snapshot; prove an OpenAPI change against the served document
 with the assembled-server contract suite
-(`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`) instead:
+(`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`) instead:
 
 ```bash
 mise run test:principals:integration
@@ -178,26 +178,15 @@ a specific change will trip:
 
 | Gate | What it enforces |
 |---|---|
-| `check:client-tier` | Foundation invariants (wyrd-spec server-tier-free; shared shells pyo3+sqlx-free; Skald locked Wyrd edges) |
-| `check:pyo3-scope` | PyO3 stays out of pure contracts and Python-free shared crates |
-| `check:unwrap-audit` | Audits `unwrap()`/`expect()` outside tests |
-| `check:tenant-isolation` | SQL foundation tenant isolation + server-tier boundaries |
-| `check:registry-no-server-routes` | `wyrd-sql` does not import `axum`/`hyper`/`tower` |
-| `check:registry-tx-coupling` | Card registry writes stay inside caller's `TenantConn` tx |
-| `check:registry-immutable-spec-hash` | `wyrd.cards` trigger raises `P0001` |
-| `check:registry-single-table` | Single `wyrd.cards` table; no per-kind shadow tables |
-| `check:object-store-pin` | Single versions of `object_store`/`datafusion`/`arrow`/`parquet` |
-| `check:from-pools-allowlist` | Pool construction remains limited to sanctioned production and fixture boundaries |
-| `check:fixtures-no-server` | `wyrd-dev-fixtures` does not import `wyrd-server` |
-| `check:no-legacy-server-vocab` | Reject legacy vocabulary + orphan-rule violations |
-| `check:no-tonic-outside-wyrd-tonic` | Reject tonic-family deps outside `wyrd-tonic` + workspace pins |
-| `check:test-coverage` | Every crate assigned to exactly one family test lane |
+| `lints` | Workspace Clippy policy from `Cargo.toml` `[lints]`, including `unwrap_used` and reasoned suppressions |
+| `check:deps` | Crate boundaries on the resolved graph: client tier, PyO3 scope, test tooling out of production, Skald foundation edges, one Arrow/DataFusion stack, AWS-LC-only Rustls, no test seams in the shipped server |
+| `check:tenant-isolation` | Query and server code reach tenant tables only through `TenantConn`; RLS itself is proven by Postgres readiness |
+| `check:storage:drift` | Storage credential and tenancy guardrails |
 | `check:py-wheel-no-testing` | Production `wyrd-sdk-python` wheel does not expose `wyrd.testing` |
-| `check:error-coverage` | Skald error codes mapped; SQL errors have coverage |
-| `check:design-sync` | `ValaQueryService` + payload-read permissions match `wyrd-design.md` |
-| `check:single-into-response-impl` | HTTP errors flow through one server `IntoResponse` mapper |
-| `check:proto-drift` | `wyrd.v1` FileDescriptorSet matches `.proto` |
-| `check:tokens` | Generated theme CSS matches `palette.json` |
+| `codegen:check` | Generated schemas, `.pyi` stubs, TypeScript error codes, and UI theme tokens match their sources |
+
+Family test lanes take every crate under their directory, so no check is
+needed to prove each crate has a lane.
 
 ## Aggregate CI Gate
 

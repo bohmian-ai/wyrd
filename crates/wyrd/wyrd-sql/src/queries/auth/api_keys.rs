@@ -66,12 +66,12 @@ pub async fn list_api_key_metadata(
     principal_id: Uuid,
 ) -> Result<Vec<ApiKeyMetadataRow>, SqlxError> {
     sqlx::query_as::<_, ApiKeyMetadataRow>(
-        r#"
+        r"
         SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at
           FROM wyrd.auth_api_keys
          WHERE principal_id = $1
          ORDER BY created_at DESC
-        "#,
+        ",
     )
     .bind(principal_id)
     .fetch_all(&mut **conn.transaction())

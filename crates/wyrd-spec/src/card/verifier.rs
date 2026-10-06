@@ -54,9 +54,10 @@ pub struct VerifierSpec {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-// justification: mirrors the `Spec` contract; boxing a variant would change the
-// authored wire shape's ergonomics for every consumer that matches on it
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "mirrors the `Spec` contract; boxing a variant would change the authored wire shape's ergonomics for every consumer that matches on it"
+)]
 pub enum VerifierImplementation {
     /// Continuous distribution or metric drift over observed records.
     Drift(DriftSpec),

@@ -258,11 +258,12 @@ fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), Assig
     buffer.push(literal.digest_tag());
     match literal {
         ScanLiteral::Bool(value) => buffer.push(u8::from(*value)),
-        ScanLiteral::I64(value) => buffer.extend_from_slice(&value.to_be_bytes()),
+        ScanLiteral::I64(value) | ScanLiteral::TimestampMicros(value) => {
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
         ScanLiteral::U64(value) => buffer.extend_from_slice(&value.to_be_bytes()),
         ScanLiteral::F64Bits(bits) => buffer.extend_from_slice(&bits.to_be_bytes()),
         ScanLiteral::Utf8(value) => push_string(buffer, value)?,
-        ScanLiteral::TimestampMicros(value) => buffer.extend_from_slice(&value.to_be_bytes()),
     }
     Ok(())
 }
@@ -351,6 +352,10 @@ fn push_time_partition(buffer: &mut Vec<u8>, partition: crate::vala::api::TimePa
 /// # Errors
 ///
 /// Never fails; the `Result` is the shape `push_option` requires.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is the callback shape push_option requires"
+)]
 fn push_scribe_cut(
     buffer: &mut Vec<u8>,
     cut: &crate::vala::api::ScribeProviderCut,
@@ -624,7 +629,7 @@ mod tests {
     /// longer carries its `u32` batch count and `u64` retained-byte limit.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
-        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
@@ -980,7 +985,7 @@ mod tests {
         Vec<String>,
         Vec<ScanPredicate>,
     ) {
-        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
@@ -1185,7 +1190,7 @@ mod tests {
         )]);
         let float_mutated = baseline_digest(&[ScanPredicate::Gt(
             "duration_ms".to_string(),
-            ScanLiteral::F64Bits(1.0000001_f64.to_bits()),
+            ScanLiteral::F64Bits(1.000_000_1_f64.to_bits()),
         )]);
         assert_ne!(float_baseline, float_mutated);
     }

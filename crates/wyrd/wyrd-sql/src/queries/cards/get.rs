@@ -9,30 +9,30 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use crate::row_types::cards::{CardRow, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
-const SELECT_BY_UID: &str = r#"
+const SELECT_BY_UID: &str = r"
     SELECT card_uid, data_tenant_id, kind, space, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
     WHERE card_uid = $1 AND status != 'deleted'
-"#;
+";
 
-const SELECT_BY_REF: &str = r#"
+const SELECT_BY_REF: &str = r"
     SELECT card_uid, data_tenant_id, kind, space, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
     WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
       AND status != 'deleted'
-"#;
+";
 
-const SELECT_FOR_RECONCILIATION: &str = r#"
+const SELECT_FOR_RECONCILIATION: &str = r"
     SELECT card_uid, data_tenant_id, kind, space, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
     WHERE card_uid = $1
-"#;
+";
 
 /// Load one card by UID within the current tenant.
 ///

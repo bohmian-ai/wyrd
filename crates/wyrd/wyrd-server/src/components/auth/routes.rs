@@ -528,12 +528,11 @@ async fn issue_key(
     Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
     let request_id_str: String;
-    let req_id = match request_id.as_ref() {
-        Some(Extension(id)) => id.as_str(),
-        None => {
-            request_id_str = Uuid::new_v4().to_string();
-            &request_id_str
-        }
+    let req_id = if let Some(Extension(id)) = request_id.as_ref() {
+        id.as_str()
+    } else {
+        request_id_str = Uuid::new_v4().to_string();
+        &request_id_str
     };
     let audited_caller = Caller::from_authenticated(
         &caller,
@@ -623,6 +622,7 @@ fn bad_subject_token_format() -> WyrdError {
 #[cfg(test)]
 mod pg_tests {
     use std::sync::Arc;
+    use wyrd_spec::reference::CardRefScope;
 
     use axum::Json;
     use axum::extract::State;
@@ -671,10 +671,10 @@ mod pg_tests {
                 kind: PrincipalKindTag::User,
                 tenant_id,
                 card_ref: None,
-                card_ref_scope: Default::default(),
+                card_ref_scope: CardRefScope::default(),
             },
             roles: vec![],
-            permissions: Default::default(),
+            permissions: PermissionSet::default(),
             act: None,
             aud: "wyrd".to_owned(),
             exp: 9_999_999_999,

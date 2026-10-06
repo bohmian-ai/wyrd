@@ -40,7 +40,7 @@ use crate::{OperatorPool, TenantConn};
 const EVAL_IMPLEMENTATION: &str = "eval";
 
 /// Resolve a binding target's frozen identities, readiness, and implementation.
-const RESOLVE_BINDING_SQL: &str = r#"
+const RESOLVE_BINDING_SQL: &str = r"
     SELECT b.verifier_uid, v.version AS verifier_version,
            v.spec #>> '{implementation,kind}' AS implementation,
            wyrd.verifier_readiness(b.verifier_uid) AS readiness,
@@ -52,10 +52,10 @@ const RESOLVE_BINDING_SQL: &str = r#"
       FROM wyrd.verification_bindings b
       LEFT JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
      WHERE b.binding_id = $1
-"#;
+";
 
 /// Resolve a direct target: no owner, binding, Trigger, or Operators.
-const RESOLVE_DIRECT_SQL: &str = r#"
+const RESOLVE_DIRECT_SQL: &str = r"
     SELECT p.verifier_uid, v.version AS verifier_version,
            v.spec #>> '{implementation,kind}' AS implementation,
            wyrd.verifier_readiness(p.verifier_uid) AS readiness,
@@ -68,7 +68,7 @@ const RESOLVE_DIRECT_SQL: &str = r#"
            '[]'::jsonb AS operators
       FROM (SELECT $1::uuid AS verifier_uid) p
       LEFT JOIN wyrd.cards v ON v.card_uid = p.verifier_uid
-"#;
+";
 
 /// Insert one run, due at PostgreSQL's statement time; a duplicate scheduled
 /// occurrence or observation record conflicts on its partial unique index and
@@ -80,7 +80,7 @@ const RESOLVE_DIRECT_SQL: &str = r#"
 /// [`LOCK_OBSERVATION_BINDING_SQL`] from an earlier statement, so this
 /// statement's snapshot already sees every committed predecessor. A conflict
 /// stores nothing, so a duplicate consumes no ordinal.
-const INSERT_RUN_SQL: &str = r#"
+const INSERT_RUN_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
         run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
@@ -97,7 +97,7 @@ const INSERT_RUN_SQL: &str = r#"
               ) END)
     ON CONFLICT DO NOTHING
     RETURNING run_id
-"#;
+";
 
 /// Serialize observation-run creation for one binding until commit.
 ///
@@ -105,12 +105,12 @@ const INSERT_RUN_SQL: &str = r#"
 /// binding waits for this transaction and then numbers after its run.
 /// `FOR NO KEY UPDATE` leaves the key-share locks other runs' foreign keys
 /// take unblocked.
-const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
+const LOCK_OBSERVATION_BINDING_SQL: &str = r"
     SELECT 1
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
        FOR NO KEY UPDATE
-"#;
+";
 
 /// Lock and list, until commit, every `observations_ready` binding whose
 /// subject and exact owner Card match a `(subject, writer)` pair of the batch.
@@ -122,14 +122,14 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
 /// sort), so two transactions that touch overlapping bindings acquire them in
 /// the same order and one simply waits for the other instead of forming a
 /// cycle.
-const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
+const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
     SELECT binding_id, subject_card_uid, owner_card_uid
       FROM wyrd.verification_bindings
      WHERE activation = 'observations_ready'
        AND (subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
      ORDER BY binding_id
        FOR NO KEY UPDATE
-"#;
+";
 
 /// Insert one observation run per unseen `(binding, record)` of a batch in
 /// one statement, due at PostgreSQL's statement time.
@@ -142,7 +142,7 @@ const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r#"
 /// [`LOCK_OBSERVATION_SUBJECTS_SQL`], so this statement's snapshot already sees
 /// every committed predecessor. The frozen identities, Trigger, and Operators
 /// come from the locked binding and its Verifier Card.
-const INSERT_OBSERVATION_RUNS_SQL: &str = r#"
+const INSERT_OBSERVATION_RUNS_SQL: &str = r"
     INSERT INTO wyrd.verifier_runs (
         run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
@@ -168,43 +168,43 @@ const INSERT_OBSERVATION_RUNS_SQL: &str = r#"
       JOIN wyrd.verification_bindings b ON b.binding_id = r.binding_id
       JOIN wyrd.cards v ON v.card_uid = b.verifier_uid
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Find the run that already holds a scheduled occurrence or observation record.
-const EXISTING_RUN_SQL: &str = r#"
+const EXISTING_RUN_SQL: &str = r"
     SELECT run_id
       FROM wyrd.verifier_runs
      WHERE binding_id = $1
        AND origin = $2
        AND ((origin = 'schedule' AND window_end = $3)
          OR (origin = 'observation' AND input_record_id = $4))
-"#;
+";
 
 /// Serialize concurrent manual requests that share one requester and key.
 ///
 /// Transaction-scoped, so it releases on commit or rollback; the class keeps
 /// these locks apart from every other advisory lock in the database.
-const LOCK_REQUEST_KEY_SQL: &str = r#"
+const LOCK_REQUEST_KEY_SQL: &str = r"
     SELECT pg_advisory_xact_lock($1, hashtext($2::text || '/' || $3))
-"#;
+";
 
 /// Advisory lock class of [`LOCK_REQUEST_KEY_SQL`].
 const REQUEST_KEY_LOCK_CLASS: i32 = 0x0C_A2_D0_31;
 
 /// Find the manual run a requester already created under one key.
-const KEYED_RUN_SQL: &str = r#"
+const KEYED_RUN_SQL: &str = r"
     SELECT run_id, request_sha256
       FROM wyrd.verifier_runs
      WHERE requested_by_principal_id = $1
        AND idempotency_key = $2
-"#;
+";
 
 /// Read the subject Card a binding verifies.
-const BINDING_SUBJECT_SQL: &str = r#"
+const BINDING_SUBJECT_SQL: &str = r"
     SELECT subject_card_uid
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
-"#;
+";
 
 /// How long after a scheduled window ends its occurrence becomes claimable.
 ///
@@ -224,7 +224,7 @@ const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
 /// schedule clock, so the synchronous cron calculation anchors on the database
 /// clock rather than the scheduler process's, and judges missed occurrences
 /// and the next cursor on the same delayed clock that decides dueness.
-const DUE_BINDING_SQL: &str = r#"
+const DUE_BINDING_SQL: &str = r"
     SELECT binding_id, schedule_cron, schedule_tz, next_run_at,
            statement_timestamp() - ($1::bigint * INTERVAL '1 millisecond') AS schedule_clock
       FROM wyrd.verification_bindings
@@ -233,21 +233,21 @@ const DUE_BINDING_SQL: &str = r#"
      ORDER BY next_run_at, binding_id
      LIMIT 1
        FOR UPDATE SKIP LOCKED
-"#;
+";
 
 /// Move a claimed binding's cursor; NULL disarms an unparseable schedule.
-const ADVANCE_CURSOR_SQL: &str = r#"
+const ADVANCE_CURSOR_SQL: &str = r"
     UPDATE wyrd.verification_bindings
        SET next_run_at = $2
      WHERE binding_id = $1
-"#;
+";
 
 /// Settle every expired lease that has no attempt left as `errored`.
 ///
 /// Expiry is decided and stamped by PostgreSQL, so a lease written by one pod
 /// is never judged against another pod's clock. A run with a stored result is
 /// never exhausted: its result is decided, and the next claimant writes it.
-const EXHAUST_EXPIRED_SQL: &str = r#"
+const EXHAUST_EXPIRED_SQL: &str = r"
     UPDATE wyrd.verifier_runs r
        SET status = 'errored', error = $1, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
@@ -256,7 +256,7 @@ const EXHAUST_EXPIRED_SQL: &str = r#"
        AND r.lease_expires_at <= statement_timestamp()
        AND r.attempts >= r.max_attempts
        AND NOT EXISTS (SELECT 1 FROM wyrd.verifier_run_results s WHERE s.run_id = r.run_id)
-"#;
+";
 
 /// Claim the oldest due, retry-due, or lease-expired run under a fresh lease.
 ///
@@ -268,7 +268,7 @@ const EXHAUST_EXPIRED_SQL: &str = r#"
 /// rows are attributed to, the exact Verifier Card's status (`NULL` when the
 /// Card is absent), and the Verifier's ready fitted Drift baseline, so no
 /// later phase opens a connection to read them.
-const CLAIM_RUN_SQL: &str = r#"
+const CLAIM_RUN_SQL: &str = r"
     WITH candidate AS (
         SELECT run_id, COALESCE(next_attempt_at, lease_expires_at) AS due_at
           FROM wyrd.verifier_runs
@@ -299,40 +299,40 @@ const CLAIM_RUN_SQL: &str = r#"
                 WHERE c.card_uid = r.verifier_uid) AS verifier_status,
               (SELECT b.fitted FROM wyrd.drift_baselines b
                 WHERE b.verifier_uid = r.verifier_uid AND b.state = 'ready') AS fitted_baseline
-"#;
+";
 
 /// Read a run's stored result, in its table write order.
-const STAGED_RESULT_SQL: &str = r#"
+const STAGED_RESULT_SQL: &str = r"
     SELECT result_id, event_time, verdict, summary, counts, verifier,
            tables, batch_ids, payloads
       FROM wyrd.verifier_run_results
      WHERE run_id = $1
-"#;
+";
 
 /// Lock a run still held by this lease token, so a concurrent reclaim either
 /// commits first (and this finds nothing) or waits for the caller's store.
-const LOCK_HELD_RUN_SQL: &str = r#"
+const LOCK_HELD_RUN_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.verifier_runs
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
        FOR UPDATE
-"#;
+";
 
 /// Store a held run's decided result; a result already stored for the run is
 /// kept, because only the claimant that stored it could have decided it.
-const STORE_RESULT_SQL: &str = r#"
+const STORE_RESULT_SQL: &str = r"
     INSERT INTO wyrd.verifier_run_results (
         run_id, data_tenant_id, result_id, event_time, verdict, summary,
         counts, verifier, tables, batch_ids, payloads
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     ON CONFLICT (run_id) DO NOTHING
-"#;
+";
 
 /// Delete a settled run's stored result.
-const DELETE_STAGED_SQL: &str = r#"
+const DELETE_STAGED_SQL: &str = r"
     DELETE FROM wyrd.verifier_run_results WHERE run_id = $1
-"#;
+";
 
 /// Renew every listed lease still held, on the database clock.
 ///
@@ -341,7 +341,7 @@ const DELETE_STAGED_SQL: &str = r#"
 /// it has passed. Every unexpired lease still held is returned, renewed or
 /// not; a token absent from the result has expired, been reclaimed, or been
 /// settled.
-const RENEW_LEASES_SQL: &str = r#"
+const RENEW_LEASES_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET lease_expires_at = CASE
                WHEN lease_expires_at <= statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond')
@@ -352,10 +352,10 @@ const RENEW_LEASES_SQL: &str = r#"
      WHERE status = 'running' AND lease_token = ANY($1)
        AND lease_expires_at > statement_timestamp()
     RETURNING lease_token
-"#;
+";
 
 /// Complete a leased run, or re-apply the same completion idempotently.
-const COMPLETE_RUN_SQL: &str = r#"
+const COMPLETE_RUN_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET status = 'completed', result_id = $3, error = NULL,
            lease_expires_at = NULL, next_attempt_at = NULL,
@@ -365,7 +365,7 @@ const COMPLETE_RUN_SQL: &str = r#"
        AND lease_token = $2
        AND (status = 'running' OR (status = 'completed' AND result_id = $3))
     RETURNING binding_id, operators
-"#;
+";
 
 /// Insert one Operator dispatch; the (tenant, run, Operator) key absorbs retries.
 ///
@@ -373,7 +373,7 @@ const COMPLETE_RUN_SQL: &str = r#"
 /// Verifier and subject Cards plus the runner's bounded summary (`$5`) and
 /// the Verifier implementation's counts (`$6`), so every delivery attempt
 /// renders the same payload.
-const INSERT_DISPATCH_SQL: &str = r#"
+const INSERT_DISPATCH_SQL: &str = r"
     INSERT INTO wyrd.operator_dispatches (
         dispatch_id, data_tenant_id, run_id, operator_uid, operator_digest,
         failure_context, next_attempt_at, created_at, updated_at
@@ -399,49 +399,49 @@ const INSERT_DISPATCH_SQL: &str = r#"
       JOIN wyrd.cards s ON s.card_uid = r.subject_card_uid
      WHERE r.run_id = $2
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Lock a leased run's attempt budget before deciding retry or exhaustion.
-const LEASED_ATTEMPTS_SQL: &str = r#"
+const LEASED_ATTEMPTS_SQL: &str = r"
     SELECT attempts, max_attempts
       FROM wyrd.verifier_runs
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
        FOR UPDATE
-"#;
+";
 
 /// Schedule a leased run's next attempt with its last error.
 ///
 /// `$4` is the backoff in milliseconds; the deadline itself is PostgreSQL's
 /// statement time plus that delay, and the statement returns it so the caller
 /// reports the stored instant rather than a locally derived one.
-const RETRY_RUN_SQL: &str = r#"
+const RETRY_RUN_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET status = 'retrying', error = $3,
            next_attempt_at = statement_timestamp() + ($4::bigint * INTERVAL '1 millisecond'),
            lease_expires_at = NULL, updated_at = statement_timestamp()
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
     RETURNING next_attempt_at
-"#;
+";
 
 /// Settle a leased run in a terminal non-completed status.
-const TERMINATE_RUN_SQL: &str = r#"
+const TERMINATE_RUN_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET status = $3, error = $4, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
            updated_at = statement_timestamp()
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
-"#;
+";
 
 /// Return a leased run to the queue, refunding its attempt; `$3` is the delay
 /// in milliseconds before it is due again.
-const RELEASE_RUN_SQL: &str = r#"
+const RELEASE_RUN_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
            attempts = attempts - 1, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
-"#;
+";
 
 /// Requeue a leased run whose required trace has not landed, refunding its
 /// attempt, while PostgreSQL's statement time is still before the run's
@@ -449,7 +449,7 @@ const RELEASE_RUN_SQL: &str = r#"
 ///
 /// `$3` is the poll delay and `$4` the deadline, both in milliseconds; both
 /// instants are derived from the database clock and the stored deadline anchor.
-const AWAIT_TRACE_SQL: &str = r#"
+const AWAIT_TRACE_SQL: &str = r"
     UPDATE wyrd.verifier_runs
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
            attempts = attempts - 1, error = $5, lease_expires_at = NULL,
@@ -458,25 +458,25 @@ const AWAIT_TRACE_SQL: &str = r#"
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
        AND created_at + ($4::bigint * INTERVAL '1 millisecond') > statement_timestamp()
     RETURNING next_attempt_at
-"#;
+";
 
 /// Read one run's control-plane status.
-const RUN_STATUS_SQL: &str = r#"
+const RUN_STATUS_SQL: &str = r"
     SELECT run_id, status, requested_by_principal_id, result_id, error
       FROM wyrd.verifier_runs
      WHERE run_id = $1
-"#;
+";
 
 /// Read one run's dispatches in identity order.
-const RUN_DISPATCHES_SQL: &str = r#"
+const RUN_DISPATCHES_SQL: &str = r"
     SELECT dispatch_id, operator_uid, operator_digest, status, last_error
       FROM wyrd.operator_dispatches
      WHERE run_id = $1
      ORDER BY dispatch_id
-"#;
+";
 
 /// Read a binding's frozen targets, readiness, and latest run.
-const BINDING_TARGETS_SQL: &str = r#"
+const BINDING_TARGETS_SQL: &str = r"
     SELECT b.subject_card_uid, b.verifier_uid,
            wyrd.verifier_readiness(b.verifier_uid) AS readiness,
            (SELECT r.run_id FROM wyrd.verifier_runs r
@@ -484,23 +484,23 @@ const BINDING_TARGETS_SQL: &str = r#"
              ORDER BY r.run_id DESC LIMIT 1) AS last_run_id
       FROM wyrd.verification_bindings b
      WHERE b.binding_id = $1
-"#;
+";
 
 /// List every tenant with claimable runs, longest-waiting tenant first.
-const RUNNABLE_TENANTS_SQL: &str = r#"
+const RUNNABLE_TENANTS_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.verifier_runs
      WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp())
         OR (status = 'running' AND lease_expires_at <= statement_timestamp())
      GROUP BY data_tenant_id
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
-"#;
+";
 
 /// List tenants with due scheduled bindings, most overdue tenant first.
 ///
 /// Uses the same dueness rule as [`DUE_BINDING_SQL`]: `$2` is
 /// [`SCHEDULE_CLAIM_DELAY`] in milliseconds.
-const DUE_TENANTS_SQL: &str = r#"
+const DUE_TENANTS_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
@@ -508,10 +508,10 @@ const DUE_TENANTS_SQL: &str = r#"
      GROUP BY data_tenant_id
      ORDER BY min(next_run_at), data_tenant_id
      LIMIT $1
-"#;
+";
 
 /// Count non-terminal runs and dispatches by status across every tenant.
-const QUEUE_DEPTH_SQL: &str = r#"
+const QUEUE_DEPTH_SQL: &str = r"
     SELECT
         (SELECT count(*) FROM wyrd.verifier_runs WHERE status = 'pending') AS runs_pending,
         (SELECT count(*) FROM wyrd.verifier_runs WHERE status = 'retrying') AS runs_retrying,
@@ -519,7 +519,7 @@ const QUEUE_DEPTH_SQL: &str = r#"
         (SELECT count(*) FROM wyrd.operator_dispatches WHERE status = 'pending') AS dispatches_pending,
         (SELECT count(*) FROM wyrd.operator_dispatches WHERE status = 'retrying') AS dispatches_retrying,
         (SELECT count(*) FROM wyrd.operator_dispatches WHERE status = 'running') AS dispatches_running
-"#;
+";
 
 /// Why a run was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,30 +1151,28 @@ impl VerifierRunQueue {
         request: &RunRequest,
         key: Option<RequestKey<'_>>,
     ) -> Result<EnqueueOutcome, SqlxError> {
-        let resolved: Option<ResolvedTarget> = match request {
-            RunRequest::Manual {
-                target:
-                    VerificationRunTarget::Verifier {
-                        verifier_uid,
-                        subject_card_uid,
-                    },
-                ..
-            } => {
-                sqlx::query_as(RESOLVE_DIRECT_SQL)
-                    .bind(verifier_uid.as_uuid())
-                    .bind(subject_card_uid.as_uuid())
-                    .fetch_optional(&mut **conn.transaction())
-                    .await?
-            }
-            _ => {
-                let binding = request
-                    .binding_id()
-                    .expect("invariant: every non-direct request names a binding");
-                sqlx::query_as(RESOLVE_BINDING_SQL)
-                    .bind(binding.as_uuid())
-                    .fetch_optional(&mut **conn.transaction())
-                    .await?
-            }
+        let resolved: Option<ResolvedTarget> = if let RunRequest::Manual {
+            target:
+                VerificationRunTarget::Verifier {
+                    verifier_uid,
+                    subject_card_uid,
+                },
+            ..
+        } = request
+        {
+            sqlx::query_as(RESOLVE_DIRECT_SQL)
+                .bind(verifier_uid.as_uuid())
+                .bind(subject_card_uid.as_uuid())
+                .fetch_optional(&mut **conn.transaction())
+                .await?
+        } else {
+            let binding = request
+                .binding_id()
+                .expect("invariant: every non-direct request names a binding");
+            sqlx::query_as(RESOLVE_BINDING_SQL)
+                .bind(binding.as_uuid())
+                .fetch_optional(&mut **conn.transaction())
+                .await?
         };
         let Some(resolved) = resolved else {
             return Ok(EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound));

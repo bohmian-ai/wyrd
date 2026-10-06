@@ -1584,6 +1584,89 @@ Non-goals stayed excluded:
 
 IMPLEMENTED
 
+### Rustls Ring provider removed from the production graph
+
+The merged dependency check found Rustls's `ring` feature enabled in the
+`wyrd-server` graph. Path: `vala-bifrost-redux` → `iceberg-compaction-core`
+(fork) → `iceberg-catalog-rest` → `gcp_auth` (`ring`) → `hyper-rustls` →
+`rustls`. Core only re-exported the REST catalog, and Wyrd never used that
+re-export.
+
+- Fork commit `170bf8e` on `bohmian-ai/iceberg-compaction` branch
+  `wyrd/no-rest-catalog-in-core`, based on the previously pinned `6773e19`.
+  It removes the dependency and the re-export from core. The fork's
+  integration tests and `rest-catalog` example now depend on
+  `iceberg-catalog-rest` directly.
+- Wyrd pins `170bf8e`. The lockfile drops `gcp_auth`, `iceberg-catalog-rest`
+  and `tracing-futures`, and `workspace-hack` was regenerated.
+- Evidence:
+  - `cargo tree -p wyrd-server -e features -i rustls` shows no `ring` feature.
+  - `cargo hakari verify` and `mise run lints` pass.
+  - The `ring` crate remains only through `jsonwebtoken` for JWT signing,
+    which is not a Rustls provider.
+
+**Carry-forward for the Forge and Bifrost merges.** The other fork lines
+still contain the old dependency: Forge pins `35f037e`
+(`wyrd/narrow-managed-seam`) and Bifrost pins `2b65fa1`
+(`wyrd/bifrost-variant`). If either pin lands unchanged, Ring returns and
+the dependency check fails. At the Forge merge:
+
+1. Merge `wyrd/narrow-managed-seam` into `wyrd/bifrost-variant`. Only
+   `35f037e` is missing there.
+2. Cherry-pick `170bf8e` on top.
+3. Pin every Wyrd line to that single commit.
+
+### Repository check audit
+
+Every check now protects a live boundary that the compiler, Clippy, or a
+Postgres test does not already enforce. The `check*` tasks went from 42 to 9.
+
+- **Replaced by the compiler or Clippy:**
+  - unwrap-audit and clippy-allow-audit became workspace `[lints]`:
+    pedantic, `unsafe_code = deny`, and `#[expect(..., reason)]`.
+  - `from_pools` compiles only behind `test-support`.
+  - `SecretRef` is `#[non_exhaustive]`.
+- **Merged into `check:deps`** (`scripts/checks/deps.sh`), which reads the
+  resolved production graph. It covers:
+  - client-tier and PyO3 scope;
+  - test tooling kept out of production crates;
+  - the Skald foundation edges, plus `vala-sql` never reaching the Skald
+    engine;
+  - single Arrow/DataFusion versions;
+  - one Rustls provider;
+  - no test seams in the shipped server;
+  - the inline-secret gate.
+- **Folded into `codegen:check`:** proto drift (the unused descriptor
+  snapshot was deleted) and theme tokens.
+- **Directory-derived:** the test families come from `cargo metadata`, so
+  the hand-kept family lists and `check:test-coverage` are gone.
+- **Skills mirror:** `.claude/skills` is a symlink to `.agents/skills`.
+- **Trimmed:**
+  - `check:storage:drift` is down to the bearer-token column rule.
+  - `check:tenant-isolation` keeps only the code-shape rules (`TenantConn`,
+    raw pools and transactions, raw-query justification). RLS policies and
+    role attributes are proven against the live catalog by
+    `OperatorPool::verify_tenant_isolation`, `verify_serving_roles` and
+    `pg_migration`.
+- **Deleted as name bans or marginal proxies:**
+  - `check:error-coverage`;
+  - `check:test-contracts`, together with the `wyrd-test-contract-macros`
+    crate and the `wyrd_covers` marker, which linked 13 functions;
+  - the registry, vocabulary, tonic and object-store bans.
+
+### Test binary consolidation
+
+The gate exhausted host memory: about 160 test binaries, each statically
+linking the full dependency cone with full debug info, linked up to 32 at once
+at about 2 GB each. The dev profile now emits `line-tables-only` debug info for
+every crate (file:line backtraces remain). Nine crates (`wyrd-server`,
+`skald-agent`, `vala-sql`, `wyrd-sql`, `wyrd-sdk-rust`, `wyrd-client`,
+`skald-runtime`, `vala-eval`, `wyrd-storage`) folded 83 `tests/*.rs` targets
+into one `tests/integration/main.rs` each; former `required-features` became
+`#[cfg(feature = ...)]` module gates, and lanes select a former target with
+`--test integration -E 'test(/^<module>::/)'`. Historical review evidence keeps
+the old target names it ran.
+
 ## Specification Revision 51
 
 Approved and folded into the spec under "Direct execution, telemetry, and

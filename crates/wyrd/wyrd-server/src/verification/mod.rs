@@ -108,20 +108,20 @@ impl Default for RuntimeLimits {
         Self {
             operator_global_permits: 16,
             operator_tenant_permits: 4,
-            lease: Duration::from_secs(600),
-            execution_timeout: Duration::from_secs(300),
+            lease: Duration::from_mins(10),
+            execution_timeout: Duration::from_mins(5),
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),
             trace_poll: Duration::from_secs(5),
-            trace_deadline: Duration::from_secs(300),
+            trace_deadline: Duration::from_mins(5),
             operator_attempts: 3,
-            operator_deadline: Duration::from_secs(300),
+            operator_deadline: Duration::from_mins(5),
             operator_lease: Duration::from_secs(45),
             operator_attempt_timeout: Duration::from_secs(30),
-            operator_backoff: [Duration::from_secs(30), Duration::from_secs(120)],
-            rewrap_interval: Duration::from_secs(300),
-            rewrap_pass_budget: Duration::from_secs(120),
+            operator_backoff: [Duration::from_secs(30), Duration::from_mins(2)],
+            rewrap_interval: Duration::from_mins(5),
+            rewrap_pass_budget: Duration::from_mins(2),
             rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
@@ -528,13 +528,13 @@ mod tests {
         assert_eq!(limits.drain_grace, Duration::from_secs(30));
         assert_eq!(limits.operator_attempts, 3);
         assert_eq!(limits.operator_attempt_timeout, Duration::from_secs(30));
-        assert_eq!(limits.operator_deadline, Duration::from_secs(300));
+        assert_eq!(limits.operator_deadline, Duration::from_mins(5));
         assert_eq!(
             [1, 2, 3].map(|attempt| limits.operator_backoff(attempt)),
             [
                 Duration::from_secs(30),
-                Duration::from_secs(120),
-                Duration::from_secs(120)
+                Duration::from_mins(2),
+                Duration::from_mins(2)
             ]
         );
         assert!(

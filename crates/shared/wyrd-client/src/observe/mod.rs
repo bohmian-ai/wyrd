@@ -44,6 +44,10 @@ const DATASETS_PREFIX: &str = "vala.datasets.";
 /// Cloning a run is cloning its view: the `run_id` and the state-owned Bifrost
 /// writer are shared, the subject is not.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "`run_id` is the wire name of the invocation identity"
+)]
 pub struct Run {
     /// The hydrated graph and the one Bifrost lifetime this run emits through.
     state: WyrdState,

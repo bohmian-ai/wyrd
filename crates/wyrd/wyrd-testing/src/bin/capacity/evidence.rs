@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive;
 use serde::Serialize;
 use sqlx::PgPool;
 use wyrd_testing::release_server::Metrics;
@@ -37,7 +38,8 @@ impl Percentiles {
             if sorted.is_empty() {
                 return None;
             }
-            let index = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1;
+            let rank = (q * sorted.len() as f64).ceil().to_usize().unwrap_or(0);
+            let index = rank.clamp(1, sorted.len()) - 1;
             Some(sorted[index] as f64 * scale)
         };
         Self {
@@ -100,7 +102,9 @@ fn scribe_backlog(scrapes: &[Metrics]) -> u64 {
                 + metrics.sum("bifrost_scribe_staging_live_members", &[])
         })
         .sum::<f64>()
-        .max(0.0) as u64
+        .max(0.0)
+        .to_u64()
+        .unwrap_or(u64::MAX)
 }
 
 /// The generic outbox gauge each replica exports for items it still owns
@@ -199,7 +203,9 @@ impl Backlog {
             .iter()
             .map(|metrics| metrics.sum(AUDIT_PENDING, &[AUDIT_OUTBOX]))
             .sum::<f64>()
-            .max(0.0) as u64;
+            .max(0.0)
+            .to_u64()
+            .unwrap_or(u64::MAX);
         Self {
             scribe: scribe_backlog(scrapes),
             audit: self.audit + pending,
@@ -219,18 +225,18 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Connects as the database owner the Postgres wrapper exports.
+    /// Connects as the database owner at `owner_url`.
     ///
     /// # Errors
     ///
-    /// Returns the missing variable or connection failure.
+    /// Returns the connection failure.
     ///
     /// # Cancellation
     ///
     /// Read-only; a dropped connect leaves nothing behind.
-    pub async fn connect() -> Result<Self> {
+    pub async fn connect(owner_url: &str) -> Result<Self> {
         Ok(Self {
-            owner: PgPool::connect(&std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")?).await?,
+            owner: PgPool::connect(owner_url).await?,
         })
     }
 
@@ -420,7 +426,7 @@ mod tests {
         };
         let combined = durable.with_replicas(&[scrape(2), scrape(0)]);
         assert_eq!((combined.audit, combined.scribe), (5, 2));
-        assert!(Backlog::default().with_replicas(&[scrape(0)]).audit == 0);
+        assert_eq!(Backlog::default().with_replicas(&[scrape(0)]).audit, 0);
     }
 
     /// One staged live member keeps Scribe's backlog nonzero while the
@@ -498,7 +504,7 @@ mod pg_tests {
     use crate::Result;
 
     /// How long the held-commit proof waits for any one server move.
-    const WAIT: Duration = Duration::from_secs(60);
+    const WAIT: Duration = Duration::from_mins(1);
 
     /// The backlog a drain poll at `stopped` reads through
     /// [`Queue::poll`], with the replica's `/metrics` snapshot as its only
@@ -597,12 +603,18 @@ mod pg_tests {
     /// still owns a decision, or stays nonzero after publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "starts an in-process server; needs the repository Postgres wrapper and migrations"]
+    #[expect(
+        clippy::float_cmp,
+        reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+    )]
     async fn the_audit_backlog_holds_from_a_pending_decision_until_its_publication() -> Result<()> {
         let metrics = wyrd_server::app::metrics::install_recorder()?;
-        let server = WyrdTestServer::builder()
-            .without_audit_publication_for_test()
-            .start_bound()
-            .await?;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .without_audit_publication_for_test()
+                .start_bound(),
+        )
+        .await?;
         let tenant = server.data_tenant_id();
         let table = format!("capacity_audit_{}", uuid::Uuid::now_v7().simple());
         server
@@ -638,7 +650,7 @@ mod pg_tests {
         // The in-process server owns its own fixture database; the queue
         // reads it as that database's owner, as the benchmark reads its own.
         let queue = Queue {
-            owner: server.pg_fixture().superuser_pool().await?,
+            owner: server.pg_fixture().superuser_pool()?,
         };
         let publisher =
             AuditPublisher::from_state(server.state()).ok_or("the server owns a local Scribe")?;

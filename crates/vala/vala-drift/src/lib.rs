@@ -65,30 +65,17 @@ mod smoke {
         let _ = std::any::type_name::<FittedBaseline>();
         let _ = std::any::type_name::<DriftFitError>();
         let _ = std::any::type_name::<DriftScoreError>();
-        let _fit: fn(
-            &RecordBatch,
-            &PsiProfile,
-            &[FeatureName],
-        ) -> Result<PsiBaseline, DriftFitError> = fit_psi_baseline;
-        let _score: fn(
-            &PsiBaseline,
-            &RecordBatch,
-            &PsiProfile,
-        ) -> Result<DriftReport, DriftScoreError> = score_psi;
-        let _fit_spc: fn(
-            &RecordBatch,
-            &SpcProfile,
-            &[FeatureName],
-        ) -> Result<SpcBaseline, DriftFitError> = fit_spc_baseline;
-        let _score_spc: fn(&SpcBaseline, &RecordBatch) -> Result<DriftReport, DriftScoreError> =
-            score_spc;
-        let _score_custom_fn: fn(
-            &RecordBatch,
-            &CustomProfile,
-        ) -> Result<DriftReport, DriftScoreError> = score_custom;
-        let _fit_dispatch: fn(&RecordBatch, &DriftSpec) -> Result<FittedBaseline, DriftFitError> =
-            fit_baseline;
-        let _score_dispatch: fn(
+        let _: fn(&RecordBatch, &PsiProfile, &[FeatureName]) -> Result<PsiBaseline, DriftFitError> =
+            fit_psi_baseline;
+        let _: fn(&PsiBaseline, &RecordBatch, &PsiProfile) -> Result<DriftReport, DriftScoreError> =
+            score_psi;
+        let _: fn(&RecordBatch, &SpcProfile, &[FeatureName]) -> Result<SpcBaseline, DriftFitError> =
+            fit_spc_baseline;
+        let _: fn(&SpcBaseline, &RecordBatch) -> Result<DriftReport, DriftScoreError> = score_spc;
+        let _: fn(&RecordBatch, &CustomProfile) -> Result<DriftReport, DriftScoreError> =
+            score_custom;
+        let _: fn(&RecordBatch, &DriftSpec) -> Result<FittedBaseline, DriftFitError> = fit_baseline;
+        let _: fn(
             &FittedBaseline,
             &RecordBatch,
             &DriftSpec,

@@ -6,8 +6,7 @@
 //   node brand/gen-theme.mjs           regenerate every target
 //   node brand/gen-theme.mjs --check   exit non-zero if any target is stale
 //
-// The .claude/skills copy is a byte mirror of .agents/skills owned by
-// `mise run skills:sync`; run it after regenerating.
+// .claude/skills is a symlink to .agents/skills, so it needs no copy.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';

@@ -256,13 +256,13 @@ mod pg_tests {
                 root: root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(600),
+            presign_ttl: Duration::from_mins(10),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
         })
         .await
         .expect("local storage handle");
-        let pool = crate::test_support::test_pool().await;
+        let pool = crate::test_support::test_pool();
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
         let vala = vala_sql::ValaPostgres::from_pool(pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
@@ -273,8 +273,8 @@ mod pg_tests {
         )
     }
 
-    async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
-        let tenant = crate::test_support::test_tenant().await;
+    fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = crate::test_support::test_tenant();
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -378,7 +378,7 @@ mod pg_tests {
     fn bifrost_tables_register_is_idempotent() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
             let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
 
@@ -410,8 +410,7 @@ mod pg_tests {
             let caller = caller_with([
                 Permission::bifrost_table_write(),
                 Permission::bifrost_table_read(),
-            ])
-            .await;
+            ]);
             let name = unique_name();
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             let target = 256 * 1024 * 1024;
@@ -501,7 +500,7 @@ mod pg_tests {
     fn bifrost_tables_register_pre_commit_failure_records_one_verdict() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             req.physical_layout = Some(PhysicalLayoutWire {
@@ -534,8 +533,8 @@ mod pg_tests {
     fn bifrost_tables_concurrent_same_fqn_register_records_each_verdict() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let first_caller = caller_with([Permission::bifrost_table_write()]).await;
-            let second_caller = caller_with([Permission::bifrost_table_write()]).await;
+            let first_caller = caller_with([Permission::bifrost_table_write()]);
+            let second_caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
             let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
 
@@ -562,7 +561,7 @@ mod pg_tests {
     fn bifrost_tables_register_conflicting_schema_returns_mismatch() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
 
             register_table(
@@ -589,7 +588,7 @@ mod pg_tests {
     fn bifrost_tables_register_requires_write_permission() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([]).await;
+            let caller = caller_with([]);
             let err = register_table(
                 &state,
                 caller,
@@ -605,7 +604,7 @@ mod pg_tests {
     fn bifrost_tables_register_reserved_namespace_is_rejected() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let writer = caller_with([Permission::bifrost_table_write()]).await;
+            let writer = caller_with([Permission::bifrost_table_write()]);
             let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
             denied.namespace = "vala.traces".to_owned();
             let err = register_table(&state, writer, denied)
@@ -622,8 +621,7 @@ mod pg_tests {
             let caller = caller_with([
                 Permission::bifrost_table_write(),
                 Permission::bifrost_table_read(),
-            ])
-            .await;
+            ]);
             let name = unique_name();
 
             register_table(
@@ -690,7 +688,7 @@ mod pg_tests {
     fn bifrost_tables_list_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([]).await;
+            let caller = caller_with([]);
             let err = list_tables(&state, caller.clone())
                 .await
                 .expect_err("no read permission is denied");
@@ -707,7 +705,7 @@ mod pg_tests {
     fn bifrost_tables_describe_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-            let caller = caller_with([]).await;
+            let caller = caller_with([]);
             let name = unique_name();
             let err = describe_table(
                 &state,

@@ -65,22 +65,17 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::registry::ListCardsRequest;
 
-    use crate::cards::Cards;
+    use wyrd_spec::error::WyrdError;
 
-    /// Credential variables the shared chain consults before the home file.
-    const CREDENTIAL_VARS: [&str; 4] = [
-        "WYRD_ACCESS_TOKEN",
-        "WYRD_WORKLOAD_TOKEN",
-        "WYRD_TENANT",
-        "WYRD_API_KEY",
-    ];
+    use crate::cards::{Cards, config};
+    use crate::environment::Environment;
 
     /// Public `Cards` construction and operations report shared client failures
     /// with the same `WYRD_CLIENT_*` code and status as `Bifrost`.
     ///
-    /// The credential chain is emptied under the crate env lock with `HOME`
-    /// redirected to an empty directory, so only the explicit arguments decide
-    /// each outcome.
+    /// Construction reads an environment naming only an empty home directory,
+    /// so no credential tier or saved login exists and only the explicit
+    /// arguments decide each outcome.
     ///
     /// # Panics
     ///
@@ -88,35 +83,26 @@ mod tests {
     #[tokio::test]
     async fn cards_client_failures_keep_client_catalog_identity() {
         let home = tempfile::tempdir().expect("temporary home is created");
-        let env = crate::ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            for name in CREDENTIAL_VARS {
-                std::env::remove_var(name);
-            }
-            std::env::set_var("HOME", home.path());
-        }
+        let environment = Environment::from([("HOME", home.path().to_str().expect("utf-8 path"))]);
+        let cards_in = |server_url: Option<&str>, credential: Option<&str>| {
+            config::load(
+                environment.clone(),
+                server_url,
+                credential.map(SecretString::from),
+                None,
+            )
+            .map(Cards::with_client)
+            .map_err(WyrdError::from)
+        };
 
-        let missing = Cards::new(Some("http://127.0.0.1:1"), None, None)
+        let missing = cards_in(Some("http://127.0.0.1:1"), None)
             .err()
             .expect("an empty credential chain is refused");
-        let invalid = Cards::new(Some(""), Some(SecretString::from("wyrd_sk_t_v_s")), None)
+        let invalid = cards_in(Some(""), Some("wyrd_sk_t_v_s"))
             .err()
             .expect("an empty explicit server URL is refused");
-        let cards = Cards::new(
-            Some("http://127.0.0.1:1"),
-            Some(SecretString::from("wyrd_sk_t_v_s")),
-            None,
-        )
-        .expect("a complete offline configuration constructs without network");
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-
-        drop(env);
+        let cards = cards_in(Some("http://127.0.0.1:1"), Some("wyrd_sk_t_v_s"))
+            .expect("a complete offline configuration constructs without network");
         let down = cards
             .list(ListCardsRequest {
                 kind: Some(CardKind::Prompt),

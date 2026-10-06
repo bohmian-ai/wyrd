@@ -57,7 +57,7 @@ pub const CPUS: u64 = 8;
 pub const MEMORY_BYTES: u64 = 16 << 30;
 
 /// How long the server may take to report ready on `/readyz`.
-const READY_TIMEOUT: Duration = Duration::from_secs(120);
+const READY_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// How long the server may take to exit after `SIGTERM`: the kind pods'
 /// `terminationGracePeriodSeconds`, 10 s beyond the server's default 35 s
@@ -128,7 +128,8 @@ pub struct LocalServer {
 }
 
 impl LocalServer {
-    /// Migrates and serves `binary` with `env` added, then runs `setup` once
+    /// Migrates `binary` as the database owner at `owner_url` and serves it
+    /// with `env` added, then runs `setup` once
     /// per slug in `tenants`, returning once `/readyz` answers 200, the
     /// cgroup enforces the envelope, and every tenant's credential was
     /// printed.
@@ -139,8 +140,7 @@ impl LocalServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when `WYRD_TEST_DATABASE_ADMIN_URL` is unset (the
-    /// benchmark is not running under the Postgres wrapper), `migrate` or a
+    /// Returns an error when `migrate` or a
     /// `setup` fails or prints no credential, the server exits or never
     /// becomes ready, or its cgroup does not enforce the
     /// [`CPUS`]/[`MEMORY_BYTES`] envelope.
@@ -154,9 +154,12 @@ impl LocalServer {
     /// and reaped with its working directory, `server.log`, and each
     /// `setup`'s stderr file kept. Rows `migrate` and the finished `setup`s
     /// wrote stay in the database; a retry starts from a fresh database.
-    pub async fn start(binary: &Path, tenants: &[&str], env: &[(&str, &str)]) -> Result<Self> {
-        let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
-            .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;
+    pub async fn start(
+        binary: &Path,
+        owner_url: &str,
+        tenants: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
         let storage = root.path().join("storage");
         std::fs::create_dir_all(&storage)?;
@@ -742,6 +745,10 @@ mod tests {
     ///
     /// Panics when the sum includes the wrong series.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+    )]
     fn metrics_sum_selects_family_and_labels() {
         let metrics = Metrics::parse(
             "# HELP x\noracle_queries_queued{class=\"a\"} 3\noracle_queries_queued{class=\"b\"} 4\n\

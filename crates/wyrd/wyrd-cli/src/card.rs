@@ -244,7 +244,7 @@ struct DeleteOutput {
 /// # Errors
 /// Returns `WyrdCliError::CardLoad` when loading or local registration-input
 /// construction fails, or an output error when JSON serialization fails.
-pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
+pub fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
     let tree = match load(&args.path) {
         Ok(tree) => tree,
         Err(error) => {

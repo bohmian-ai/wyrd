@@ -213,7 +213,7 @@ pub async fn insert_initiating(
     let wire_protocol = row.wire_protocol.to_string();
 
     let result = sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.storage_multipart_uploads (
             id,
             data_tenant_id,
@@ -248,7 +248,7 @@ pub async fn insert_initiating(
             'initiating',
             now() + ($13::text || ' seconds')::interval
         )
-        "#,
+        ",
     )
     .bind(row.id)
     .bind(row.card_uid)
@@ -280,13 +280,13 @@ pub async fn mark_pending(
     backend_upload_id: Option<&str>,
 ) -> Result<(), SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'pending',
             backend_upload_id = $2
         WHERE id = $1
           AND status = 'initiating'
-        "#,
+        ",
     )
     .bind(id)
     .bind(backend_upload_id)
@@ -306,7 +306,7 @@ pub async fn find_by_id(
     id: Uuid,
 ) -> Result<Option<MultipartUploadRow>, SqlError> {
     let row = sqlx::query_as::<_, MultipartUploadRowDb>(
-        r#"
+        r"
         SELECT
             id,
             data_tenant_id,
@@ -330,7 +330,7 @@ pub async fn find_by_id(
             expires_at
         FROM wyrd.storage_multipart_uploads
         WHERE id = $1
-        "#,
+        ",
     )
     .bind(id)
     .fetch_optional(&mut **conn.transaction())
@@ -346,7 +346,7 @@ pub async fn find_open_for_card(
     card_uid: &str,
 ) -> Result<Vec<MultipartUploadRow>, SqlError> {
     let rows = sqlx::query_as::<_, MultipartUploadRowDb>(
-        r#"
+        r"
         SELECT
             id,
             data_tenant_id,
@@ -372,7 +372,7 @@ pub async fn find_open_for_card(
         WHERE card_uid = $1
           AND status IN ('initiating', 'pending')
         ORDER BY created_at
-        "#,
+        ",
     )
     .bind(card_uid)
     .fetch_all(&mut **conn.transaction())
@@ -393,7 +393,7 @@ pub async fn find_pending_for_dedupe(
     expected_sha256: &str,
 ) -> Result<Option<MultipartUploadRow>, SqlError> {
     let row = sqlx::query_as::<_, MultipartUploadRowDb>(
-        r#"
+        r"
         SELECT
             id,
             data_tenant_id,
@@ -421,7 +421,7 @@ pub async fn find_pending_for_dedupe(
           AND expected_sha256 = $3
           AND status = 'pending'
         FOR UPDATE
-        "#,
+        ",
     )
     .bind(card_uid)
     .bind(relative_path)
@@ -445,13 +445,13 @@ pub async fn find_pending_for_dedupe(
 /// initiating, aborted, or failed.
 pub async fn mark_completed(conn: &mut TenantConn<'_>, id: Uuid) -> Result<(), SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'completed',
             completed_at = COALESCE(completed_at, now())
         WHERE id = $1
           AND status IN ('pending', 'completed')
-        "#,
+        ",
     )
     .bind(id)
     .execute(&mut **conn.transaction())
@@ -471,13 +471,13 @@ pub async fn mark_completed_if_pending(
     id: Uuid,
 ) -> Result<(), SqlError> {
     sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'completed',
             completed_at = now()
         WHERE id = $1
           AND status = 'pending'
-        "#,
+        ",
     )
     .bind(id)
     .execute(&mut **conn.transaction())
@@ -499,14 +499,14 @@ pub async fn mark_aborted(
     reason: Option<&str>,
 ) -> Result<(), SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
             terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('initiating', 'pending')
-        "#,
+        ",
     )
     .bind(id)
     .bind(reason)
@@ -535,14 +535,14 @@ pub async fn mark_aborted_if_open(
     reason: &str,
 ) -> Result<u64, SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'aborted',
             terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('pending', 'initiating')
-        "#,
+        ",
     )
     .bind(id)
     .bind(reason)
@@ -563,14 +563,14 @@ pub async fn mark_failed(
     reason: &str,
 ) -> Result<(), SqlError> {
     sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'failed',
             terminal_at = now(),
             failure_reason = $2
         WHERE id = $1
           AND status IN ('initiating', 'pending')
-        "#,
+        ",
     )
     .bind(id)
     .bind(reason)

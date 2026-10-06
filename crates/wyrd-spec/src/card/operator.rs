@@ -461,6 +461,10 @@ impl VerifierCounts {
     ///
     /// Derives `failed_tasks` and a pass rate rounded down, so a partial pass
     /// never reads `100`. `passed` above `total` is clamped to `total`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a percentage of at most 100 does not fit `u32`, which cannot happen.
     #[must_use]
     pub fn eval(passed: u32, total: u32) -> Self {
         let passed = passed.min(total);

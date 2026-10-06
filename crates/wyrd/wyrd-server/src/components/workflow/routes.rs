@@ -119,9 +119,7 @@ async fn get_workflow_run_http(
     caller: Caller,
     Path(run_id): Path<String>,
 ) -> Result<Json<WorkflowRun>, WyrdErrorResponse> {
-    Ok(Json(
-        WorkflowRunHost::new(state).get(&caller, &run_id).await?,
-    ))
+    Ok(Json(WorkflowRunHost::new(state).get(&caller, &run_id)?))
 }
 
 /// Cancel one of the caller's Workflow runs and return its terminal snapshot.

@@ -65,8 +65,10 @@ impl TaskOutput {
     #[must_use]
     pub fn result(&self) -> &AssertionResult {
         match self {
-            Self::Assertion(result) | Self::Trace(result) | Self::Agent(result) => result,
-            Self::Judge { result, .. } => result,
+            Self::Assertion(result)
+            | Self::Trace(result)
+            | Self::Agent(result)
+            | Self::Judge { result, .. } => result,
         }
     }
 }
@@ -135,7 +137,7 @@ impl ContextSnapshot {
     {
         let prior = self.task_outputs.as_ref();
         let mut next = HashMap::with_capacity(prior.len() + 8);
-        for (id, output) in prior.iter() {
+        for (id, output) in prior {
             next.insert(id.clone(), Arc::clone(output));
         }
         for (id, output) in fresh {

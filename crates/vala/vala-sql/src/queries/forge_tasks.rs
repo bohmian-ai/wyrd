@@ -519,7 +519,7 @@ impl ForgeTasks {
         task.estimates.validate()?;
         let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
         let task_id = Uuid::now_v7();
-        sqlx::query_scalar(r#"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',COALESCE($12::timestamptz,statement_timestamp())) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO UPDATE SET updated_at=vala.forge_tasks.updated_at RETURNING task_id"#)
+        sqlx::query_scalar(r"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',COALESCE($12::timestamptz,statement_timestamp())) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO UPDATE SET updated_at=vala.forge_tasks.updated_at RETURNING task_id")
             .bind(task_id).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(task.ready_at).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)
     }
 
@@ -1054,6 +1054,10 @@ impl ForgeTasks {
     /// # Cancellation
     /// Caller-owned rollback removes the cancellation and successor demand
     /// together.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a claimed task row lacks its attempt id, which the claim check rules out.
     pub async fn cancel_superseded(
         &self,
         conn: &mut TenantConn<'_>,
@@ -1149,7 +1153,7 @@ impl ForgeTasks {
                     value.validate().map_err(|_| SqlError::InvariantViolation {
                         detail: "invalid persisted Forge watermark timestamp".to_owned(),
                     })?;
-                    values.push(value)
+                    values.push(value);
                 }
                 _ => {
                     return Err(SqlError::InvariantViolation {

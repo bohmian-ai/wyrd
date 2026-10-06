@@ -41,26 +41,5 @@ wyrd-semver = { workspace = true }
 wyrd-sql = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 
-[[test]]
-name = "pg_audit_staging"
-
-[[test]]
-name = "pg_audit_outbox"
-
-[[test]]
-name = "pg_forge_operations"
-
-[[test]]
-name = "pg_forge_tasks"
-
-[[test]]
-name = "pg_forge_file_list"
-
-[[test]]
-name = "pg_migration"
-
-[[test]]
-name = "pg_oracle_membership"
-
-[[test]]
-name = "pg_schema_usage"
+[lints]
+workspace = true

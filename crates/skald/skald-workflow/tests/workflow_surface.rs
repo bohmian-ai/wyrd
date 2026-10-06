@@ -1,6 +1,7 @@
 use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
 use skald_workflow::{AgentResolver, Workflow, WorkflowBinding};
+use std::collections::BTreeMap;
 use wyrd_spec::AgentSpec;
 use wyrd_spec::card::workflow::{WorkflowAction, WorkflowCard, WorkflowSpec, WorkflowStep};
 use wyrd_spec::envelope::CardKind;
@@ -63,7 +64,9 @@ fn workflow_sequential_chains_named_agents_with_card_ref_cascade() {
     for step in &wf.spec().steps {
         match &step.action {
             WorkflowAction::Agent(InlineableRef::Ref(_)) => {}
-            other => panic!("expected Agent::Card variant, got {other:?}"),
+            other @ WorkflowAction::Agent(_) => {
+                panic!("expected Agent::Card variant, got {other:?}")
+            }
         }
     }
 }
@@ -76,7 +79,9 @@ fn workflow_sequential_anonymous_agents_get_inline_action() {
     for step in &wf.spec().steps {
         match &step.action {
             WorkflowAction::Agent(InlineableRef::Inline(_)) => {}
-            other => panic!("expected Agent::Inline variant, got {other:?}"),
+            other @ WorkflowAction::Agent(_) => {
+                panic!("expected Agent::Inline variant, got {other:?}")
+            }
         }
     }
 }
@@ -150,13 +155,13 @@ fn workflow_hydrates_sibling_agent_with_explicit_resolver() {
                 action: WorkflowAction::Agent(InlineableRef::Sibling {
                     sibling: agent_ref.clone(),
                 }),
-                inputs: Default::default(),
+                inputs: BTreeMap::default(),
                 depends_on: Vec::new(),
                 llm_route: None,
                 fallback: None,
                 timeout_seconds: None,
                 retry: None,
-                display: Default::default(),
+                display: BTreeMap::default(),
             }],
             outputs: [(
                 "report".to_owned(),

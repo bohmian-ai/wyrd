@@ -241,8 +241,6 @@ impl PyAnthropicSystemBlock {
 #[derive(Clone)]
 enum AnthropicCacheControlPath {
     SystemBlock(usize),
-    #[allow(dead_code)]
-    Tool(usize),
 }
 
 #[pyclass(module = "wyrd.prompt", name = "AnthropicCacheControl")]
@@ -267,10 +265,6 @@ impl PyAnthropicCacheControl {
                     AnthropicSystem::Text(_) => unreachable!(),
                 }
             }
-            AnthropicCacheControlPath::Tool(i) => req.tools.as_ref().expect("guarded")[*i]
-                .cache_control
-                .as_ref()
-                .expect("guarded"),
         }
     }
 }

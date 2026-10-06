@@ -117,7 +117,10 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
     let submitted: Vec<SubmittedBatch> = (0..CONCURRENT_BATCHES)
         .map(|ordinal| {
             let values = (0..ROWS_PER_BATCH)
-                .map(|row| (ordinal * ROWS_PER_BATCH + row) as i64)
+                .map(|row| {
+                    i64::try_from(ordinal * ROWS_PER_BATCH + row)
+                        .expect("test row ordinals fit i64")
+                })
                 .collect::<Vec<_>>();
             (ordinal % PODS, uuid::Uuid::now_v7(), values)
         })
@@ -201,7 +204,7 @@ async fn one_sealed_batch_submitted_to_every_pod_is_visible_once() {
     let clients = endpoint_clients(&cluster, tenant).await;
 
     let batch_id = uuid::Uuid::now_v7();
-    let values: Vec<i64> = (0..ROWS_PER_BATCH as i64).collect();
+    let values: Vec<i64> = (0..).take(ROWS_PER_BATCH).collect();
 
     let barrier = Arc::new(tokio::sync::Barrier::new(PODS));
     let mut appends = tokio::task::JoinSet::new();
@@ -295,7 +298,7 @@ async fn dynamic_tenant_tables_ingest_without_topology_growth() {
                 let base = ((tenant_ordinal * TABLES_PER_TENANT + table_ordinal) * PODS + pod)
                     * ROWS_PER_BATCH;
                 let values = (0..ROWS_PER_BATCH)
-                    .map(|row| (base + row) as i64)
+                    .map(|row| i64::try_from(base + row).expect("test row ordinals fit i64"))
                     .collect::<Vec<_>>();
                 submitted
                     .entry((tenant_ordinal, table_ordinal))

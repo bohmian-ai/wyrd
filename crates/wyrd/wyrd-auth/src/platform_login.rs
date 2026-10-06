@@ -507,7 +507,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when the superuser read fails.
     async fn login_states(fixture: &PgFixture) -> i64 {
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query_scalar("SELECT count(*) FROM platform.login_state")
             .fetch_one(&admin)
             .await

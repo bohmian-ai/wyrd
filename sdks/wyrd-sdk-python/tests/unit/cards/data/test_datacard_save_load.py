@@ -99,8 +99,6 @@ def _text_dir(path: Path) -> Path:
     return path
 
 
-@pytest.mark.wyrd_covers("python:DataCard.save")
-@pytest.mark.wyrd_covers("python:DataCard.load")
 def test_pandas_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
     data = pd.DataFrame({"x": [1, 2]})
     path = tmp_path / "pandas-raw"

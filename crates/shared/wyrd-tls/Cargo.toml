@@ -9,3 +9,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+
+[lints]
+workspace = true

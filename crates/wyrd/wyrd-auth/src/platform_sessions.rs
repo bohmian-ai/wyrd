@@ -518,7 +518,7 @@ mod pg_tests {
         fixture: &PgFixture,
         principal: Uuid,
     ) -> Vec<(String, Option<Uuid>)> {
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query_as::<_, (String, Option<Uuid>)>(
             "SELECT principal_kind, credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
@@ -628,7 +628,7 @@ mod pg_tests {
         let principal = seed_principal(&fixture, "audit-refused").await;
         let secret = issue_credential(&fixture, principal).await;
 
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
             .execute(&admin)
             .await

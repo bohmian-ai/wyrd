@@ -77,9 +77,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    let result = if !config.role.serves_api() {
-        run_forge_worker_process(&config, state, metrics_handle).await
-    } else {
+    let result = if config.role.serves_api() {
         state.bifrost.node_id().ok_or_else(|| {
             BootExit::Other("configured Bifrost node identity is unavailable".into())
         })?;
@@ -87,6 +85,8 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
             .map_err(|e| BootExit::Other(Box::new(e)))?
             .serve(mode)
             .await
+    } else {
+        run_forge_worker_process(&config, state, metrics_handle).await
     };
 
     drop(compaction_runtime); // release Forge compaction threads after supervision drains
@@ -219,7 +219,7 @@ mod tests {
             .find("compaction_runtime,\n    } = build_state(")
             .expect("run binds the compaction runtime out of BootedServer");
         let serve = production
-            .find("let result = if !config.role.serves_api()")
+            .find("let result = if config.role.serves_api()")
             .expect("run serves after binding its runtimes");
         let release = production
             .find("drop(compaction_runtime);")

@@ -39,9 +39,7 @@ impl RequestId {
 }
 
 fn is_uuid7(value: &str) -> bool {
-    uuid::Uuid::parse_str(value)
-        .map(|uuid| uuid.get_version_num() == 7)
-        .unwrap_or(false)
+    uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version_num() == 7)
 }
 
 impl fmt::Display for RequestId {

@@ -1339,7 +1339,7 @@ async fn gateway_body_rejections_render_wyrd_problems() {
 /// Panics when `pg_locks` cannot be read or the barrier is not reached
 /// within ten seconds.
 pub(super) async fn await_lock_waiters(fixture: &PgFixture, waiters: i64) {
-    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let superuser = fixture.superuser_pool().expect("superuser pool");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let blocked: i64 = sqlx::query_scalar(

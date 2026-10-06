@@ -7009,7 +7009,7 @@ mod tests {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
-        let superuser = database.superuser_pool().await.expect("superuser pool");
+        let superuser = database.superuser_pool().expect("superuser pool");
         let postgres = Arc::new(database.vala_postgres().clone());
         let key = SealKey::new(
             database.data_tenant_id(),

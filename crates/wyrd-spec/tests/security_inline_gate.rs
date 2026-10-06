@@ -4,7 +4,7 @@
 //! `test-utils` feature is off: the shape of every production build and the
 //! shape of the committed JSON Schema goldens.
 //!
-//! `check:security-inline-gate` runs this test with
+//! `check:deps` runs this test with
 //! `--no-default-features --features server`.
 
 use wyrd_spec::security::SecretRef;
@@ -26,6 +26,6 @@ fn inline_source_rejected_when_test_utils_off() {
 #[cfg(feature = "test-utils")]
 fn inline_source_gate_skipped_when_test_utils_on() {
     // No-op in `--all-features` runs. The gate is meaningful only in the
-    // `check:security-inline-gate` invocation.
+    // `check:deps` invocation.
     let _ = std::any::type_name::<SecretRef>();
 }

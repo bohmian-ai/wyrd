@@ -75,12 +75,11 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                     // Pin the param types to the first qualifying variant and
                     // only include variants whose `message`/`details` types
                     // match, so the generated constructor always compiles.
-                    let matches = match &from_code_field_types {
-                        Some((m, d)) => types_equal(m, message_ty) && types_equal(d, details_ty),
-                        None => {
-                            from_code_field_types = Some((message_ty.clone(), details_ty.clone()));
-                            true
-                        }
+                    let matches = if let Some((m, d)) = &from_code_field_types {
+                        types_equal(m, message_ty) && types_equal(d, details_ty)
+                    } else {
+                        from_code_field_types = Some((message_ty.clone(), details_ty.clone()));
+                        true
                     };
                     if matches {
                         from_code_arms.push(quote! {

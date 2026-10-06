@@ -819,13 +819,13 @@ fn drift_json_refuses_integer_literals_beyond_64_bits() {
 /// A non-finite float cannot even reach JSON, so it is refused at the door.
 #[test]
 fn drift_refuses_non_finite_floats() {
-    let (_bundle, state) = state_fixture();
     /// A typed Drift input whose only feature is a float the test sets to NaN.
     #[derive(serde::Serialize)]
     struct Features {
         /// The feature under test; holds a non-finite value.
         score: f64,
     }
+    let (_bundle, state) = state_fixture();
     let error = state
         .run()
         .observe()

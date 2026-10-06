@@ -111,13 +111,9 @@ pub fn wyrd_error_response_from_parts(
         &error,
         WyrdError::AuthVerifyUnavailable { .. }
             | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
-            }
-            | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::QueryQueueFull,
-            }
-            | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
+                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
+                    | wyrd_spec::vala::error::BifrostError::QueryQueueFull
+                    | wyrd_spec::vala::error::BifrostError::IngestBusy { .. }
             }
     );
     let mut body = error.as_problem_json();
@@ -726,7 +722,7 @@ mod error_mapper_tests {
     impl std::error::Error for FakeDatabaseError {}
 
     impl sqlx::error::DatabaseError for FakeDatabaseError {
-        fn message(&self) -> &str {
+        fn message(&self) -> &'static str {
             "fake database error"
         }
 

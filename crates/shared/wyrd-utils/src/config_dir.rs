@@ -2,16 +2,26 @@
 
 use std::path::PathBuf;
 
+/// Resolve the Wyrd configuration directory from the process environment.
+///
+/// Delegates to [`wyrd_config_dir_from`] with [`std::env::var`] as the lookup.
+#[must_use]
+pub fn wyrd_config_dir() -> Option<PathBuf> {
+    wyrd_config_dir_from(|name| std::env::var(name).ok())
+}
+
 /// Resolve the Wyrd configuration directory without touching the filesystem.
 ///
 /// Precedence is `$WYRD_CONFIG_HOME`, `$XDG_CONFIG_HOME/wyrd`, and
-/// `$HOME/.config/wyrd`. Empty environment values are treated as unset.
+/// `$HOME/.config/wyrd`. `lookup` returns a variable's value; empty values are
+/// treated as unset. Callers outside tests use [`wyrd_config_dir`].
 #[must_use]
-pub fn wyrd_config_dir() -> Option<PathBuf> {
-    non_empty_env("WYRD_CONFIG_HOME")
+pub fn wyrd_config_dir_from(lookup: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let non_empty = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    non_empty("WYRD_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| non_empty_env("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("wyrd")))
-        .or_else(|| non_empty_env("HOME").map(|path| PathBuf::from(path).join(".config/wyrd")))
+        .or_else(|| non_empty("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("wyrd")))
+        .or_else(|| non_empty("HOME").map(|path| PathBuf::from(path).join(".config/wyrd")))
 }
 
 /// Resolve the Wyrd configuration directory or return a descriptive error.
@@ -33,153 +43,57 @@ pub enum ConfigDirError {
     Unresolvable,
 }
 
-/// Return an environment value only when it is non-empty.
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod tests {
-    use std::ffi::OsString;
-    use std::sync::Mutex;
+    use std::path::{Path, PathBuf};
 
-    use super::{ConfigDirError, wyrd_config_dir, wyrd_config_dir_required};
+    use super::wyrd_config_dir_from;
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    struct EnvironmentGuard {
-        previous: Vec<(String, Option<OsString>)>,
+    /// Resolve the configuration directory from exactly `values`.
+    fn resolve(values: &[(&str, &str)]) -> Option<PathBuf> {
+        wyrd_config_dir_from(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
     }
 
-    impl Drop for EnvironmentGuard {
-        fn drop(&mut self) {
-            unsafe {
-                for (name, value) in self.previous.drain(..) {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Run a configuration-directory assertion with a controlled environment.
-    fn with_env<T>(values: &[(&str, Option<&str>)], test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = values
-            .iter()
-            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
-            .collect::<Vec<(String, Option<OsString>)>>();
-        let _environment = EnvironmentGuard { previous };
-        unsafe {
-            for (name, value) in values {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        test()
-    }
-
+    /// `$WYRD_CONFIG_HOME` wins over every other source.
     #[test]
     fn wyrd_config_home_is_used_verbatim() {
-        let dir = with_env(
-            &[
-                ("WYRD_CONFIG_HOME", Some("/tmp/wyrd-config")),
-                ("XDG_CONFIG_HOME", None),
-                ("HOME", None),
-            ],
-            wyrd_config_dir,
-        );
-        assert_eq!(
-            dir.as_deref(),
-            Some(std::path::Path::new("/tmp/wyrd-config"))
-        );
+        let dir = resolve(&[
+            ("WYRD_CONFIG_HOME", "/tmp/wyrd-config"),
+            ("XDG_CONFIG_HOME", "/tmp/xdg"),
+            ("HOME", "/home/u"),
+        ]);
+        assert_eq!(dir.as_deref(), Some(Path::new("/tmp/wyrd-config")));
     }
 
+    /// `$XDG_CONFIG_HOME` gains a `wyrd` component.
     #[test]
     fn xdg_config_home_adds_wyrd_component() {
-        let dir = with_env(
-            &[
-                ("WYRD_CONFIG_HOME", None),
-                ("XDG_CONFIG_HOME", Some("/tmp/xdg")),
-                ("HOME", None),
-            ],
-            wyrd_config_dir,
-        );
-        assert_eq!(dir.as_deref(), Some(std::path::Path::new("/tmp/xdg/wyrd")));
+        let dir = resolve(&[("XDG_CONFIG_HOME", "/tmp/xdg"), ("HOME", "/home/u")]);
+        assert_eq!(dir.as_deref(), Some(Path::new("/tmp/xdg/wyrd")));
     }
 
+    /// `$HOME` gains the standard `.config/wyrd` components.
     #[test]
     fn home_adds_standard_config_components() {
-        let dir = with_env(
-            &[
-                ("WYRD_CONFIG_HOME", None),
-                ("XDG_CONFIG_HOME", None),
-                ("HOME", Some("/home/u")),
-            ],
-            wyrd_config_dir,
-        );
-        assert_eq!(
-            dir.as_deref(),
-            Some(std::path::Path::new("/home/u/.config/wyrd"))
-        );
+        let dir = resolve(&[("HOME", "/home/u")]);
+        assert_eq!(dir.as_deref(), Some(Path::new("/home/u/.config/wyrd")));
     }
 
+    /// An empty override falls through to the next source.
     #[test]
     fn empty_override_is_skipped() {
-        let dir = with_env(
-            &[
-                ("WYRD_CONFIG_HOME", Some("")),
-                ("XDG_CONFIG_HOME", None),
-                ("HOME", Some("/home/u")),
-            ],
-            wyrd_config_dir,
-        );
-        assert_eq!(
-            dir.as_deref(),
-            Some(std::path::Path::new("/home/u/.config/wyrd"))
-        );
+        let dir = resolve(&[("WYRD_CONFIG_HOME", ""), ("HOME", "/home/u")]);
+        assert_eq!(dir.as_deref(), Some(Path::new("/home/u/.config/wyrd")));
     }
 
+    /// No source resolves to no directory.
     #[test]
-    fn required_resolution_reports_missing_environment() {
-        let result = with_env(
-            &[
-                ("WYRD_CONFIG_HOME", None),
-                ("XDG_CONFIG_HOME", None),
-                ("HOME", None),
-            ],
-            wyrd_config_dir_required,
-        );
-        assert!(matches!(result, Err(ConfigDirError::Unresolvable)));
-    }
-
-    #[test]
-    fn environment_is_restored_after_panic() {
-        let values = [
-            ("WYRD_CONFIG_HOME", Some("/tmp/panic-config")),
-            ("XDG_CONFIG_HOME", Some("/tmp/panic-xdg")),
-            ("HOME", Some("/tmp/panic-home")),
-        ];
-        let previous = values
-            .iter()
-            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
-            .collect::<Vec<_>>();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_env(&values, || panic!("deliberate environment panic"));
-        }));
-        assert!(result.is_err());
-
-        with_env(&[], || {
-            for (name, value) in previous {
-                assert_eq!(std::env::var_os(name), value);
-            }
-        });
+    fn missing_environment_resolves_nothing() {
+        assert_eq!(resolve(&[]), None);
     }
 }

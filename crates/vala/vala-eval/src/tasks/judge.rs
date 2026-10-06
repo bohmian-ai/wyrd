@@ -154,7 +154,7 @@ async fn invoke_with_retries(
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
     let diff = Utc::now().signed_duration_since(start);
-    diff.num_milliseconds().max(0) as u64
+    u64::try_from(diff.num_milliseconds()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -409,9 +409,10 @@ mod llm_judge_executor {
     #[tokio::test]
     async fn context_path_narrows_invoker_input() {
         let mock = MockJudgeInvoker::new([Ok(json!("pass"))]);
-        let mut task = match llm_judge("judge", json!("pass"), ComparisonOperator::Equals, &[], 0) {
-            EvalTask::LlmJudge(task) => task,
-            _ => unreachable!("fixture returns judge"),
+        let EvalTask::LlmJudge(mut task) =
+            llm_judge("judge", json!("pass"), ComparisonOperator::Equals, &[], 0)
+        else {
+            unreachable!("fixture returns judge")
         };
         task.context_path = Some(jp("$.response"));
         let spec = spec_of(vec![EvalTask::LlmJudge(task)]);

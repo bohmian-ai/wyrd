@@ -140,10 +140,7 @@ impl TaskRegistry {
     /// Task ids of every task with the given kind, sorted.
     #[must_use]
     pub fn ids_of_kind(&self, kind: EvalTaskKind) -> &[TaskId] {
-        self.index_by_kind
-            .get(&kind)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.index_by_kind.get(&kind).map_or(&[], Vec::as_slice)
     }
 
     /// Number of registered tasks.

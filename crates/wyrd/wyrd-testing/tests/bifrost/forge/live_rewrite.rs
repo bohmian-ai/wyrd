@@ -29,7 +29,7 @@ const ATTEMPT_BOUND: Duration = Duration::from_secs(15);
 /// retry schedules against the refusing catalog is not released until the last
 /// of them returns, so this bound covers the whole schedule rather than one
 /// catalog call.
-const RELEASE_BOUND: Duration = Duration::from_secs(120);
+const RELEASE_BOUND: Duration = Duration::from_mins(2);
 
 /// How many production scheduler passes one drain phase may take.
 ///
@@ -2275,7 +2275,7 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let occupant = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.forge())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::forge)
         .expect("the embedded pod hosts Forge")
         .occupy_root_for_test();
     let errors_before = observer.returned_errors().len();

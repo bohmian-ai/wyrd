@@ -71,8 +71,7 @@ impl AgentTraceRecord {
         let tool_bytes = self
             .tool_io
             .as_ref()
-            .map(|v| serde_json::to_vec(v).unwrap_or_default().len())
-            .unwrap_or(0);
+            .map_or(0, |v| serde_json::to_vec(v).unwrap_or_default().len());
         if msg_bytes.len() + tool_bytes > MAX_AGENT_TRACE_PAYLOAD_BYTES {
             return err("agent trace payload exceeds MAX_AGENT_TRACE_PAYLOAD_BYTES");
         }

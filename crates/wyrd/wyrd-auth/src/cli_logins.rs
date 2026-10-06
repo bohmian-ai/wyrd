@@ -615,7 +615,7 @@ mod pg_tests {
         )
         .bind(&issuer)
         .bind(binding.connection_id)
-        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .execute(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("connection points at the mock provider");
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
@@ -778,7 +778,7 @@ mod pg_tests {
                 SET created_at = statement_timestamp() - interval '11 minutes',
                     expires_at = statement_timestamp() - interval '1 minute'",
         )
-        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .execute(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("expires the code");
         assert_eq!(
@@ -974,7 +974,7 @@ mod pg_tests {
                           WHERE device_id = $1",
                     )
                     .bind(device_id)
-                    .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+                    .execute(&fixture.superuser_pool().expect("superuser pool"))
                     .await
                     .expect("expires the code");
                     assert_eq!(
@@ -1207,7 +1207,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let (user, tokens) = seed_two_cli_logins(&fixture).await;
 
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         let logouts = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM vala.audit_staging

@@ -180,12 +180,18 @@ impl BatchBuilder {
         }
         // Reserved correlation columns: both nullable Utf8, because a row may
         // legitimately carry no Card reference and no run.
-        columns.push(Arc::new(StringArray::from_iter(
-            self.rows.iter().map(|r| r.card_ref.clone()),
-        )));
-        columns.push(Arc::new(StringArray::from_iter(
-            self.rows.iter().map(|r| r.run_id.clone()),
-        )));
+        columns.push(Arc::new(
+            self.rows
+                .iter()
+                .map(|r| r.card_ref.clone())
+                .collect::<StringArray>(),
+        ));
+        columns.push(Arc::new(
+            self.rows
+                .iter()
+                .map(|r| r.run_id.clone())
+                .collect::<StringArray>(),
+        ));
         columns.push(Arc::new(
             TimestampMicrosecondArray::from_iter_values(self.rows.iter().map(|r| r.event_time))
                 .with_timezone("UTC"),
@@ -323,6 +329,10 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
             nullable,
             Value::as_u64,
         )?)),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a Float32 column declares f32 precision, so JSON numbers narrow to it"
+        )]
         DataType::Float32 => Arc::new(Float32Array::from(collect(name, rows, nullable, |v| {
             v.as_f64().map(|n| n as f32)
         })?)),

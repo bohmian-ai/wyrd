@@ -55,15 +55,15 @@ pub(crate) async fn register(
     input: &RegistrationInput,
     progress: Option<RegistrationProgressSink>,
 ) -> Result<RegistrationReceipt, RegistryEngineError> {
-    emit_phase(&progress, RegistrationPhase::Preparing);
+    emit_phase(progress.as_ref(), RegistrationPhase::Preparing);
     let prepared = build_submission::prepare(input).await?;
     let idempotency_key = idempotency::mint();
-    emit_phase(&progress, RegistrationPhase::Submitting);
+    emit_phase(progress.as_ref(), RegistrationPhase::Submitting);
     let mut response =
         submit::submit_card_registration(&engine.client, &prepared.request, &idempotency_key)
             .await?;
 
-    emit_phase(&progress, RegistrationPhase::Uploading);
+    emit_phase(progress.as_ref(), RegistrationPhase::Uploading);
     upload::upload_artifacts(
         &engine.storage,
         &response,
@@ -73,20 +73,20 @@ pub(crate) async fn register(
     )
     .await?;
 
-    emit_phase(&progress, RegistrationPhase::Completing);
+    emit_phase(progress.as_ref(), RegistrationPhase::Completing);
     match complete::complete_uploaded_cards(&engine.client, &response, &idempotency_key).await {
         Ok(finalized) => response = finalized,
         Err(error) => {
             return Err(error);
         }
     }
-    emit_phase(&progress, RegistrationPhase::Verifying);
+    emit_phase(progress.as_ref(), RegistrationPhase::Verifying);
     ensure_active(&response)?;
     Ok(response.into())
 }
 
 /// Forward one phase event without changing the no-progress registration path.
-fn emit_phase(progress: &Option<RegistrationProgressSink>, phase: RegistrationPhase) {
+fn emit_phase(progress: Option<&RegistrationProgressSink>, phase: RegistrationPhase) {
     if let Some(progress) = progress {
         progress(RegistrationProgressEvent::Phase(phase));
     }

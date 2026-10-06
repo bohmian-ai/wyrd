@@ -276,8 +276,6 @@ pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> St
 }
 
 #[cfg(feature = "python")]
-// justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn wrong_provider(
     expected: &str,
     actual: skald_spec::ProviderName,
@@ -325,10 +323,10 @@ impl Prompt {
     /// Build a vendor-native prompt from provider and message inputs.
     #[new]
     #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
-    // justification: pyo3 #[new] constructor with 12 keyword args must materialize each variant into the appropriate ProviderRequest inline; splitting into per-variant helpers would either lose the shared pre-conversion (messages/model/provider extraction) or trigger tuple returns that erase the type into runtime dispatch.
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn __new__(
         messages: &Bound<'_, PyAny>,
         model: String,
@@ -445,8 +443,10 @@ impl Prompt {
     /// Build an `OpenAI` Chat prompt from native constructor arguments.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, cache=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn openai_chat(
         model: String,
         system: Option<String>,
@@ -481,8 +481,10 @@ impl Prompt {
     /// Build an `OpenAI` Responses prompt from native constructor arguments.
     #[staticmethod]
     #[pyo3(signature = (model, *, instructions=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn openai_responses(
         model: String,
         instructions: Option<String>,
@@ -515,8 +517,10 @@ impl Prompt {
     /// Build an Anthropic Messages prompt from native constructor arguments.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn anthropic(
         model: String,
         system: Option<String>,
@@ -549,8 +553,10 @@ impl Prompt {
     /// Build a Google Gemini `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn gemini(
         model: String,
         system: Option<String>,
@@ -581,8 +587,10 @@ impl Prompt {
     /// Build a Vertex `GenerateContent` prompt from native constructor arguments.
     #[staticmethod]
     #[pyo3(signature = (model, *, system=None, messages=None, response_format=None, output=None, model_settings=None, variables=None, version=None))]
-    // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments"
+    )]
     pub fn vertex(
         model: String,
         system: Option<String>,
@@ -884,8 +892,6 @@ impl Prompt {
     }
 
     /// Return a copy with a media placeholder bound to a provider-native value.
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
     pub fn bind_media(&self, name: &str, media: PyRef<'_, PyMediaRef>) -> WyrdPyResult<Self> {
         Ok(Self::from_native(
             self.inner
@@ -895,8 +901,6 @@ impl Prompt {
     }
 
     /// Bind a media placeholder in place.
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
     pub fn bind_media_mut(&mut self, name: &str, media: PyRef<'_, PyMediaRef>) -> WyrdPyResult<()> {
         Ok(self
             .inner

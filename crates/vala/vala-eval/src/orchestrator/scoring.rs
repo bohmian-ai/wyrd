@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use serde_json::Value;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::eval::{EvalSpec, ScenarioId};
@@ -130,10 +129,12 @@ impl ScenarioScoring {
             .map(|turn| format!("{:?}: {}", turn.role, turn.content))
             .collect();
         let ended_at = cursor.completed_at.unwrap_or_else(Utc::now);
-        let duration_ms = ended_at
-            .signed_duration_since(cursor.started_at)
-            .num_milliseconds()
-            .max(0) as u64;
+        let duration_ms = u64::try_from(
+            ended_at
+                .signed_duration_since(cursor.started_at)
+                .num_milliseconds(),
+        )
+        .unwrap_or(0);
 
         Ok(ScenarioAggregationInput {
             scenario_id: result.scenario_id.clone(),
@@ -245,10 +246,12 @@ impl ScenarioScoring {
             passenger_tasks: Vec::new(),
             conversation_history: Vec::new(),
             started_at,
-            duration_ms: Utc::now()
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64,
+            duration_ms: u64::try_from(
+                Utc::now()
+                    .signed_duration_since(started_at)
+                    .num_milliseconds(),
+            )
+            .unwrap_or(0),
         };
         self.finalize(identity, vec![aggregation])
     }
@@ -294,6 +297,3 @@ fn mechanic_by_subject(
         },
     )]))
 }
-
-#[allow(dead_code)]
-fn _assert_value_is_send_sync(_: &Value) {}

@@ -396,15 +396,21 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "score",
-                Arc::new(Float64Array::from_iter(
-                    features.clone().map(|feature| finite(feature.score)),
-                )),
+                Arc::new(
+                    features
+                        .clone()
+                        .map(|feature| finite(feature.score))
+                        .collect::<Float64Array>(),
+                ),
             ),
             (
                 "threshold",
-                Arc::new(Float64Array::from_iter(
-                    features.clone().map(|feature| finite(feature.threshold)),
-                )),
+                Arc::new(
+                    features
+                        .clone()
+                        .map(|feature| finite(feature.threshold))
+                        .collect::<Float64Array>(),
+                ),
             ),
             (
                 "verdict",
@@ -468,9 +474,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "passed",
-                Arc::new(BooleanArray::from_iter(
-                    items.iter().map(|item| item.passed),
-                )),
+                Arc::new(
+                    items
+                        .iter()
+                        .map(|item| item.passed)
+                        .collect::<BooleanArray>(),
+                ),
             ),
             (
                 "actual",
@@ -487,7 +496,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("message", text(items.iter().map(|item| item.message))),
             (
                 "stage",
-                Arc::new(Int32Array::from_iter(items.iter().map(|item| item.stage))),
+                Arc::new(items.iter().map(|item| item.stage).collect::<Int32Array>()),
             ),
             (
                 "started_at",
@@ -495,9 +504,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "duration_ms",
-                Arc::new(Int64Array::from_iter(
-                    items.iter().map(|item| item.duration_ms),
-                )),
+                Arc::new(
+                    items
+                        .iter()
+                        .map(|item| item.duration_ms)
+                        .collect::<Int64Array>(),
+                ),
             ),
             (
                 "skip_reason",
@@ -722,12 +734,11 @@ fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef 
 /// Build a nullable UTC microsecond timestamp column.
 fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
     Arc::new(
-        TimestampMicrosecondArray::from_iter(
-            values
-                .into_iter()
-                .map(|value| value.map(|at| at.timestamp_micros())),
-        )
-        .with_timezone("UTC"),
+        values
+            .into_iter()
+            .map(|value| value.map(|at| at.timestamp_micros()))
+            .collect::<TimestampMicrosecondArray>()
+            .with_timezone("UTC"),
     )
 }
 

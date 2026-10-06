@@ -90,7 +90,7 @@ fn execute_agent(
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
     let diff = Utc::now().signed_duration_since(start);
-    diff.num_milliseconds().max(0) as u64
+    u64::try_from(diff.num_milliseconds()).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -1618,6 +1618,8 @@ mod tests {
     /// validator is stack-safe.
     #[test]
     fn explicit_workflow_contract() {
+        // Table-driven pure validation failures.
+        type Mutation = fn(&mut WorkflowSpec);
         bound_spec().validate().expect("bound spec is valid");
 
         // Binding grammar.
@@ -1768,8 +1770,6 @@ mod tests {
         assert_eq!(projected.remediation, huge.remediation());
         assert_eq!(projected.details, json!({}));
 
-        // Table-driven pure validation failures.
-        type Mutation = fn(&mut WorkflowSpec);
         let cases: Vec<(&str, Mutation, &str, &str)> = vec![
             (
                 "empty steps",

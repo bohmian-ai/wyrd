@@ -834,6 +834,10 @@ mod results_aggregation {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn aggregation_pass_rates_match_per_level() {
         let task_id = TaskId::new("non_empty").expect("static task id is valid");
         let subject = card_ref("agent_a");
@@ -1038,6 +1042,10 @@ mod results_aggregation {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn empty_run_aggregation_does_not_panic() {
         let output = aggregate_run(input_with(
             vec![],

@@ -299,7 +299,7 @@ pub async fn cancel_running_query(
 }
 
 /// operators.
-pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
+pub(crate) fn arrow_decode_error(error: QueryIpcDecodeError) -> WyrdError {
     WyrdError::Internal {
         message: "failed to decode Oracle Arrow batch".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
@@ -347,8 +347,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the shared fixture tenant cannot be resolved.
-    async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
-        let tenant = crate::test_support::test_tenant().await;
+    fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = crate::test_support::test_tenant();
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -371,8 +371,8 @@ mod tests {
     /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
     async fn state_without_oracle() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -392,7 +392,7 @@ mod tests {
             };
             let allowed = stream_query(
                 state.clone(),
-                caller_with([Permission::bifrost_query_read()]).await,
+                caller_with([Permission::bifrost_query_read()]),
                 request.clone(),
                 None,
             )
@@ -400,7 +400,7 @@ mod tests {
             .expect_err("absent Oracle must fail before stream");
             assert_eq!(allowed.status(), 503);
 
-            let denied = stream_query(state, caller_with([]).await, request, None)
+            let denied = stream_query(state, caller_with([]), request, None)
                 .await
                 .expect_err("under-privileged caller must be denied");
             assert_eq!(

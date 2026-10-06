@@ -659,7 +659,7 @@ mod tests {
             transport: "grpc".to_owned(),
             message: "refused".to_owned(),
         };
-        let _n = WyrdClientError::NoCredentials;
+        let _ = WyrdClientError::NoCredentials;
     }
 
     mod grpc_convergence {

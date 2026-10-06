@@ -1044,7 +1044,7 @@ pub(crate) async fn request_content(
         // persisted and verified; stream through `operator().writer` if
         // captured uploads ever outgrow one call's memory budget.
         let bytes = match &file.content {
-            UploadContent::Bytes(bytes) => bytes.to_vec(),
+            UploadContent::Bytes(bytes) => bytes.clone(),
             UploadContent::Spooled { file: spooled, len } => {
                 let mut reader = tokio::fs::File::from_std(spooled.try_clone()?);
                 reader.seek(std::io::SeekFrom::Start(0)).await?;
@@ -1173,9 +1173,8 @@ impl PayloadObjects {
             let path = object_path(tenant, &reference.digest).ok_or(CaptureDrop::Storage)?;
             match state.storage.get_object(&path).await {
                 Ok(stored) if stored == *bytes => continue,
-                Ok(_) => return Err(CaptureDrop::Storage),
                 Err(StorageError::ObjectNotFound { .. }) => {}
-                Err(_) => return Err(CaptureDrop::Storage),
+                Ok(_) | Err(_) => return Err(CaptureDrop::Storage),
             }
             state
                 .storage

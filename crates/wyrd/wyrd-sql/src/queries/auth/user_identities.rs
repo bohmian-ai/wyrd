@@ -8,22 +8,22 @@ use sqlx::types::Uuid;
 
 use crate::TenantConn;
 
-const UPSERT_USER_IDENTITY_SQL: &str = r#"
+const UPSERT_USER_IDENTITY_SQL: &str = r"
     INSERT INTO wyrd.auth_user_identities (
         data_tenant_id, issuer, subject, user_id
     ) VALUES ($1, $2, $3, $4)
     ON CONFLICT (data_tenant_id, issuer, subject) DO UPDATE
         SET user_id = wyrd.auth_user_identities.user_id
     RETURNING user_id
-"#;
+";
 
-const USER_ID_BY_IDENTITY_SQL: &str = r#"
+const USER_ID_BY_IDENTITY_SQL: &str = r"
     SELECT user_id
       FROM wyrd.auth_user_identities
      WHERE data_tenant_id = wyrd.current_tenant()
        AND issuer = $1
        AND subject = $2
-"#;
+";
 
 /// Insert or retain a federated identity mapping.
 ///

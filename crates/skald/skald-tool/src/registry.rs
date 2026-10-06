@@ -174,9 +174,8 @@ mod registry_tests {
         reg.register(echo_tool("b")).expect("register b");
         reg.register(echo_tool("a")).expect("register a");
 
-        let err = match reg.resolve("c") {
-            Ok(_) => panic!("expected unknown tool error"),
-            Err(err) => err,
+        let Err(err) = reg.resolve("c") else {
+            panic!("expected unknown tool error")
         };
         let code = err.code();
 
@@ -246,9 +245,9 @@ mod registry_tests {
 
     #[test]
     fn test_tool_resolver_trait_is_object_safe() {
+        fn accepts(_: &dyn ToolResolver) {}
         let _boxed: Box<dyn ToolResolver> = Box::new(ToolRegistry::new());
 
-        fn accepts(_: &dyn ToolResolver) {}
         let reg = ToolRegistry::new();
         accepts(&reg);
     }
@@ -263,9 +262,8 @@ mod registry_tests {
         reg.clear();
 
         assert!(reg.names().is_empty());
-        let err = match reg.resolve("a") {
-            Ok(_) => panic!("expected missing tool error"),
-            Err(err) => err,
+        let Err(err) = reg.resolve("a") else {
+            panic!("expected missing tool error")
         };
         match err {
             ToolError::NotRegistered { available, .. } => assert!(available.is_empty()),

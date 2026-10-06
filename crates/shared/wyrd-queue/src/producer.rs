@@ -626,7 +626,7 @@ impl Producer {
     /// the first durable transport error encountered while draining, or an
     /// earlier terminal refusal of a background-sent batch not yet reported.
     pub fn shutdown(&self) -> Result<(), WyrdQueueError> {
-        self.control(Ctrl::Shutdown).map(|_| ())
+        self.control(Ctrl::Shutdown)
     }
 
     /// Returns a lightweight occupancy snapshot.
@@ -771,15 +771,12 @@ impl Task {
                     self.settle_background(settled);
                     self.pump();
                 },
-                entry = self.rx.recv(), if open => match entry {
-                    Some(entry) => {
-                        self.take(entry);
-                        self.pump();
-                    }
-                    None => {
-                        self.drain_dropped_handle().await;
-                        return None;
-                    }
+                entry = self.rx.recv(), if open => if let Some(entry) = entry {
+                    self.take(entry);
+                    self.pump();
+                } else {
+                    self.drain_dropped_handle().await;
+                    return None;
                 },
                 () = sleep_until(self.linger_deadline), if can_send && self.linger_deadline.is_some() => {
                     self.pump();

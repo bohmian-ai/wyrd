@@ -70,7 +70,7 @@ impl SkaldJudgeInvoker {
             prompts,
             media: None,
             cached_agent: Mutex::new(None),
-            call_deadline: Duration::from_secs(60),
+            call_deadline: Duration::from_mins(1),
         }
     }
 
@@ -166,10 +166,10 @@ impl SkaldJudgeInvoker {
             });
         }
 
-        let id = judge_ref
-            .as_card_ref()
-            .map(|reference| reference.name.to_string())
-            .unwrap_or_else(|| "inline-judge".to_owned());
+        let id = judge_ref.as_card_ref().map_or_else(
+            || "inline-judge".to_owned(),
+            |reference| reference.name.to_string(),
+        );
         let agent = Agent::new(prompt)
             .with_id(id)
             .with_tools(std::iter::empty())

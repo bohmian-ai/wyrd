@@ -318,17 +318,13 @@ impl PyOpenAiResponsesToolChoice {
     }
     fn as_apply_patch(&self) -> WyrdPyResult<PyOpenAiResponsesApplyPatchToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::ApplyPatch(_) => Ok(PyOpenAiResponsesApplyPatchToolChoice {
-                inner: Arc::clone(&self.inner),
-            }),
+            OpenAiResponsesToolChoice::ApplyPatch(_) => Ok(PyOpenAiResponsesApplyPatchToolChoice),
             _ => Err(wrong_variant("apply_patch", self.kind()).into()),
         }
     }
     fn as_shell(&self) -> WyrdPyResult<PyOpenAiResponsesShellToolChoice> {
         match self.c() {
-            OpenAiResponsesToolChoice::Shell(_) => Ok(PyOpenAiResponsesShellToolChoice {
-                inner: Arc::clone(&self.inner),
-            }),
+            OpenAiResponsesToolChoice::Shell(_) => Ok(PyOpenAiResponsesShellToolChoice),
             _ => Err(wrong_variant("shell", self.kind()).into()),
         }
     }
@@ -495,10 +491,7 @@ impl PyOpenAiResponsesCustomToolChoice {
 }
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesApplyPatchToolChoice")]
-pub struct PyOpenAiResponsesApplyPatchToolChoice {
-    #[allow(dead_code)]
-    inner: Arc<ProviderRequest>,
-}
+pub struct PyOpenAiResponsesApplyPatchToolChoice;
 #[pymethods]
 impl PyOpenAiResponsesApplyPatchToolChoice {
     #[getter]
@@ -511,10 +504,7 @@ impl PyOpenAiResponsesApplyPatchToolChoice {
 }
 
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponsesShellToolChoice")]
-pub struct PyOpenAiResponsesShellToolChoice {
-    #[allow(dead_code)]
-    inner: Arc<ProviderRequest>,
-}
+pub struct PyOpenAiResponsesShellToolChoice;
 #[pymethods]
 impl PyOpenAiResponsesShellToolChoice {
     #[getter]

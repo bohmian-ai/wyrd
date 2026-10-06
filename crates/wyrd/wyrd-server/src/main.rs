@@ -96,7 +96,7 @@ async fn main() {
     // `None` arm stays byte-for-byte today's `run()`.
     let cli = Cli::parse();
     let result = match cli.command {
-        None => run(cli.mode).await,
+        None => Box::pin(run(cli.mode)).await,
         Some(Command::Init) => init().await,
         Some(Command::RecoverRoot) => recover_root().await,
         Some(Command::Migrate) => migrate().await,

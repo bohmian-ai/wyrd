@@ -198,7 +198,6 @@ mod pg_tests {
         .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -261,7 +260,6 @@ mod pg_tests {
         .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -474,7 +472,6 @@ mod pg_tests {
         .expect("cloud workload exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -631,7 +628,7 @@ mod pg_tests {
         let external_verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                StdDuration::from_secs(300),
+                StdDuration::from_mins(5),
                 StdDuration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
@@ -796,7 +793,7 @@ mod pg_tests {
             &prefix,
             &key_hash,
             created_by,
-            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+            Some(std::time::Duration::from_hours(720)),
         )
         .await
         .expect("api key inserts");
@@ -861,7 +858,7 @@ mod pg_tests {
             .collect()
     }
 
-    async fn verify_issued_token(
+    fn verify_issued_token(
         state: &AppState,
         tenant: DataTenantId,
         token: &str,
@@ -940,7 +937,7 @@ mod pg_tests {
             tenant_id: tenant,
             issuer: IssuerUrl::new(EXTERNAL_ISSUER).expect("issuer URL is valid"),
             subject: subject.to_owned(),
-            audience: audience.map(|audience| audience.to_owned()),
+            audience: audience.map(std::borrow::ToOwned::to_owned),
             card_ref: card_ref(card_kind, name),
         }
     }
@@ -961,7 +958,7 @@ mod pg_tests {
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
             principal_kind: IssuerTokenPolicy::Workload,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 

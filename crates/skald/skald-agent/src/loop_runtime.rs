@@ -120,7 +120,7 @@ impl Agent {
                         });
                     }
                     ChainResult::Replaced(input) => {
-                        replace_seed_user_turn(&mut conversation, input)
+                        replace_seed_user_turn(&mut conversation, input);
                     }
                 }
                 let rendered =
@@ -912,10 +912,6 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
-        ProviderRequest::GeminiGenerateContent(_)
-        | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::VertexPredict(_)
-        | ProviderRequest::RawV1 { .. } => None,
         _ => None,
     }
 }
@@ -951,17 +947,18 @@ fn response_finish_reason(response: &ProviderResponse) -> String {
             .first()
             .and_then(|choice| choice.finish_reason.clone())
             .unwrap_or_else(|| "other".to_owned()),
-        ProviderResponse::AnthropicMessage(response) => response
-            .stop_reason
-            .as_ref()
-            .map(|reason| format!("{reason:?}").to_lowercase())
-            .unwrap_or_else(|| "other".to_owned()),
+        ProviderResponse::AnthropicMessage(response) => response.stop_reason.as_ref().map_or_else(
+            || "other".to_owned(),
+            |reason| format!("{reason:?}").to_lowercase(),
+        ),
         ProviderResponse::GeminiGenerateContent(response) => response
             .candidates
             .first()
             .and_then(|candidate| candidate.finish_reason.as_ref())
-            .map(|reason| format!("{reason:?}").to_lowercase())
-            .unwrap_or_else(|| "other".to_owned()),
+            .map_or_else(
+                || "other".to_owned(),
+                |reason| format!("{reason:?}").to_lowercase(),
+            ),
         _ => format!("{:?}", response.adapter().finish_reason()).to_lowercase(),
     }
 }

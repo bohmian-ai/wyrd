@@ -105,10 +105,10 @@ async fn scribe_write_flush_read_user_journey() {
         "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
     );
 
-    let uncached_run = cluster
-        .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
-        .await
-        .expect("the production workload runs on public routes with the cache disabled");
+    let uncached_run =
+        Box::pin(cluster.run_scribe_production_workload(&workload, ScribeCacheMode::Disabled))
+            .await
+            .expect("the production workload runs on public routes with the cache disabled");
     uncached_run
         .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
@@ -124,10 +124,10 @@ async fn scribe_write_flush_read_user_journey() {
     )
     .await
     .expect("a fresh one-pod mixed cluster starts with the cache enabled");
-    let cached_run = cached_cluster
-        .run_scribe_production_workload(&cached, ScribeCacheMode::Enabled)
-        .await
-        .expect("the same record runs on public routes with the cache enabled");
+    let cached_run =
+        Box::pin(cached_cluster.run_scribe_production_workload(&cached, ScribeCacheMode::Enabled))
+            .await
+            .expect("the same record runs on public routes with the cache enabled");
     cached_run
         .evidence
         .assert_matches(&cached, ScribeCacheMode::Enabled)
@@ -645,7 +645,6 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     let pool = server
         .pg_fixture()
         .superuser_pool()
-        .await
         .expect("system membership pool");
     sqlx::query(
         "UPDATE vala.cluster_nodes SET advertise_addr=$1, heartbeat_at=now(), ready=true \
@@ -929,11 +928,7 @@ async fn declare_component_card(
     )
     .expect("the root Service spec declares its component");
 
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("registry pool");
+    let pool = server.pg_fixture().superuser_pool().expect("registry pool");
     let (component_hash, _) = component_spec
         .canonical_hash_with_bytes()
         .expect("component spec hashes");
@@ -1019,11 +1014,7 @@ async fn registry_card_uid(
     server: &wyrd_testing::WyrdTestServer,
     card: &wyrd_spec::reference::CardRef,
 ) -> String {
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("registry pool");
+    let pool = server.pg_fixture().superuser_pool().expect("registry pool");
     let uid: uuid::Uuid = sqlx::query_scalar(
         "SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND space = $2 AND name = $3 \
          AND version = $4",
@@ -1199,10 +1190,10 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let occupant = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.forge())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::forge)
         .expect("the embedded pod hosts Forge")
         .occupy_root_for_test();
-    tokio::time::timeout(std::time::Duration::from_secs(60), server.flush_bifrost())
+    tokio::time::timeout(std::time::Duration::from_mins(1), server.flush_bifrost())
         .await
         .expect("a stage under a full root settles promptly instead of waiting for bytes")
         .expect("a refused stage attempt retains its generation rather than failing the pod");
@@ -1237,8 +1228,7 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
         "published rows retire the WAL segments that backed them: {retained:?}"
     );
 
-    let server = server
-        .restart_bound(builder())
+    let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("the pod restarts on its retained data root");
     let client = tenant_client(&server, tenant).await;

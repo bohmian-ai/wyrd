@@ -258,7 +258,5 @@ fn smallest_cycle<'a>(
 }
 
 fn self_loops_to(adj: &HashMap<&TaskId, Vec<&TaskId>>, vertex: &TaskId) -> bool {
-    adj.get(vertex)
-        .map(|edges| edges.contains(&vertex))
-        .unwrap_or(false)
+    adj.get(vertex).is_some_and(|edges| edges.contains(&vertex))
 }

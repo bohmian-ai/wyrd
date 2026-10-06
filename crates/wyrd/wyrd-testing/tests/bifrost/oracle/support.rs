@@ -140,11 +140,11 @@ pub(crate) async fn client_for_tenant(
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, name, &["admin"])
         .await?;
-    client_from_bootstrap(server, bootstrap).await
+    client_from_bootstrap(server, bootstrap)
 }
 
 /// Build a client while retaining the bootstrap principal for exact audit correlation.
-pub(crate) async fn client_from_bootstrap(
+pub(crate) fn client_from_bootstrap(
     server: &wyrd_testing::WyrdTestServer,
     bootstrap: Bootstrap,
 ) -> Result<WyrdClient, JourneyError> {
@@ -545,9 +545,9 @@ const UNUSED_PAYLOAD_CHARS: usize = 4096;
 /// cannot collapse it to near-zero bytes. A payload that compressed away would
 /// make a projection proof measure nothing.
 pub(crate) fn unused_payload(id: i64) -> String {
-    #[allow(clippy::cast_sign_loss)]
+    use std::fmt::Write as _;
     let mut state = 0x9E37_79B9_7F4A_7C15_u64
-        .wrapping_mul(id as u64)
+        .wrapping_mul(id.cast_unsigned())
         .wrapping_add(1);
     let mut out = String::with_capacity(UNUSED_PAYLOAD_CHARS);
     while out.len() < UNUSED_PAYLOAD_CHARS {
@@ -556,7 +556,7 @@ pub(crate) fn unused_payload(id: i64) -> String {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
-        out.push_str(&format!("{z:016x}"));
+        let _ = write!(out, "{z:016x}");
     }
     out.truncate(UNUSED_PAYLOAD_CHARS);
     out
@@ -573,7 +573,7 @@ pub(crate) fn unused_payload(id: i64) -> String {
 /// failed with nothing compacted and no time elapsed. Generous, because a pass
 /// may claim nothing, retry, or lose a lease race; finite, because a stalled
 /// Forge must fail the journey rather than hang it.
-const COMPACTION_BUDGET: Duration = Duration::from_secs(180);
+const COMPACTION_BUDGET: Duration = Duration::from_mins(3);
 
 /// Longest one requested pass is waited on before the loop re-reads the truth.
 const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);

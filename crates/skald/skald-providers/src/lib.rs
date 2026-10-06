@@ -26,7 +26,6 @@ pub use trait_::{ProviderClient, ProviderStream};
 pub use transport::{HttpTransport, TransportConfig};
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) mod common {
     use std::time::Duration;
 

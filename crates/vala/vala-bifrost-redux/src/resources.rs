@@ -2056,8 +2056,9 @@ impl BifrostResourceGovernor {
     ///
     /// Returns [`BifrostResourceError::InvalidPlan`] when an override inflates a
     /// detected resource, weakens a minimum floor, or checked plan arithmetic
-    /// cannot fit every enabled role.
-    pub(crate) fn from_snapshot(
+    /// cannot fit every enabled role. Private to this module so the runtime
+    /// resources owner is the only place a root governor is built.
+    fn from_snapshot(
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
     ) -> Result<Self, BifrostResourceError> {

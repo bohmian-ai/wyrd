@@ -103,8 +103,6 @@ def _round_trip(card: ModelCard, path: Path, expected_kind: str, *, interface=No
     return restored
 
 
-@pytest.mark.wyrd_covers("python:ModelCard.save")
-@pytest.mark.wyrd_covers("python:ModelCard.load")
 def test_raw_sklearn_model_autodetects_and_round_trips(tmp_path: Path) -> None:
     card = ModelCard(
         _sklearn_model(),

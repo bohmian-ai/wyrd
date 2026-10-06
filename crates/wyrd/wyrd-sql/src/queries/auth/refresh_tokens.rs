@@ -11,7 +11,7 @@ use sqlx::types::Uuid;
 use crate::TenantConn;
 use crate::row_types::auth::{HumanSessionBinding, RefreshTokenRow};
 
-const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
+const CONSUME_ACTIVE_REFRESH_SQL: &str = r"
     UPDATE wyrd.auth_refresh_tokens
        SET revoked_at = statement_timestamp(),
            revoked_reason = 'rotated'
@@ -22,18 +22,18 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
               issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
               human_connection_id, human_connection_revision, client_id
-"#;
+";
 
 /// Serializes every refresh operation for one stored principal family in the
 /// bound tenant; see [`lock_refresh_family`].
 const LOCK_REFRESH_FAMILY_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended(\
      'wyrd.auth_refresh_tokens:' || wyrd.current_tenant()::text || ':' || $1 || ':' || $2::text, 0))";
 
-const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
+const REFRESH_ISSUANCE_INSTANT_SQL: &str = r"
     SELECT date_trunc('second', statement_timestamp())
-"#;
+";
 
-const REFRESH_BY_HASH_SQL: &str = r#"
+const REFRESH_BY_HASH_SQL: &str = r"
     SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
            issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
            human_connection_id, human_connection_revision, client_id
@@ -41,10 +41,10 @@ const REFRESH_BY_HASH_SQL: &str = r#"
      WHERE token_hash = $1
        AND data_tenant_id = $2
      LIMIT 1
-"#;
+";
 
 /// The unrevoked, unexpired row with this hash, left unconsumed.
-const ACTIVE_REFRESH_SQL: &str = r#"
+const ACTIVE_REFRESH_SQL: &str = r"
     SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
            issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
            human_connection_id, human_connection_revision, client_id
@@ -52,17 +52,17 @@ const ACTIVE_REFRESH_SQL: &str = r#"
      WHERE token_hash = $1
        AND revoked_at IS NULL
        AND expires_at > statement_timestamp()
-"#;
+";
 
 /// Inserts one human refresh row bound to the login connection revision and
 /// the OAuth client it is issued to.
-const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r#"
+const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r"
     INSERT INTO wyrd.auth_refresh_tokens (
         id, data_tenant_id, principal_kind, principal_id,
         token_hash, expires_at, rotated_from,
         human_connection_id, human_connection_revision, client_id
     ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9)
-"#;
+";
 
 /// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a
 /// whole second.
@@ -186,13 +186,13 @@ pub async fn revoke_refresh(
     reason: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.auth_refresh_tokens
            SET revoked_at = now(),
                revoked_reason = $2
          WHERE id = $1
            AND revoked_at IS NULL
-        "#,
+        ",
     )
     .bind(id)
     .bind(reason)
@@ -217,7 +217,7 @@ pub async fn revoke_refresh_chain(
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        r#"
+        r"
         WITH RECURSIVE chain(id) AS (
             SELECT id FROM wyrd.auth_refresh_tokens WHERE id = $1
             UNION
@@ -230,7 +230,7 @@ pub async fn revoke_refresh_chain(
                revoked_reason = $2
          WHERE id IN (SELECT id FROM chain)
            AND revoked_at IS NULL
-        "#,
+        ",
     )
     .bind(root_id)
     .bind(reason)
@@ -253,14 +253,14 @@ pub async fn revoke_refresh_family(
     reason: &str,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.auth_refresh_tokens
            SET revoked_at = now(),
                revoked_reason = $3
          WHERE principal_kind = $1
            AND principal_id = $2
            AND revoked_at IS NULL
-        "#,
+        ",
     )
     .bind(principal_kind)
     .bind(principal_id)

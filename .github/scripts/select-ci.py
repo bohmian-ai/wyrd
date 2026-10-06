@@ -29,12 +29,12 @@ GLOBAL = re.compile(r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|
 # Paths that select no verification of their own.
 UNVERIFIED = re.compile(r"^(changes/|architecture/|[^/]+\.md$)")
 DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)")
-# UI also covers the generated token targets so check:tokens fires on a
+# UI also covers the generated token targets so the token drift check fires on a
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.
 UI = re.compile(
     r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css"
-    r"|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
+    r"|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
 )
 PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/python/)")
 TYPESCRIPT = re.compile(r"^sdks/wyrd-sdk-ts/")
@@ -78,17 +78,26 @@ RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
 # release-plz publishes these crates.
 PUBLISHED_CRATES = {"wyrd-spec"}
-FAMILIES_FILE = "scripts/test-families.sh"
+# Each Rust test family is a directory tree; scripts/run-family-tests.sh
+# uses the same prefixes.
+FAMILY_DIRS = (
+    ("crates/wyrd/", "wyrd"),
+    ("crates/wyrd-spec/", "wyrd"),
+    ("crates/skald/", "skald"),
+    ("crates/vala/", "vala"),
+    ("crates/shared/", "shared"),
+    ("sdks/wyrd-sdk-rust/", "shared"),
+)
 
 
-def read_families(root):
-    """Map each package to its Rust test family from scripts/test-families.sh."""
-    families = {}
-    text = open(os.path.join(root, FAMILIES_FILE), encoding="utf-8").read()
-    for name, body in re.findall(r"FAMILY_([A-Z]+)=\(([^)]*)\)", text):
-        for package in body.split():
-            families[package] = name.lower()
-    return families
+def read_families(workspace):
+    """Map each package to the Rust test family that owns its directory."""
+    return {
+        name: family
+        for directory, name in workspace.dirs
+        for prefix, family in FAMILY_DIRS
+        if directory.startswith(prefix)
+    }
 
 
 def read_metadata(root):
@@ -189,7 +198,7 @@ def select(paths, root):
 
     try:
         workspace = Workspace(read_metadata(root))
-        families = read_families(root)
+        families = read_families(workspace)
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         sel.full_gate(f"cannot read the workspace graph: {error}")
         return sel, outputs

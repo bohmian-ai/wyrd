@@ -31,7 +31,7 @@ use crate::{OperatorPool, TenantConn};
 /// A due or lease-expired row fails when its attempt budget (`$1`) is spent or
 /// its deadline (`$2` ms after creation) has passed; a live lease is left to
 /// its holder.
-const EXHAUST_SQL: &str = r#"
+const EXHAUST_SQL: &str = r"
     UPDATE wyrd.operator_dispatches
        SET status = 'failed',
            last_error = CASE
@@ -49,12 +49,12 @@ const EXHAUST_SQL: &str = r#"
             OR (status = 'running' AND lease_expires_at <= statement_timestamp()))
        AND (attempts >= $1
             OR created_at + ($2::bigint * INTERVAL '1 millisecond') <= statement_timestamp())
-"#;
+";
 
 /// Claim the oldest due or lease-expired dispatch under a fresh lease.
 ///
 /// Returns the remaining deadline in milliseconds as PostgreSQL computes it.
-const CLAIM_SQL: &str = r#"
+const CLAIM_SQL: &str = r"
     WITH candidate AS (
         SELECT dispatch_id
           FROM wyrd.operator_dispatches
@@ -78,23 +78,23 @@ const CLAIM_SQL: &str = r#"
               GREATEST(0, floor(extract(epoch FROM
                   d.created_at + ($4::bigint * INTERVAL '1 millisecond') - statement_timestamp()
               ) * 1000))::bigint AS remaining_ms
-"#;
+";
 
 /// Settle a leased dispatch `delivered`.
-const DELIVER_SQL: &str = r#"
+const DELIVER_SQL: &str = r"
     UPDATE wyrd.operator_dispatches
        SET status = 'delivered', last_error = NULL, lease_expires_at = NULL,
            updated_at = statement_timestamp()
      WHERE dispatch_id = $1 AND lease_token = $2 AND status = 'running'
-"#;
+";
 
 /// Settle a leased dispatch `failed` with its terminal error.
-const FAIL_SQL: &str = r#"
+const FAIL_SQL: &str = r"
     UPDATE wyrd.operator_dispatches
        SET status = 'failed', last_error = $3, lease_expires_at = NULL,
            updated_at = statement_timestamp()
      WHERE dispatch_id = $1 AND lease_token = $2 AND status = 'running'
-"#;
+";
 
 /// Schedule a retry within the budget and deadline, or fail.
 ///
@@ -102,7 +102,7 @@ const FAIL_SQL: &str = r#"
 /// milliseconds. The delay is first bounded by the deadline so an oversized
 /// provider `Retry-After` cannot overflow the interval, then the next attempt
 /// is clipped to the absolute deadline; a row already at or past it fails.
-const RETRY_SQL: &str = r#"
+const RETRY_SQL: &str = r"
     UPDATE wyrd.operator_dispatches
        SET status = CASE WHEN attempts < $4
                           AND created_at + ($6::bigint * INTERVAL '1 millisecond') > statement_timestamp()
@@ -115,27 +115,27 @@ const RETRY_SQL: &str = r#"
            last_error = $3, lease_expires_at = NULL, updated_at = statement_timestamp()
      WHERE dispatch_id = $1 AND lease_token = $2 AND status = 'running'
     RETURNING status, next_attempt_at
-"#;
+";
 
 /// Return a leased dispatch to the queue immediately, refunding its attempt.
-const RELEASE_SQL: &str = r#"
+const RELEASE_SQL: &str = r"
     UPDATE wyrd.operator_dispatches
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
            attempts = attempts - 1, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE dispatch_id = $1 AND lease_token = $2 AND status = 'running'
-"#;
+";
 
 /// List every tenant with claimable or exhaustible dispatches,
 /// longest-waiting first.
-const DUE_TENANTS_SQL: &str = r#"
+const DUE_TENANTS_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.operator_dispatches
      WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp())
         OR (status = 'running' AND lease_expires_at <= statement_timestamp())
      GROUP BY data_tenant_id
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
-"#;
+";
 
 /// Server delivery ceilings every dispatch transition applies.
 ///
@@ -157,7 +157,7 @@ impl Default for OperatorDispatchQueue {
     /// the lease exceeds the 30-second attempt timeout so a live attempt is
     /// never reclaimed by another worker.
     fn default() -> Self {
-        Self::new(3, Duration::from_secs(300), Duration::from_secs(45))
+        Self::new(3, Duration::from_mins(5), Duration::from_secs(45))
     }
 }
 

@@ -4094,33 +4094,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcp_auth"
-version = "0.12.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d27dbcc645b60b8e7f6e2868a9d7102ece97d1bb49c1288b5321fcc67f7260"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "http 1.4.2",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4686,27 +4659,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-catalog-rest"
-version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "gcp_auth",
- "http 1.4.2",
- "iceberg",
- "itertools 0.13.0",
- "reqwest 0.12.28",
- "serde",
- "serde_derive",
- "serde_json",
- "tokio",
- "typed-builder",
- "uuid",
-]
-
-[[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
 source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
@@ -4720,7 +4672,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=6773e192c995d4d9423536f44f05f99b6ea81e5a#6773e192c995d4d9423536f44f05f99b6ea81e5a"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=170bf8e1164be84f8e27be70d088459097871f21#170bf8e1164be84f8e27be70d088459097871f21"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4731,7 +4683,6 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
- "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -5950,7 +5901,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -7120,7 +7071,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7141,7 +7092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8075,7 +8026,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -10014,16 +9964,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-futures"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
-dependencies = [
- "pin-project",
- "tracing",
-]
-
-[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10409,6 +10349,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "num-traits",
  "serde",
  "serde_json",
  "statrs",
@@ -10760,7 +10701,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -11130,7 +11071,6 @@ dependencies = [
  "rsa",
  "rustix",
  "rustls",
- "rustls-webpki",
  "secrecy",
  "security-framework-sys",
  "semver",
@@ -11167,6 +11107,7 @@ dependencies = [
  "typenum",
  "url",
  "uuid",
+ "windows-sys 0.48.0",
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",
@@ -11337,7 +11278,6 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
- "wyrd-test-contract-macros",
  "wyrd-utils",
 ]
 
@@ -11796,6 +11736,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
+ "num-traits",
  "oauth2 5.0.0",
  "opendal 0.57.0",
  "rand 0.9.5",
@@ -11842,7 +11783,6 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-cli",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -11984,16 +11924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-test-contract-macros"
-version = "0.0.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
- "workspace-hack",
-]
-
-[[package]]
 name = "wyrd-testing"
 version = "0.0.1"
 dependencies = [
@@ -12016,6 +11946,7 @@ dependencies = [
  "iceberg",
  "metrics",
  "metrics-exporter-prometheus",
+ "num-traits",
  "opendal 0.57.0",
  "opentelemetry",
  "opentelemetry-otlp",

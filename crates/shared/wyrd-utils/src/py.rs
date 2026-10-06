@@ -341,8 +341,7 @@ pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
     let type_name = error
         .get_type(py)
         .name()
-        .map(|name| name.to_string())
-        .unwrap_or_else(|_| "PyException".to_owned());
+        .map_or_else(|_| "PyException".to_owned(), |name| name.to_string());
     let detail = error.to_string();
     SpecWyrdError::AgentValidation {
         message: detail.clone(),

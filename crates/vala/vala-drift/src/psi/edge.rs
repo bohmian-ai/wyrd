@@ -21,6 +21,10 @@ enum Edge {
 ///
 /// # Errors
 /// Returns the serializer's error.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's serialize_with passes the field by reference"
+)]
 pub(super) fn serialize<S: Serializer>(
     value: &Option<f64>,
     serializer: S,

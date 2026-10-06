@@ -743,12 +743,11 @@ async fn complete_login(
     Json(request): Json<PlatformCallbackRequest>,
 ) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;
-    let req_id = match request_id.as_ref() {
-        Some(axum::Extension(id)) => id.as_str(),
-        None => {
-            fallback_request_id = uuid::Uuid::new_v4().to_string();
-            &fallback_request_id
-        }
+    let req_id = if let Some(axum::Extension(id)) = request_id.as_ref() {
+        id.as_str()
+    } else {
+        fallback_request_id = uuid::Uuid::new_v4().to_string();
+        &fallback_request_id
     };
     let token = login_service(&state)?
         .complete(

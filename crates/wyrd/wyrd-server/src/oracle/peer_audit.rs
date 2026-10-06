@@ -133,7 +133,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(outbox.shutdown(deadline).await, 0, "both rejections commit");
 
-        let pool = fixture.superuser_pool().await.expect("assertion pool");
+        let pool = fixture.superuser_pool().expect("assertion pool");
         let rows: Vec<(uuid::Uuid, uuid::Uuid, String, String, String, String)> = sqlx::query_as(
             "SELECT data_tenant_id, principal_id, principal_kind, permission, \
                         outcome, detail \

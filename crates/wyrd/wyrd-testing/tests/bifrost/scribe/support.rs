@@ -319,7 +319,7 @@ pub(super) const INGEST_BUSY: &str = "WYRD_VALA_429_INGEST_BUSY";
 /// in any case depends on how long a turn took, only on whether every
 /// participant eventually got one. A participant that reaches this bound has
 /// not lost a race, it has been passed over indefinitely.
-const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Longest pause between two retries of a refused append.
 ///

@@ -3,13 +3,15 @@
 use crate::GlobalConfig;
 use crate::WyrdClient;
 use crate::config::ClientConfig;
+use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use secrecy::SecretString;
 
 use crate::cards::error::RegistryEngineError;
 
-/// Resolve the shared Wyrd client for a registry handle, applying the
-/// explicit credential and tenant selector over the configured ones.
+/// Resolve the shared Wyrd client for a registry handle from `environment`,
+/// applying the explicit credential and tenant selector over the configured
+/// ones.
 ///
 /// Repository filesystem configuration is intentionally not loaded here.
 /// `wyrd-loader` owns authored-card and `wyrd.toml` discovery; this module only
@@ -22,6 +24,7 @@ use crate::cards::error::RegistryEngineError;
 /// empty, when the saved-login selection fails, or when the authenticated
 /// transport cannot be constructed.
 pub(crate) fn load(
+    environment: Environment,
     server_url: Option<&str>,
     credential: Option<SecretString>,
     tenant: Option<&str>,
@@ -33,8 +36,8 @@ pub(crate) fn load(
         }
         .into());
     }
-    let mut client_config =
-        ClientConfig::from_global_with_overrides(&GlobalConfig::load()?, server_url, None);
+    let global = GlobalConfig::load_in(&environment)?;
+    let mut client_config = ClientConfig::from_environment(environment, &global, server_url, None);
     if credential.is_some() {
         client_config.credential = credential;
     }

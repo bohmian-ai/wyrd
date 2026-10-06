@@ -65,6 +65,10 @@ impl VersionRange {
     }
 
     /// Check whether a concrete version matches this range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored range or version is invalid, which construction rules out.
     pub fn matches(&self, version: &VersionBlock) -> bool {
         let range = semver::VersionReq::parse(&self.0)
             .expect("VersionRange invariant: stored value is valid");
@@ -87,7 +91,7 @@ impl VersionRange {
         let s = self.0.as_str();
         let mut chars = s.chars();
         let prefix = match chars.next() {
-            Some('^') | Some('~') => s.as_bytes()[0],
+            Some('^' | '~') => s.as_bytes()[0],
             _ => return false,
         };
         let body = &s[1..];

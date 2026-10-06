@@ -386,19 +386,6 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
-    let server = start_engine_fixture_server().await;
-    let fixture = seed_forge_group(&server, "promotion_window").await;
-    let catalog_owner = server.bifrost_catalog();
-    let table_ref = fixture.binding.table_ref.clone();
-    let tenant = fixture.tenant;
-
-    let sealed = file_rows(&fixture)
-        .await
-        .into_iter()
-        .map(|row| row.file_path)
-        .collect::<BTreeSet<_>>();
-    assert!(!sealed.is_empty(), "the fixture sealed real objects");
-
     /// Asserts one production cut sees every sealed path exactly once.
     async fn assert_exact_cut(
         catalog: &vala_bifrost_redux::catalog::BifrostCatalog,
@@ -432,6 +419,18 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
             "{label}: the cut does not cover the sealed set exactly"
         );
     }
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_window").await;
+    let catalog_owner = server.bifrost_catalog();
+    let table_ref = fixture.binding.table_ref.clone();
+    let tenant = fixture.tenant;
+
+    let sealed = file_rows(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect::<BTreeSet<_>>();
+    assert!(!sealed.is_empty(), "the fixture sealed real objects");
 
     assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "before").await;
 
@@ -457,7 +456,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "mid-window").await;
     catalog.release_paused_commit();
 
-    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+    let forge = tokio::time::timeout(std::time::Duration::from_mins(1), held)
         .await
         .expect("held promotion completes")
         .expect("held promotion task");
@@ -836,7 +835,7 @@ async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
     let stolen = steal_forge_lease(&fixture).await;
     catalog.reject_paused_commit();
 
-    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+    let forge = tokio::time::timeout(std::time::Duration::from_mins(1), held)
         .await
         .expect("stolen promotion returns")
         .expect("stolen promotion task");

@@ -1956,7 +1956,7 @@ mod tests {
             tampered(|cut| cut.ancestry_path = vec![0; MAXIMUM_ANCESTRY_PATH + 1]),
             Err(PrivateConversionError::Invalid {
                 field: "ancestry_path"
-            }) | Err(PrivateConversionError::TooLarge {
+            } | PrivateConversionError::TooLarge {
                 field: "ancestry_path"
             })
         ));

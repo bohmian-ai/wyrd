@@ -9,18 +9,18 @@ use sqlx::types::Uuid;
 
 use crate::TenantConn;
 
-const GRANT_ROLE_TO_USER_SQL: &str = r#"
+const GRANT_ROLE_TO_USER_SQL: &str = r"
         INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)
         VALUES ($1, $2, $3)
         ON CONFLICT (data_tenant_id, user_id, role_id) DO NOTHING
-        "#;
+        ";
 
 const REVOKE_ROLE_FROM_USER_SQL: &str = "DELETE FROM wyrd.auth_user_roles
            WHERE data_tenant_id = wyrd.current_tenant()
              AND user_id = $1
              AND role_id = $2";
 
-const LIST_USER_ROLES_SQL: &str = r#"
+const LIST_USER_ROLES_SQL: &str = r"
         SELECT r.name
           FROM wyrd.auth_user_roles ur
           JOIN wyrd.auth_roles r
@@ -29,11 +29,11 @@ const LIST_USER_ROLES_SQL: &str = r#"
          WHERE ur.data_tenant_id = wyrd.current_tenant()
            AND ur.user_id = $1
          ORDER BY r.name
-        "#;
+        ";
 
 /// Replaces a user's role bindings with exactly the named set in one
 /// statement.
-const REPLACE_USER_ROLES_SQL: &str = r#"
+const REPLACE_USER_ROLES_SQL: &str = r"
         WITH wanted AS (
             SELECT id
               FROM wyrd.auth_roles
@@ -50,21 +50,21 @@ const REPLACE_USER_ROLES_SQL: &str = r#"
             RETURNING 1
         )
         SELECT EXISTS (SELECT 1 FROM removed) OR EXISTS (SELECT 1 FROM added)
-        "#;
+        ";
 
-const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r#"
+const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r"
         INSERT INTO wyrd.auth_service_account_roles (
             data_tenant_id, service_account_id, role_id
         ) VALUES ($1, $2, $3)
         ON CONFLICT (data_tenant_id, service_account_id, role_id) DO NOTHING
-        "#;
+        ";
 
 const REVOKE_ROLE_FROM_SERVICE_ACCOUNT_SQL: &str = "DELETE FROM wyrd.auth_service_account_roles
            WHERE data_tenant_id = wyrd.current_tenant()
              AND service_account_id = $1
              AND role_id = $2";
 
-const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r#"
+const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r"
         SELECT r.name
           FROM wyrd.auth_service_account_roles sar
           JOIN wyrd.auth_roles r
@@ -73,7 +73,7 @@ const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r#"
          WHERE sar.data_tenant_id = wyrd.current_tenant()
            AND sar.service_account_id = $1
          ORDER BY r.name
-        "#;
+        ";
 
 /// Grant a role to a user.
 ///

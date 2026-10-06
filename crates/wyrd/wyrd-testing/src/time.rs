@@ -33,7 +33,7 @@ mod tests {
     async fn advance_moves_virtual_clock() {
         let handle = ClockHandle::new();
         handle.advance(Duration::ZERO).await;
-        let sleep = tokio::time::sleep(Duration::from_secs(60));
+        let sleep = tokio::time::sleep(Duration::from_mins(1));
         tokio::pin!(sleep);
 
         tokio::select! {
@@ -41,7 +41,7 @@ mod tests {
             () = tokio::task::yield_now() => {}
         }
 
-        handle.advance(Duration::from_secs(60)).await;
+        handle.advance(Duration::from_mins(1)).await;
         sleep.await;
     }
 }

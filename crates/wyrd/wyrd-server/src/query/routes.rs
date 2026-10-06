@@ -298,13 +298,13 @@ pub(crate) async fn sync_query(
     let fault = state
         .query_stream_fault
         .as_ref()
-        .and_then(|controller| controller.claim());
+        .and_then(super::super::state::QueryStreamFaultController::claim);
     #[cfg(feature = "test-support")]
     let stall = match fault {
         Some(crate::state::QueryStreamFault::StallAfterSchema) => state
             .query_stream_fault
             .as_ref()
-            .and_then(|controller| controller.claim_stall()),
+            .and_then(super::super::state::QueryStreamFaultController::claim_stall),
         _ => None,
     };
     // Passive: the capture reads this query's probe and returns the stream
@@ -314,7 +314,7 @@ pub(crate) async fn sync_query(
         && let Some(capture) = state
             .query_stream_fault
             .as_ref()
-            .and_then(|controller| controller.claim_capture())
+            .and_then(super::super::state::QueryStreamFaultController::claim_capture)
     {
         capture.bind(result.resource_probe_for_test());
     }
@@ -590,8 +590,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the shared fixture tenant cannot be resolved.
-    async fn query_caller() -> Caller {
-        let tenant = crate::test_support::test_tenant().await;
+    fn query_caller() -> Caller {
+        let tenant = crate::test_support::test_tenant();
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -614,8 +614,8 @@ mod tests {
     /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
     async fn state_without_oracle() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -775,7 +775,7 @@ mod tests {
             let response = sync_query(
                 State(state_without_oracle().await),
                 None,
-                query_caller().await,
+                query_caller(),
                 Json(BifrostQueryRequest {
                     sql: "SELECT 1".to_owned(),
                     deadline_ms: Some(1_000),

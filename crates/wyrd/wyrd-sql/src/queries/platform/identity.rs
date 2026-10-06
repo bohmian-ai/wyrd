@@ -82,10 +82,10 @@ pub async fn platform_oidc_connection(
 /// # Errors
 /// Returns [`SqlError::Query`] when the write fails, including when
 /// `client_auth` is not a known discriminant.
-// justification: this mirrors one table's column list on a single-row upsert;
-// grouping the columns into a struct here would add a type whose only purpose is
-// to be destructured immediately on the other side of the call.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this mirrors one table's column list on a single-row upsert; grouping the columns into a struct here would add a type whose only purpose is to be destructured immediately on the other side of the call."
+)]
 pub async fn upsert_platform_oidc_connection(
     conn: &mut TenantConn<'_>,
     issuer_url: &str,

@@ -40,14 +40,14 @@ pub fn map_claims(
     claims: &serde_json::Value,
 ) -> Result<MappedClaims, OidcError> {
     let subject =
-        extract_string(claims, &mapping.subject)?.ok_or_else(|| OidcError::ClaimMissing {
+        extract_string(claims, &mapping.subject).ok_or_else(|| OidcError::ClaimMissing {
             path: mapping.subject.as_str().to_owned(),
         })?;
 
     let email = mapping
         .email
         .as_ref()
-        .and_then(|path| extract_string(claims, path).ok().flatten());
+        .and_then(|path| extract_string(claims, path));
 
     let groups = mapping
         .groups
@@ -77,13 +77,10 @@ fn get_at_path<'a>(
 /// Extract a `String` from a dotted path. Returns `Ok(None)` when the path
 /// is absent (not an error); returns `Ok(Some(...))` for a string value;
 /// returns `Ok(None)` for a non-string value (silently skipped).
-fn extract_string(
-    claims: &serde_json::Value,
-    path: &ClaimPath,
-) -> Result<Option<String>, OidcError> {
-    Ok(get_at_path(claims, path)
+fn extract_string(claims: &serde_json::Value, path: &ClaimPath) -> Option<String> {
+    get_at_path(claims, path)
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned))
+        .map(str::to_owned)
 }
 
 /// Extract a `Vec<String>` from a dotted path that points to an array of

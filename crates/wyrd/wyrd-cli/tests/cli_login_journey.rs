@@ -358,7 +358,6 @@ pub(crate) async fn cli_device_login_journey() {
     .execute(
         &srv.pg_fixture()
             .superuser_pool()
-            .await
             .expect("superuser pool opens"),
     )
     .await

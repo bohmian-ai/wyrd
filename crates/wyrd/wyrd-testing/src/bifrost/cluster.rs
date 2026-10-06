@@ -651,6 +651,10 @@ impl OracleTelemetryCapture {
     ///
     /// Returns [`ClusterError::Telemetry`] when a changed Prometheus line has
     /// invalid label or numeric syntax.
+    #[expect(
+        clippy::float_cmp,
+        reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+    )]
     pub fn delta_since(
         &self,
         checkpoint: &OracleTelemetryCheckpoint,
@@ -812,7 +816,7 @@ impl Default for ForgeHarnessOptions {
             completion_observer: None,
             config: None,
             inject_uncertainty: false,
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
         }
     }
 }
@@ -1000,6 +1004,10 @@ impl WyrdTestCluster {
     ///
     /// Returns an error when the node is unknown, already stopped, or its test
     /// supervisor cannot be terminated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_id` is not a known server slot.
     pub async fn terminate_node_abruptly_for_test(
         &mut self,
         node_id: NodeId,
@@ -1100,7 +1108,7 @@ impl WyrdTestCluster {
         resources.http_addr = http_addr;
         resources.grpc_addr = grpc_addr;
         resources.peer_addr = peer_addr;
-        let server = match self.build_node(node_id).await {
+        let server = match Box::pin(self.build_node(node_id)).await {
             Ok(server) => server,
             Err(error) => {
                 let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
@@ -1197,7 +1205,7 @@ impl WyrdTestCluster {
     /// shared resource and independently bound server cannot start.
     pub async fn start(pods: usize, topology: BifrostTopology) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec(topology.spec()).await
+        Box::pin(Self::start_spec(topology.spec())).await
     }
 
     /// Start a concrete role topology over shared real dependencies.
@@ -1208,7 +1216,13 @@ impl WyrdTestCluster {
     /// installation failure, or node bind failure. Nodes already started are
     /// shut down before the error returns.
     pub async fn start_spec(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, false).await
+        Box::pin(Self::start_spec_with_options(
+            spec,
+            Duration::ZERO,
+            None,
+            false,
+        ))
+        .await
     }
 
     /// Starts a topology while retaining the final node as an unbooted slot.
@@ -1220,7 +1234,13 @@ impl WyrdTestCluster {
     /// Returns the same resource, topology, and boot errors as
     /// [`Self::start_spec`].
     pub async fn start_spec_delayed_last(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, true).await
+        Box::pin(Self::start_spec_with_options(
+            spec,
+            Duration::ZERO,
+            None,
+            true,
+        ))
+        .await
     }
 
     /// Start a named topology with an explicit WAL fsync delay.
@@ -1234,7 +1254,13 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false).await
+        Box::pin(Self::start_spec_with_options(
+            topology.spec(),
+            wal_sync_delay,
+            None,
+            false,
+        ))
+        .await
     }
 
     /// Start a named topology with deterministic Scribe admission bounds.
@@ -1248,7 +1274,13 @@ impl WyrdTestCluster {
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), Duration::ZERO, Some(admission), false).await
+        Box::pin(Self::start_spec_with_options(
+            topology.spec(),
+            Duration::ZERO,
+            Some(admission),
+            false,
+        ))
+        .await
     }
 
     /// Start an explicit descriptor with admission pressure on one Server.
@@ -1261,7 +1293,7 @@ impl WyrdTestCluster {
         node_index: usize,
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             Some(admission),
@@ -1273,7 +1305,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1288,7 +1320,7 @@ impl WyrdTestCluster {
     pub async fn start_spec_with_forge_completion_observer(
         spec: BifrostClusterSpec,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             None,
@@ -1303,7 +1335,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1326,7 +1358,7 @@ impl WyrdTestCluster {
         delay_last_node: bool,
         inject_uncertainty: bool,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             None,
@@ -1343,7 +1375,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1357,7 +1389,7 @@ impl WyrdTestCluster {
         spec: BifrostClusterSpec,
         storage_root: std::path::PathBuf,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             None,
@@ -1372,7 +1404,7 @@ impl WyrdTestCluster {
                     dedicated_root: Some(storage_root),
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1392,7 +1424,7 @@ impl WyrdTestCluster {
         node_index: usize,
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             Some(admission),
@@ -1407,7 +1439,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1416,7 +1448,10 @@ impl WyrdTestCluster {
     /// # Errors
     /// Returns a topology, resource, or role-supervision error.
     pub async fn start_with_dedicated_forge_workers() -> Result<Self, ClusterError> {
-        Self::start_with_dedicated_forge_workers_with_options(None, None, None).await
+        Box::pin(Self::start_with_dedicated_forge_workers_with_options(
+            None, None, None,
+        ))
+        .await
     }
 
     /// Start dedicated workers with deterministic uncertain-commit injection.
@@ -1425,7 +1460,12 @@ impl WyrdTestCluster {
     /// Returns a topology, resource, or role-supervision error.
     pub async fn start_with_dedicated_forge_workers_with_uncertainty_for_test()
     -> Result<Self, ClusterError> {
-        Self::start_with_dedicated_forge_workers_with_options(None, None, Some(true)).await
+        Box::pin(Self::start_with_dedicated_forge_workers_with_options(
+            None,
+            None,
+            Some(true),
+        ))
+        .await
     }
 
     /// Start dedicated workers with a complete validated Forge config.
@@ -1435,7 +1475,12 @@ impl WyrdTestCluster {
     pub async fn start_with_dedicated_forge_workers_with_config_for_test(
         config: ForgeConfig,
     ) -> Result<Self, ClusterError> {
-        Self::start_with_dedicated_forge_workers_with_options(Some(config), None, None).await
+        Box::pin(Self::start_with_dedicated_forge_workers_with_options(
+            Some(config),
+            None,
+            None,
+        ))
+        .await
     }
 
     /// Start an embedded `all` process with a completion observer.
@@ -1444,7 +1489,7 @@ impl WyrdTestCluster {
     /// Returns a topology, resource, or role-supervision error.
     pub async fn start_with_embedded_forge_observer() -> Result<Self, ClusterError> {
         let observer = ForgeWorkerCompletionObserver::new();
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             BifrostClusterSpec::one_mixed(),
             Duration::ZERO,
             None,
@@ -1459,7 +1504,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1470,7 +1515,7 @@ impl WyrdTestCluster {
     pub async fn start_with_embedded_forge_panic_recovery_for_test(
         config: ForgeConfig,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             BifrostClusterSpec::one_mixed(),
             Duration::ZERO,
             None,
@@ -1487,7 +1532,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1505,7 +1550,7 @@ impl WyrdTestCluster {
     pub async fn start_embedded_forge_uncertainty_for_test(
         interval: Duration,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             BifrostClusterSpec::one_mixed(),
             Duration::ZERO,
             None,
@@ -1522,7 +1567,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1532,7 +1577,7 @@ impl WyrdTestCluster {
         uncertainty: Option<bool>,
     ) -> Result<Self, ClusterError> {
         let observer = ForgeWorkerCompletionObserver::new();
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             BifrostClusterSpec::dedicated_forge_workers(),
             Duration::ZERO,
             None,
@@ -1543,13 +1588,13 @@ impl WyrdTestCluster {
                     completion_observer: Some(observer),
                     config: forge_config,
                     inject_uncertainty: uncertainty.unwrap_or(false),
-                    interval: forge_interval.unwrap_or(Duration::from_secs(60)),
+                    interval: forge_interval.unwrap_or(Duration::from_mins(1)),
                 },
                 ClusterResourceSource::Owned {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1579,7 +1624,7 @@ impl WyrdTestCluster {
         scribe_admission: Option<AdmissionConfig>,
         delay_last_node: bool,
     ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
+        Box::pin(Self::start_spec_with_all_options(
             spec,
             wal_sync_delay,
             scribe_admission,
@@ -1591,7 +1636,7 @@ impl WyrdTestCluster {
                     dedicated_root: None,
                 },
             ),
-        )
+        ))
         .await
     }
 
@@ -1668,7 +1713,7 @@ impl WyrdTestCluster {
                 root: storage_root.path().to_path_buf(),
             },
             require_encryption: false,
-            presign_ttl: Duration::from_secs(600),
+            presign_ttl: Duration::from_mins(10),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
         };
@@ -1678,13 +1723,12 @@ impl WyrdTestCluster {
         // Only the uncertainty wrapper needs a cluster-level catalog handle;
         // every node otherwise builds its own from its own storage owner, so
         // constructing one unconditionally would create a catalog no node uses.
-        let commit_uncertainty_catalog = match options.inject_uncertainty {
-            false => None,
-            true => {
-                let catalog: Arc<BifrostCatalog> =
-                    test_catalog(&fixture, crate::server::test_storage_owner(&storage)).await?;
-                Some(CommitUncertaintyCatalog::new(catalog.iceberg_catalog()))
-            }
+        let commit_uncertainty_catalog = if options.inject_uncertainty {
+            let catalog: Arc<BifrostCatalog> =
+                test_catalog(&fixture, crate::server::test_storage_owner(&storage)).await?;
+            Some(CommitUncertaintyCatalog::new(catalog.iceberg_catalog()))
+        } else {
+            None
         };
         // Every replica in one topology must chain to the same peer CA, so the
         // authority is minted once per cluster and shared. The peer plane is
@@ -1760,7 +1804,7 @@ impl WyrdTestCluster {
         let node_ids = cluster.nodes.keys().copied().collect::<Vec<_>>();
         let delayed = delay_last_node.then(|| node_ids.last().copied()).flatten();
         for node_id in node_ids.into_iter().filter(|node| Some(*node) != delayed) {
-            if let Err(error) = cluster.restart_node(node_id).await {
+            if let Err(error) = Box::pin(cluster.restart_node(node_id)).await {
                 let _ = cluster.shutdown().await;
                 return Err(error);
             }
@@ -1832,11 +1876,14 @@ impl WyrdTestCluster {
         if let Some((_, tls)) = &self.oracle_peer_tls {
             builder = builder.with_peer_tls(tls.clone());
         }
-        Ok(builder
-            .start_with_resources(Arc::clone(&self.fixture), Arc::clone(&self.storage), None)
-            .await?
-            .bind()
-            .await?)
+        Ok(Box::pin(builder.start_with_resources(
+            Arc::clone(&self.fixture),
+            Arc::clone(&self.storage),
+            None,
+        ))
+        .await?
+        .bind()
+        .await?)
     }
 
     /// Return the selected named topology.
@@ -1900,7 +1947,6 @@ impl WyrdTestCluster {
         let owner = self
             .fixture
             .superuser_pool()
-            .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let pool = &owner;
         let rows = sqlx::query(
@@ -2262,7 +2308,7 @@ impl WyrdTestCluster {
                 node_id.as_uuid()
             )));
         }
-        let server = self.build_node(node_id).await?;
+        let server = Box::pin(self.build_node(node_id)).await?;
         self.servers.insert(node_id, Some(server));
         self.abrupt_request_lifetimes
             .insert(node_id, CancellationToken::new());
@@ -2413,7 +2459,7 @@ impl WyrdTestCluster {
     ///
     /// Returns the first teardown error after attempting every running node.
     pub async fn shutdown(self) -> Result<(), ClusterError> {
-        self.shutdown_and_inspect().await.map(|_| ())
+        Box::pin(self.shutdown_and_inspect()).await.map(|_| ())
     }
 
     /// Stop every server and return concrete listener/server teardown evidence.
@@ -2757,9 +2803,9 @@ mod tests {
             memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
             cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
         };
-        let mut cluster = WyrdTestCluster::start_spec(
+        let mut cluster = Box::pin(WyrdTestCluster::start_spec(
             BifrostClusterSpec::one_mixed().with_system_resources(observation),
-        )
+        ))
         .await
         .expect("cluster starts");
         let node_id = cluster.ready_query_nodes()[0];
@@ -2773,7 +2819,9 @@ mod tests {
         let wal_root = cluster.wal_dirs().next().expect("WAL root").to_path_buf();
         cluster.stop_node(node_id).await.expect("node stops");
         assert!(cluster.server_by_node(node_id).is_none());
-        cluster.restart_node(node_id).await.expect("node restarts");
+        Box::pin(cluster.restart_node(node_id))
+            .await
+            .expect("node restarts");
         let server = cluster.server_by_node(node_id).expect("node is running");
         sqlx::query("SELECT 1")
             .execute(server.state().postgres.app_pool())
@@ -2813,9 +2861,11 @@ mod tests {
     /// application or Vala pool fails to answer a trivial query.
     #[tokio::test]
     async fn process_pool_lifecycle_isolated_across_restart() {
-        let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
-            .await
-            .expect("cluster starts");
+        let mut cluster = Box::pin(WyrdTestCluster::start_spec(
+            BifrostClusterSpec::three_mixed(),
+        ))
+        .await
+        .expect("cluster starts");
         let ids = cluster.configured_node_ids();
         cluster.stop_node(ids[0]).await.expect("node stops");
         assert!(cluster.server_by_node(ids[0]).is_none());
@@ -2824,7 +2874,9 @@ mod tests {
             .execute(survivor.state().postgres.app_pool())
             .await
             .expect("survivor pool remains usable");
-        cluster.restart_node(ids[0]).await.expect("node restarts");
+        Box::pin(cluster.restart_node(ids[0]))
+            .await
+            .expect("node restarts");
         for id in &ids {
             let server = cluster
                 .server_by_node(*id)
@@ -2844,9 +2896,11 @@ mod tests {
     /// Role-separated descriptors expose only matching live endpoint sets.
     #[tokio::test]
     async fn role_separated_readiness_matches_configured_roles() {
-        let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
-            .await
-            .expect("role-separated cluster starts");
+        let cluster = Box::pin(WyrdTestCluster::start_spec(
+            BifrostClusterSpec::role_separated(),
+        ))
+        .await
+        .expect("role-separated cluster starts");
         // The spec binds two Oracle-only nodes and one Scribe-only node, so the
         // two endpoint sets are disjoint. Asserting the configured node count on
         // both sides would pass only if every node ran every role, which is the

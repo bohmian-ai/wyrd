@@ -60,6 +60,10 @@ impl GrpcConnection {
     /// already owns the process, the endpoint URI is invalid, or the dial fails
     /// (DNS, TCP, or TLS) on all attempts. Cancellation stops retries and drops
     /// the in-progress channel without retaining a connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the retry loop ends without an attempt, which its nonzero attempt bound rules out.
     pub async fn connect(
         config: &GrpcConfig,
         auth: Arc<AuthMiddleware>,

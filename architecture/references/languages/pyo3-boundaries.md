@@ -26,7 +26,7 @@ pyo3 = { workspace = true, optional = true }
 
 `sdks/wyrd-sdk-python` is the extension-module aggregator and public package. It
 must not duplicate validation, lifecycle, registry, storage, transport, or
-runtime logic. `check:pyo3-scope` enforces the foundational exclusions and the
+runtime logic. `check:deps` enforces the foundational exclusions and the
 approved optional-feature boundary.
 
 The Python testing extra may expose the `WyrdTestServer` harness, but test-tier

@@ -310,7 +310,7 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) {
                 let rows = batch_values(ordinal, batch);
                 // Consecutive batches alternate between two adjacent hours, so
                 // one table's rows span two physical partitions.
-                let event_time = base + chrono::Duration::hours((batch % 2) as i64);
+                let event_time = base + chrono::Duration::hours(i64::from(batch % 2 != 0));
                 until_admitted(&format!("tenant {ordinal} dynamic {batch}"), || {
                     append_values_at(
                         &client,
@@ -351,7 +351,9 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) {
 /// and batch. That is what lets a read-back comparison detect a row credited to
 /// the wrong tenant as well as a lost or duplicated one.
 fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
-    let base = tenant_ordinal as i64 * TENANT_KEY_STRIDE + batch as i64 * ROWS_PER_BATCH;
+    let tenant_ordinal = i64::try_from(tenant_ordinal).expect("test row ordinals fit i64");
+    let batch = i64::try_from(batch).expect("test row ordinals fit i64");
+    let base = tenant_ordinal * TENANT_KEY_STRIDE + batch * ROWS_PER_BATCH;
     (base..base + ROWS_PER_BATCH).collect()
 }
 

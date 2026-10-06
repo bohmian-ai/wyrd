@@ -1,6 +1,7 @@
 //! Generate JSON schema goldens.
 
 use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -315,10 +316,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Returns filesystem failures writing `path`.
 fn write_ts_error_codes(path: &Path) -> Result<(), Box<dyn StdError>> {
     let codes: std::collections::BTreeSet<&str> = WyrdError::codes().into_iter().collect();
-    let variants: String = codes
-        .iter()
-        .map(|code| format!("\n  | \"{code}\""))
-        .collect();
+    let variants = codes.iter().fold(String::new(), |mut variants, code| {
+        write!(variants, "\n  | \"{code}\"").expect("writing to a String cannot fail");
+        variants
+    });
     fs::write(
         path,
         format!(

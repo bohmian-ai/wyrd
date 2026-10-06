@@ -29,3 +29,6 @@ uuid = { workspace = true, features = ["v7"] }
 wiremock = { workspace = true }
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }
 wyrd-tls = { workspace = true }
+
+[lints]
+workspace = true

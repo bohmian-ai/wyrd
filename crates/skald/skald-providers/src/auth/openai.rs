@@ -77,18 +77,21 @@ impl OpenAiAuth {
     }
 
     /// Overrides the base API URL, primarily for local tests.
+    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
     /// Sets the optional organization header.
+    #[must_use]
     pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
         self.organization = Some(organization.into());
         self
     }
 
     /// Sets the optional project header.
+    #[must_use]
     pub fn with_project(mut self, project: impl Into<String>) -> Self {
         self.project = Some(project.into());
         self
@@ -153,7 +156,7 @@ impl fmt::Debug for OpenAiAuth {
             .field("organization", &self.organization)
             .field("project", &self.project)
             .field("base_url", &self.base_url)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

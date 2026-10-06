@@ -108,7 +108,7 @@ impl ClusterNodes {
         .await
         .map_err(SqlError::from)?;
         let row = sqlx::query_as::<_, ClusterNodeDbRow>(
-            r#"INSERT INTO vala.cluster_nodes
+            r"INSERT INTO vala.cluster_nodes
                (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,
                 capability_version, capabilities, ready)
                VALUES ($1,$2,$3,$4,1,$5,statement_timestamp(),1,$6,false)
@@ -118,7 +118,7 @@ impl ClusterNodes {
                  started_at=EXCLUDED.started_at, heartbeat_at=statement_timestamp(),
                  capability_version=1, capabilities=EXCLUDED.capabilities, ready=false
                RETURNING node_id, role, advertise_addr, fencing_token, capability_version,
-                         capabilities, ready, started_at, heartbeat_at"#,
+                         capabilities, ready, started_at, heartbeat_at",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(registration.key.node_id.as_uuid())

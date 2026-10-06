@@ -792,7 +792,7 @@ mod tests {
                 losses
                     .try_lock()
                     .expect("loss observer is uncontended")
-                    .push(rows)
+                    .push(rows);
             }
         });
 

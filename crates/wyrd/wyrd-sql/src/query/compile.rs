@@ -403,10 +403,11 @@ fn push_typed_value(
 ) -> Result<(), WyrdError> {
     match (ty, value) {
         (ValueType::Str, Value::String(value)) => qb.push_bind(value.clone()),
-        (ValueType::Int, Value::Int(value)) => qb.push_bind(*value),
+        (ValueType::Int, Value::Int(value)) | (ValueType::Duration, Value::Duration(value)) => {
+            qb.push_bind(*value)
+        }
         (ValueType::Float, Value::Float(value)) => qb.push_bind(*value),
         (ValueType::Bool, Value::Bool(value)) => qb.push_bind(*value),
-        (ValueType::Duration, Value::Duration(value)) => qb.push_bind(*value),
         (ValueType::Timestamp, Value::Timestamp(value)) => qb.push_bind(*value),
         (ValueType::Timestamp, Value::String(value)) => {
             let parsed = parse_timestamp(value, predicate, resolver, operator)?;

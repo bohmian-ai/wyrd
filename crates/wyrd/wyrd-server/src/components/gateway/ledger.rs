@@ -171,17 +171,14 @@ impl<'c, 'a> GatewayLedger<'c, 'a> {
             let (requests, tokens, leases) = gateway_limit_usage(self.conn, key, window, now)
                 .await
                 .map_err(unavailable)?;
-            let over_tokens =
-                limit
-                    .tokens_per_minute
-                    .is_some_and(|cap| match exposure(plan, &limit.target) {
-                        Some(held) => u64::try_from(tokens.saturating_add(held))
-                            .is_ok_and(|total| total > cap.get()),
-                        None => {
-                            unbounded |= covered_attempts(plan, &limit.target) > 0;
-                            true
-                        }
-                    });
+            let over_tokens = limit.tokens_per_minute.is_some_and(|cap| {
+                if let Some(held) = exposure(plan, &limit.target) {
+                    u64::try_from(tokens.saturating_add(held)).is_ok_and(|total| total > cap.get())
+                } else {
+                    unbounded |= covered_attempts(plan, &limit.target) > 0;
+                    true
+                }
+            });
             if reached(limit.requests_per_minute, requests)
                 || over_tokens
                 || reached(limit.concurrent_calls, leases)

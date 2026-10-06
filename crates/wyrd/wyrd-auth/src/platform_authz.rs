@@ -276,7 +276,7 @@ mod pg_tests {
 
     /// Read the `principal_kind` one staged decision recorded.
     async fn staged_principal_kind(fixture: &PgFixture, principal: PrincipalId) -> String {
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query_scalar(
             "SELECT principal_kind FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3",
@@ -297,7 +297,7 @@ mod pg_tests {
     /// granted only `INSERT` on staging, so the production boundary cannot see
     /// what it wrote.
     async fn staged_rows(fixture: &PgFixture, principal: PrincipalId, outcome: &str) -> i64 {
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_staging
               WHERE data_tenant_id = $1
@@ -322,7 +322,7 @@ mod pg_tests {
         fixture: &PgFixture,
         principal: PrincipalId,
     ) -> Vec<Option<Uuid>> {
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query_scalar(
             "SELECT credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3
@@ -498,7 +498,7 @@ mod pg_tests {
         )
         .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
         .bind(principal.as_uuid())
-        .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
+        .fetch_one(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("denial row reads");
         assert_eq!(row.get::<String, _>("resource"), format!("tenant:{target}"));
@@ -567,7 +567,7 @@ mod pg_tests {
         // Remove the staging table's insert privilege for the role the outbox
         // commits as, so the commit fails exactly as an unavailable audit log
         // would.
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
             .execute(&admin)
             .await

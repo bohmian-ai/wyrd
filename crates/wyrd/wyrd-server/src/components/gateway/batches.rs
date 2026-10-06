@@ -583,16 +583,15 @@ impl<'a> GatewayBatches<'a> {
         let mut verdicts: BTreeMap<&str, bool> = BTreeMap::new();
         let mut data = Vec::new();
         for row in rows.iter().take(limit as usize) {
-            let visible = match verdicts.get(row.model.as_str()) {
-                Some(visible) => *visible,
-                None => {
-                    let model = ModelRef::from_projection(&row.model).map_err(internal)?;
-                    let visible = invocation
-                        .decide(caller, "gateway.batches.list", &model)
-                        .is_ok();
-                    verdicts.insert(&row.model, visible);
-                    visible
-                }
+            let visible = if let Some(visible) = verdicts.get(row.model.as_str()) {
+                *visible
+            } else {
+                let model = ModelRef::from_projection(&row.model).map_err(internal)?;
+                let visible = invocation
+                    .decide(caller, "gateway.batches.list", &model)
+                    .is_ok();
+                verdicts.insert(&row.model, visible);
+                visible
             };
             if let Some(object) = row.batch.as_ref().filter(|_| visible) {
                 data.push(public_batch(row, object));

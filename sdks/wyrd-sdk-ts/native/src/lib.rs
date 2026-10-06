@@ -401,9 +401,6 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// not one mappable JSON Schema, a declared column is server-owned, the
 /// layout is not one physical-layout declaration, or the compaction target is
 /// not a non-negative integer.
-// justification: napi boundary; a JavaScript string is primitive and cannot be
-// passed by reference, so the generated binding requires an owned String
-#[allow(clippy::needless_pass_by_value)]
 #[napi]
 pub fn table_config_from_json_schema(
     table: String,
@@ -430,9 +427,6 @@ pub fn table_config_from_json_schema(
 ///
 /// Returns a napi error only when the described config cannot be encoded;
 /// credential, transport, and server refusals are returned as catalog metadata.
-// justification: napi boundary; a JavaScript string is primitive and cannot be
-// passed by reference, so the generated binding requires an owned String
-#[allow(clippy::needless_pass_by_value)]
 #[napi]
 pub async fn describe_table_config(
     table: String,
@@ -593,8 +587,6 @@ impl NativeBifrost {
     ///
     /// Returns a napi error when the config is not one serialized `TableConfig`
     /// or the previous binding cannot be projected.
-    // justification: napi boundary; a generated object argument arrives owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn use_table(&self, table: NativeTableConfig) -> Result<Option<NativeTableConfig>> {
         self.client
@@ -611,9 +603,6 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// not-found, authorization, and transport failures are returned in
     /// [`NativeLifecycleResult`].
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn use_table_by_name(&self, table: String) -> Result<NativeLifecycleResult> {
         match self.client.use_table_by_name(&table).await {
@@ -646,9 +635,6 @@ impl NativeBifrost {
     ///
     /// Returns a napi error for an invalid card reference; no-active-table and
     /// queue-full refusals are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn insert(
         &self,
@@ -675,8 +661,6 @@ impl NativeBifrost {
     /// Returns a napi error when the bytes are not one single-batch Arrow IPC
     /// stream; server and envelope refusals are returned in
     /// [`NativeLifecycleResult`].
-    // justification: napi boundary; the generated binding requires owned values
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn write_batch(
         &self,

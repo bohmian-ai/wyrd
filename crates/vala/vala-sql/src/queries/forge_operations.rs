@@ -328,7 +328,7 @@ impl<'resource> ForgeOperations<'resource> {
         // turns "no cursor" into "every row", keeping one statement rather than
         // two that could drift apart.
         let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
-            r#"
+            r"
             SELECT *
               FROM vala.forge_operation_state
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -338,7 +338,7 @@ impl<'resource> ForgeOperations<'resource> {
                AND COALESCE((prepared_at, operation_id) > ($4, $5), TRUE)
              ORDER BY prepared_at, operation_id
              LIMIT $3
-            "#,
+            ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -453,7 +453,7 @@ impl<'resource> ForgeOperations<'resource> {
 // Private SQL helpers owned by ForgeOperations
 // ---------------------------------------------------------------------------
 
-impl<'resource> ForgeOperations<'resource> {
+impl ForgeOperations<'_> {
     /// Acquires a transaction-scoped advisory lock on `(resource, family, operation_id)`.
     ///
     /// Every transition path acquires this lock before selecting state or appending
@@ -476,7 +476,7 @@ impl<'resource> ForgeOperations<'resource> {
         operation_id: Uuid,
     ) -> Result<(), SqlError> {
         sqlx::query(
-            r#"
+            r"
         SELECT pg_advisory_xact_lock(
             hashtextextended(
                 jsonb_build_array(
@@ -488,7 +488,7 @@ impl<'resource> ForgeOperations<'resource> {
                 0
             )
         )
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -519,7 +519,7 @@ impl<'resource> ForgeOperations<'resource> {
         // against concurrent upsert races. The advisory lock ensures serialized
         // access, and FOR UPDATE provides an additional row-level safety layer.
         let row: Option<ForgeOperationStateSqlRow> = sqlx::query_as(
-            r#"
+            r"
         SELECT state.*
           FROM vala.forge_operation_state AS state
          WHERE state.data_tenant_id = wyrd.current_tenant()
@@ -527,7 +527,7 @@ impl<'resource> ForgeOperations<'resource> {
            AND state.family = $2
            AND state.operation_id = $3
          FOR UPDATE OF state
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -571,7 +571,7 @@ impl<'resource> ForgeOperations<'resource> {
             })?;
 
         sqlx::query(
-            r#"
+            r"
         INSERT INTO vala.forge_operation_state
             (data_tenant_id, resource, family, operation_id, phase,
              prepared_detail, current_detail,
@@ -585,7 +585,7 @@ impl<'resource> ForgeOperations<'resource> {
                 prepared_at = EXCLUDED.prepared_at,
                 updated_at = EXCLUDED.updated_at
             WHERE vala.forge_operation_state.phase = 'reset'
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -624,7 +624,7 @@ impl<'resource> ForgeOperations<'resource> {
             })?;
 
         sqlx::query(
-            r#"
+            r"
         UPDATE vala.forge_operation_state
            SET phase = $4,
                current_detail = $5::jsonb,
@@ -633,7 +633,7 @@ impl<'resource> ForgeOperations<'resource> {
            AND resource = $1
            AND family = $2
            AND operation_id = $3
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -698,8 +698,7 @@ fn validate_transition(
     if detail_phase != expected_phase {
         return Err(SqlError::Conflict {
             detail: format!(
-                "detail phase {:?} does not match expected {:?}",
-                detail_phase, expected_phase
+                "detail phase {detail_phase:?} does not match expected {expected_phase:?}"
             ),
         });
     }
@@ -708,8 +707,7 @@ fn validate_transition(
     if actual_group != expected_resource {
         return Err(SqlError::Conflict {
             detail: format!(
-                "detail group {} does not match resource {}",
-                actual_group, expected_resource
+                "detail group {actual_group} does not match resource {expected_resource}"
             ),
         });
     }

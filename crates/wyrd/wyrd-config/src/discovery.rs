@@ -7,19 +7,36 @@ use crate::error::WyrdConfigError;
 
 pub(crate) const FILENAME: &str = "wyrd.toml";
 
-/// Walk ancestors of `start` looking for `wyrd.toml`. Stops at the
-/// first ancestor that either contains a `.git` entry or equals the
-/// user's `$HOME` (whichever is hit first). Returns `None` when no
-/// file is found within the bounded region — not an error.
+/// Walk ancestors of `start` looking for `wyrd.toml`, bounded by the
+/// process `$HOME`.
+///
+/// Delegates to [`find_wyrd_toml_within`] with `$HOME` read from the process
+/// environment.
+///
+/// # Errors
+/// Returns [`WyrdConfigError::Io`] when `start` cannot be canonicalized.
 pub(crate) fn find_wyrd_toml(start: &Path) -> Result<Option<PathBuf>, WyrdConfigError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    find_wyrd_toml_within(start, home.as_deref())
+}
+
+/// Walk ancestors of `start` looking for `wyrd.toml`. Stops at the
+/// first ancestor that either contains a `.git` entry or equals `home`
+/// (whichever is hit first). Returns `None` when no file is found within
+/// the bounded region — not an error.
+///
+/// # Errors
+/// Returns [`WyrdConfigError::Io`] when `start` cannot be canonicalized.
+pub(crate) fn find_wyrd_toml_within(
+    start: &Path,
+    home: Option<&Path>,
+) -> Result<Option<PathBuf>, WyrdConfigError> {
     let canonical = start.canonicalize().map_err(|e| WyrdConfigError::Io {
         message: format!("canonicalize failed: {e}"),
         path: start.to_path_buf(),
     })?;
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|p| p.canonicalize().ok());
+    let home = home.and_then(|p| p.canonicalize().ok());
 
     for ancestor in canonical.ancestors() {
         let candidate = ancestor.join(FILENAME);
@@ -39,12 +56,12 @@ pub(crate) fn find_wyrd_toml(start: &Path) -> Result<Option<PathBuf>, WyrdConfig
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod discovery_tests {
     use std::fs;
 
     use tempfile::TempDir;
 
+    use super::find_wyrd_toml_within;
     use crate::{WyrdConfig, WyrdConfigError};
 
     fn plant_git_marker(root: &std::path::Path) {
@@ -170,8 +187,8 @@ mod discovery_tests {
         assert!(matches!(err, WyrdConfigError::Io { .. }), "got {err:?}");
     }
 
+    /// The walk stops at `home` even when a `wyrd.toml` sits above it.
     #[test]
-    #[serial_test::serial]
     fn discovery_stops_at_home_boundary() {
         let outer = TempDir::new().unwrap();
         fs::write(outer.path().join("wyrd.toml"), "[defaults]\n").unwrap();
@@ -180,30 +197,15 @@ mod discovery_tests {
         let cwd = home.join("project");
         fs::create_dir(&cwd).unwrap();
 
-        let home_canonical = home.canonicalize().unwrap();
-        let saved_home = std::env::var_os("HOME");
-        // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
-        unsafe { std::env::set_var("HOME", &home_canonical) };
-        std::env::set_current_dir(&cwd).unwrap();
-
-        let cfg = WyrdConfig::load(None).unwrap();
-
-        // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
-        unsafe {
-            match saved_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
+        let found = find_wyrd_toml_within(&cwd, Some(&home)).unwrap();
         assert!(
-            cfg.root_path.is_none(),
-            "walk must not cross HOME boundary: {cfg:?}"
+            found.is_none(),
+            "walk must not cross HOME boundary: {found:?}"
         );
     }
 
+    /// A `wyrd.toml` placed at `home` itself is found.
     #[test]
-    #[serial_test::serial]
     fn discovery_finds_wyrd_toml_at_home() {
         let home = TempDir::new().unwrap();
         fs::write(
@@ -214,25 +216,7 @@ mod discovery_tests {
         let cwd = home.path().join("project");
         fs::create_dir(&cwd).unwrap();
 
-        let home_canonical = home.path().canonicalize().unwrap();
-        let saved_home = std::env::var_os("HOME");
-        // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
-        unsafe { std::env::set_var("HOME", &home_canonical) };
-        std::env::set_current_dir(&cwd).unwrap();
-
-        let cfg = WyrdConfig::load(None).unwrap();
-
-        // SAFETY: serial_test::serial ensures single-threaded access to env vars here.
-        unsafe {
-            match saved_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
-        assert!(
-            cfg.root_path.is_some(),
-            "should find wyrd.toml placed at HOME: {cfg:?}"
-        );
+        let found = find_wyrd_toml_within(&cwd, Some(home.path())).unwrap();
+        assert!(found.is_some(), "should find wyrd.toml placed at HOME");
     }
 }

@@ -42,3 +42,6 @@ serde_json = { workspace = true }
 skald-providers = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true

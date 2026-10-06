@@ -87,7 +87,7 @@ const DEADLINE_ENV: &str = "WYRD_CAPACITY_DEADLINE";
 
 /// What the lifetime keeps after the replicas stop: writing the report, the
 /// Postgres wrapper's teardown, and the command's exit.
-const EXIT_RESERVE: Duration = Duration::from_secs(60);
+const EXIT_RESERVE: Duration = Duration::from_mins(1);
 
 /// How long cleanup lets the tenants' clients flush and stop before
 /// dropping them.
@@ -129,6 +129,10 @@ struct Cli {
     /// S3-compatible endpoint of that store.
     #[arg(long, env = "WYRD_STORAGE_ENDPOINT_URL")]
     storage_endpoint_url: String,
+    /// Database owner URL, exported by the Postgres wrapper; `migrate` runs
+    /// and the queue backlog is read as this owner.
+    #[arg(long, env = "WYRD_TEST_DATABASE_ADMIN_URL", hide_env_values = true)]
+    database_admin_url: String,
 }
 
 /// One absolute command lifetime split into a measuring part and the
@@ -391,7 +395,7 @@ impl Benchmark {
     /// queued observations; durable rows from finished requests remain.
     async fn run(mut self) -> Result<bool> {
         let lifetime = self.lifetime;
-        let mut failure = lifetime.measure(self.measure()).await;
+        let mut failure = Box::pin(lifetime.measure(self.measure())).await;
         let (stopped, shutdown) = self.clean_up().await;
         if failure.is_none() {
             failure = stopped;
@@ -490,7 +494,13 @@ impl Benchmark {
     /// seeded observations already written stay in the database and store;
     /// a retry starts a fresh database through the Postgres wrapper.
     async fn provision(&mut self) -> Result<()> {
-        let first = LocalServer::start(&self.binary, &TENANTS, &self.env(0)).await?;
+        let first = LocalServer::start(
+            &self.binary,
+            &self.cli.database_admin_url,
+            &TENANTS,
+            &self.env(0),
+        )
+        .await?;
         let mut tenants = Vec::new();
         for setup in first.tenants() {
             self.auth_pace.tick().await;
@@ -501,7 +511,7 @@ impl Benchmark {
             replicas: vec![first],
             tenants,
             clients: Vec::new(),
-            queue: Queue::connect().await?,
+            queue: Queue::connect(&self.cli.database_admin_url).await?,
             judge: Arc::clone(&self.judge),
             permits: permits(),
             profiles: self.cli.profile.then(|| self.output.join("profiles")),
@@ -705,7 +715,7 @@ async fn main() -> ExitCode {
             )
             .await
         {
-            Ok(benchmark) => benchmark.run().await,
+            Ok(benchmark) => Box::pin(benchmark.run()).await,
             Err(error) => Err(error.into()),
         },
         Err(error) => Err(error),
@@ -747,7 +757,7 @@ mod tests {
         let started = Instant::now();
         let lifetime = Lifetime::new(
             started,
-            started + Duration::from_secs(60),
+            started + Duration::from_mins(1),
             Duration::from_secs(5),
             Duration::from_secs(10),
         );
@@ -829,10 +839,6 @@ esac
     #[tokio::test]
     #[ignore = "starts a stand-in server in a systemd user scope on port 8080; needs a delegating systemd user manager and python3"]
     async fn a_stalled_tenant_setup_stops_the_run_by_its_deadline() {
-        // SAFETY: nextest runs this test alone in its process, and no other
-        // thread reads the environment yet. `LocalServer::start` only checks
-        // that the Postgres wrapper set it; the stand-in never connects.
-        unsafe { std::env::set_var("WYRD_TEST_DATABASE_ADMIN_URL", "postgres://unused") };
         let scratch = tempfile::tempdir().expect("scratch directory");
         let server = scratch.path().join("wyrd-server");
         stand_in(&server, STALLING_SERVER, scratch.path());
@@ -844,6 +850,8 @@ esac
             "file:///unused",
             "--storage-endpoint-url",
             "http://127.0.0.1:1",
+            "--database-admin-url",
+            "postgres://unused",
         ]);
         let started = Instant::now();
         let deadline = started + Duration::from_secs(12);
@@ -857,7 +865,9 @@ esac
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
 
-        let passed = benchmark.run().await.expect("the failed report is written");
+        let passed = Box::pin(benchmark.run())
+            .await
+            .expect("the failed report is written");
 
         assert!(!passed, "a stopped run fails its verdict");
         assert!(Instant::now() < deadline, "the run ended by its deadline");
@@ -919,10 +929,6 @@ esac
     #[tokio::test]
     #[ignore = "starts a stand-in server in a systemd user scope on port 8080; needs a delegating systemd user manager and python3"]
     async fn a_slow_replica_stop_leaves_the_runtime_free() {
-        // SAFETY: nextest runs this test alone in its process, and no other
-        // thread reads the environment yet. `LocalServer::start` only checks
-        // that the Postgres wrapper set it; the stand-in never connects.
-        unsafe { std::env::set_var("WYRD_TEST_DATABASE_ADMIN_URL", "postgres://unused") };
         let scratch = tempfile::tempdir().expect("scratch directory");
         let server = scratch.path().join("wyrd-server");
         stand_in(&server, STALLING_SERVER, scratch.path());
@@ -934,18 +940,20 @@ esac
             "file:///unused",
             "--storage-endpoint-url",
             "http://127.0.0.1:1",
+            "--database-admin-url",
+            "postgres://unused",
         ]);
         let started = Instant::now();
         let lifetime = Lifetime::new(
             started,
-            started + Duration::from_secs(60),
+            started + Duration::from_mins(1),
             Duration::from_secs(5),
             Duration::from_secs(10),
         );
         let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
-        let replica = LocalServer::start(&server, &[], &[])
+        let replica = LocalServer::start(&server, "postgres://unused", &[], &[])
             .await
             .expect("the stand-in serves");
         benchmark.deployment = Some(super::Deployment {

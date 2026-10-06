@@ -746,13 +746,10 @@ impl QueryResultStream {
                             "batch frame contains no record batch".to_owned(),
                         )));
                     };
-                    let rows = match u64::try_from(decoded.num_rows()) {
-                        Ok(rows) => rows,
-                        Err(_) => {
-                            return Err(self.mark_broken(BifrostClientError::Protocol(
-                                "row count does not fit u64".to_owned(),
-                            )));
-                        }
+                    let Ok(rows) = u64::try_from(decoded.num_rows()) else {
+                        return Err(self.mark_broken(BifrostClientError::Protocol(
+                            "row count does not fit u64".to_owned(),
+                        )));
                     };
                     let Some(emitted) = self.emitted_rows.checked_add(rows) else {
                         return Err(self.mark_broken(BifrostClientError::Protocol(
@@ -1109,7 +1106,7 @@ pub struct CollectedQueryResult {
 /// The server tier has its own copy of this state machine in
 /// `vala-bifrost-redux`. Client-tier crates may not depend on the Bifrost
 /// server engine, so the wire contract — not shared code — is what keeps the
-/// two honest, and the journeys in `tests/pg_bifrost_e2e.rs` are what prove it.
+/// two honest, and the journeys in `tests/integration/pg_bifrost_e2e.rs` are what prove it.
 ///
 /// End-of-stream receipt is tracked here rather than delegated to
 /// [`arrow::ipc::reader::StreamDecoder::finish`], which reports success both

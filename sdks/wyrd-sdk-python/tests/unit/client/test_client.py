@@ -81,7 +81,6 @@ def test_every_public_constructor_accepts_and_forwards_tenant():
     from wyrd.gateway import Gateway
     from wyrd.operators import OperatorConnections
     from wyrd.state import WyrdState
-    from wyrd.verification import Verification
 
     options = {"server_url": "http://127.0.0.1:9", "credential": "wyrd_test_actor"}
 
@@ -93,7 +92,6 @@ def test_every_public_constructor_accepts_and_forwards_tenant():
 
     refused(lambda: WyrdClient(**options, tenant="acme"))
     refused(lambda: Cards(**options, tenant="acme"))
-    refused(lambda: Verification(**options, tenant="acme"))
     refused(lambda: OperatorConnections(**options, tenant="acme"))
     refused(lambda: Gateway(**options, tenant="acme"))
     refused(

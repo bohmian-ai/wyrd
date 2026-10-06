@@ -146,6 +146,9 @@ class CardRef:
         space: str,
         uid: str | None = ...,
     ) -> None: ...
+    def __str__(self) -> str:
+        """The canonical ``space/Kind/name@version`` text of this reference."""
+        ...
     def __repr__(self) -> str: ...
 
 class VersionBump:

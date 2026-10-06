@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from ..bifrost import Bifrost, Correlation
 from ..eval import MediaRef
+from .cards import CardRef
 
 #### end of imports ####
 
@@ -25,8 +26,11 @@ class Run:
         ...
 
     @property
-    def card_ref(self) -> str:
-        """The exact ``space/Kind/name@version`` this view observes."""
+    def alias(self) -> str:
+        """The alias this view was opened with.
+
+        ``state.card_ref(alias)`` returns the exact typed ``CardRef``.
+        """
         ...
 
     @property
@@ -46,7 +50,8 @@ class Run:
     def __enter__(self) -> Run:
         """Enter this view's ambient OpenTelemetry span correlation.
 
-        Best-effort and execution-local: attaches this view's ``card_ref`` and
+        Best-effort and execution-local: attaches this view's exact Card
+        reference and
         ``run_id`` as ``wyrd.card_ref`` / ``wyrd.run_id`` to the active
         recording span and to every span started inside the block on a
         provider holding the Wyrd processor (the global provider is installed
@@ -69,8 +74,59 @@ class Run:
         """
         ...
 
+class Judgment:
+    """One direct verification judgment, returned by :meth:`Observe.verify`.
+
+    A ``failed`` verdict is an ordinary return value, not an exception.
+    """
+
+    @property
+    def passed(self) -> bool:
+        """Whether the expectations held: true only for a ``passed`` verdict."""
+        ...
+
+    @property
+    def execution_id(self) -> str:
+        """Transient identity of this execution, shared with its audit and trace."""
+        ...
+
+    @property
+    def verifier(self) -> CardRef:
+        """The exact Verifier executed."""
+        ...
+
+    @property
+    def subject(self) -> CardRef:
+        """The exact subject judged."""
+        ...
+
+    @property
+    def kind(self) -> Literal["drift", "eval"]:
+        """The Verifier classification."""
+        ...
+
+    @property
+    def verdict(self) -> Literal["passed", "failed", "inconclusive"]:
+        """The common verdict."""
+        ...
+
+    @property
+    def summary(self) -> str:
+        """Bounded human-readable summary of the verdict."""
+        ...
+
+    @property
+    def counts(self) -> dict[str, Any]:
+        """Count-only rollup of the judgment as its wire mapping."""
+        ...
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        """The engine report: ``{"drift": {...}}`` or ``{"eval": {...}}``."""
+        ...
+
 class Observe:
-    """The three emits available on one scoped run.
+    """The emits and the direct judgment available on one scoped run.
 
     Returning from an emit is queue admission, not a durable acknowledgement.
     ``WyrdState.shutdown()`` is the durability barrier.
@@ -120,6 +176,31 @@ class Observe:
         """
         ...
 
+    def verify(
+        self,
+        verifier: str,
+        input: Mapping[str, Any] | Sequence[Mapping[str, Any]] | Any,
+        *,
+        media: Sequence[MediaRef] | None = None,
+    ) -> Judgment:
+        """Judge this view's subject with a bound Verifier and return its judgment.
+
+        ``verifier`` names a Verifier bound in ``verified_by`` to this view's
+        subject. An Eval Verifier takes one context mapping, dataclass instance,
+        or Pydantic model plus optional ``media``; a Drift Verifier takes a
+        list of flat feature rows. Blocks for the one server call. Nothing is
+        observed, recorded, enqueued, or dispatched, and Bifrost need not be
+        started.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_VERIFIER`` for an unbound
+                Verifier and ``WYRD_SDK_400_INVALID_OBSERVATION`` for input of
+                the wrong shape, both before any network IO, and otherwise the
+                server's verification refusal such as
+                ``WYRD_VERIFICATION_409_BASELINE_NOT_READY``.
+        """
+        ...
+
     def record(self, table: str, row: Mapping[str, Any] | Any) -> None:
         """Emit one row into a registered ``vala.datasets.<name>`` table.
 
@@ -150,4 +231,4 @@ def record(
     """
     ...
 
-__all__ = ["Observe", "Run", "record"]
+__all__ = ["Judgment", "Observe", "Run", "record"]

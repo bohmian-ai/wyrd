@@ -1,6 +1,6 @@
 """Scoped observation emits, and fire-and-forget Vala telemetry.
 
-``Run`` and ``Observe`` are reached through ``WyrdState.run()``; they are not
+``Run``, ``Observe``, and ``Judgment`` are reached through ``WyrdState.run()``; they are not
 constructed directly. ``record`` below is the separate telemetry door that
 swallows queue-full instead of raising.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .._wyrd.observe import Observe, Run
+from .._wyrd.observe import Judgment, Observe, Run
 from .._wyrd.observe import record as _record
 
 if TYPE_CHECKING:
@@ -42,4 +42,4 @@ def record(
     )
 
 
-__all__ = ["Observe", "Run", "record"]
+__all__ = ["Judgment", "Observe", "Run", "record"]

@@ -218,6 +218,11 @@ impl CardRefPy {
         self.0.uid.as_ref().map(ToString::to_string)
     }
 
+    /// The canonical `space/Kind/name@version` text of this reference.
+    fn __str__(&self) -> String {
+        self.0.to_string()
+    }
+
     fn __repr__(&self) -> String {
         let uid = self
             .0

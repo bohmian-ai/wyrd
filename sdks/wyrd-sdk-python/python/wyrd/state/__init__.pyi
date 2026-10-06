@@ -180,17 +180,17 @@ class WyrdState:
         """
         ...
 
-    def run(self, *, card: str | None = None) -> Run:
-        """Open one invocation, targeting ``card`` or the root Service Card.
+    def run(self, alias: str | None = None) -> Run:
+        """Open one invocation whose first view observes ``alias``.
 
         Local only: no network IO, no server-side Run resource, and no Verifier
-        execution. ``card`` selects a registered alias before the run mints its
-        ``run_id``; later ``for_card`` views share that id. Use
-        ``with state.run(card=...)`` to correlate OpenTelemetry spans created
-        inside the block.
+        execution. ``alias`` selects a registered Card before the run mints its
+        ``run_id``; omitting it opens the root Service Card's view. Later
+        ``for_card`` views share that id. Use ``with state.run("alias")`` to
+        correlate OpenTelemetry spans created inside the block.
 
         Raises:
-            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when ``card`` is not
+            WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when ``alias`` is not
                 registered in this bundle. No network IO occurs.
         """
         ...

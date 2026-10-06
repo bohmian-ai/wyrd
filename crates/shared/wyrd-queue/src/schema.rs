@@ -13,22 +13,42 @@ use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_K
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
 use parquet_variant_compute::VariantType;
 use serde_json::{Map, Value};
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit};
 
 use crate::error::WyrdQueueError;
 use crate::variant::{is_variant, variant_storage_type};
 
-/// Walk a JSON-Schema object (a Pydantic `model_json_schema()` output) into the
-/// wire `Vec<FieldSpec>`, per the locked mapping table.
+/// Walk a JSON-Schema object (a Pydantic `model_json_schema()`, Zod
+/// `z.toJSONSchema()`, or `schemars` output) into the wire `Vec<FieldSpec>`.
 ///
 /// User fields only; field order follows the input `Value`'s property order.
+/// Every node maps through one decision table:
+///
+/// - an empty or always-true schema, an object without `properties`, a string
+///   with `contentMediaType: application/json`, an array without `items`, and
+///   a union (`anyOf`, `oneOf`, or a `type` list) with more than one non-null
+///   branch are Variant;
+/// - a union of exactly one type and null is that type, nullable, and an
+///   `allOf` with one member is that member;
+/// - an object with `properties` is a Struct and a typed array a List.
+///
+/// `$ref` resolves through `$defs` or `definitions`.
 ///
 /// # Errors
-/// Returns [`WyrdQueueError::SchemaParse`] on a free-form `object` (no
-/// `properties`), an `array` with no `items`, an unsupported type, or an
-/// unresolvable `$ref`.
+/// Returns [`WyrdQueueError::SchemaParse`] for a root without `properties`, an
+/// object allowing undeclared keys beside declared properties, an unsupported
+/// type, or an unresolvable `$ref`.
 pub fn json_schema_to_fieldspec(schema: &Value) -> Result<Vec<FieldSpec>, WyrdQueueError> {
-    let defs = schema.get("$defs").and_then(Value::as_object);
+    let defs = schema
+        .get("$defs")
+        .or_else(|| schema.get("definitions"))
+        .and_then(Value::as_object);
+    if schema.get("properties").is_none() {
+        return Err(WyrdQueueError::SchemaParse(
+            "a table schema must be an object with `properties`".to_owned(),
+        ));
+    }
     build_fields(schema, defs)
 }
 
@@ -40,9 +60,17 @@ pub fn json_schema_to_fieldspec(schema: &Value) -> Result<Vec<FieldSpec>, WyrdQu
 ///
 /// # Errors
 /// Returns [`WyrdQueueError::SchemaParse`] naming the first field whose Arrow
-/// type is outside the register-accepted wire set.
+/// type is outside the register-accepted wire set, and
+/// [`WyrdQueueError::Contract`] for a type Bifrost cannot store (see
+/// [`check_supported`]).
 pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Result<Vec<FieldSpec>, WyrdQueueError> {
-    schema.fields().iter().map(|f| field_to_spec(f)).collect()
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| field_to_spec(f))
+        .collect::<Result<Vec<_>, _>>()?;
+    check_supported(&fields)?;
+    Ok(fields)
 }
 
 /// Map a `Vec<FieldSpec>` into an Arrow `Schema`, the client-side forward
@@ -121,6 +149,14 @@ pub fn json_schema_to_arrow(schema: &Value) -> Result<Schema, WyrdQueueError> {
     fieldspec_to_arrow(&json_schema_to_fieldspec(schema)?)
 }
 
+/// Map the `properties` of one object node into fields.
+///
+/// A field is nullable when its schema admits null or, when the node names a
+/// `required` set, when it is not in that set.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] when the node allows undeclared
+/// keys beside its properties, or a property fails [`map_type`].
 fn build_fields(
     obj_schema: &Value,
     defs: Option<&Map<String, Value>>,
@@ -128,7 +164,15 @@ fn build_fields(
     let props = obj_schema
         .get("properties")
         .and_then(Value::as_object)
-        .ok_or_else(free_form_dict)?;
+        .ok_or_else(|| WyrdQueueError::SchemaParse("`properties` is not an object".to_owned()))?;
+    if obj_schema
+        .get("additionalProperties")
+        .is_some_and(|extra| extra != &Value::Bool(false))
+    {
+        return Err(WyrdQueueError::SchemaParse(
+            "an object allows undeclared keys beside its declared properties; declare a Variant field for open data".to_owned(),
+        ));
+    }
     let required = obj_schema.get("required").and_then(Value::as_array);
     let has_required = required.is_some();
     let required: std::collections::HashSet<&str> = required
@@ -137,112 +181,200 @@ fn build_fields(
 
     let mut out = Vec::with_capacity(props.len());
     for (name, prop) in props {
-        let optional = is_optional(prop);
-        // Nullability: an `anyOf[..,null]` (Optional[T]) or a field absent from
-        // `required` is nullable; a field in `required` is not. Defaults to true
-        // when the schema names no `required` set at all.
-        let nullable = if optional {
-            true
-        } else if has_required {
-            !required.contains(name.as_str())
-        } else {
-            true
-        };
+        let (data_type, admits_null) = map_type(prop, defs)?;
         out.push(FieldSpec {
             name: name.clone(),
-            data_type: map_type(prop, defs)?,
-            nullable,
+            data_type,
+            nullable: admits_null || !has_required || !required.contains(name.as_str()),
             metadata: BTreeMap::new(),
         });
     }
     Ok(out)
 }
 
+/// Map one schema node to its column type and whether it admits null.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] for a node no column type holds:
+/// an always-false schema, a null-only union, a multi-member `allOf`, an
+/// unknown `type`, or an unresolvable `$ref`.
 fn map_type(
     prop: &Value,
     defs: Option<&Map<String, Value>>,
-) -> Result<DataTypeSpec, WyrdQueueError> {
-    if let Some(reference) = prop.get("$ref").and_then(Value::as_str) {
-        let resolved = resolve_ref(reference, defs)?;
-        return map_type(resolved, defs);
+) -> Result<(DataTypeSpec, bool), WyrdQueueError> {
+    let node = match prop {
+        Value::Bool(true) => return Ok((DataTypeSpec::Variant, true)),
+        Value::Object(node) => node,
+        other => {
+            return Err(WyrdQueueError::SchemaParse(format!(
+                "schema node {other} admits no value"
+            )));
+        }
+    };
+    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        return map_type(resolve_ref(reference, defs)?, defs);
     }
-    if let Some(any) = prop.get("anyOf").and_then(Value::as_array) {
-        let branch = any
+    if let Some(all) = node.get("allOf").and_then(Value::as_array) {
+        return match all.as_slice() {
+            [member] => map_type(member, defs),
+            _ => Err(WyrdQueueError::SchemaParse(
+                "allOf with more than one member is unsupported".to_owned(),
+            )),
+        };
+    }
+    if let Some(branches) = node
+        .get("anyOf")
+        .or_else(|| node.get("oneOf"))
+        .and_then(Value::as_array)
+    {
+        let (nulls, others): (Vec<_>, Vec<_>) = branches.iter().partition(|b| is_null(b));
+        return match others.as_slice() {
+            [] => Err(WyrdQueueError::SchemaParse(
+                "union without a non-null branch".to_owned(),
+            )),
+            [only] => map_type(only, defs).map(|(dt, admits)| (dt, admits || !nulls.is_empty())),
+            _ => Ok((DataTypeSpec::Variant, !nulls.is_empty())),
+        };
+    }
+    if let Some(types) = node.get("type").and_then(Value::as_array) {
+        let others: Vec<&str> = types
             .iter()
-            .find(|b| b.get("type").and_then(Value::as_str) != Some("null"))
-            .ok_or_else(|| {
-                WyrdQueueError::SchemaParse("anyOf without a non-null branch".to_owned())
-            })?;
-        return map_type(branch, defs);
+            .filter_map(Value::as_str)
+            .filter(|t| *t != "null")
+            .collect();
+        let admits_null = others.len() < types.len();
+        return match others.as_slice() {
+            [] => Err(WyrdQueueError::SchemaParse(
+                "union without a non-null branch".to_owned(),
+            )),
+            [only] => {
+                let mut single = node.clone();
+                single.insert("type".to_owned(), Value::from(*only));
+                map_type(&Value::Object(single), defs)
+                    .map(|(dt, admits)| (dt, admits || admits_null))
+            }
+            _ => Ok((DataTypeSpec::Variant, admits_null)),
+        };
     }
     // A bare `{"enum": [...]}` (no explicit type) is a string enumeration → Utf8;
     // dictionary-encoding is a builder optimization, not a wire type.
-    if prop.get("type").is_none() && prop.get("enum").is_some() {
-        return Ok(DataTypeSpec::Utf8);
+    if node.get("type").is_none() && node.get("enum").is_some() {
+        return Ok((DataTypeSpec::Utf8, false));
     }
-    match prop.get("type").and_then(Value::as_str) {
-        Some("integer") => Ok(DataTypeSpec::Int64),
-        Some("number") => Ok(DataTypeSpec::Float64),
-        Some("boolean") => Ok(DataTypeSpec::Bool),
-        Some("string") => Ok(match prop.get("format").and_then(Value::as_str) {
-            Some("date-time") => DataTypeSpec::Timestamp {
-                unit: TimeUnit::Microsecond,
-                tz: Some("UTC".to_owned()),
-            },
-            Some("date") => DataTypeSpec::Date32,
-            _ => DataTypeSpec::Utf8,
-        }),
-        Some("array") => {
-            let items = prop.get("items").ok_or_else(|| {
-                WyrdQueueError::SchemaParse("array schema missing `items`".to_owned())
-            })?;
-            Ok(DataTypeSpec::List(Box::new(FieldSpec {
-                name: "item".to_owned(),
-                data_type: map_type(items, defs)?,
-                nullable: true,
-                metadata: BTreeMap::new(),
-            })))
-        }
-        Some("object") => {
-            if prop.get("properties").is_some() {
-                Ok(DataTypeSpec::Struct(build_fields(prop, defs)?))
+    let data_type = match node.get("type").and_then(Value::as_str) {
+        // An untyped node constrains nothing: `Any`, `JsonValue`, `unknown`.
+        None => return Ok((DataTypeSpec::Variant, true)),
+        Some("integer") => DataTypeSpec::Int64,
+        Some("number") => DataTypeSpec::Float64,
+        Some("boolean") => DataTypeSpec::Bool,
+        Some("string") => {
+            if node.get("contentMediaType").and_then(Value::as_str) == Some("application/json") {
+                DataTypeSpec::Variant
             } else {
-                Err(free_form_dict())
+                match node.get("format").and_then(Value::as_str) {
+                    Some("date-time") => DataTypeSpec::Timestamp {
+                        unit: TimeUnit::Microsecond,
+                        tz: Some("UTC".to_owned()),
+                    },
+                    Some("date") => DataTypeSpec::Date32,
+                    _ => DataTypeSpec::Utf8,
+                }
             }
         }
-        Some(other) => Err(WyrdQueueError::SchemaParse(format!(
-            "unsupported JSON-Schema type: {other}"
-        ))),
-        None => Err(WyrdQueueError::SchemaParse(
-            "schema node has no `type`, `$ref`, `anyOf`, or `enum`".to_owned(),
-        )),
-    }
+        Some("array") => match node.get("items") {
+            None => DataTypeSpec::Variant,
+            Some(items) => DataTypeSpec::List(Box::new(FieldSpec {
+                name: "item".to_owned(),
+                data_type: map_type(items, defs)?.0,
+                nullable: true,
+                metadata: BTreeMap::new(),
+            })),
+        },
+        Some("object") if node.contains_key("properties") => {
+            DataTypeSpec::Struct(build_fields(prop, defs)?)
+        }
+        Some("object") => DataTypeSpec::Variant,
+        Some(other) => {
+            return Err(WyrdQueueError::SchemaParse(format!(
+                "unsupported JSON-Schema type: {other}"
+            )));
+        }
+    };
+    Ok((data_type, false))
 }
 
+/// Report whether a union branch is the null schema.
+fn is_null(branch: &Value) -> bool {
+    branch.get("type").and_then(Value::as_str) == Some("null")
+}
+
+/// Resolve a local `$ref` through `$defs` or `definitions`.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] for a non-local reference or a
+/// missing definition.
 fn resolve_ref<'a>(
     reference: &str,
     defs: Option<&'a Map<String, Value>>,
 ) -> Result<&'a Value, WyrdQueueError> {
-    let name = reference.strip_prefix("#/$defs/").ok_or_else(|| {
-        WyrdQueueError::SchemaParse(format!("unsupported $ref form: {reference}"))
-    })?;
+    let name = reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+        .ok_or_else(|| {
+            WyrdQueueError::SchemaParse(format!("unsupported $ref form: {reference}"))
+        })?;
     defs.and_then(|d| d.get(name))
         .ok_or_else(|| WyrdQueueError::SchemaParse(format!("unresolvable $ref: {reference}")))
 }
 
-fn is_optional(prop: &Value) -> bool {
-    prop.get("anyOf")
-        .and_then(Value::as_array)
-        .is_some_and(|any| {
-            any.iter()
-                .any(|b| b.get("type").and_then(Value::as_str) == Some("null"))
-        })
+/// Refuse every declaration Bifrost cannot store, at any depth.
+///
+/// This is the one supported-type decision: the SDK schema doors call it
+/// before any request and the server register path repeats it. Iceberg
+/// stores neither UInt64, Date64, Time32, nanosecond Time64, second or
+/// millisecond timestamps, nor a timestamp zone other than UTC.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::Contract`] carrying
+/// [`BifrostError::UnsupportedType`] naming the first refused field by its
+/// dotted path and its Arrow type.
+pub fn check_supported(fields: &[FieldSpec]) -> Result<(), WyrdQueueError> {
+    fields
+        .iter()
+        .try_for_each(|field| check_supported_type(&field.name, &field.data_type))
 }
 
-fn free_form_dict() -> WyrdQueueError {
-    WyrdQueueError::SchemaParse(
-        "free-form dict unsupported — declare a model or a `pyarrow.Schema`".to_owned(),
-    )
+/// Refuse one declaration, recursing through List and Struct children.
+///
+/// # Errors
+/// As [`check_supported`].
+fn check_supported_type(path: &str, data_type: &DataTypeSpec) -> Result<(), WyrdQueueError> {
+    let supported = match data_type {
+        DataTypeSpec::UInt64 | DataTypeSpec::Date64 | DataTypeSpec::Time32 { .. } => false,
+        DataTypeSpec::Time64 { unit } => *unit == TimeUnit::Microsecond,
+        DataTypeSpec::Timestamp { unit, tz } => {
+            matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond)
+                && tz
+                    .as_deref()
+                    .is_none_or(|zone| zone == "UTC" || zone == "+00:00")
+        }
+        DataTypeSpec::List(element) => {
+            return check_supported_type(&format!("{path}.{}", element.name), &element.data_type);
+        }
+        DataTypeSpec::Struct(children) => {
+            return children.iter().try_for_each(|child| {
+                check_supported_type(&format!("{path}.{}", child.name), &child.data_type)
+            });
+        }
+        _ => true,
+    };
+    if supported {
+        return Ok(());
+    }
+    Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
+        field: path.to_owned(),
+        data_type: data_type_to_arrow(data_type, false).to_string(),
+    }))
 }
 
 /// Project one Arrow field onto its wire declaration, metadata included.
@@ -442,7 +574,7 @@ mod schema_tests {
 
     use crate::WyrdQueueError;
     use crate::schema::{
-        arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow,
+        arrow_schema_to_fieldspec, field_to_spec, fieldspec_to_arrow, json_schema_to_arrow,
         json_schema_to_fieldspec,
     };
     use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
@@ -568,14 +700,152 @@ mod schema_tests {
         assert_eq!(field(inner, "x").data_type, DataTypeSpec::Float64);
     }
 
+    /// Every REQ-012 declaration form maps to its exact column, and every
+    /// unsupported form is refused with its exact catalog code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a form maps to another type or nullability, or a refusal
+    /// carries another code or detail.
     #[test]
-    fn free_form_dict_is_schema_parse() {
-        let err = json_schema_to_fieldspec(&json!({"type": "object"})).unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+    fn open_nested_and_unsupported_schemas_map_exactly() {
+        use crate::schema::check_supported;
+        use wyrd_spec::vala::BifrostError;
 
-        let nested = json!({"properties": {"blob": {"type": "object"}}});
-        let err = json_schema_to_fieldspec(&nested).unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        let variant = DataTypeSpec::Variant;
+        let schema = json!({
+            "definitions": {"Inner": {"type": "object", "properties": {"k": {"type": "string"}}, "required": ["k"]}},
+            "properties": {
+                "any": {},
+                "always": true,
+                "dict_any": {"type": "object", "additionalProperties": true},
+                "dict_int": {"type": "object", "additionalProperties": {"type": "integer"}},
+                "record": {"type": "object", "propertyNames": {"type": "string"}, "additionalProperties": {}},
+                "json_text": {"type": "string", "contentMediaType": "application/json"},
+                "union": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                "one_of": {"oneOf": [{"type": "integer"}, {"type": "boolean"}, {"type": "null"}]},
+                "type_list": {"type": ["integer", "string"]},
+                "optional_int": {"type": ["integer", "null"]},
+                "optional_ref": {"anyOf": [{"$ref": "#/definitions/Inner"}, {"type": "null"}]},
+                "wrapped": {"allOf": [{"$ref": "#/definitions/Inner"}]},
+                "untyped_list": {"type": "array"},
+                "typed_list": {"type": "array", "items": {"type": "integer"}},
+                "closed": {"type": "object", "properties": {"x": {"type": "number"}}, "additionalProperties": false, "required": ["x"]},
+            },
+            "required": ["any", "always", "dict_any", "union", "type_list", "wrapped", "typed_list", "closed"]
+        });
+        let specs = json_schema_to_fieldspec(&schema).expect("every REQ-012 form maps");
+        let inner = DataTypeSpec::Struct(vec![make_field("k", DataTypeSpec::Utf8, false)]);
+        let expected = vec![
+            ("any", variant.clone(), true),
+            ("always", variant.clone(), true),
+            ("dict_any", variant.clone(), false),
+            ("dict_int", variant.clone(), true),
+            ("record", variant.clone(), true),
+            ("json_text", variant.clone(), true),
+            ("union", variant.clone(), false),
+            ("one_of", variant.clone(), true),
+            ("type_list", variant.clone(), false),
+            ("optional_int", DataTypeSpec::Int64, true),
+            ("optional_ref", inner.clone(), true),
+            ("wrapped", inner, false),
+            ("untyped_list", variant, true),
+            (
+                "typed_list",
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, true))),
+                false,
+            ),
+            (
+                "closed",
+                DataTypeSpec::Struct(vec![make_field("x", DataTypeSpec::Float64, false)]),
+                false,
+            ),
+        ];
+        assert_eq!(
+            specs
+                .iter()
+                .map(|f| (f.name.as_str(), f.data_type.clone(), f.nullable))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        for open in [
+            json!({"properties": {"id": {"type": "integer"}}, "additionalProperties": true}),
+            json!({"properties": {"m": {"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": {}}}}),
+        ] {
+            let error = json_schema_to_fieldspec(&open).expect_err("open extras refuse");
+            assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+            assert!(
+                error
+                    .to_string()
+                    .contains("declare a Variant field for open data")
+            );
+        }
+        assert_eq!(
+            json_schema_to_fieldspec(&json!({"type": "object"}))
+                .expect_err("a free-form root declares no columns")
+                .code(),
+            "WYRD_VALA_400_SCHEMA_PARSE"
+        );
+
+        let ts = |unit, tz: Option<&str>| DataTypeSpec::Timestamp {
+            unit,
+            tz: tz.map(str::to_owned),
+        };
+        for data_type in [
+            DataTypeSpec::UInt64,
+            DataTypeSpec::Date64,
+            DataTypeSpec::Time32 {
+                unit: TimeUnit::Second,
+            },
+            DataTypeSpec::Time64 {
+                unit: TimeUnit::Nanosecond,
+            },
+            ts(TimeUnit::Second, None),
+            ts(TimeUnit::Millisecond, Some("UTC")),
+            ts(TimeUnit::Microsecond, Some("America/New_York")),
+        ] {
+            let rendered = fieldspec_to_arrow(&[make_field("x", data_type.clone(), true)])
+                .expect("projects")
+                .field(0)
+                .data_type()
+                .to_string();
+            let nested = vec![make_field(
+                "outer",
+                DataTypeSpec::Struct(vec![make_field("bad", data_type, true)]),
+                true,
+            )];
+            let Err(WyrdQueueError::Contract(error)) = check_supported(&nested) else {
+                panic!("{rendered} must be refused");
+            };
+            assert_eq!(
+                error,
+                BifrostError::UnsupportedType {
+                    field: "outer.bad".to_owned(),
+                    data_type: rendered,
+                }
+            );
+            let arrow = fieldspec_to_arrow(&nested).expect("projects");
+            assert_eq!(
+                arrow_schema_to_fieldspec(&arrow)
+                    .expect_err("the SDK door refuses")
+                    .code(),
+                "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
+            );
+        }
+        check_supported(&[
+            make_field("ok_utc", ts(TimeUnit::Microsecond, Some("UTC")), true),
+            make_field("ok_ns", ts(TimeUnit::Nanosecond, None), true),
+            make_field(
+                "ok_time",
+                DataTypeSpec::Time64 {
+                    unit: TimeUnit::Microsecond,
+                },
+                true,
+            ),
+            make_field("ok_variant", DataTypeSpec::Variant, true),
+        ])
+        .expect("supported types pass");
     }
 
     #[test]
@@ -585,7 +855,7 @@ mod schema_tests {
             Field::new("money", DataType::Decimal128(10, 2), true),
             Field::new(
                 "local",
-                DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("America/New_York".into())),
+                DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into())),
                 true,
             ),
         ]);
@@ -605,7 +875,7 @@ mod schema_tests {
             field(&specs, "local").data_type,
             DataTypeSpec::Timestamp {
                 unit: TimeUnit::Nanosecond,
-                tz: Some("America/New_York".to_owned())
+                tz: Some("+00:00".to_owned())
             }
         );
     }
@@ -642,9 +912,19 @@ mod schema_tests {
         }
     }
 
+    /// Projects `specs` to Arrow and inverts each field through the pure wire
+    /// mapping, so every wire type (stored or not) proves its round trip.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a spec does not project or a projected field does not map back.
     fn round_trip(specs: Vec<FieldSpec>) -> Vec<FieldSpec> {
         let schema = fieldspec_to_arrow(&specs).expect("fieldspec_to_arrow");
-        arrow_schema_to_fieldspec(&schema).expect("a projected schema maps back")
+        schema
+            .fields()
+            .iter()
+            .map(|f| field_to_spec(f).expect("a projected field maps back"))
+            .collect()
     }
 
     #[test]
@@ -793,20 +1073,6 @@ mod schema_tests {
         let via_compose = fieldspec_to_arrow(&json_schema_to_fieldspec(&schema).expect("parse"))
             .expect("compose");
         assert_eq!(direct, via_compose);
-    }
-
-    #[test]
-    fn json_schema_to_arrow_array_missing_items_is_schema_parse() {
-        let schema = json!({"properties": {"bad": {"type": "array"}}});
-        let err = json_schema_to_arrow(&schema).unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-    }
-
-    #[test]
-    fn json_schema_to_arrow_free_form_dict_is_schema_parse() {
-        let schema = json!({"type": "object"});
-        let err = json_schema_to_arrow(&schema).unwrap_err();
-        assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
     /// A recursive declaration keeps every child's shape and drops its ids.

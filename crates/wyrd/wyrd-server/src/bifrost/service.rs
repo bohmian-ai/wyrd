@@ -86,7 +86,9 @@ fn assert_registered_layout_matches(
 /// Returns a permission error when the caller lacks `bifrost_table:write`,
 /// [`WyrdError::AuditUnavailable`] when the decision audit append fails,
 /// a validation error for a non-dataset namespace,
-/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// [`wyrd_spec::vala::BifrostError::UnsupportedType`] for a field type Bifrost
+/// cannot store (the same `wyrd_queue::check_supported` decision every SDK
+/// applies before sending), [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
 /// carries no catalog, and the mapped catalog error otherwise.
 pub async fn register_table(
     state: &AppState,
@@ -120,6 +122,10 @@ pub async fn register_table(
             message: "only vala.datasets registrations are caller-owned".to_owned(),
             details: serde_json::json!({ "table": fqn_for_audit }),
         });
+    }
+    if let Err(error) = wyrd_queue::check_supported(&body.fields) {
+        record_allowed().await?;
+        return Err(WyrdError::from(&error));
     }
     let user_fields: Vec<Field> = body
         .fields

@@ -246,7 +246,7 @@ fn collect<T>(
 /// Returns [`WyrdQueueError::SchemaParse`] when a value does not convert to
 /// the column type (including malformed or wrong-width hex), when a required
 /// value is null or missing, or when the data type is unsupported, and
-/// [`WyrdQueueError::Variant`] when a Variant value exceeds a Variant limit.
+/// [`WyrdQueueError::Contract`] when a Variant value exceeds a Variant limit.
 fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueError> {
     let name = field.name();
     let nullable = field.is_nullable();
@@ -341,7 +341,7 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
 /// # Errors
 ///
 /// Returns [`WyrdQueueError::SchemaParse`] when a non-nullable column has a
-/// null or absent value, and [`WyrdQueueError::Variant`] naming the field and
+/// null or absent value, and [`WyrdQueueError::Contract`] naming the field and
 /// row when a value exceeds a Variant limit.
 fn build_variant_column(
     name: &str,
@@ -354,7 +354,7 @@ fn build_variant_column(
         values.iter().map(Option::as_ref),
         EncodedVariant::from_json,
     )
-    .map_err(WyrdQueueError::Variant)
+    .map_err(WyrdQueueError::Contract)
 }
 
 /// Decode exactly `width` bytes from canonical lowercase hex.

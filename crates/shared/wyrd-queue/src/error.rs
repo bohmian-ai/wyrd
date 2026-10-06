@@ -61,10 +61,12 @@ pub enum WyrdQueueError {
     #[error("reserved column: {0}")]
     ReservedColumn(String),
 
-    /// A Variant value is out of range, too deep, or too large to store.
-    /// Carries the stable catalogued Variant error with its field and row.
-    #[error("variant value refused: {0}")]
-    Variant(#[source] BifrostError),
+    /// A catalogued Bifrost contract refusal raised before admission: an
+    /// unsupported or undeclared field, or a Variant value that is invalid,
+    /// out of range, too deep, or too large. Carries the stable error with
+    /// its details.
+    #[error("bifrost contract refused: {0}")]
+    Contract(#[source] BifrostError),
 
     /// A sink-reported server error, already mapped to the stable catalog.
     #[error("sink error: {0}")]
@@ -83,7 +85,7 @@ impl WyrdQueueError {
             Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",
             Self::ReservedColumn(_) => "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
-            Self::Variant(err) => err.code(),
+            Self::Contract(err) => err.code(),
             Self::Sink(err) => err.code(),
         }
     }
@@ -120,7 +122,7 @@ impl From<&WyrdQueueError> for WyrdError {
                 column: column.clone(),
             }
             .into(),
-            WyrdQueueError::Variant(error) => error.clone().into(),
+            WyrdQueueError::Contract(error) => error.clone().into(),
             WyrdQueueError::Sink(inner) => inner.clone(),
         }
     }

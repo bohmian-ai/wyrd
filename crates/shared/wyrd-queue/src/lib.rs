@@ -41,8 +41,8 @@ pub use producer::{
 };
 pub use queue::{Flushable, RecordQueue, Row};
 pub use schema::{
-    arrow_schema_to_fieldspec, field_to_spec, fieldspec_to_arrow, is_extension_key,
-    json_schema_to_arrow, json_schema_to_fieldspec, spec_to_field,
+    arrow_schema_to_fieldspec, check_supported, field_to_spec, fieldspec_to_arrow,
+    is_extension_key, json_schema_to_arrow, json_schema_to_fieldspec, spec_to_field,
 };
 pub use sealed_sender::SealedBatchSender;
 pub use sink::{

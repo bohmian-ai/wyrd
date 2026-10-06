@@ -79,8 +79,10 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_ref`, or `run_id` name, and `WYRD_VALA_400_SCHEMA_PARSE`
-    /// when a column's Arrow type is not representable on the wire.
+    /// `wyrd_*`, `card_ref`, or `run_id` name, `WYRD_VALA_400_SCHEMA_PARSE`
+    /// when a column's Arrow type is not representable on the wire, and
+    /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
+    /// Bifrost cannot store it — before any request is sent.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
@@ -107,8 +109,8 @@ impl TableConfig {
     /// # Errors
     ///
     /// As [`TableConfig::from_arrow`], plus a schema-parse failure for a
-    /// free-form object, an untyped array, an unsupported type, or an
-    /// unresolvable `$ref`.
+    /// model allowing undeclared keys beside its declared properties, an
+    /// unsupported JSON-Schema type, or an unresolvable `$ref`.
     pub fn from_json_schema(
         fqn: &str,
         schema: &serde_json::Value,
@@ -124,9 +126,9 @@ impl TableConfig {
     /// a Rust struct, a Pydantic model, and a Zod object that describe the same
     /// columns reach the same Arrow schema through the same single mapper.
     ///
-    /// The declared type must be a struct of supported scalar, list, or nested
-    /// struct fields; `schemars` emits a `$ref` for a nested type, which the
-    /// shared mapper resolves only from a `$defs` section.
+    /// The declared type must be a struct; a nested struct becomes a Struct
+    /// column, a `Vec<T>` a List, and `serde_json::Value` or
+    /// `HashMap<String, T>` a Variant.
     ///
     /// # Errors
     ///

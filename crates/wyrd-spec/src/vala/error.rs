@@ -227,7 +227,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_SCHEMA_PARSE",
         status = 400,
         title = "Bifrost schema parse failed",
-        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec."
+        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data."
     )]
     SchemaParse {
         /// Human-readable schema or value validation detail.

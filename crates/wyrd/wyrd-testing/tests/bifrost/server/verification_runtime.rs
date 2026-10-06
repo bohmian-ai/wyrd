@@ -1054,7 +1054,11 @@ async fn query_rows(
 /// columns are read back through the server's query entry and every Variant
 /// cell decodes to the producer's native JSON value. A scored Drift carries
 /// only `drift_report`, an Eval only `eval_summary`, and an unscored Drift
-/// neither. The retained audit row's `entry_hash` is recomputed from the
+/// neither. Every child of both summary Structs is projected with
+/// `get_field` from the hot rows before the flush and the published rows
+/// after it: an absent summary's children all read SQL null, including
+/// `to_json` of its Variant, and a present summary's children read its
+/// values. The retained audit row's `entry_hash` is recomputed from the
 /// stored columns, with the decoded detail re-canonicalized, and matches.
 ///
 /// # Errors
@@ -1069,8 +1073,68 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let call = journey.capture_gateway_call().await?;
     let trace = journey.write_agent_trace().await?;
     let decision = journey.append_audit_decision().await?;
+    let children_sql = format!(
+        "SELECT result_id, drift_report['method'], drift_report['verdict'], \
+         drift_report['features'], to_json(drift_report['features']) IS NULL, \
+         eval_summary['total_tasks'], eval_summary['passed_tasks'], \
+         eval_summary['failed_tasks'], eval_summary['pass_rate'], \
+         eval_summary['duration_ms'] FROM vala.verification.results \
+         WHERE result_id IN ('{}', '{}', '{}') ORDER BY result_id",
+        results.scored_drift, results.unscored_drift, results.eval
+    );
+    let drift = |key: &str| results.drift_report[key].clone();
+    let eval = |key: &str| results.eval_summary[key].clone();
+    let mut expected_children = vec![
+        vec![
+            json!(results.scored_drift.to_string()),
+            drift("method"),
+            drift("verdict"),
+            drift("features"),
+            json!(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        vec![
+            json!(results.unscored_drift.to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            json!(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        vec![
+            json!(results.eval.to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            json!(true),
+            eval("total_tasks"),
+            eval("passed_tasks"),
+            eval("failed_tasks"),
+            eval("pass_rate"),
+            eval("duration_ms"),
+        ],
+    ];
+    expected_children.sort_by_key(|row| row[0].to_string());
+    expect_eq(
+        "hot summary Struct children",
+        &journey.rows(children_sql.clone()).await?,
+        &expected_children,
+    )?;
     journey.server.flush_bifrost().await?;
     journey.server.await_audit_published(journey.tenant).await?;
+    expect_eq(
+        "published summary Struct children",
+        &journey.rows(children_sql).await?,
+        &expected_children,
+    )?;
 
     // Verification results: the two summary Structs are set exclusively.
     let summaries = journey
@@ -1197,13 +1261,20 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// malformed frame is refused with its exact catalogued error before any ACK.
 ///
 /// `vala.dev.agent_traces` covers a missing and a foreign extension marker,
-/// invalid bytes, one container past the depth limit, and one byte past the
-/// size limit. Precedence is pinned twice: an oversized value that is also
-/// malformed reports its size, and a wrong marker on one field outranks
-/// invalid bytes in another. `vala.traces.spans` covers the Variant nested in
-/// `events`, named by its top-level column. A non-Variant type change stays a
-/// fingerprint mismatch. Afterward only the two valid sentinel frames are
-/// readable, so no refused frame persisted a row.
+/// the Variant marker with foreign extension metadata, invalid bytes, one
+/// container past the depth limit, a compact value nested 20,000 levels deep
+/// that is refused for depth without taking the server down, and one byte
+/// past the size limit. Precedence is pinned: an oversized value that is also
+/// malformed reports its size, a wrong marker on one field outranks invalid
+/// bytes in another, and an undeclared column or a non-Variant type change
+/// outranks each of invalid, over-deep, and oversized Variant bytes. A JSON
+/// row whose Variant holds an out-of-range integer beside an over-deep branch
+/// is refused for numeric range in both key orders before any ACK.
+/// `vala.traces.spans` covers the Variant nested in `events`, with a missing
+/// marker and with foreign extension metadata, named by its top-level column.
+/// A non-Variant type change stays a fingerprint mismatch. Afterward the same
+/// server accepts the two valid sentinel frames and only they are readable,
+/// so no refused frame persisted a row.
 ///
 /// # Errors
 ///
@@ -1227,6 +1298,18 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             "arrow.json".to_owned(),
         )]))
     };
+    let foreign_metadata = |name: &str| {
+        variant_field(name, false).with_metadata(HashMap::from([
+            (
+                EXTENSION_NAME_KEY.to_owned(),
+                "arrow.parquet.variant".to_owned(),
+            ),
+            (
+                EXTENSION_METADATA_KEY.to_owned(),
+                r#"{"shredded":true}"#.to_owned(),
+            ),
+        ]))
+    };
     let messages = || variant_field("messages", false);
     let tool_io = || variant_field("tool_io", true);
     let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES)?;
@@ -1242,6 +1325,13 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     let deepest = nested_lists(VARIANT_MAX_DEPTH)?;
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
         .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
+    let too_deep = BifrostError::VariantTooDeep {
+        field: "messages".to_owned(),
+        row: 0,
+        path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
+        depth: VARIANT_MAX_DEPTH + 1,
+        limit: VARIANT_MAX_DEPTH,
+    };
 
     let traces = [
         (
@@ -1254,6 +1344,11 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             (foreign("messages"), valid()?),
             unsupported("messages"),
         ),
+        (
+            "foreign extension metadata",
+            (foreign_metadata("messages"), valid()?),
+            unsupported("messages"),
+        ),
         ("invalid bytes", (messages(), invalid()?), invalid_messages),
         (
             "one container past the depth limit",
@@ -1261,13 +1356,15 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
                 messages(),
                 raw_variant(&EMPTY_METADATA, &nested_lists(VARIANT_MAX_DEPTH + 1)?)?,
             ),
-            BifrostError::VariantTooDeep {
-                field: "messages".to_owned(),
-                row: 0,
-                path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
-                depth: VARIANT_MAX_DEPTH + 1,
-                limit: VARIANT_MAX_DEPTH,
-            },
+            too_deep.clone(),
+        ),
+        (
+            "a compact hostile depth",
+            (
+                messages(),
+                raw_variant(&EMPTY_METADATA, &nested_lists(20_000)?)?,
+            ),
+            too_deep.clone(),
         ),
         (
             "an oversized malformed value reports its size",
@@ -1299,28 +1396,82 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             &unsupported("tool_io"),
         )
         .await?;
+    let large_model = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
+        let fields = frame
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "model" => Arc::new(Field::new("model", DataType::LargeUtf8, false)),
+                _ => Arc::clone(field),
+            })
+            .collect::<Vec<_>>();
+        let mut columns = frame.columns().to_vec();
+        columns[frame.schema().index_of("model")?] = cast(
+            frame.column_by_name("model").ok_or("no model")?,
+            &DataType::LargeUtf8,
+        )?;
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    };
+    let undeclared = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
+        let mut fields = frame.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("undeclared", DataType::Utf8, true)));
+        let mut columns = frame.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(vec![None::<&str>])));
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    };
     let frame = admission.trace_frame(&refused, (messages(), valid()?), (tool_io(), valid()?))?;
-    let mismatched = frame
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| match field.name().as_str() {
-            "model" => Arc::new(Field::new("model", DataType::LargeUtf8, false)),
-            _ => Arc::clone(field),
-        })
-        .collect::<Vec<_>>();
-    let mut columns = frame.columns().to_vec();
-    columns[frame.schema().index_of("model")?] = cast(
-        frame.column_by_name("model").ok_or("no model")?,
-        &DataType::LargeUtf8,
-    )?;
-    let mismatched = RecordBatch::try_new(Arc::new(Schema::new(mismatched)), columns)?;
-    let error = admission.refusal(AGENT_TRACES, &mismatched).await?;
+    let error = admission
+        .refusal(AGENT_TRACES, &large_model(frame)?)
+        .await?;
     expect_eq(
         "a non-Variant type change",
         &error.code(),
         &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
     )?;
+    let variant_defects = [
+        ("invalid", invalid()?),
+        (
+            "over-deep",
+            raw_variant(&EMPTY_METADATA, &nested_lists(VARIANT_MAX_DEPTH + 1)?)?,
+        ),
+        ("oversized", raw_variant(&[0xff], &vec![0xff; limit])?),
+    ];
+    for (defect, bytes) in variant_defects {
+        let frame = || {
+            admission.trace_frame(
+                &refused,
+                (messages(), Arc::clone(&bytes)),
+                (tool_io(), valid()?),
+            )
+        };
+        admission
+            .refuse(
+                &format!("an undeclared column outranks {defect} Variant bytes"),
+                AGENT_TRACES,
+                &undeclared(frame()?)?,
+                &BifrostError::UndeclaredField {
+                    field: "undeclared".to_owned(),
+                    row: 0,
+                },
+            )
+            .await?;
+        let error = admission
+            .refusal(AGENT_TRACES, &large_model(frame()?)?)
+            .await?;
+        expect_eq(
+            &format!("a non-Variant type change outranks {defect} Variant bytes"),
+            &error.code(),
+            &"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+        )?;
+    }
+    admission.refuse_numeric_before_depth().await?;
 
     let refused_spans = admission.spans_frame(&refused);
     let event_storage =
@@ -1335,6 +1486,24 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             "a nested marker",
             SPANS,
             &event_storage,
+            &BifrostError::UnsupportedType {
+                field: "events".to_owned(),
+                data_type: events_type,
+            },
+        )
+        .await?;
+    let event_metadata =
+        with_event_attributes(&refused_spans, foreign_metadata("attributes"), valid()?)?;
+    let events_type = event_metadata
+        .schema()
+        .field_with_name("events")?
+        .data_type()
+        .to_string();
+    admission
+        .refuse(
+            "nested foreign extension metadata",
+            SPANS,
+            &event_metadata,
             &BifrostError::UnsupportedType {
                 field: "events".to_owned(),
                 data_type: events_type,
@@ -1405,6 +1574,9 @@ const SPANS: &str = "vala.traces.spans";
 /// Arrow field-metadata key naming a field's extension type.
 const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
 
+/// Arrow field-metadata key carrying a field's extension parameters.
+const EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
+
 /// Variant metadata with an empty key dictionary.
 const EMPTY_METADATA: [u8; 3] = [0x01, 0x00, 0x00];
 
@@ -1420,6 +1592,8 @@ struct VariantAdmissionJourney {
     journey: TypedPayloadJourney,
     /// Ingest transport that sends frames exactly as built.
     ingest: RawIngest,
+    /// Admin client the public Bifrost facade writes JSON rows through.
+    client: wyrd_client::WyrdClient,
     /// The described `vala.traces.spans` user schema.
     spans: SchemaRef,
     /// Suffix that scopes this run's sessions and span scopes.
@@ -1456,10 +1630,72 @@ impl VariantAdmissionJourney {
         let spans = Arc::clone(TableConfig::describe(&client, SPANS).await?.user_schema());
         Ok(Self {
             ingest: RawIngest::connect(&client).await?,
+            client,
             journey,
             spans,
             run: uuid::Uuid::now_v7().simple().to_string(),
         })
+    }
+
+    /// Require that a JSON agent-trace row is refused for numeric range in
+    /// both key orders when its `messages` Variant also nests past the depth
+    /// limit.
+    ///
+    /// Each row goes through the public facade's JSON-row path with its
+    /// integer token intact, and the refusal surfaces from the flush before
+    /// any frame is acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connect, describe, or enqueue error, or a description when
+    /// a row is accepted or refused with any other error.
+    async fn refuse_numeric_before_depth(&self) -> Result<(), ServerJourneyError> {
+        let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
+        for (numeric, nested) in [("a", "b"), ("b", "a")] {
+            let bifrost = Bifrost::connect(&self.client).await?;
+            let table = bifrost.writer_table(AGENT_TRACES).await?;
+            let fields = table
+                .user_schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    let value = match field.data_type() {
+                        _ if field.name() == "messages" => {
+                            format!(r#"{{"{numeric}": 18446744073709551616, "{nested}": {deep}}}"#)
+                        }
+                        _ if field.is_nullable() => "null".to_owned(),
+                        DataType::Timestamp(..) => format!("\"{}\"", Utc::now().to_rfc3339()),
+                        _ => format!("\"{}\"", self.session("refused")),
+                    };
+                    format!("{}: {value}", Value::from(field.name().as_str()))
+                })
+                .collect::<Vec<_>>();
+            bifrost.insert_into(
+                &table,
+                format!("{{{}}}", fields.join(", ")).into_bytes(),
+                wyrd_client::bifrost::Correlation::default(),
+            )?;
+            let refused = bifrost
+                .flush()
+                .await
+                .map(|()| "the row was accepted".to_owned())
+                .map_err(|error| WyrdError::from(&error));
+            let what = format!("numeric range outranks depth with numeric key {numeric}");
+            match refused {
+                Err(WyrdError::Vala { error }) => expect_eq(
+                    &what,
+                    &error,
+                    &BifrostError::VariantNumericOutOfRange {
+                        field: "messages".to_owned(),
+                        row: 0,
+                        path: format!("/{numeric}"),
+                        numeric_kind: "integer".to_owned(),
+                    },
+                )?,
+                other => return Err(format!("{what}: {other:?}").into()),
+            }
+        }
+        Ok(())
     }
 
     /// Name one session or span scope of this run.

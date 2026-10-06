@@ -222,3 +222,127 @@ package, target, features, and exact expression. At minimum prove:
 Do not replace exact focused selectors with a positional filter that can select
 zero tests. Do not weaken, ignore, allow, or delete an existing gate to clear
 this remediation.
+
+## Implementation Evidence — 2026-10-06
+
+### Diagnosis — V2 Gate write refused after nulling absent Struct children
+
+- **Symptom:** `verification_runtime::typed_builtin_payloads_are_queryable`
+  failed with `OtlpRequestMalformed { table: "unknown", detail: "ingest frame
+  validation failed" }` once absent `drift_report`/`eval_summary` children
+  became null slots.
+- **Evidence:** `scribe/material_plan.rs` `NativeScan::visit_batch` refused
+  every non-nullable node with `null_count != 0`; `gate/error.rs` maps that
+  `ScribeError::InvalidFrame` to the OTLP-labelled decode error before table
+  resolution. Arrow 59.3 `ArrayData::validate_nulls` /
+  `validate_non_nullable` (`arrow-data-59.3.0/src/data.rs:1416-1479`) admit a
+  non-nullable Struct child null exactly where the parent is null.
+- **Cause:** the native preflight was stricter than Arrow and the client
+  encoder (`scribe/fixed_ipc.rs` `visit_nodes`); this is the same rule the
+  original placeholder workaround existed to satisfy.
+- **Fix site:** `NativeScan` (every native write passes it). A field under
+  an enclosing nullable Struct (no List between) may carry nulls; exact
+  bitmap containment stays with Arrow decode validation, which always runs (`preprocess.rs` `StreamDecoder::new()`, no
+  `skip_validation`). Top-level columns and list items stay strict. Other
+  callers checked: `validate_buffer_layouts` (count/bitmap agreement only),
+  `tables/mod.rs` `validate_variant_values` (skips null cells),
+  `execution_lanes.rs` (top-level `card_ref` only).
+- **Diagnostician (`diag-r4-frame`, read-only):** same cause and fix site;
+  Arrow decode validation already enforces exact containment; the
+  top-level `native_preflight_rejects_nonnullable_nulls` stays red.
+
+### Diagnosis — published Struct children of an absent summary read non-null
+
+- **Symptom:** after the Gate fix, V2 passes "hot summary Struct children" but
+  the published read (after `flush_bifrost`) returns `method: ""`,
+  `verdict: ""`, numeric children, and an empty Variant for absent
+  `drift_report`/`eval_summary`; its JSON rendering is invalid
+  (`"...[features]":,`).
+- **Evidence:** traced `rows` output (scratchpad `r4/v2c.log`): the scored
+  Drift row's published `eval_summary` reads `1, 1, 0, 1.0, 7`, which are the
+  Eval row's values. `parquet-59.3.0/src/arrow/record_reader/mod.rs:261-276`
+  (`consume_bitmap`) drops the null mask of a REQUIRED leaf by design;
+  `record_reader/buffer.rs:66-84` (`pad_nulls`) leaves vacated slots stale;
+  `array_reader/struct_array.rs:121` rebuilds nulls only for the nullable
+  parent; `datafusion-functions-55.1.0/src/core/getfield.rs:237-242` returns
+  the child without the parent's nulls. Hot reads come from Scribe's Arrow IPC
+  and keep the child nulls.
+- **Cause:** a non-null Arrow child is a REQUIRED Parquet leaf, so the pinned
+  reader cannot return its parent-masked nulls, and `get_field` exposes the
+  padded buffer. The placeholders this remediation removed never reached
+  Parquet either (the writer stores no leaf value under a null parent), so the
+  published leak predates this candidate. Separately,
+  `VariantJsonEncoderFactory` rendered from the masked storage but passed the
+  unmasked `array.logical_nulls()` to `NullableEncoder`.
+- **Fix site:** the encoder is fixed at its owner (`storage.logical_nulls()`),
+  proven red-then-green by `variant::tests::json_writer_renders_variants_as_values`;
+  this repairs the CLI, MCP, Rust SDK, and test renderers. The child-null leak
+  has no in-contract fix site: spec revision 11 (lines 230-251) fixes these
+  children as non-null, and this remediation forbids a read-normalization
+  layer or custom Struct operator. The only remaining options are nullable
+  children in the declared schema (a persisted fingerprint/Iceberg schema
+  change), a read layer that pushes parent nulls into children on the hot
+  and Iceberg paths, or an upstream parquet/DataFusion change.
+- **Diagnostician (`diag-r4-published`, read-only):** same cause and fix
+  sites; flags auditing other built-ins with a nullable Struct over non-null
+  children (List<Struct> elements are unaffected).
+
+**Resolution (human decision, 2026-10-06):** spec revision 12 makes every
+child of the nullable `drift_report` and `eval_summary` Structs nullable
+(`ResultsTable::drift_report_fields` / `eval_summary_fields`), so the leaves
+are OPTIONAL Parquet columns whose nulls survive the read and `get_field`
+returns SQL null with no read layer. TASK-001 now binds revision 12. The
+Scribe masked-null allowance adopts TASK-002 commit `535367c94`'s
+`fixed_ipc.rs` and `material_plan.rs` verbatim (same base blobs), so one
+implementation exists across the stack. Out of this spec's scope and left
+for its owner (`bifrost-canonical-otel-signals`): `vala.gateway.calls.resolved_model`
+and `vala.metrics.points.positive_buckets`/`negative_buckets` are nullable
+Structs over non-null children with the same published-read leak.
+
+### Acceptance
+
+All commands ran with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd-bifrost-variant/target`
+on the final working tree and exited 0. Spec binding is revision 12.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-14: every child of absent `drift_report`/`eval_summary` reads SQL null hot and published; present summaries unchanged | `tables/verification/results.rs` nullable children (spec rev 12); `wyrd-server/src/verification/results.rs` null child slots via `VariantColumnBuilder` null path and Option arrays; Scribe masked-null allowance from TASK-002 `535367c94`; `VariantJsonEncoderFactory` uses masked nulls | V2 `verification_runtime::typed_builtin_payloads_are_queryable` ("hot/published summary Struct children"); `verification::results::tests::unscored_drift_writes_only_the_summary`; `variant::tests::json_writer_renders_variants_as_values` (red without the encoder fix); `scribe::fixed_ipc::tests::masked_required_struct_child_null_roundtrips`; V1 layout test | PASS |
+| FIND-15: competing schema + Variant defects return the earlier schema code, no ACK, no row; isolated Variant defects keep codes | `tables/mod.rs` `validate_predeclared` + `refuse_undeclared`; `tables/signal.rs` shares it | `verification_runtime::builtin_variant_columns_are_refused_before_ack` (undeclared → `UndeclaredField`, schema drift → 409 `FINGERPRINT_MISMATCH` against invalid/over-deep/oversized Variants; accepted batch afterwards) | PASS |
+| FIND-16: compact hostile depth > 64 returns the depth error without process loss; server then accepts; malformed bytes stay typed | `wyrd-queue/src/variant.rs` `from_bytes`: size, bounded shallow `check_depth` inside `catch_unwind`, then `Variant::try_new` | `variant::tests::raw_depth_is_bounded_before_full_validation` (20,000 levels; upstream `try_new` alone aborts); journey case "a compact hostile depth" then accepted batch | PASS |
+| FIND-17: correct-name Variant with foreign metadata refused `UnsupportedType` top-level and nested | `is_variant` requires `None` or `""` metadata (Arrow writes `""`, the Iceberg fork reads `None`) | `variant::tests::variant_extension_requires_empty_metadata`; journey cases "foreign extension metadata", "nested foreign extension metadata" | PASS |
+| FIND-18: numeric range outranks depth in either key order via conversion, `parse_json`, and a pre-ACK write | `append_raw` defers the depth violation and keeps walking; `from_json_text` returns it last. `batch_builder.rs` keeps each field's raw token so SDK JSON rows reach that owner | `variant::tests::numeric_range_outranks_depth_in_any_key_order`; `oracle::variant_sql::tests::parse_json_numeric_range_outranks_depth_in_any_key_order`; journey `refuse_numeric_before_depth` | PASS |
+| FIND-19: compiled CLI proves native Variant JSON, exact `u64::MAX`, raw `3.0` | `wyrd-cli/tests/query_server_journey.rs` | `query_server_journey::query_command_reads_seeded_table` | PASS |
+| FIND-20: `EncodedVariant::to_json` absent | deleted; tests use `variant_bytes_to_json` | `wyrd-queue` lib (60/60) | PASS |
+| FIND-21: task evidence names the bound revision, the real placeholder owner, the pinned compaction SHA; final-pin V13 passes | `tasks/TASK-001-variant-storage-and-query.md` | V13 at `2b65fa189f2d05002acc6e59515a071a63777970`; V12 at iceberg-rust `e999331f`; V10 rerun on this tree | PASS |
+
+Commands:
+- Unit: `mise exec -- cargo nextest run --locked -p wyrd-queue --lib`;
+  `-p vala-bifrost-redux --lib --features test-support -E 'test(/^tables::/) | test(/^scribe::fixed_ipc::/) | test(/^scribe::material_plan::/)'`
+  (58); Scribe lib under the Postgres wrapper (348); `-p wyrd-server --lib -E 'test(/verification::results::/)'` (7);
+  Oracle `parse_json_numeric_range_outranks_depth_in_any_key_order` and
+  `variant_operators_and_functions_follow_the_contract` under the wrapper.
+- Journeys: V2 + `builtin_variant_columns_are_refused_before_ack`; V4 (3);
+  V5; V6 + V14 + `test_drift_journey.py` (5); V7 + V15; V8; V9; V10; V11;
+  V12; V13; CLI `query_server_journey::query_command_reads_seeded_table`;
+  Rust `wyrd-sdk-rust --test drift_verification` (4); TypeScript
+  `drift-verification.test.ts`.
+- Gates: `mise run fmt`, `mise run lints`, `mise run codegen:check`,
+  `mise run check:skills-sync`, `git diff --check`.
+
+Non-goals stayed excluded: no shredding, read-normalization layer, Struct
+operator, second Variant parser, CLI encoder, dependency, error code, or
+configuration. `batch_builder.rs` changed because FIND-18's pre-ACK write
+goes through it; it now hands raw tokens to the existing conversion owner
+instead of reparsing through `serde_json::Value`, which also closes a silent
+integer-to-double coercion of values above `u64::MAX`. The depth preflight
+reuses the existing recursive `check_depth`, bounded at 65 frames, rather
+than a new iterative walker.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `batch_builder::collect_raw` | `collect` (same module), `EncodedVariant::from_json_text` | `collect` now delegates to it; the Variant column needs each field's raw token, which `collect`'s `&Value` signature discards |
+| `tables::refuse_undeclared` | `validate_predeclared`, `signal.rs` `validate_canonical_user_batch` inline check | the one undeclared-field check, now shared by both validators instead of inline in one |
+| `fixed_ipc::has_unmasked_null` | `visit_nodes`, Arrow `NullBuffer` API | adopted verbatim from TASK-002 `535367c94` so the stack has one implementation |
+| `verification_runtime` `EXTENSION_METADATA_KEY`, `refuse_numeric_before_depth` | file's `EXTENSION_NAME_KEY`; `arrow` facade (does not re-export `arrow_schema::extension`) | follows the file's existing constant; the method drives the SDK JSON-row write path the raw-IPC helpers cannot |
+| tests `numeric_range_outranks_depth_in_any_key_order`, `raw_depth_is_bounded_before_full_validation`, `variant_extension_requires_empty_metadata`, `parse_json_numeric_range_outranks_depth_in_any_key_order`, `masked_required_struct_child_null_roundtrips` | existing module tests | one per new behavior |

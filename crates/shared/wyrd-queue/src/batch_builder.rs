@@ -4,9 +4,11 @@
 //! injection. The client batch carries **user columns plus the two per-row
 //! correlation columns `card_ref` and `run_id`** (both client-supplied); the
 //! server stamps the per-request system columns. Rows are appended as deferred
-//! `serde_json::Value` (parse-on-build) and driven through one typed Arrow
-//! builder per column at [`finish`](BatchBuilder::finish).
+//! raw JSON fields (parse-on-build) and driven through one typed Arrow builder
+//! per column at [`finish`](BatchBuilder::finish). A Variant column encodes
+//! each field's original text, so an integer keeps its exact token.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -16,7 +18,8 @@ use arrow::array::{
 };
 use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use serde_json::{Map, Value};
+use serde_json::Value;
+use serde_json::value::RawValue;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
@@ -38,7 +41,8 @@ pub fn is_reserved_column(name: &str) -> bool {
 }
 
 struct BuiltRow {
-    obj: Map<String, Value>,
+    /// Each top-level field's raw JSON text; a repeated key keeps its last.
+    obj: BTreeMap<String, Box<RawValue>>,
     card_ref: Option<String>,
     run_id: Option<String>,
 }
@@ -116,13 +120,10 @@ impl BatchBuilder {
         card_ref: Option<&CardRef>,
         run_id: Option<&RunId>,
     ) -> Result<(), WyrdQueueError> {
-        let value: Value = serde_json::from_str(json)
+        let row: &RawValue = serde_json::from_str(json)
             .map_err(|e| WyrdQueueError::SchemaParse(format!("row is not valid JSON: {e}")))?;
-        let Value::Object(obj) = value else {
-            return Err(WyrdQueueError::SchemaParse(
-                "row is not a JSON object".to_owned(),
-            ));
-        };
+        let obj: BTreeMap<String, Box<RawValue>> = serde_json::from_str(row.get())
+            .map_err(|_| WyrdQueueError::SchemaParse("row is not a JSON object".to_owned()))?;
         for key in obj.keys() {
             if is_reserved_column(key) {
                 return Err(WyrdQueueError::ReservedColumn(format!(
@@ -201,16 +202,45 @@ impl BatchBuilder {
     }
 }
 
+/// Convert one column's field from every row with `parse`.
+///
+/// Each present field is parsed as a JSON value first; see [`collect_raw`].
+///
+/// # Errors
+///
+/// Returns the refusal of [`collect_raw`].
 fn collect<T>(
     name: &str,
     rows: &[BuiltRow],
     nullable: bool,
     parse: impl Fn(&Value) -> Option<T>,
 ) -> Result<Vec<Option<T>>, WyrdQueueError> {
+    collect_raw(name, rows, nullable, |raw| {
+        serde_json::from_str::<Value>(raw.get())
+            .ok()
+            .as_ref()
+            .and_then(&parse)
+    })
+}
+
+/// Convert one column's raw JSON field from every row with `parse`.
+///
+/// An absent field or JSON `null` is a null cell.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::SchemaParse`] when a non-nullable column's field
+/// is null or absent, or `parse` rejects a present field.
+fn collect_raw<'r, T>(
+    name: &str,
+    rows: &'r [BuiltRow],
+    nullable: bool,
+    parse: impl Fn(&'r RawValue) -> Option<T>,
+) -> Result<Vec<Option<T>>, WyrdQueueError> {
     let mut out = Vec::with_capacity(rows.len());
     for (idx, row) in rows.iter().enumerate() {
-        match row.obj.get(name) {
-            None | Some(Value::Null) => {
+        match row.obj.get(name).filter(|raw| raw.get() != "null") {
+            None => {
                 if nullable {
                     out.push(None);
                 } else {
@@ -348,12 +378,10 @@ fn build_variant_column(
     rows: &[BuiltRow],
     nullable: bool,
 ) -> Result<ArrayRef, WyrdQueueError> {
-    let values = collect(name, rows, nullable, |value| Some(value.clone()))?;
-    VariantColumnBuilder::encode(
-        name,
-        values.iter().map(Option::as_ref),
-        EncodedVariant::from_json,
-    )
+    let values = collect_raw(name, rows, nullable, Some)?;
+    VariantColumnBuilder::encode(name, values, |raw| {
+        EncodedVariant::from_json_text(raw.get())
+    })
     .map_err(WyrdQueueError::Variant)
 }
 

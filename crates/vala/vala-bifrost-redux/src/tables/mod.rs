@@ -253,20 +253,64 @@ pub(crate) fn validate_declared_variants(
     Ok(())
 }
 
-/// The value validator of a pre-declared built-in: its Variant contract.
+/// The value validator of a pre-declared built-in: its schema, then its
+/// Variant contract.
 ///
-/// A pre-declared table's fingerprint already fixes every other column's
-/// storage type, so the Variant walk over its declared fields is its only
-/// value rule. The batch is returned unchanged.
+/// Checks run in the locked write order, so a request with several defects
+/// reports the earliest. An undeclared column is refused first. A user block
+/// that otherwise differs from the declaration — a missing, reordered, or
+/// differently nullable column, or a non-Variant storage type — is returned
+/// unwalked, so the later schema fingerprint refuses it before any Variant
+/// value is read. Only a block whose names, order, nullability, and storage
+/// types all match goes through [`validate_declared_variants`]. The batch is
+/// returned unchanged.
 ///
 /// # Errors
 ///
-/// Returns the refusal of [`validate_declared_variants`].
+/// Returns [`BifrostError::UndeclaredField`] for an undeclared column and the
+/// refusal of [`validate_declared_variants`].
 fn validate_predeclared<T: DomainTable + ?Sized>(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
-    validate_declared_variants(&T::arrow_fields(), batch)?;
+    let declared = T::arrow_fields();
+    let schema = batch.schema();
+    refuse_undeclared(&declared, &schema)?;
+    let shaped = schema.fields().len() == declared.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(&declared)
+            .all(|(supplied, declared)| {
+                supplied.name() == declared.name()
+                    && supplied.is_nullable() == declared.is_nullable()
+                    && supplied.data_type().equals_datatype(declared.data_type())
+            });
+    if shaped {
+        validate_declared_variants(&declared, batch)?;
+    }
     Ok(batch.clone())
+}
+
+/// Refuse the first supplied column a built-in does not declare.
+///
+/// Every built-in validator runs this first, because an undeclared field
+/// outranks every other write refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UndeclaredField`] naming the first such column.
+pub(crate) fn refuse_undeclared(declared: &[Field], schema: &Schema) -> Result<(), BifrostError> {
+    match schema
+        .fields()
+        .iter()
+        .find(|supplied| !declared.iter().any(|field| field.name() == supplied.name()))
+    {
+        Some(undeclared) => Err(BifrostError::UndeclaredField {
+            field: undeclared.name().clone(),
+            row: 0,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Report whether a declared field is or nests a Variant.
@@ -1282,9 +1326,9 @@ mod tests {
                     "drift_report",
                     DataType::Struct(
                         vec![
-                            utf8("method", false),
-                            variant_field("features", false),
-                            utf8("verdict", false),
+                            utf8("method", true),
+                            variant_field("features", true),
+                            utf8("verdict", true),
                         ]
                         .into(),
                     ),
@@ -1294,11 +1338,11 @@ mod tests {
                     "eval_summary",
                     DataType::Struct(
                         vec![
-                            int32("total_tasks", false),
-                            int32("passed_tasks", false),
-                            int32("failed_tasks", false),
-                            float64("pass_rate", false),
-                            int64("duration_ms", false),
+                            int32("total_tasks", true),
+                            int32("passed_tasks", true),
+                            int32("failed_tasks", true),
+                            float64("pass_rate", true),
+                            int64("duration_ms", true),
                         ]
                         .into(),
                     ),
@@ -2542,7 +2586,7 @@ mod tests {
         let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
             entries
                 .iter()
-                .map(|(name, variant)| ((*name).to_owned(), false, *variant))
+                .map(|(name, variant)| ((*name).to_owned(), true, *variant))
                 .collect()
         };
         assert_eq!(

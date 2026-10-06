@@ -692,7 +692,10 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
 ///
 /// `method` and `verdict` are the enums' serialized names and `features` is
 /// the per-feature map as a Variant, so the row decodes to the same JSON the
-/// report serializes to (a non-finite score becomes JSON null).
+/// report serializes to (a non-finite score becomes JSON null). An unscored
+/// row nulls every nullable child under its null parent, because DataFusion's
+/// `get_field` returns a child without the parent's validity, so a child
+/// projection must itself read SQL null rather than a placeholder.
 ///
 /// # Errors
 /// Returns a JSON error when the report cannot be serialized and
@@ -700,16 +703,14 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
 fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadError> {
     let (features, method, verdict) = match report {
         Some(report) => (
-            serde_json::to_value(&report.features)?,
+            Some(serde_json::to_value(&report.features)?),
             serialized_name(&report.method)?,
             serialized_name(&report.verdict)?,
         ),
-        // The children are non-nullable, so a null report holds placeholder
-        // values under its null parent rather than child nulls.
-        None => (Value::Null, Some(String::new()), Some(String::new())),
+        None => (None, None, None),
     };
     let features =
-        VariantColumnBuilder::encode(DRIFT_REPORT, [Some(&features)], EncodedVariant::from_json)?;
+        VariantColumnBuilder::encode(DRIFT_REPORT, [features.as_ref()], EncodedVariant::from_json)?;
     Ok(Arc::new(StructArray::try_new(
         ResultsTable::drift_report_fields(),
         vec![text([method]), features, text([verdict])],
@@ -718,24 +719,27 @@ fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadE
 }
 
 /// Build the one-row `eval_summary` Struct column; null when absent.
+///
+/// An absent summary nulls every child under its null parent, as
+/// [`drift_report`] does, so a child projection reads SQL null.
 fn eval_summary(summary: Option<&EvalWorkflowSummary>) -> ArrayRef {
     Arc::new(StructArray::new(
         ResultsTable::eval_summary_fields(),
         vec![
             Arc::new(Int32Array::from(vec![
-                summary.map_or(0, |summary| summary.total_tasks),
+                summary.map(|summary| summary.total_tasks),
             ])),
             Arc::new(Int32Array::from(vec![
-                summary.map_or(0, |summary| summary.passed_tasks),
+                summary.map(|summary| summary.passed_tasks),
             ])),
             Arc::new(Int32Array::from(vec![
-                summary.map_or(0, |summary| summary.failed_tasks),
+                summary.map(|summary| summary.failed_tasks),
             ])),
             Arc::new(Float64Array::from(vec![
-                summary.map_or(0.0, |summary| summary.pass_rate),
+                summary.map(|summary| summary.pass_rate),
             ])),
             Arc::new(Int64Array::from(vec![
-                summary.map_or(0, |summary| summary.duration_ms),
+                summary.map(|summary| summary.duration_ms),
             ])),
         ],
         summary.is_none().then(|| NullBuffer::new_null(1)),
@@ -1055,9 +1059,9 @@ mod tests {
             let report = struct_column(summary, column);
             assert!(report.is_null(0), "{column} is null");
             assert!(
-                report.columns().iter().all(|child| child.null_count() == 0),
-                "{column}'s non-nullable children hold placeholders, not nulls, \
-                 under the null parent, as native ingest requires"
+                report.columns().iter().all(|child| child.is_null(0)),
+                "{column}'s children are null under the null parent, so a \
+                 child projection reads SQL null"
             );
         }
     }

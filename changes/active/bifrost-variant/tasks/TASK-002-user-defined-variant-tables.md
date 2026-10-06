@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: implemented
 spec: SPEC-bifrost-variant
 spec_revision: 12
 requirements: [REQ-003, REQ-004, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-018, REQ-019, INV-002, INV-003, INV-004, INV-006, INV-007, AC-004, AC-005, AC-008]
@@ -259,11 +259,19 @@ Open findings:
 - DataFusion 55 `get_field` returns a Struct's child column without the
   parent's nulls, so `point['x']` on a row whose `point` is null reads the
   child's placeholder (`0`) instead of `null`. Whole-Struct reads are correct.
-  The fix belongs in the Oracle SQL surface (`oracle/variant_sql.rs`), which
-  already installs Wyrd's functions; it needs an owner decision.
+  This predates TASK-002: it is the same Parquet-reader and `get_field`
+  limitation `wyrd_queue::variant::mask_placeholders` documents, which can
+  only repair Variant children because they have a recognizable empty
+  placeholder. A fix means replacing Struct field-access planning in the
+  Oracle (losing DataFusion's nested projection pushdown and changing the
+  plan contract peers verify), so it is a follow-up for the Oracle owner, not
+  part of this task.
 - TypeScript `TableConfig.fromJsonSchema` refusals carry the message but no
   stable `code` (pre-existing for every construction-time TS error). Rust and
   Python carry the code.
 - Nested Variant fields inside List/Struct columns (e.g. span `events[].attributes`)
   cannot be written from Arrow JSON text; revision 12 conforms top-level
   declared Variant columns only. The OTLP path still covers them.
+
+Status: IMPLEMENTED. Every acceptance criterion above is met; the open
+findings are follow-ups outside this task's write set.

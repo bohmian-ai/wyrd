@@ -28,9 +28,10 @@ and objects keep their type, and a missing key stays distinct from a key whose
 value is null. Object keys are unique; when an OpenTelemetry attribute
 collection repeats a key, the final occurrence is stored.
 
-JSON input converts an integer in the signed 64-bit range to an integer,
-another integer that fits a Variant decimal to a decimal, and any other number
-to a double. A value is refused before acknowledgement with a stable code:
+JSON input converts an integer in the signed 64-bit range to an integer, an
+integer above that but within the unsigned 64-bit range to a scale-zero
+decimal, and a non-integer number to a double, so every accepted integer reads
+back exactly. Send a wider integer as a string. A value is refused before acknowledgement with a stable code:
 
 | Condition | Code |
 |---|---|
@@ -38,7 +39,7 @@ to a double. A value is refused before acknowledgement with a stable code:
 | Encoded metadata plus value over 8,388,608 bytes | `WYRD_VALA_413_VARIANT_TOO_LARGE` |
 | Invalid JSON or Variant encoding | `WYRD_VALA_400_VARIANT_INVALID_JSON` |
 | Nesting deeper than 64 containers | `WYRD_VALA_400_VARIANT_TOO_DEEP` |
-| Integer no Variant numeric type holds | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
+| Integer outside the signed and unsigned 64-bit ranges | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
 
 Query a Variant with these operators and functions:
 

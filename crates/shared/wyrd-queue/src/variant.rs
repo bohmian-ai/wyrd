@@ -8,7 +8,8 @@
 //! module adds only the Bifrost contract around them:
 //!
 //! - a JSON integer within the signed 64-bit range is a Variant integer of the
-//!   narrowest width, a larger integer is a scale-zero Variant decimal, and a
+//!   narrowest width, a larger integer within the unsigned 64-bit range is a
+//!   scale-zero Variant decimal, any other integer is refused, and a
 //!   non-integer number is a double;
 //! - an object key whose value is JSON `null` is stored as a Variant null, so
 //!   it stays distinct from an absent key;
@@ -32,7 +33,7 @@ use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_K
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use parquet_variant::{
     BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
-    VariantBuilderExt, VariantDecimal16,
+    VariantBuilderExt,
 };
 use parquet_variant_json::VariantToJson;
 use serde_json::value::RawValue;
@@ -647,23 +648,28 @@ fn append_raw(
 
 /// Convert one JSON number token under the Bifrost numeric rules.
 ///
-/// A token without a fraction or exponent is an integer and is parsed exactly
-/// as `i128` before [`integer_variant`] narrows it; any other token is a
+/// A token without a fraction or exponent is an integer: within `i64` it is
+/// the narrowest Variant integer, above `i64` but within `u64` it is a
+/// scale-zero decimal, and anything else is refused, so every accepted
+/// integer reads back exactly as a `serde_json::Number`. Any other token is a
 /// double.
 ///
 /// # Errors
 ///
-/// Returns [`VariantViolation::NumericOutOfRange`] for an integer no Variant
-/// integer or decimal holds and for a double that is not finite.
+/// Returns [`VariantViolation::NumericOutOfRange`] for an integer outside the
+/// 64-bit ranges and for a double that is not finite.
 fn raw_number_variant(
     token: &str,
     path: &JsonPointer,
 ) -> Result<Variant<'static, 'static>, VariantViolation> {
     if !token.contains(['.', 'e', 'E']) {
+        if let Ok(integer) = token.parse::<i64>() {
+            return Ok(narrow_integer(integer));
+        }
         return token
-            .parse::<i128>()
-            .map_err(|_| out_of_range(path, "integer"))
-            .and_then(|integer| integer_variant(integer, path));
+            .parse::<u64>()
+            .map(Variant::from)
+            .map_err(|_| out_of_range(path, "integer"));
     }
     token
         .parse::<f64>()
@@ -671,27 +677,6 @@ fn raw_number_variant(
         .filter(|double| double.is_finite())
         .map(Variant::from)
         .ok_or_else(|| out_of_range(path, "double"))
-}
-
-/// Store an integer as the narrowest Variant integer, else a scale-zero
-/// decimal.
-///
-/// Both JSON paths route integers through this one rule.
-///
-/// # Errors
-///
-/// Returns [`VariantViolation::NumericOutOfRange`] when the integer exceeds
-/// the 38 digits a Variant decimal holds.
-fn integer_variant(
-    integer: i128,
-    path: &JsonPointer,
-) -> Result<Variant<'static, 'static>, VariantViolation> {
-    if let Ok(integer) = i64::try_from(integer) {
-        return Ok(narrow_integer(integer));
-    }
-    VariantDecimal16::try_new(integer, 0)
-        .map(Variant::from)
-        .map_err(|_| out_of_range(path, "integer"))
 }
 
 /// Return a numeric-range violation at the current pointer.
@@ -739,10 +724,10 @@ fn number_variant(
     path: &JsonPointer,
 ) -> Result<Variant<'static, 'static>, VariantViolation> {
     if let Some(integer) = number.as_i64() {
-        return integer_variant(i128::from(integer), path);
+        return Ok(narrow_integer(integer));
     }
     if let Some(unsigned) = number.as_u64() {
-        return integer_variant(i128::from(unsigned), path);
+        return Ok(Variant::from(unsigned));
     }
     number
         .as_f64()
@@ -867,48 +852,51 @@ mod tests {
         );
     }
 
-    /// JSON text keeps exact integers past 64 bits and the final duplicate key.
+    /// JSON text classifies integers by the 64-bit ranges and keeps the final
+    /// duplicate key.
     ///
-    /// Covers the `i64` boundary, `u64::MAX + 1`, a negative below `i64::MIN`,
-    /// the largest and first-unsupported Decimal16 integers on both signs,
-    /// fraction and exponent tokens as doubles, and a repeated object key.
+    /// Covers `i64::MAX`, `i64::MAX + 1`, `u64::MAX`, and `i64::MIN` as exact
+    /// values that render back as the same JSON number, `u64::MAX + 1` and
+    /// `i64::MIN - 1` as refused, fraction and exponent tokens as doubles,
+    /// and a repeated object key.
     ///
     /// # Panics
     ///
-    /// Panics when a token converts to another Variant type, loses digits, or
-    /// is not refused with the exact range violation.
+    /// Panics when a token converts to another Variant type, renders other
+    /// digits, or is not refused with the exact range violation.
     #[test]
     fn json_text_classifies_integers_from_their_tokens() {
-        let max_decimal = "9".repeat(38);
         let text = format!(
-            r#"{{"i64_max": {}, "past_u64": 18446744073709551616,
-                "below_i64": -9223372036854775809, "max_decimal": {max_decimal},
-                "min_decimal": -{max_decimal}, "fraction": 2.5, "exponent": 1e3,
-                "dup": 1, "dup": "last"}}"#,
-            i64::MAX
+            r#"{{"i64_max": {}, "past_i64": {}, "u64_max": {}, "i64_min": {},
+                "fraction": 2.5, "exponent": 1e3, "dup": 1, "dup": "last"}}"#,
+            i64::MAX,
+            i64::MAX.unsigned_abs() + 1,
+            u64::MAX,
+            i64::MIN
         );
         let encoded = EncodedVariant::from_json_text(&text).expect("encodes");
         let variant = Variant::try_new(encoded.metadata(), encoded.value()).expect("valid");
         let object = variant.as_object().expect("object");
-        let decimal = |integer: i128| {
+        let decimal = |integer: u64| {
             Some(Variant::from(
-                VariantDecimal16::try_new(integer, 0).expect("in range"),
+                parquet_variant::VariantDecimal16::try_new(i128::from(integer), 0)
+                    .expect("in range"),
             ))
         };
-        let max = max_decimal.parse::<i128>().expect("38 digits fit i128");
         assert_eq!(object.get("i64_max"), Some(Variant::Int64(i64::MAX)));
-        assert_eq!(object.get("past_u64"), decimal(i128::from(u64::MAX) + 1));
-        assert_eq!(object.get("below_i64"), decimal(i128::from(i64::MIN) - 1));
-        assert_eq!(object.get("max_decimal"), decimal(max));
-        assert_eq!(object.get("min_decimal"), decimal(-max));
+        assert_eq!(object.get("past_i64"), decimal(i64::MAX.unsigned_abs() + 1));
+        assert_eq!(object.get("u64_max"), decimal(u64::MAX));
+        assert_eq!(object.get("i64_min"), Some(Variant::Int64(i64::MIN)));
         assert_eq!(object.get("fraction"), Some(Variant::Double(2.5)));
         assert_eq!(object.get("exponent"), Some(Variant::Double(1000.0)));
         assert_eq!(object.get("dup"), Some(Variant::from("last")));
+        let rendered = encoded.to_json().expect("json");
+        assert_eq!(rendered["i64_max"], json!(i64::MAX));
+        assert_eq!(rendered["past_i64"], json!(i64::MAX.unsigned_abs() + 1));
+        assert_eq!(rendered["u64_max"], json!(u64::MAX));
+        assert_eq!(rendered["i64_min"], json!(i64::MIN));
 
-        for token in [
-            format!("1{}", "0".repeat(38)),
-            format!("-1{}", "0".repeat(38)),
-        ] {
+        for token in ["18446744073709551616", "-9223372036854775809"] {
             assert_eq!(
                 EncodedVariant::from_json_text(&format!(r#"{{"n": [{token}]}}"#)),
                 Err(VariantViolation::NumericOutOfRange {

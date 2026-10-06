@@ -900,9 +900,8 @@ mod tests {
         assert!(plan.contains("get_field(t.s, Utf8(\"method\"))"), "{plan}");
     }
 
-    /// `parse_json` keeps integers past 64 bits exact and refuses with typed
-    /// errors: invalid text, and the first integer a Variant decimal cannot
-    /// hold.
+    /// `parse_json` keeps every 64-bit integer exact and refuses with typed
+    /// errors: invalid text, and an integer outside both 64-bit ranges.
     ///
     /// # Panics
     ///
@@ -915,25 +914,29 @@ mod tests {
             "WYRD_VALA_400_VARIANT_INVALID_JSON"
         );
 
-        let max_decimal = "9".repeat(38);
         let exact = format!(
-            "[{}, 18446744073709551616, -9223372036854775809, {max_decimal}, -{max_decimal}]",
-            i64::MAX
+            "[{},{},{},{}]",
+            i64::MAX,
+            i64::MAX.unsigned_abs() + 1,
+            u64::MAX,
+            i64::MIN
         );
         assert_eq!(
             column(&context, &format!("SELECT to_json(parse_json('{exact}'))")).await,
-            [exact.replace(' ', "")]
+            [exact]
         );
-        let past_decimal = format!("1{}", "0".repeat(38));
-        assert_eq!(
-            refusal(&context, &format!("SELECT parse_json('{past_decimal}')")).await,
-            BifrostError::VariantNumericOutOfRange {
-                field: "parse_json".to_owned(),
-                row: 0,
-                path: String::new(),
-                numeric_kind: "integer".to_owned(),
-            }
-        );
+        for token in ["18446744073709551616", "-9223372036854775809"] {
+            assert_eq!(
+                refusal(&context, &format!("SELECT parse_json('{token}')")).await,
+                BifrostError::VariantNumericOutOfRange {
+                    field: "parse_json".to_owned(),
+                    row: 0,
+                    path: String::new(),
+                    numeric_kind: "integer".to_owned(),
+                },
+                "{token}"
+            );
+        }
     }
 
     /// Run a query expected to fail and return its typed Variant error.

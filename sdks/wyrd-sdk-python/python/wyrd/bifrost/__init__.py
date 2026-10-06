@@ -212,7 +212,9 @@ class TableConfig:
 
         Args:
             model: a Pydantic model class, not an instance. Its
-                ``model_json_schema()`` becomes the declared user columns.
+                ``model_json_schema()`` becomes the declared user columns:
+                a nested model is a Struct, a typed list a List, and a
+                free-form (``Any``, open ``dict``) or union field a Variant.
                 ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
@@ -238,6 +240,8 @@ class TableConfig:
         Raises:
             WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` when ``table`` is not
                 ``namespace.name`` or the model schema has no column mapping;
+                ``WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`` for a column type
+                Bifrost cannot store;
                 ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
                 column; ``WYRD_SPEC_400_VALIDATION`` for an unknown
                 granularity, sort-key, or compaction-type spelling. Column,
@@ -275,7 +279,8 @@ class TableConfig:
         """Declare a table from an explicit ``pyarrow.Schema``.
 
         Use this for column types JSON Schema cannot express, such as
-        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        ``int32``, a non-UTC timestamp, or ``decimal128``. A Variant column is
+        a field carrying the ``arrow.parquet.variant`` extension. ``schema`` holds
         user columns only; every other argument and error is as for
         ``TableConfig()``.
         """

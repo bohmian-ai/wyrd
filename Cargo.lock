@@ -4093,33 +4093,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcp_auth"
-version = "0.12.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d27dbcc645b60b8e7f6e2868a9d7102ece97d1bb49c1288b5321fcc67f7260"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "http 1.4.2",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4685,27 +4658,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-catalog-rest"
-version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "gcp_auth",
- "http 1.4.2",
- "iceberg",
- "itertools 0.13.0",
- "reqwest 0.12.28",
- "serde",
- "serde_derive",
- "serde_json",
- "tokio",
- "typed-builder",
- "uuid",
-]
-
-[[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
 source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
@@ -4719,7 +4671,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=35f037e5413a3dfbffb996fbb8c882da79644804#35f037e5413a3dfbffb996fbb8c882da79644804"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=4e9f325d993d900bcdec2fa74239c6a6173f49cd#4e9f325d993d900bcdec2fa74239c6a6173f49cd"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4730,7 +4682,6 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
- "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -7121,7 +7072,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7142,7 +7093,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8076,7 +8027,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -10015,16 +9965,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-futures"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
-dependencies = [
- "pin-project",
- "tracing",
-]
-
-[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10762,7 +10702,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11130,7 +11070,6 @@ dependencies = [
  "rsa",
  "rustix",
  "rustls",
- "rustls-webpki",
  "secrecy",
  "security-framework-sys",
  "semver",
@@ -11167,7 +11106,6 @@ dependencies = [
  "typenum",
  "url",
  "uuid",
- "windows-sys 0.48.0",
  "windows-sys 0.61.2",
  "zerocopy",
  "zeroize",

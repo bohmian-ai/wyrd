@@ -153,3 +153,69 @@ Use the existing test owners and harnesses only:
    Python/TypeScript Analytical harness.
 
 Route this task directly to `$wyrd-implement`.
+
+## Implementation Evidence — 2026-10-06
+
+All commands ran on the final candidate with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd-bifrost-variant/target`.
+The V1–V17 commands are exactly those in TASK-001 Verification.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-4: the active authority states the `i64`/`u64` integer policy and the universal full-problem late terminal with no partial result | `architecture/bifrost-design.md` (79f60eec3); no new artifact or mechanism | `mise run docs:check`, `mise run check:docs` | PASS |
+| FIND-10: changed declarations use module-scope imports and bare names; only `Trait as _` local imports remain | Cumulative Rust diff from `80b33286e` reinspected. b0acb1901 names the built-in validator types (`CanonicalBatchValidator`, `RecordBatch`, `BifrostError`) through module imports. | The function-local-import scan over every changed line reports nothing. The qualified-type scan reports no qualified declaration type. Its remaining hits are expression paths (constants, enum values, constructors) and `fmt::Result`. `mise run lints` | PASS |
+| FIND-12: Variant and non-Variant worker `BifrostError`s round-trip through one general envelope into identical pre-stream and late problems; malformed or uncatalogued text stays generic; no message parser or family branch | `oracle/mod.rs` catalog envelope at the `DataFusionError::External` boundary (929ce7771). Deleted: `VariantQueryError`, `catalog_query_error`, `is_tenant_refusal` | `oracle::tests::catalog_errors_keep_their_identity_locally_and_remotely`; `oracle::query_stream::tests::late_catalog_error_keeps_its_identity`; `oracle::tests::late_failure_terminal_is_closed_and_non_success`; `query_conversion::tests::failed_terminal_problem_round_trips`; `bifrost::query::tests::failed_terminal_problem_rebuilds_its_catalog_error` | PASS |
+| FIND-12: the multi-pod journey's worker-side `QueryTenantInvariant` keeps the complete pre-stream problem, returns no partial result, and settles graph ownership; the late cast stays generic | `published.rs` `prove_worker_tenant_refusal` with `peer_cluster.rs` `seed_foreign_hot_row` (eaa8a5dbe) | V9 `published::variant_sql_registry_covers_every_session` | PASS (either surface, see below) |
+| Repository lanes | — | `mise run fmt`, `mise run lints`, `mise run py:format`, `mise run py:lints`, `mise run ts:typecheck`, V16 `mise run codegen:check`, `mise run docs:check`, `mise run check:docs`, V17 `git diff --check`, V1–V15 | PASS |
+
+Stated limit (lead decision): the worker tenant refusal is accepted on either
+the pre-stream or the late surface. The footer tenant check fails on first
+poll, so deterministic late ordering would need a new hook, which is
+forbidden. The late-surface identity of a worker `BifrostError` is pinned by
+the remote arm of `late_catalog_error_keeps_its_identity`. The Variant late
+path is proven end to end by `prove_late_failures` in the same journey.
+
+### Duplication remediation (round-4 addendum)
+
+`scratchpad/dedup-gate.sh` exits 0. Production code since 79f60eec3, tests
+excluded, is net negative.
+
+| Finding | Owner kept | Code deleted | Test |
+|---|---|---|---|
+| D0 (929ce7771) | `map_datafusion_error` plus the general catalog envelope | `VariantQueryError`, `catalog_query_error`, `is_tenant_refusal` | `oracle::tests::catalog_errors_keep_their_identity_locally_and_remotely` |
+| D1 (126d214cd) | `wyrd_queue::schema` (`field_to_spec`, `spec_to_field`, `is_extension_key`) | Variant arms and key filters in `catalog/wire.rs` and `wyrd-server/src/bifrost/convert.rs`, plus redux `data_type_to_arrow`/`time_unit_*` | `schema::tests::arrow_schema_refuses_unrepresentable_types`; `fieldspec_to_arrow_*_round_trip` |
+| D2 (a59101b34) | `wyrd_queue::variant::variant_field` via `VariantType`; one `is_variant` | hand-written `EXTENSION_TYPE_*` keys; `fields::variant_storage`, `fields::variant`, `mark_variant`, redux `is_variant` | V1 `tables::tests::variant_contract_and_builtin_schemas_are_stable` |
+| D3 (53fe413ec) | upstream `VariantArray` | `binary_cell`, hand decoding in `variant_cell_to_json` | `variant::tests::json_writer_renders_variants_as_values` |
+| D4 (95d070055) | `EncodedVariant::from_json_text` token walker | `append_json`, `append_items`, `number_variant` | `variant::tests::json_converts_under_the_variant_contract`; `json_text_classifies_integers_from_their_tokens` |
+| D5 (0545aa97c) | `VariantColumnBuilder::encode` and `FromIterator` | five hand loops (batch builder, `results.rs` `variants`, audit projection, gateway capture, signal) | `variant::tests::column_encoding_names_the_refused_row`; audit projection and V2 journeys |
+| D6 (4a9d52f8c) | `wyrd_tonic::error::wyrd_error_to_status` | the Gate's hand-built `WYRD_ERROR_HEADER` insert | `gate::error::tests::every_ingest_error_has_one_transport_projection` |
+| D7 (dab737003, b0acb1901) | the `CanonicalBatchValidator` seam, now returning `BifrostError` | `validate_variants`, `variant_identity_matches`, the signal extension recheck | `scribe::execution_lanes::tests::canonical_validator_refusal_keeps_its_catalogued_code` |
+| D8 (9a0dff4b0) | serialized `BifrostError` details; every producer sends them | `bifrost_error_from_code` and its two message parsers (about 300 lines) | `error::tests::bifrost_problems_reconstruct_their_exact_variant`; `grpc_convergence::*` built from the real producers |
+| D9 (eae32051b) | `impl From<&WyrdQueueError> for WyrdError` | `queue_catalog_error` | `wyrd-client` and `wyrd-queue` lib tests |
+| D10 (5a30d46f5) | `vala_sql::queries::audit_staging::entry_hash` (made `pub`) | `recomputed_entry_hash`, `push_text`, `push_optional`, `RetainedAuditRow` | V2 `verification_runtime::typed_builtin_payloads_are_queryable` |
+| D11 (e92db1cb6) | Arrow JSON writer plus `VariantJsonEncoderFactory`; Oracle `to_json` | `cell_json`, `variant_texts` | V2 and all `eval_verification::*` journeys |
+| D12 (fork 2b65fa1, repin 9a65d5469) | `iceberg::metadata_columns::get_metadata_field_id` | `row_lineage_field_id` | V13 `compaction::tests::rewrite_preserves_v3_row_lineage`; V10 |
+| D13 | `VariantFailure::reason` | signal.rs `refusal`, deleted by D7 | covered by D7 |
+| P1 (4fa671a65) | `mask_placeholders` validates each present cell with `Variant::try_new` | `root.value(row)` panic path | `variant::tests::malformed_stored_variant_is_an_error_not_a_panic`; `oracle::variant_sql::tests::malformed_stored_variant_fails_every_function_without_panicking` |
+
+Behaviour changes accepted with D7:
+- A canonical-table refusal keeps its catalog code instead of collapsing to
+  `FingerprintMismatch`.
+- An undeclared column is `UndeclaredField`.
+- A signal storage-type mismatch is `UnsupportedType`.
+- A non-catalogued signal or metric-kind reason is `SchemaParse`.
+
+Defect found during D11 (6c518085b):
+- **Symptom:** the journey's `drift_report` score `3.0` read back as `3`
+  through Arrow's JSON writer.
+- **Evidence:** `VariantJsonEncoderFactory` and the Oracle's
+  `to_json`/`->>` rendered through upstream `to_json_string`, which writes
+  doubles with `Display`. `variant_bytes_to_json`, used by Python and
+  TypeScript, renders through `to_json_value`.
+- **Cause:** two renderings, so a double became an integer on the Rust,
+  MCP, CLI and SQL surfaces. This violates REQ-004.
+- **Fix site:** all three sites render `to_json_value()?.to_string()`.
+  `json_writer_renders_variants_as_values` now asserts `"score": 3.0`.
+
+The eval journey's `context LIKE` lookup was refused at planning because
+`context` is a Variant. It now reads `context ->> 'marker'`.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 13
+revision: 14
 status: approved
 ---
 
@@ -548,9 +548,7 @@ Iceberg metadata columns remain internal. Forge reads `_row_id` and
 its internal physical batch, and writes those exact values for every surviving
 row. They never enter the public schema or fingerprint. The existing five-field
 Forge rewrite handoff is unchanged; lineage evidence stays in its output
-`DataFile`s. Missing, null, duplicate, or unencodable lineage fails the rewrite
-before commit, publishes no output, and follows the existing retry/recovery
-identity.
+`DataFile`s.
 
 ### Nested-field performance evidence
 
@@ -1188,6 +1186,11 @@ None.
 
 ## Revision history
 
+- **Revision 14 (2026-10-06, approved):** By explicit human direction, Forge
+  copies rewrite lineage through without a missing/null check, as Java and
+  Spark v3 rewrites do. Bifrost writes only v3 tables whose manifest lists
+  always assign row ids, so the refusal guarded an unreachable state; it and
+  its injection proof are removed.
 - **Revision 13 (2026-10-06, approved):** From TASK-001 review r5 and explicit
   human direction to choose the smallest user-facing contract. Canonical Arrow
   Variant input now uses the same exact numeric domain as JSON: integer

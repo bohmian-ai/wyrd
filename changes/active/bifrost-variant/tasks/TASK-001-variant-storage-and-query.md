@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: review
 spec: SPEC-bifrost-variant
-spec_revision: 13
+spec_revision: 14
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-017, REQ-019, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-005, AC-008, AC-009]
 depends_on: []
 parent_task:
@@ -127,15 +127,14 @@ planner.
 
 **Behavior.** Every table is created as v3, non-v3 input is unsupported,
 append identity is
-assigned, repeated Forge rewrites preserve both hidden lineage values, failed
-lineage validation commits nothing, and GC operates on v3. This proves REQ-001,
+assigned, repeated Forge rewrites preserve both hidden lineage values, and GC operates
+on v3. This proves REQ-001,
 REQ-002, INV-003, INV-006, and AC-002.
 
 **RED.** Add
 `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`. It creates
 built-in and user tables, writes rows, records both hidden values, compacts
-twice, compares every surviving row, injects missing lineage and asserts no
-commit, then runs v3 GC. Run:
+twice, compares every surviving row, then runs v3 GC. Run:
 `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite)'`.
 
 **GREEN.** Carry metadata only in the fork/internal physical batch and validate

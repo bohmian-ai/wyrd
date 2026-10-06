@@ -525,9 +525,13 @@ export class TableConfig {
    * registration naming a different type is refused with
    * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
    *
-   * @throws when the resulting document does not map to an Arrow schema,
-   * declares a column the write path already owns, the compaction target is
-   * not a non-negative integer, or the compaction type is not a known spelling.
+   * @throws {WyrdError} with the catalog code, status, details, and
+   * remediation when the table name is not `namespace.name`, the document
+   * does not map to an Arrow schema (`WYRD_VALA_400_SCHEMA_PARSE`, including a
+   * model that allows extra keys), or it declares a column the write path
+   * already owns.
+   * @throws when the compaction target is not a non-negative integer or the
+   * compaction type is not a known spelling.
    */
   static fromJsonSchema(
     table: string,
@@ -540,15 +544,14 @@ export class TableConfig {
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
         ? (schema as JsonSchemaSource).toJSONSchema()
         : schema;
-    return new TableConfig(
-      tableConfigFromJsonSchema(
-        table,
-        JSON.stringify(document),
-        layoutJson(layout),
-        compactionTargetFileSizeBytes,
-        compactionType,
-      ),
+    const declared = tableConfigFromJsonSchema(
+      table,
+      JSON.stringify(document),
+      layoutJson(layout),
+      compactionTargetFileSizeBytes,
+      compactionType,
     );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
   }
 
   /**

@@ -77,6 +77,7 @@ it("maps model fields to Variant, Struct, and List columns", () => {
   expect(isVariant(field("mixed"))).toBe(true);
   expect(String(field("point")?.type)).toMatch(/^Struct/);
   expect(String(field("tags")?.type)).toMatch(/^List/);
+  expect(field("tags")?.type.children[0]?.nullable).toBe(false); // string[] items are never null
 });
 
 it("returns inserted rows as native values", async () => {
@@ -161,8 +162,33 @@ it("refuses invalid JSON text and writes nothing", async () => {
   expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
 });
 
-it("refuses open extras beside fixed fields", () => {
-  const Loose = z.looseObject({ id: z.int() });
+it("refuses a model allowing extra keys", () => {
+  const Loose = z.looseObject({ id: z.int() }); // extra keys could be silently lost
 
-  expect(() => TableConfig.fromJsonSchema("vala.datasets.loose", Loose)).toThrow(/schema parse/);
+  let error: unknown;
+  try {
+    TableConfig.fromJsonSchema("vala.datasets.loose", Loose);
+  } catch (thrown) {
+    error = thrown;
+  }
+
+  expect(error).toBeInstanceOf(WyrdError);
+  expect(error).toMatchObject({ code: "WYRD_VALA_400_SCHEMA_PARSE", status: 400 });
+  expect((error as WyrdError).message).toContain("declare a Variant field for open data");
+});
+
+it("refuses a Variant column sent as neither Variant nor JSON text", async () => {
+  // JSON Schema cannot declare the types Iceberg cannot store, so this is
+  // where a TypeScript caller meets the unsupported-type refusal.
+  const arrow = new Table({
+    id: vectorFromArray([1n], new Int64()),
+    payload: vectorFromArray([7n], new Int64()),
+  });
+
+  const error = await rejection(bifrost.writeBatch(table, arrow.batches[0]!));
+  server.flushBifrost();
+
+  expect(error).toMatchObject({ code: "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE", status: 400 });
+  expect(error.message).toContain("for field payload");
+  expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
 });

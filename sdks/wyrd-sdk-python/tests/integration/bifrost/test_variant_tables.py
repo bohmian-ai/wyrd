@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost, TableConfig
 
@@ -59,6 +59,7 @@ def test_model_fields_become_variant_struct_and_list_columns(bifrost: Bifrost) -
     assert is_variant(schema.field("mixed"))
     assert pyarrow.types.is_struct(schema.field("point").type)
     assert pyarrow.types.is_list(schema.field("tags").type)
+    assert not schema.field("tags").type.value_field.nullable  # list[str] items are never null
 
 
 def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTestServer) -> None:
@@ -152,10 +153,38 @@ def test_invalid_json_text_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestSer
     assert len(bifrost.sql(f"SELECT id FROM {bifrost.table.fqn}")) == 0
 
 
-def test_unsupported_type_is_refused() -> None:
-    schema = pyarrow.schema([pyarrow.field("count", pyarrow.uint64())])
+class Loose(BaseModel):
+    model_config = ConfigDict(extra="allow")  # extra keys could be silently lost
+
+    id: int
+
+
+def test_model_allowing_extra_keys_is_refused() -> None:
+    with pytest.raises(WyrdError) as error:
+        TableConfig(Loose, "vala.datasets.loose")
+
+    assert error.value.code == "WYRD_VALA_400_SCHEMA_PARSE"
+    assert error.value.status == 400
+    assert "declare a Variant field for open data" in error.value.message
+
+
+@pytest.mark.parametrize(
+    "arrow_type",
+    [
+        pyarrow.uint64(),
+        pyarrow.date64(),
+        pyarrow.time32("s"),
+        pyarrow.timestamp("s"),
+        pyarrow.timestamp("ms", tz="UTC"),
+        pyarrow.timestamp("us", tz="America/New_York"),
+    ],
+)
+def test_unsupported_type_is_refused(arrow_type: pyarrow.DataType) -> None:
+    schema = pyarrow.schema([pyarrow.field("moment", arrow_type)])
 
     with pytest.raises(WyrdError) as error:
-        TableConfig.from_arrow(schema, "vala.datasets.unsigned")
+        TableConfig.from_arrow(schema, "vala.datasets.unsupported")
 
     assert error.value.code == "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
+    assert error.value.status == 400
+    assert error.value.message.endswith("for field moment"), error.value.message

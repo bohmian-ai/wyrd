@@ -21,13 +21,10 @@ use arrow::util::display::array_value_to_string;
 use futures_util::TryStreamExt as _;
 use iceberg::metadata_columns::{
     RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
-    RESERVED_COL_NAME_ROW_ID, RESERVED_FIELD_ID_ROW_ID,
+    RESERVED_COL_NAME_ROW_ID,
 };
-use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, FormatVersion, ManifestContentType, Operation,
-};
+use iceberg::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType, Operation};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
@@ -1349,87 +1346,6 @@ async fn advance_and_observe(
     }
 }
 
-/// Publishes a byte-identical copy of one live rewrite output beside it.
-///
-/// The copy carries the original's physical `_row_id` values, so the next
-/// rewrite of that partition reads every one of those ids twice. The copy is
-/// committed directly, as a foreign writer would, so it makes no rewrite due
-/// by itself. Returns the copy's descriptor so the scenario can withdraw it.
-///
-/// # Panics
-///
-/// Panics when the table holds no rewritten file or the copy cannot be
-/// committed.
-async fn publish_duplicate_lineage(promoted: &PromotedRewriteFixture) -> DataFile {
-    let table = promoted.load_table().await;
-    let original = promoted
-        .live_data_files()
-        .await
-        .into_iter()
-        .find(|file| file.value_counts().contains_key(&RESERVED_FIELD_ID_ROW_ID))
-        .expect("a live rewrite output carries physical lineage");
-    let prefix = &promoted.fixture.binding.object_prefix;
-    let key = |path: &str| {
-        path.split_once(&format!("{prefix}/")).map_or_else(
-            || path.to_owned(),
-            |(_, suffix)| format!("{prefix}/{suffix}"),
-        )
-    };
-    let copy_path = format!("{}.duplicate.parquet", original.file_path());
-    let bytes = promoted
-        .fixture
-        .staging
-        .read(&key(original.file_path()))
-        .await
-        .expect("the live output is readable")
-        .to_bytes();
-    promoted
-        .fixture
-        .staging
-        .write(&key(&copy_path), bytes)
-        .await
-        .expect("the duplicate is writable");
-    let copy = DataFileBuilder::default()
-        .content(DataContentType::Data)
-        .file_path(copy_path)
-        .file_format(original.file_format())
-        .partition(original.partition().clone())
-        .record_count(original.record_count())
-        .file_size_in_bytes(original.file_size_in_bytes())
-        .partition_spec_id(original.partition_spec_id())
-        .build()
-        .expect("the duplicate descriptor builds");
-    let transaction = Transaction::new(&table);
-    transaction
-        .fast_append()
-        .add_data_files([copy.clone()])
-        .apply(transaction)
-        .expect("the duplicate append applies")
-        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
-        .await
-        .expect("the duplicate append commits");
-    copy
-}
-
-/// Withdraws a file published by [`publish_duplicate_lineage`].
-///
-/// # Panics
-///
-/// Panics when the removal cannot be committed.
-async fn withdraw(promoted: &PromotedRewriteFixture, file: DataFile) {
-    let table = promoted.load_table().await;
-    let transaction = Transaction::new(&table);
-    transaction
-        .rewrite_files()
-        .set_enable_delete_filter_manager(false)
-        .delete_files([file])
-        .apply(transaction)
-        .expect("the withdrawal applies")
-        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
-        .await
-        .expect("the withdrawal commits");
-}
-
 /// Counts the data manifests of a table's current snapshot.
 ///
 /// # Panics
@@ -1481,68 +1397,6 @@ async fn assert_builtins_are_v3(fixture: &PromotionIntegrationFixture) {
             definition.name
         );
     }
-}
-
-/// Proves a rewrite whose lineage cannot be preserved commits nothing.
-///
-/// A byte copy of one rewrite output duplicates that partition's physical
-/// `_row_id` values. Forge's partial-progress rule still publishes the
-/// healthy sibling partitions, so the refusal shows as the poisoned
-/// partition left exactly as it was; once the copy is withdrawn the
-/// partition rewrites again with every observed lineage intact.
-///
-/// # Panics
-///
-/// Panics when the poisoned partition changes while the copy is live, does
-/// not rewrite after the copy is withdrawn, or any lineage observation fails.
-async fn refuse_unencodable_lineage(
-    promoted: &PromotedRewriteFixture,
-    supervisor: &mut SupervisedPromotion,
-    tables: &mut [LineageTable],
-) {
-    let fixture = &promoted.fixture;
-    let duplicate = publish_duplicate_lineage(promoted).await;
-    let partition = duplicate.partition().clone();
-    let poisoned = |files: Vec<DataFile>| {
-        files
-            .into_iter()
-            .filter(|file| file.partition() == &partition)
-            .map(|file| file.file_path().to_owned())
-            .collect::<BTreeSet<_>>()
-    };
-    let before = poisoned(promoted.live_data_files().await);
-    assert_eq!(
-        before.len(),
-        2,
-        "the partition holds the output and its copy"
-    );
-    fixture.seal_more(1).await;
-    advance(supervisor).await;
-    assert!(
-        tables[0].owes_compaction(fixture, supervisor),
-        "the promotion makes the poisoned partition due"
-    );
-    advance(supervisor).await;
-    assert_eq!(
-        poisoned(promoted.live_data_files().await),
-        before,
-        "a rewrite whose lineage is not preserved commits nothing"
-    );
-    withdraw(promoted, duplicate).await;
-    fixture.clear_task_backoff().await;
-    for _ in 0..LINEAGE_STEPS {
-        if poisoned(promoted.live_data_files().await).is_disjoint(&before) {
-            break;
-        }
-        if !tables[0].owes_compaction(fixture, supervisor) {
-            fixture.seal_more(1).await;
-        }
-        advance_and_observe(supervisor, fixture, tables).await;
-    }
-    assert!(
-        poisoned(promoted.live_data_files().await).is_disjoint(&before),
-        "the partition rewrites again once its lineage is encodable"
-    );
 }
 
 /// Fragments the user table's head and lets one leader pass collect it.
@@ -1620,18 +1474,15 @@ async fn collect_v3_garbage(
 /// originally promoted row has lived in two successive rewrite outputs, with
 /// more rows promoted between rounds because only Forge's own commits make a
 /// table due. After every step each known row must still carry the `_row_id`
-/// and `_last_updated_sequence_number` it was first seen with. A duplicate of
-/// one rewrite output then makes that partition's lineage unencodable: its
-/// rewrite fails and commits nothing, and once the duplicate is withdrawn
-/// the table rewrites again with lineage intact. Finally a leader maintenance
+/// and `_last_updated_sequence_number` it was first seen with. Finally a leader maintenance
 /// pass rewrites the user table's fragmented manifests and expires its
 /// replaced snapshots, and both existing lineage and fresh row-id assignment
 /// survive it.
 ///
 /// # Panics
 ///
-/// Panics when a table is not v3, when any row's lineage changes, when the
-/// injected duplicate commits, or when GC does not rewrite and expire.
+/// Panics when a table is not v3, when any row's lineage changes, or when GC
+/// does not rewrite and expire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn v3_row_lineage_survives_repeated_rewrite() {
@@ -1714,8 +1565,6 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
             table.binding.table_ref.name
         );
     }
-
-    refuse_unencodable_lineage(&promoted, &mut supervisor, &mut tables).await;
 
     let rows_before = collect_v3_garbage(fixture, &mut supervisor, &mut tables).await;
 

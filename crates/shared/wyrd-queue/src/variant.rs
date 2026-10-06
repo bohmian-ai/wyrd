@@ -20,6 +20,7 @@
 //! unshredded Arrow storage: a struct of non-null `metadata` and `value`
 //! binary children under the `arrow.parquet.variant` extension.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -439,6 +440,34 @@ impl VariantColumnBuilder {
         }
     }
 
+    /// Encode each optional input into one column; `None` is a null row.
+    ///
+    /// Every producer of a Variant column from open values goes through this
+    /// one loop, passing [`EncodedVariant::from_json`] or
+    /// [`EncodedVariant::from_json_text`] as `encode`. Encoding stops at the
+    /// first refused value, so no partial column escapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the catalogued Variant error naming `field` and the zero-based
+    /// row of the first value `encode` refuses.
+    pub fn encode<T>(
+        field: &str,
+        values: impl IntoIterator<Item = Option<T>>,
+        encode: impl Fn(T) -> Result<EncodedVariant, VariantViolation>,
+    ) -> Result<ArrayRef, BifrostError> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| {
+                value.map(&encode).transpose().map_err(|violation| {
+                    violation.into_error(field, u64::try_from(row).unwrap_or(u64::MAX))
+                })
+            })
+            .collect::<Result<Self, _>>()
+            .map(Self::finish)
+    }
+
     /// Append one present value.
     pub fn append(&mut self, value: &EncodedVariant) {
         self.metadata.append_value(&value.metadata);
@@ -478,6 +507,18 @@ impl VariantColumnBuilder {
             ],
             nulls,
         ))
+    }
+}
+
+/// Collects owned or borrowed encoded values; `None` is a null row.
+impl<V: Borrow<EncodedVariant>> FromIterator<Option<V>> for VariantColumnBuilder {
+    fn from_iter<I: IntoIterator<Item = Option<V>>>(values: I) -> Self {
+        let values = values.into_iter();
+        let mut builder = Self::with_capacity(values.size_hint().0);
+        for value in values {
+            builder.append_option(value.as_ref().map(Borrow::borrow));
+        }
+        builder
     }
 }
 
@@ -840,6 +881,35 @@ mod tests {
         );
     }
 
+    /// Column encoding names the field and row of the first refused value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refusal loses its field or row, or a null drifts.
+    #[test]
+    fn column_encoding_names_the_refused_row() {
+        let column = VariantColumnBuilder::encode(
+            "detail",
+            [Some("[1]"), None],
+            EncodedVariant::from_json_text,
+        )
+        .expect("encodes");
+        assert!(column.is_null(1));
+        assert_eq!(
+            VariantColumnBuilder::encode(
+                "detail",
+                [Some("[1]"), None, Some("{bad")],
+                EncodedVariant::from_json_text,
+            )
+            .expect_err("refuses"),
+            BifrostError::VariantInvalidJson {
+                field: "detail".to_owned(),
+                row: 2,
+                path: String::new(),
+            }
+        );
+    }
+
     /// Arrow's JSON writer renders top-level and nested Variants as values.
     ///
     /// # Panics
@@ -849,16 +919,12 @@ mod tests {
     #[test]
     fn json_writer_renders_variants_as_values() {
         let column = |values: &[Option<Value>]| {
-            let mut builder = VariantColumnBuilder::with_capacity(values.len());
-            for value in values {
-                match value {
-                    Some(value) => {
-                        builder.append(&EncodedVariant::from_json(value).expect("encodes"));
-                    }
-                    None => builder.append_null(),
-                }
-            }
-            builder.finish()
+            VariantColumnBuilder::encode(
+                "v",
+                values.iter().map(Option::as_ref),
+                EncodedVariant::from_json,
+            )
+            .expect("encodes")
         };
         let nested = StructArray::new(
             Fields::from(vec![

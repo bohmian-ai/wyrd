@@ -450,11 +450,19 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "actual",
-                variants("actual", items.iter().map(|item| item.actual.as_ref()))?,
+                VariantColumnBuilder::encode(
+                    "actual",
+                    items.iter().map(|item| item.actual.as_ref()),
+                    EncodedVariant::from_json,
+                )?,
             ),
             (
                 "expected",
-                variants("expected", items.iter().map(|item| item.expected.as_ref()))?,
+                VariantColumnBuilder::encode(
+                    "expected",
+                    items.iter().map(|item| item.expected.as_ref()),
+                    EncodedVariant::from_json,
+                )?,
             ),
             (
                 "operator",
@@ -690,29 +698,21 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
 /// Returns a JSON error when the report cannot be serialized and
 /// [`ResultPayloadError::Variant`] when the features exceed a Variant limit.
 fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadError> {
-    let mut features = VariantColumnBuilder::with_capacity(1);
-    let (method, verdict) = match report {
-        Some(report) => {
-            let encoded = EncodedVariant::from_json(&serde_json::to_value(&report.features)?)
-                .map_err(|violation| violation.into_error(DRIFT_REPORT, 0))?;
-            features.append(&encoded);
-            (
-                serialized_name(&report.method)?,
-                serialized_name(&report.verdict)?,
-            )
-        }
+    let (features, method, verdict) = match report {
+        Some(report) => (
+            serde_json::to_value(&report.features)?,
+            serialized_name(&report.method)?,
+            serialized_name(&report.verdict)?,
+        ),
         // The children are non-nullable, so a null report holds placeholder
         // values under its null parent rather than child nulls.
-        None => {
-            let placeholder = EncodedVariant::from_json(&Value::Null)
-                .map_err(|violation| violation.into_error(DRIFT_REPORT, 0))?;
-            features.append(&placeholder);
-            (Some(String::new()), Some(String::new()))
-        }
+        None => (Value::Null, Some(String::new()), Some(String::new())),
     };
+    let features =
+        VariantColumnBuilder::encode(DRIFT_REPORT, [Some(&features)], EncodedVariant::from_json)?;
     Ok(Arc::new(StructArray::try_new(
         ResultsTable::drift_report_fields(),
-        vec![text([method]), features.finish(), text([verdict])],
+        vec![text([method]), features, text([verdict])],
         report.is_none().then(|| NullBuffer::new_null(1)),
     )?))
 }
@@ -748,28 +748,6 @@ fn eval_summary(summary: Option<&EvalWorkflowSummary>) -> ArrayRef {
 /// Returns a JSON error when the value cannot be serialized.
 fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError> {
     Ok(serde_json::to_value(value)?.as_str().map(str::to_owned))
-}
-
-/// Build a nullable Variant column from optional JSON values.
-///
-/// # Errors
-/// Returns [`ResultPayloadError::Variant`] naming `column` and the row when a
-/// value exceeds a Variant limit.
-fn variants<'v>(
-    column: &str,
-    values: impl ExactSizeIterator<Item = Option<&'v Value>>,
-) -> Result<ArrayRef, ResultPayloadError> {
-    let mut builder = VariantColumnBuilder::with_capacity(values.len());
-    for (row, value) in values.enumerate() {
-        let encoded = value
-            .map(EncodedVariant::from_json)
-            .transpose()
-            .map_err(|violation| {
-                violation.into_error(column, u64::try_from(row).unwrap_or(u64::MAX))
-            })?;
-        builder.append_option(encoded.as_ref());
-    }
-    Ok(builder.finish())
 }
 
 /// The stored value of a Drift feature verdict.

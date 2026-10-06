@@ -198,11 +198,7 @@ fn append_object(builder: &mut impl VariantBuilderExt, entries: &[KeyValue]) {
 pub fn variant_column<'a>(
     values: impl ExactSizeIterator<Item = Option<&'a EncodedVariant>>,
 ) -> ArrayRef {
-    let mut builder = VariantColumnBuilder::with_capacity(values.len());
-    for value in values {
-        builder.append_option(value);
-    }
-    builder.finish()
+    values.collect::<VariantColumnBuilder>().finish()
 }
 
 /// Build one `resource_entity_refs` list column from flattened references.

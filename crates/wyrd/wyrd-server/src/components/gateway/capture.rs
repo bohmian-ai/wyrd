@@ -1021,13 +1021,8 @@ fn is_payload_column(name: &str) -> bool {
 /// Returns [`CaptureDrop::Payload`] when the text is not JSON or exceeds a
 /// Variant limit, so the capture is dropped rather than stored partially.
 fn payload_column(text: Option<&str>) -> Result<ArrayRef, CaptureDrop> {
-    let encoded = text
-        .map(EncodedVariant::from_json_text)
-        .transpose()
-        .map_err(|_| CaptureDrop::Payload)?;
-    let mut builder = VariantColumnBuilder::with_capacity(1);
-    builder.append_option(encoded.as_ref());
-    Ok(builder.finish())
+    VariantColumnBuilder::encode("payload", [text], EncodedVariant::from_json_text)
+        .map_err(|_| CaptureDrop::Payload)
 }
 
 /// Redacts `value`, collecting substituted binary content into `objects`, and

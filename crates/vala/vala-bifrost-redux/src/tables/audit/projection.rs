@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use vala_sql::row_types::audit_staging::AuditStagingRow;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::AuditLogTable;
@@ -72,13 +73,9 @@ pub enum AuditProjectionError {
     SequenceOverflow,
     /// A staged `detail` is not JSON or exceeds a Variant limit, so it cannot
     /// be stored in the Variant `detail` column.
-    #[error("audit row {index} has a detail that cannot be stored as a Variant: {violation:?}")]
-    InvalidDetail {
-        /// Position of the row within the projected range.
-        index: usize,
-        /// Why the detail's canonical JSON could not be encoded.
-        violation: VariantViolation,
-    },
+    /// The error names the row's position within the projected range.
+    #[error("audit detail cannot be stored as a Variant: {0}")]
+    InvalidDetail(BifrostError),
     #[error("audit content schema construction failed: {0}")]
     Schema(String),
 }
@@ -282,17 +279,12 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
 /// Returns [`AuditProjectionError::InvalidDetail`] naming the first row whose
 /// detail is not JSON or exceeds a Variant limit.
 fn detail_column(rows: &[AuditStagingRow]) -> Result<ArrayRef, AuditProjectionError> {
-    let mut builder = VariantColumnBuilder::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        let encoded = row
-            .detail
-            .as_deref()
-            .map(EncodedVariant::from_json_text)
-            .transpose()
-            .map_err(|violation| AuditProjectionError::InvalidDetail { index, violation })?;
-        builder.append_option(encoded.as_ref());
-    }
-    Ok(builder.finish())
+    VariantColumnBuilder::encode(
+        "detail",
+        rows.iter().map(|row| row.detail.as_deref()),
+        EncodedVariant::from_json_text,
+    )
+    .map_err(AuditProjectionError::InvalidDetail)
 }
 
 fn hash_hex(
@@ -453,7 +445,9 @@ mod tests {
         bad.detail = Some("{not json".to_owned());
         assert!(matches!(
             project_audit_rows(authenticated, &[row(authenticated, 8), bad]),
-            Err(AuditProjectionError::InvalidDetail { index: 1, .. })
+            Err(AuditProjectionError::InvalidDetail(
+                BifrostError::VariantInvalidJson { row: 1, .. }
+            ))
         ));
     }
 

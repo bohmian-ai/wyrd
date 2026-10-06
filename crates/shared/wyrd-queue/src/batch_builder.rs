@@ -349,20 +349,12 @@ fn build_variant_column(
     nullable: bool,
 ) -> Result<ArrayRef, WyrdQueueError> {
     let values = collect(name, rows, nullable, |value| Some(value.clone()))?;
-    let mut builder = VariantColumnBuilder::with_capacity(values.len());
-    for (row, value) in values.iter().enumerate() {
-        let encoded = value
-            .as_ref()
-            .map(EncodedVariant::from_json)
-            .transpose()
-            .map_err(|violation| {
-                WyrdQueueError::Variant(
-                    violation.into_error(name, u64::try_from(row).unwrap_or(u64::MAX)),
-                )
-            })?;
-        builder.append_option(encoded.as_ref());
-    }
-    Ok(builder.finish())
+    VariantColumnBuilder::encode(
+        name,
+        values.iter().map(Option::as_ref),
+        EncodedVariant::from_json,
+    )
+    .map_err(WyrdQueueError::Variant)
 }
 
 /// Decode exactly `width` bytes from canonical lowercase hex.

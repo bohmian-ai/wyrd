@@ -6,7 +6,9 @@
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use crate::tables::fields::{float64, int32, int64, ts_us_utc, utf8, variant};
+use wyrd_queue::variant::variant_field;
+
+use crate::tables::fields::{float64, int32, int64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -43,7 +45,7 @@ impl ResultsTable {
     pub fn drift_report_fields() -> Fields {
         Fields::from(vec![
             utf8("method", false),
-            variant("features", false),
+            variant_field("features", false),
             utf8("verdict", false),
         ])
     }

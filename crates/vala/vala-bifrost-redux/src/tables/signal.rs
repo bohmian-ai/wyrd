@@ -28,7 +28,9 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation, narrow_integer};
+use wyrd_queue::variant::{
+    EncodedVariant, VariantColumnBuilder, VariantViolation, is_variant, narrow_integer,
+};
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
@@ -979,7 +981,7 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
         ));
     }
     let expected = declared.to_arrow();
-    let extension_matches = !matches!(declared.ty, T::Variant) || fields::is_variant(supplied);
+    let extension_matches = !matches!(declared.ty, T::Variant) || is_variant(supplied);
     if !extension_matches || !supplied.data_type().equals_datatype(expected.data_type()) {
         return Err(format!(
             "canonical field {} has type {}, expected {}",

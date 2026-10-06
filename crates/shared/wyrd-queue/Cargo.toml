@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 parquet-variant-json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

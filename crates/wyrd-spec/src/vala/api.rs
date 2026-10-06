@@ -281,9 +281,6 @@ pub enum DataTypeSpec {
     Variant,
 }
 
-/// Arrow extension name every Variant column carries on the wire.
-pub const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
-
 /// Maximum Variant nesting depth, counting the root container as one.
 ///
 /// A fixed contract constant, not configuration: a deeper value is refused

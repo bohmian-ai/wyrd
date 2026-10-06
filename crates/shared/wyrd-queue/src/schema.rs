@@ -12,12 +12,10 @@ use std::sync::Arc;
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
 use serde_json::{Map, Value};
-use wyrd_spec::vala::api::{
-    BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit, VARIANT_EXTENSION_NAME,
-};
+use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit};
 
 use crate::error::WyrdQueueError;
-use crate::variant::{variant_field, variant_storage_type};
+use crate::variant::{is_variant, variant_field, variant_storage_type};
 
 /// Walk a JSON-Schema object (a Pydantic `model_json_schema()` output) into the
 /// wire `Vec<FieldSpec>`, per the locked mapping table.
@@ -244,7 +242,7 @@ fn free_form_dict() -> WyrdQueueError {
 /// Metadata is carried verbatim so a stable `PARQUET:field_id` survives at
 /// every nesting depth rather than only on top-level columns.
 fn field_to_spec(field: &Field) -> FieldSpec {
-    let variant = field.extension_type_name() == Some(VARIANT_EXTENSION_NAME);
+    let variant = is_variant(field);
     FieldSpec {
         name: field.name().clone(),
         data_type: if variant {

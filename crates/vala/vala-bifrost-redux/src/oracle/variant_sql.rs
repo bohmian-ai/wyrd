@@ -45,12 +45,11 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, variant_field,
-    variant_storage_type,
+    EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, is_variant,
+    variant_field, variant_storage_type,
 };
 
 use super::QueryCatalogError;
-use crate::tables::fields::is_variant;
 
 /// Version of the Oracle Variant SQL contract every peer must share.
 ///

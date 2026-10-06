@@ -11535,6 +11535,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "parquet-variant",
+ "parquet-variant-compute",
  "parquet-variant-json",
  "serde_json",
  "thiserror 2.0.18",

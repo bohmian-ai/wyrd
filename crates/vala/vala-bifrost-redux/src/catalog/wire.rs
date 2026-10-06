@@ -9,7 +9,9 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 
 use crate::catalog::BifrostCatalogError;
-use crate::tables::fields::{is_extension_key, is_variant};
+use wyrd_queue::variant::is_variant;
+
+use crate::tables::fields::is_extension_key;
 use crate::tables::managed_columns::is_managed_column;
 
 /// Reject user fields that collide with server-owned physical columns.

@@ -12,10 +12,12 @@ use chrono::{DateTime, Utc};
 use wyrd_runtime::Principal;
 use wyrd_spec::ids::CardUid;
 
+use wyrd_queue::variant::variant_field;
+
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::resolve_card_uids;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, utf8, variant};
+use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -49,11 +51,11 @@ impl DomainTable for ObservationsTable {
         vec![
             utf8("record_id", false),
             utf8("session_id", true),
-            variant("context", false),
+            variant_field("context", false),
             fixed_binary("trace_id", 16, true),
             fixed_binary("span_id", 8, true),
             ts_us_utc("created_at", false),
-            variant("media", true),
+            variant_field("media", true),
         ]
     }
 

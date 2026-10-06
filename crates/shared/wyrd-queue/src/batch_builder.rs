@@ -18,11 +18,11 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::{Map, Value};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::api::{BifrostTableDescription, VARIANT_EXTENSION_NAME};
+use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
-use crate::variant::{EncodedVariant, VariantColumnBuilder};
+use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -250,7 +250,7 @@ fn collect<T>(
 fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueError> {
     let name = field.name();
     let nullable = field.is_nullable();
-    if field.extension_type_name() == Some(VARIANT_EXTENSION_NAME) {
+    if is_variant(field) {
         return build_variant_column(name, rows, nullable);
     }
     let array: ArrayRef = match field.data_type() {

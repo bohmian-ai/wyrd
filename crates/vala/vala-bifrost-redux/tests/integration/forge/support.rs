@@ -63,7 +63,7 @@ use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwn
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
@@ -2897,7 +2897,7 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
 /// Panics when the field type is not one [`flat_builtin_batch`] supports or a
 /// Variant value cannot be encoded.
 fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -> ArrayRef {
-    if vala_bifrost_redux::tables::fields::is_variant(field) {
+    if is_variant(field) {
         let mut builder = VariantColumnBuilder::with_capacity(offsets.len());
         for row in offsets {
             let value = serde_json::json!({ field.name().as_str(): [file_number, row] });

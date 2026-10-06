@@ -12,9 +12,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
-use vala_bifrost_redux::tables::fields::{
-    is_extension_key, is_variant, mark_variant, variant_storage,
-};
+use vala_bifrost_redux::tables::fields::{is_extension_key, mark_variant};
+use wyrd_queue::variant::{is_variant, variant_storage_type};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
@@ -79,7 +78,7 @@ pub fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Struct(fields) => {
             DataType::Struct(fields.iter().map(field_to_arrow).collect())
         }
-        DataTypeSpec::Variant => variant_storage(),
+        DataTypeSpec::Variant => variant_storage_type(),
     }
 }
 

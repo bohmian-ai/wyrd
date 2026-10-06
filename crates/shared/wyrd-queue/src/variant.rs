@@ -20,7 +20,7 @@
 //! unshredded Arrow storage: a struct of non-null `metadata` and `value`
 //! binary children under the `arrow.parquet.variant` extension.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -29,17 +29,18 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
-use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use parquet_variant::{
     BuilderSpecificState, ListBuilder, ObjectFieldBuilder, Variant, VariantBuilder,
     VariantBuilderExt,
 };
+use parquet_variant_compute::VariantType;
 use parquet_variant_json::VariantToJson;
 use serde_json::value::RawValue;
 use serde_json::{Number, Value};
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{VARIANT_EXTENSION_NAME, VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
+use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
 
 /// Why one Variant value cannot be stored.
 ///
@@ -310,7 +311,7 @@ impl EncoderFactory for VariantJsonEncoderFactory {
         array: &'a dyn Array,
         _options: &'a EncoderOptions,
     ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
-        if field.extension_type_name() != Some(VARIANT_EXTENSION_NAME) {
+        if !is_variant(field) {
             return Ok(None);
         }
         let rendered = (0..array.len())
@@ -403,13 +404,16 @@ fn variant_storage_fields() -> Fields {
 /// `arrow.parquet.variant` extension.
 #[must_use]
 pub fn variant_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, variant_storage_type(), nullable).with_metadata(HashMap::from([
-        (
-            EXTENSION_TYPE_NAME_KEY.to_owned(),
-            VARIANT_EXTENSION_NAME.to_owned(),
-        ),
-        (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
-    ]))
+    Field::new(name, variant_storage_type(), nullable).with_extension_type(VariantType)
+}
+
+/// Report whether a field carries the `arrow.parquet.variant` extension.
+///
+/// The extension name, not the storage struct, is what makes a column a
+/// Variant: a user Struct with `metadata`/`value` children stays a Struct.
+#[must_use]
+pub fn is_variant(field: &Field) -> bool {
+    field.extension_type_name() == Some(VariantType::NAME)
 }
 
 /// Accumulates encoded Variant values into one canonical Arrow column.

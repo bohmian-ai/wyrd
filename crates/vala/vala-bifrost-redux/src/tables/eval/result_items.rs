@@ -5,7 +5,9 @@
 
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8, variant};
+use wyrd_queue::variant::variant_field;
+
+use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -45,8 +47,8 @@ impl DomainTable for ResultItemsTable {
             utf8("task_id", false),
             utf8("outcome_kind", false),
             boolean("passed", true),
-            variant("actual", true),
-            variant("expected", true),
+            variant_field("actual", true),
+            variant_field("expected", true),
             utf8("operator", true),
             utf8("message", true),
             int32("stage", true),

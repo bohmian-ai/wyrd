@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wyrd_queue::variant::EncodedVariant;
+use wyrd_queue::variant::{EncodedVariant, is_variant};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
@@ -240,7 +240,7 @@ impl BuiltinTableDefinition {
 
 /// Report whether a declared field is or nests a Variant.
 fn holds_variant(field: &Field) -> bool {
-    fields::is_variant(field)
+    is_variant(field)
         || match field.data_type() {
             DataType::Struct(children) => children.iter().any(|child| holds_variant(child)),
             DataType::List(element) => holds_variant(element),
@@ -253,8 +253,8 @@ fn holds_variant(field: &Field) -> bool {
 /// The storage types already matched the fingerprint, so only the extension
 /// marker remains to compare, at the same position in the nesting.
 fn variant_identity_matches(declared: &Field, supplied: &Field) -> bool {
-    if fields::is_variant(declared) {
-        return fields::is_variant(supplied);
+    if is_variant(declared) {
+        return is_variant(supplied);
     }
     match (declared.data_type(), supplied.data_type()) {
         (DataType::Struct(declared), DataType::Struct(supplied)) => {
@@ -304,7 +304,7 @@ fn validate_variant_values(
         return Ok(());
     }
     let malformed = || unsupported_variant(label, column.data_type());
-    if fields::is_variant(declared) {
+    if is_variant(declared) {
         let storage = column.as_struct_opt().ok_or_else(malformed)?;
         let child = |name: &str| {
             storage
@@ -613,9 +613,7 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
     let data_type = match (field.data_type(), registered.field_type.as_ref()) {
         // A Variant's `metadata`/`value` storage children carry no Iceberg
         // field ids: the Variant is one logical Iceberg field.
-        (DataType::Struct(_), Type::Variant(_)) if fields::is_variant(field) => {
-            field.data_type().clone()
-        }
+        (DataType::Struct(_), Type::Variant(_)) if is_variant(field) => field.data_type().clone(),
         (DataType::List(element), Type::List(list)) => {
             DataType::List(Arc::new(with_registered_id(element, &list.element_field)?))
         }
@@ -830,7 +828,7 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 /// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
 /// or its type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
-    let variant = fields::is_variant(field);
+    let variant = is_variant(field);
     encode_len_prefixed(field.name().as_bytes(), out)?;
     if variant {
         out.push(VARIANT_TYPE_TAG);
@@ -1055,7 +1053,7 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
-    use wyrd_queue::variant::VariantViolation;
+    use wyrd_queue::variant::{VariantViolation, variant_field};
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 
@@ -1199,11 +1197,11 @@ mod tests {
                 columns: vec![
                     utf8("record_id", false),
                     utf8("session_id", true),
-                    fields::variant("context", false),
+                    variant_field("context", false),
                     fields::fixed_binary("trace_id", 16, true),
                     fields::fixed_binary("span_id", 8, true),
                     ts_us_utc("created_at", false),
-                    fields::variant("media", true),
+                    variant_field("media", true),
                 ],
                 blooms: &[],
             },
@@ -1238,8 +1236,8 @@ mod tests {
                     utf8("task_id", false),
                     utf8("outcome_kind", false),
                     boolean("passed", true),
-                    fields::variant("actual", true),
-                    fields::variant("expected", true),
+                    variant_field("actual", true),
+                    variant_field("expected", true),
                     utf8("operator", true),
                     utf8("message", true),
                     int32("stage", true),
@@ -1279,7 +1277,7 @@ mod tests {
                     DataType::Struct(
                         vec![
                             utf8("method", false),
-                            fields::variant("features", false),
+                            variant_field("features", false),
                             utf8("verdict", false),
                         ]
                         .into(),
@@ -2460,7 +2458,7 @@ mod tests {
 
         // A Variant commits its name, tag, and zero children; neither the
         // storage children nor the extension keys enter the identity.
-        let payload = fields::variant("payload", true);
+        let payload = variant_field("payload", true);
         let mut metadata = payload.metadata().clone();
         metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
         let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![
@@ -2537,13 +2535,7 @@ mod tests {
             };
             children
                 .iter()
-                .map(|child| {
-                    (
-                        child.name().clone(),
-                        child.is_nullable(),
-                        fields::is_variant(child),
-                    )
-                })
+                .map(|child| (child.name().clone(), child.is_nullable(), is_variant(child)))
                 .collect()
         };
         let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
@@ -2636,7 +2628,7 @@ mod tests {
                     .field_with_name(column)
                     .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
                 assert!(
-                    fields::is_variant(field),
+                    is_variant(field),
                     "vala.{namespace}.{name}.{column} is Variant"
                 );
             }

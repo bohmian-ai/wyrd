@@ -1,8 +1,10 @@
 use arrow::datatypes::{DataType, Field};
 
+use wyrd_queue::variant::variant_field;
+
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
-use crate::tables::fields::{utf8, variant};
+use crate::tables::fields::utf8;
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, sort_asc, sort_desc};
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -63,7 +65,7 @@ impl DomainTable for AuditLogTable {
             utf8("principal_kind", false),
             utf8("permission", false),
             utf8("outcome", false),
-            variant(DETAIL, true),
+            variant_field(DETAIL, true),
             utf8(CREDENTIAL_ID, true),
         ]
     }

@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8, variant};
+use wyrd_queue::variant::variant_field;
+
+use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
@@ -114,8 +116,8 @@ impl DomainTable for CallsTable {
             utf8("currency", true),
             Field::new("pricing_versions", Self::pricing_versions_type(), false),
             int64("capture_policy_version", false),
-            variant(REQUEST_PAYLOAD, true),
-            variant(RESPONSE_PAYLOAD, true),
+            variant_field(REQUEST_PAYLOAD, true),
+            variant_field(RESPONSE_PAYLOAD, true),
             Field::new(
                 "payload_object_refs",
                 Self::payload_object_refs_type(),

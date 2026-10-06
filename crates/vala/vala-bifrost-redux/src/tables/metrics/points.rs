@@ -31,12 +31,16 @@ pub static EXPLICIT_BOUND_ELEMENT: F = F::payload("item", T::Float64, false);
 pub static POSITIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
 
 /// Ordered fields of the positive exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `positive_buckets['offset']` would expose.
 pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&POSITIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 
@@ -44,12 +48,16 @@ pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
 pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
 
 /// Ordered fields of the negative exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `negative_buckets['offset']` would expose.
 pub static NEGATIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&NEGATIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 

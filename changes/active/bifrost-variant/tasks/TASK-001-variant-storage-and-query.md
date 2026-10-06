@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-variant
-spec_revision: 11
+spec_revision: 12
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-017, REQ-019, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-005, AC-008, AC-009]
 depends_on: []
 parent_task:
@@ -27,7 +27,7 @@ there is no intermediate releasable state that can compact v3 rows incorrectly.
   schemas/projections, v3 validation, Oracle registration, writer properties,
   and Forge orchestration.
 - `wyrd-queue` and `vala-bifrost-redux` receive direct workspace dependencies
-  on the existing Arrow 59.3 Variant crates only where revision 10 requires
+  on the existing Arrow 59.3 Variant crates only where revision 12 requires
   them. DataFusion, Parquet, and Iceberg stay out of client-tier crates.
 - TASK-001 remains on the current workspace DataFusion source. It owns semantic
   `variant_get`, SQL lowering, session registration, codec round trips, and
@@ -68,7 +68,7 @@ there is no intermediate releasable state that can compact v3 rows incorrectly.
 
 **Behavior.** Exact limits, error precedence/details, fingerprint tag, Struct
 layouts, duplicate-key rule, promotions, sensitivity, and all built-in Variant
-replacements match revision 10. Every old-format producer changes in the same
+replacements match revision 12. Every old-format producer changes in the same
 scenario. This proves REQ-003, REQ-004, REQ-006–REQ-011, REQ-019, INV-001,
 INV-002, INV-004, INV-005, INV-007, AC-001, AC-003, and AC-005.
 
@@ -161,7 +161,7 @@ and rerun the focused test.
 ## Acceptance Criteria
 
 - Variant limits, errors, fingerprint, persisted Structs, and every built-in
-  producer/consumer match revision 10 with no legacy stored form.
+  producer/consumer match revision 12 with no legacy stored form.
 - Every Oracle production session and codec supports the same SQL contract and
   enforces sensitivity before IO. Struct remains `get_field`; Variant remains
   semantic `variant_get` with correct full-root and residual evaluation.
@@ -235,7 +235,7 @@ persisted, security, or sequencing decision remains.
 
 ## Authority Links
 
-- `changes/active/bifrost-variant/spec.md` revision 10
+- `changes/active/bifrost-variant/spec.md` revision 12
 - `AGENTS.md`
 - `architecture/agent-rules.md`
 - `architecture/wyrd-design.md`
@@ -251,9 +251,9 @@ on the final candidate and exited 0.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| Variant limits, errors, fingerprint, persisted Structs, and every built-in producer/consumer match revision 10 with no legacy stored form | `wyrd-spec/src/vala/error.rs`, `wyrd-queue/src/variant.rs`, `vala-bifrost-redux/src/tables/`, producers in `wyrd-client/src/observe/eval.rs`, `wyrd-server/src/verification/results.rs`, gateway/audit/OTLP owners; regenerated `wyrd-spec/schemas`, `tests/schemas`, `error-codes.ts` | V1 `tables::tests::variant_contract_and_builtin_schemas_are_stable`; V2 `verification_runtime::typed_builtin_payloads_are_queryable`; V3 lists the three OTLP names; V4 runs all three; V5 Rust, V6 Python, V7 TypeScript, V8 MCP `builtin_variant_and_struct_payloads_are_queryable`; V16 `codegen:check` | PASS |
+| Variant limits, errors, fingerprint, persisted Structs, and every built-in producer/consumer match revision 12 with no legacy stored form | `wyrd-spec/src/vala/error.rs`, `wyrd-queue/src/variant.rs`, `vala-bifrost-redux/src/tables/`, producers in `wyrd-client/src/observe/eval.rs`, `wyrd-server/src/verification/results.rs`, gateway/audit/OTLP owners; regenerated `wyrd-spec/schemas`, `tests/schemas`, `error-codes.ts` | V1 `tables::tests::variant_contract_and_builtin_schemas_are_stable`; V2 `verification_runtime::typed_builtin_payloads_are_queryable`; V3 lists the three OTLP names; V4 runs all three; V5 Rust, V6 Python, V7 TypeScript, V8 MCP `builtin_variant_and_struct_payloads_are_queryable`; V16 `codegen:check` | PASS |
 | Every Oracle production session and codec supports the same SQL contract and enforces sensitivity before IO; Struct stays `get_field`; Variant stays semantic `variant_get` with correct full-root and residual evaluation | `oracle/variant_sql.rs` (one `OracleVariantSql` registration, `mask_placeholders` for Variants under null Structs), `oracle/mod.rs` (`remote_variant_error` keeps catalog identity across distributed hops), `wyrd-client/src/error.rs` (exact `BifrostError` reconstruction) | V9 `published::variant_sql_registry_covers_every_session` (interactive + analytical matrices, invalid JSON code on both paths, workload role refused before follower leases advance); plan shape (`get_field` vs `variant_as_text(variant_get(...))`) and null-parent Struct/Variant rows proven by `oracle::variant_sql::tests::variant_operators_and_functions_follow_the_contract` | PASS |
-| All tables are v3 only after repeated-rewrite lineage and v3 GC pass; hidden columns stay out of the logical schema and handoff | Forge managed rewrite + `parquet/promoted_object.rs` Variant group arm; pinned forks `iceberg-rust` e999331f280b698bcd026550812b5047e8789df6, `iceberg-compaction` 94db7b94f72c48c75c937d36a59e80c237e8ca72 (tested revisions equal the pins) | V10 `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`; V12 `arrow::schema::tests::variant_round_trips_unshredded`; V13 `compaction::tests::rewrite_preserves_v3_row_lineage` | PASS |
+| All tables are v3 only after repeated-rewrite lineage and v3 GC pass; hidden columns stay out of the logical schema and handoff | Forge managed rewrite + `parquet/promoted_object.rs` Variant group arm; pinned forks `iceberg-rust` e999331f280b698bcd026550812b5047e8789df6, `iceberg-compaction` 2b65fa189f2d05002acc6e59515a071a63777970 (V12 and V13 ran at exactly these pinned revisions; V10 ran on the candidate whose lockfile pins them) | V10 `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`; V12 `arrow::schema::tests::variant_round_trips_unshredded`; V13 `compaction::tests::rewrite_preserves_v3_row_lineage` | PASS |
 | Both writers use row-group Bloom capacity and retain folding/FPP behavior | `parquet/writer_properties.rs` | V11 `parquet::writer_properties::tests::bloom_capacity_uses_row_group_limit_for_scribe_and_forge` | PASS |
 | Canonical signal round-trip in Python and TypeScript | `sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/oracle-query.test.ts` | V14 `test_canonical_signal_arrow_write_and_sql_read_round_trip`; V15 `canonical signal Arrow write and SQL read round-trip` | PASS |
 
@@ -283,8 +283,9 @@ Diagnosis — Python `test_drift_method_edges_score_through_oracle` 500:
   child, and neither the Parquet reader nor DataFusion `get_field` pushes the
   parent null down.
 - **Fix site:** every Variant argument now passes through `mask_placeholders`
-  in `oracle/variant_sql.rs` before it is decoded. It uses the shared
-  `wyrd_queue::variant::is_placeholder`, which the JSON writer also uses.
+  in `oracle/variant_sql.rs` before it is decoded. `mask_placeholders` marks
+  cells whose `metadata` and `value` are both empty as null; every other
+  present cell is fully validated.
 
 Format and lint: `mise run fmt`, `mise run lints`, `mise run py:format`,
 `mise run py:lints`, `mise run ts:typecheck`, and V17 `git diff --check` all

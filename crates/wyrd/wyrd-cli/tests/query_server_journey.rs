@@ -60,14 +60,20 @@ fn assert_cli_problem(problem: &Value, expected: &WyrdError) {
     );
 }
 
-/// The compiled CLI reads two seeded rows and reports a successful terminal.
+/// The compiled CLI reads two seeded rows and reports a successful terminal,
+/// then renders a Variant as its native JSON value.
+///
+/// The Variant query returns an object holding the double `3.0` and
+/// `u64::MAX`; its JSONL line must be that object, with the integer's exact
+/// digits and the double spelled `3.0`, not the storage struct.
 ///
 /// Runs in the Postgres-backed `test:wyrd` lane on its own isolated server.
 ///
 /// # Panics
 /// Panics when the server, fixture, or shutdown fails, the CLI exits
-/// non-zero, stdout rows are not UTF-8 JSON equal to the seeded rows, or the
-/// final stderr line is not a complete two-row success terminal.
+/// non-zero, stdout rows are not UTF-8 JSON equal to the seeded rows, the
+/// final stderr line is not a complete two-row success terminal, or the
+/// Variant line is not the exact native JSON object.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_command_reads_seeded_table() {
     let server = WyrdTestServer::start_bound()
@@ -118,6 +124,40 @@ async fn query_command_reads_seeded_table() {
     );
     assert_eq!(terminal["row_count"], 2);
     assert_eq!(terminal["error"], Value::Null);
+
+    let variant_sql = format!(
+        r#"SELECT parse_json('{{"score": 3.0, "big": {}}}') AS v FROM {} LIMIT 1"#,
+        u64::MAX,
+        fixture.table
+    );
+    let output = crate::principal_journey::run_cli_with_credential(
+        &[
+            "query",
+            "--server",
+            &fixture.endpoint,
+            "--sql",
+            &variant_sql,
+            "--format",
+            "jsonl",
+        ],
+        "WYRD_ACCESS_TOKEN",
+        &fixture.token,
+    );
+    assert!(
+        output.status.success(),
+        "Variant query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("CLI emits the Variant row");
+    assert_eq!(
+        line,
+        format!(r#"{{"v":{{"big":{},"score":3.0}}}}"#, u64::MAX),
+        "the Variant renders as its native JSON value"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 

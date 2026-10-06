@@ -838,6 +838,21 @@ mod pg_tests {
             ))
             .await;
         assert_variant_point(&row);
+        let buckets = journey
+            .query_one_row(&format!(
+                "SELECT positive_buckets['offset'] AS positive_offset, \
+                 positive_buckets['bucket_counts'] AS positive_counts, \
+                 negative_buckets['offset'] AS negative_offset, \
+                 negative_buckets['bucket_counts'] AS negative_counts \
+                 FROM {METRICS_TABLE} WHERE scope_name = '{VARIANT_METRIC_SCOPE}'"
+            ))
+            .await;
+        for column in buckets.columns() {
+            assert!(
+                column.is_null(0),
+                "a published gauge's bucket fields read SQL null, not a padded value"
+            );
+        }
 
         let stored = journey
             .query_one_row(&format!(

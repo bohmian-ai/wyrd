@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: implemented
 spec: SPEC-bifrost-variant
-spec_revision: 12
+spec_revision: 13
 requirements: [REQ-003, REQ-004, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-018, REQ-019, INV-002, INV-003, INV-004, INV-006, INV-007, AC-004, AC-005, AC-008]
 depends_on: [TASK-001]
 parent_task:
@@ -248,7 +248,7 @@ schema acquisition are fixed above; only local symbol placement remains.
 | --- | --- | --- | --- |
 | REQ-012 declarations map exactly; client and server refuse unsupported forms | `wyrd-queue` `schema.rs` shared decision table; server register validation | Cmd 1; Rust `unsupported_type_is_refused_by_sdk_and_server` (SDK + raw server, no table created); Python `test_unsupported_type_is_refused`; TS `refuses open extras beside fixed fields` | pass |
 | Rows fully prepared before one reservation; failures leave queue state unchanged | `RowPreflight::prepare -> PreparedRows`; producer accepts only `PreparedRows` | Cmd 2; Rust/Python/TS undeclared-field cases read back zero rows | pass |
-| `write_batch` describes once, then conforms by the same rules as `insert` (revision 12) | `RowPreflight::prepare_batch`, sharing the `undeclared`, `missing_required`, and `encode_variant` helpers with `prepare`; facade calls it after `describe` | Cmd 3; `wyrd-queue` batch conformance unit tests (57/57); Arrow JSON-text cases in all three SDKs | pass |
+| `write_batch` describes once, then conforms by the same rules as `insert` (revision 13) | `RowPreflight::prepare_batch`, sharing the `undeclared`, `missing_required`, and `encode_variant` helpers with `prepare`; facade calls it after `describe` | Cmd 3; `wyrd-queue` batch conformance unit tests (57/57); Arrow JSON-text cases in all three SDKs | pass |
 | Server accepts only the extension and repeats checks; struct-masked nulls in required children are accepted | `scribe/fixed_ipc.rs`, `scribe/material_plan.rs` masked-null handling | `masked_required_struct_child_null_roundtrips`; `vala-bifrost-redux` lib 347/347 | pass |
 | Rust, Python, TypeScript journeys round-trip native and Arrow values and refuse atomically | Focused files per SDK; TS typed rows project Struct to objects and List to arrays (`nativeValue`) | Cmds 4–6: Rust 8/8 (full `pg_bifrost_e2e` 26/26), Python 8/8, TS 8/8 | pass |
 | Canonical-signal Arrow journeys write Variant columns as JSON text; OTLP detour removed | Python `test_bifrost_query.py`, TS `oracle-query.test.ts` build batches from the described schema | Cmds 7–8 (Python file 9/9, TS file 9/9) | pass |
@@ -270,7 +270,7 @@ Open findings:
   stable `code` (pre-existing for every construction-time TS error). Rust and
   Python carry the code.
 - Nested Variant fields inside List/Struct columns (e.g. span `events[].attributes`)
-  cannot be written from Arrow JSON text; revision 12 conforms top-level
+  cannot be written from Arrow JSON text; revision 13 conforms top-level
   declared Variant columns only. The OTLP path still covers them.
 
 Status: IMPLEMENTED. Every acceptance criterion above is met; the open

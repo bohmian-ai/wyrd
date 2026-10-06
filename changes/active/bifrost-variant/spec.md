@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -238,19 +238,24 @@ resource_entity_refs: non-null List<non-null Struct<
 >>
 
 drift_report: nullable Struct<
-  method: non-null Utf8,
-  features: non-null Variant,
-  verdict: non-null Utf8
+  method: nullable Utf8,
+  features: nullable Variant,
+  verdict: nullable Utf8
 >
 
 eval_summary: nullable Struct<
-  total_tasks: non-null Int32,
-  passed_tasks: non-null Int32,
-  failed_tasks: non-null Int32,
-  pass_rate: non-null Float64,
-  duration_ms: non-null Int64
+  total_tasks: nullable Int32,
+  passed_tasks: nullable Int32,
+  failed_tasks: nullable Int32,
+  pass_rate: nullable Float64,
+  duration_ms: nullable Int64
 >
 ```
+
+Children of a nullable Struct are nullable. Producers write every child of a
+present Struct and null every child of an absent one, so a field query such as
+`eval_summary['total_tasks']` reads SQL null for a row without that Struct on
+hot and published data alike.
 
 `DriftReport.features` is Variant because feature names are open. The owning
 enum display strings are persisted for `method` and `verdict`. Producers in
@@ -1181,7 +1186,7 @@ None.
 
 ## Revision history
 
-- **Revision 12 (2026-10-06, approved):** From TASK-002 implementation. Arrow
+- **Revision 13 (2026-10-06, approved):** From TASK-002 implementation. Arrow
   `write_batch` follows the same column rules as row `insert`: columns match by
   name in any order and take their declared nullability, an omitted nullable
   column is written as nulls, an omitted required column or a null in one is
@@ -1189,6 +1194,13 @@ None.
   `UNDECLARED_FIELD`. The shared client conforms the batch in the same
   describe-then-normalize step, so every SDK has one behavior; the server wire
   contract is unchanged and stays exact.
+- **Revision 12 (2026-10-06, approved):** From TASK-001 review r4. The
+  children of the nullable `drift_report` and `eval_summary` Structs become
+  nullable. A non-null child is a required Parquet leaf, whose parent-masked
+  nulls the pinned Parquet reader drops while DataFusion `get_field` returns
+  the child without the parent's nulls, so published field queries read
+  another row's values for an absent Struct (FIND-TASK-001-14). Nullable
+  children keep their own nulls through Parquet with no read layer.
 - **Revision 11 (2026-10-06, approved):** From TASK-001 review r2. JSON
   integers outside the signed/unsigned 64-bit ranges are refused with
   `NUMERIC_OUT_OF_RANGE` instead of stored as wide decimals, so every accepted

@@ -31,11 +31,17 @@ pub struct CallsTable;
 
 impl CallsTable {
     /// Arrow type of one `ModelRef`: its provider and provider-native model.
+    ///
+    /// Both children are nullable because `resolved_model` is: a required
+    /// Parquet leaf under a null Struct reads back padded values, which a field
+    /// query such as `resolved_model['provider']` would expose. The JSON row
+    /// decoder nulls both children of an absent model and fills both of a
+    /// present one.
     #[must_use]
     pub fn model_ref_type() -> DataType {
         DataType::Struct(Fields::from(vec![
-            utf8("provider", false),
-            utf8("model", false),
+            utf8("provider", true),
+            utf8("model", true),
         ]))
     }
 

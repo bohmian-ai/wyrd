@@ -868,6 +868,36 @@ mod tests {
         }
     }
 
+    /// `parse_json` reports numeric range before depth whatever the object
+    /// key order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either key order reports depth or the details differ.
+    #[tokio::test]
+    async fn parse_json_numeric_range_outranks_depth_in_any_key_order() {
+        let context = session(&[None]);
+        let deep = format!("{}1{}", "[".repeat(65), "]".repeat(65));
+        for (numeric, nested) in [("a", "b"), ("b", "a")] {
+            assert_eq!(
+                refusal(
+                    &context,
+                    &format!(
+                        r#"SELECT parse_json('{{"{numeric}": 18446744073709551616, "{nested}": {deep}}}')"#
+                    ),
+                )
+                .await,
+                BifrostError::VariantNumericOutOfRange {
+                    field: "parse_json".to_owned(),
+                    row: 0,
+                    path: format!("/{numeric}"),
+                    numeric_kind: "integer".to_owned(),
+                },
+                "numeric key {numeric}"
+            );
+        }
+    }
+
     /// Malformed stored Variant bytes fail every Variant function, never panic.
     ///
     /// Upstream decoding validates shallowly and panics on such bytes, so this

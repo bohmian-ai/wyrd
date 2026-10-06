@@ -14,6 +14,8 @@ use arrow::datatypes::{
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
+use arrow::buffer::NullBuffer;
+
 use crate::contracts::ScribeError;
 
 /// Maximum number of Arrow IPC field nodes accepted by the native V1 contract.
@@ -212,7 +214,7 @@ impl BatchFacts {
             if array.len() != batch.num_rows() {
                 return Err(ScribeError::InvalidFrame);
             }
-            visit_nodes(field, array.as_ref(), 0, &mut |array| {
+            visit_nodes(field, array.as_ref(), 0, None, &mut |array| {
                 facts.push_node(array)
             })?;
         }
@@ -281,18 +283,25 @@ impl BatchFacts {
 ///
 /// Returns [`ScribeError::InvalidFrame`] when nesting exceeds
 /// [`MAX_NESTING_DEPTH`], the concrete array does not match its declared field,
-/// an array is sliced, a non-nullable field carries nulls, or a list's child
-/// length diverges from its terminal offset. Propagates the visitor's error.
+/// an array is sliced, a non-nullable field carries a null its enclosing
+/// structs do not mask, or a list's child length diverges from its terminal
+/// offset. Propagates the visitor's error.
+///
+/// `masked` is the union of the enclosing structs' nulls at this array's row
+/// positions; Arrow permits a non-nullable child to hold a null exactly where
+/// an ancestor struct is null. A list item starts a new position space, so
+/// list children are visited unmasked.
 fn visit_nodes(
     field: &Field,
     array: &dyn Array,
     depth: usize,
+    masked: Option<&NullBuffer>,
     visit: &mut dyn FnMut(&dyn Array) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     if depth > MAX_NESTING_DEPTH
         || array.offset() != 0
         || array.data_type() != field.data_type()
-        || (!field.is_nullable() && array.logical_null_count() != 0)
+        || (!field.is_nullable() && has_unmasked_null(array, masked))
     {
         return Err(ScribeError::InvalidFrame);
     }
@@ -313,7 +322,7 @@ fn visit_nodes(
             if values.len() != terminal {
                 return Err(ScribeError::InvalidFrame);
             }
-            visit_nodes(item, values.as_ref(), depth + 1, visit)
+            visit_nodes(item, values.as_ref(), depth + 1, None, visit)
         }
         DataType::Struct(children) => {
             let record = array
@@ -323,16 +332,31 @@ fn visit_nodes(
             if record.columns().len() != children.len() {
                 return Err(ScribeError::InvalidFrame);
             }
+            let masked = NullBuffer::union(masked, record.nulls());
             for (child, column) in children.iter().zip(record.columns()) {
                 if column.len() != record.len() {
                     return Err(ScribeError::InvalidFrame);
                 }
-                visit_nodes(child, column.as_ref(), depth + 1, visit)?;
+                visit_nodes(child, column.as_ref(), depth + 1, masked.as_ref(), visit)?;
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Reports whether `array` holds a null at a row `masked` does not null.
+///
+/// `masked` is the enclosing structs' null union over the same positions;
+/// `None` means no ancestor masks any row.
+fn has_unmasked_null(array: &dyn Array, masked: Option<&NullBuffer>) -> bool {
+    array.logical_nulls().is_some_and(|nulls| match masked {
+        None => nulls.null_count() != 0,
+        Some(masked) => nulls
+            .iter()
+            .zip(masked.iter())
+            .any(|(valid, enclosing_valid)| !valid && enclosing_valid),
+    })
 }
 
 /// Emits the canonical physical buffers of one array in Arrow IPC order.
@@ -1242,7 +1266,7 @@ fn write_body(
     let mut cursor = 0_usize;
     let schema = batch.schema();
     for (field, array) in schema.fields().iter().zip(batch.columns()) {
-        visit_nodes(field, array.as_ref(), 0, &mut |array| {
+        visit_nodes(field, array.as_ref(), 0, None, &mut |array| {
             array_buffers(array, &mut |source, length| {
                 let fact = facts
                     .buffers
@@ -1745,6 +1769,26 @@ mod tests {
         let observed = decode_one(encoded);
         assert_eq!(observed, batch);
         assert_eq!(observed, reference_roundtrip(&batch));
+    }
+
+    /// Proves a required struct child's null under a null struct is accepted.
+    ///
+    /// Arrow permits it and refuses an unmasked one at construction, so the
+    /// encoder must accept exactly what Arrow does: row 1's struct is null and
+    /// masks its required child's null.
+    #[test]
+    fn masked_required_struct_child_null_roundtrips() {
+        let children = Fields::from(vec![Field::new("x", DataType::Int64, false)]);
+        let field = Field::new("point", DataType::Struct(children.clone()), true);
+        let x: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let point = StructArray::new(children, vec![x], Some(NullBuffer::from(vec![true, false])));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(point) as ArrayRef],
+        )
+        .expect("masked child null is valid Arrow");
+        let plan = FixedIpcPlan::count(&batch).expect("masked child null is accepted");
+        assert_eq!(decode_one(plan.encode(&batch).expect("encodes")), batch);
     }
 
     /// Proves a schema outside the recursive accepted subset still fails closed.

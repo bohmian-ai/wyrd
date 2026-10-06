@@ -171,7 +171,10 @@ struct NativeScan {
     fields: usize,
     /// Closed layout for each schema field.
     field_layouts: [NativeFieldLayout; MAX_NATIVE_FIELDS],
-    /// Nullability for each schema field.
+    /// Whether each flattened node may carry nulls: the field is nullable,
+    /// or an enclosing nullable struct (with no list between) may mask a
+    /// required child's null. Arrow decode validation and the WAL encoder
+    /// then refuse a null its enclosing structs do not mask.
     field_nullable: [bool; MAX_NATIVE_FIELDS],
     /// Whether each flattened node is a top-level batch column.
     field_top_level: [bool; MAX_NATIVE_FIELDS],
@@ -316,7 +319,7 @@ impl NativeScan {
             return Err(ScribeError::InvalidFrame);
         }
         for field in schema_fields {
-            self.push_field(field, 0)?;
+            self.push_field(field, 0, false)?;
             self.schema_material_bytes = self
                 .schema_material_bytes
                 .checked_add(size_of::<arrow::datatypes::Field>())
@@ -359,17 +362,21 @@ impl NativeScan {
     /// Returns [`ScribeError::InvalidFrame`] for an unsupported field layout,
     /// nesting beyond [`MAX_NATIVE_DEPTH`], or more nodes than the configured
     /// native field budget admits.
+    ///
+    /// `masked` reports whether an enclosing nullable struct, with no list
+    /// between it and this field, may null this field's rows.
     fn push_field(
         &mut self,
         field: arrow::ipc::Field<'_>,
         depth: usize,
+        masked: bool,
     ) -> Result<(), ScribeError> {
         if depth > MAX_NATIVE_DEPTH || self.fields == MAX_NATIVE_FIELDS {
             return Err(ScribeError::InvalidFrame);
         }
         let layout = native_field_layout(field)?;
         self.field_layouts[self.fields] = layout;
-        self.field_nullable[self.fields] = field.nullable();
+        self.field_nullable[self.fields] = field.nullable() || masked;
         self.field_top_level[self.fields] = depth == 0;
         self.fields += 1;
         if matches!(
@@ -380,8 +387,9 @@ impl NativeScan {
             if children.is_empty() {
                 return Err(ScribeError::InvalidFrame);
             }
+            let masked = layout == NativeFieldLayout::Struct && (masked || field.nullable());
             for child in children {
-                self.push_field(child, depth + 1)?;
+                self.push_field(child, depth + 1, masked)?;
             }
         }
         Ok(())

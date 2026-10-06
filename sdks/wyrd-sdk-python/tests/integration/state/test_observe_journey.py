@@ -109,7 +109,7 @@ class EvalRow(BaseModel):
     session_id: str | None
     trace_id: bytes | None
     span_id: bytes | None
-    media: str | None
+    media: list[dict] | None
     card_uid: str | None
     run_id: str | None
 
@@ -125,9 +125,9 @@ EXPLICIT_TRACE = "0af7651916cd43dd8448eb211c80319c"
 EXPLICIT_SPAN = "b7ad6b7169203331"
 SESSION = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f"
 MEDIA = MediaRef(id="screenshot", kind="image", uri="s3://bucket/shot.png", media_type="image/png")
-MEDIA_TEXT = (
-    '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]'
-)
+MEDIA_VALUE = [
+    {"id": "screenshot", "kind": "image", "uri": "s3://bucket/shot.png", "media_type": "image/png"}
+]
 FIXED_TABLES = ("vala.drift.observations", "vala.eval.observations")
 
 
@@ -315,7 +315,7 @@ def assert_read_back(
     assert by_answer["traced"].trace_hex() == active
     assert by_answer["explicit"].trace_hex() == (EXPLICIT_TRACE, EXPLICIT_SPAN)
     # Session and media persist exactly as authored, only where supplied.
-    assert (by_answer["explicit"].session_id, by_answer["explicit"].media) == (SESSION, MEDIA_TEXT)
+    assert (by_answer["explicit"].session_id, by_answer["explicit"].media) == (SESSION, MEDIA_VALUE)
     assert (by_answer["yes"].session_id, by_answer["yes"].media) == (None, None)
 
     # Two tables, two scopes, one invocation: each row keeps the subject of the
@@ -556,7 +556,7 @@ def assert_scope_joins(
 
     evals = (
         query.sql(
-            "SELECT e.context, e.trace_id, e.span_id, e.run_id, e.card_uid, s.name "
+            "SELECT to_json(e.context) AS context, e.trace_id, e.span_id, e.run_id, e.card_uid, s.name "
             "FROM vala.eval.observations e JOIN vala.traces.spans s "
             "ON e.trace_id = s.trace_id AND e.span_id = s.span_id "
             f"WHERE e.run_id = '{run_id}'"

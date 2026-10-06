@@ -324,7 +324,7 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
             "SELECT name, gen_ai_operation_name, status_code, "
             "CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) AS is_root "
             f"FROM vala.traces.spans WHERE scope_name = '{scope}' "
-            "ORDER BY start_time_unix_nano"
+            "ORDER BY is_root DESC"
         )
         .to_arrow()
         .to_pylist()

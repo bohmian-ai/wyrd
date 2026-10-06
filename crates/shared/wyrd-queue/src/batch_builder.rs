@@ -219,15 +219,16 @@ impl RowPreflight {
     /// `arrow.parquet.variant` extension (the server validates its bytes) and
     /// is encoded from `Utf8`/`LargeUtf8` JSON text exactly as a row value
     /// is, row by row in input order and then column by column; a null text
-    /// is a null Variant. Every other supplied column keeps its type, which
-    /// the server checks.
+    /// is a null Variant. Every supplied column takes its declared
+    /// nullability, so a writer's default-nullable Arrow field fits a required
+    /// column, and otherwise keeps its type, which the server checks.
     ///
     /// # Errors
     ///
     /// Returns the first refusal: [`WyrdQueueError::Contract`] with
     /// `BIFROST_UNDECLARED_FIELD` at row 0 for a non-reserved column the
-    /// schema does not declare; [`WyrdQueueError::SchemaParse`] at row 0 for
-    /// an omitted non-nullable column; `BIFROST_UNSUPPORTED_TYPE` for a
+    /// schema does not declare; [`WyrdQueueError::SchemaParse`] for an
+    /// omitted non-nullable column (row 0) or its first null, as for rows; `BIFROST_UNSUPPORTED_TYPE` for a
     /// declared Variant column that is neither the extension nor text; the
     /// catalogued Variant error for the first unstorable text; and
     /// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
@@ -254,6 +255,11 @@ impl RowPreflight {
                 continue;
             };
             let (field, column) = (schema.field(index), batch.column(index));
+            if !declared.is_nullable()
+                && let Some(row) = (0..column.len()).find(|&row| column.is_null(row))
+            {
+                return Err(missing_required(declared.name(), row));
+            }
             if is_variant(declared) && !is_variant(field) {
                 if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
                     return Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
@@ -263,11 +269,16 @@ impl RowPreflight {
                 }
                 let text = cast(column, &DataType::Utf8View).map_err(arrow_failure)?;
                 texts.push((columns.len(), text));
-                fields.push(Arc::new(variant_field(field.name(), field.is_nullable())));
+                fields.push(Arc::new(variant_field(
+                    field.name(),
+                    declared.is_nullable(),
+                )));
                 columns.push(Arc::clone(column));
                 continue;
             }
-            fields.push(Arc::new(field.clone()));
+            fields.push(Arc::new(
+                field.clone().with_nullable(declared.is_nullable()),
+            ));
             columns.push(Arc::clone(column));
         }
         let mut builders: Vec<VariantColumnBuilder> = texts
@@ -1149,9 +1160,10 @@ mod batch_builder_tests {
             .expect("batch builds")
     }
 
-    /// Columns match by name: the output follows declared order, an omitted
-    /// nullable column is all-null with its declared type, and a reserved
-    /// column passes through after the declared ones.
+    /// Columns match by name: the output follows declared order, a supplied
+    /// column takes its declared nullability, an omitted nullable column is
+    /// all-null with its declared type, and a reserved column passes through
+    /// after the declared ones.
     #[test]
     fn batch_columns_match_by_name_and_omitted_nullable_columns_are_null() {
         let conformed = preflight()
@@ -1161,12 +1173,14 @@ mod batch_builder_tests {
         let schema = conformed.schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, ["id", "name", "payload", "run_id"]);
+        assert!(!schema.field(0).is_nullable(), "id is declared required");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
         assert!(crate::variant::is_variant(schema.field(2)));
         assert!(conformed.column(1).is_null(0) && conformed.column(2).is_null(0));
     }
 
-    /// An undeclared column and an omitted required column are refused.
+    /// An undeclared column, an omitted required column, and a null in a
+    /// required column are refused.
     #[test]
     fn undeclared_and_missing_required_columns_are_refused() {
         let undeclared = preflight()
@@ -1180,5 +1194,16 @@ mod batch_builder_tests {
             .expect_err("id is required");
         assert_eq!(missing.code(), "WYRD_VALA_400_SCHEMA_PARSE");
         assert!(missing.to_string().contains("id"), "{missing}");
+
+        let null_id = arrow::array::RecordBatch::try_from_iter([(
+            "id",
+            std::sync::Arc::new(Int64Array::from(vec![Some(1), None])) as arrow::array::ArrayRef,
+        )])
+        .expect("batch builds");
+        let null = preflight()
+            .prepare_batch(&null_id)
+            .expect_err("id is required");
+        assert_eq!(null.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert!(null.to_string().contains("row 1 field `id`"), "{null}");
     }
 }

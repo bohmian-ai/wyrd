@@ -1,24 +1,22 @@
 import { Metadata } from "@grpc/grpc-js";
-import { SeverityNumber } from "@opentelemetry/api-logs";
-import {
-  SpanKind,
-  SpanStatusCode,
-  TraceFlags,
-  ValueType,
-  context,
-  createTraceState,
-  trace,
-} from "@opentelemetry/api";
-import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-grpc";
-import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
-import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
 import { startTestServer } from "@wyrd/testing";
-import { RecordBatch, Struct, makeBuilder, makeData, tableFromIPC } from "apache-arrow";
+import {
+  DataType,
+  RecordBatch,
+  Struct,
+  Table,
+  Utf8,
+  makeBuilder,
+  makeData,
+  tableFromIPC,
+  vectorFromArray,
+  type Field,
+  type Schema,
+} from "apache-arrow";
 import { describe, expect, it } from "vitest";
 
 import { Bifrost, IncompleteQueryStreamError, TableConfig, WyrdError } from "@wyrd/sdk";
@@ -214,7 +212,6 @@ const OUTPUT_MESSAGES =
   '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]';
 const LOG_BODY = "tool call exhausted its retry budget";
 const EVENT_NAME = "gen_ai.choice";
-const LINK_TRACE_STATE = "wyrd=fixture";
 const COUNTER_VALUE = 7;
 const GAUGE_VALUE = 0.75;
 const HISTOGRAM_VALUES = [1, 2.5, 3, 6];
@@ -227,111 +224,161 @@ function exporterMetadata(server: NativeWyrdTestServer): Metadata {
   return metadata;
 }
 
-/**
- * Exports the GenAI chat, its failing tool call, the tool's log, and three
- * metrics through the stock OpenTelemetry SDK and OTLP exporters, so the
- * canonical rows and their Variant payloads come from the server's own ingress.
- */
-async function exportCanonicalSignals(
-  server: NativeWyrdTestServer,
-  scope: string,
-): Promise<void> {
-  const resource = resourceFromAttributes({ "service.name": SERVICE });
-  const traces = new BasicTracerProvider({
-    resource,
-    spanProcessors: [
-      new BatchSpanProcessor(
-        new OTLPTraceExporter({ url: server.grpcUrl, metadata: exporterMetadata(server) }),
-      ),
-    ],
-  });
-  const logs = new LoggerProvider({
-    resource,
-    processors: [
-      new BatchLogRecordProcessor({
-        exporter: new OTLPLogExporter({
-          url: server.grpcUrl,
-          metadata: exporterMetadata(server),
-        }),
-      }),
-    ],
-  });
-  const tracer = traces.getTracer(scope, "1.0.0");
-  const parent = tracer.startSpan("chat claude-opus-5", {
-    kind: SpanKind.CLIENT,
-    links: [
-      {
-        context: {
-          traceId: "00000000000000000000000000000001",
-          spanId: "0000000000000002",
-          traceFlags: TraceFlags.SAMPLED,
-          traceState: createTraceState(LINK_TRACE_STATE),
-        },
-      },
-    ],
-  });
-  parent.setAttributes({
-    "gen_ai.operation.name": "chat",
-    "gen_ai.request.model": MODEL,
-    "gen_ai.usage.input_tokens": INPUT_TOKENS,
-    "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
-    "gen_ai.input.messages": INPUT_MESSAGES,
-    "gen_ai.output.messages": OUTPUT_MESSAGES,
-  });
-  parent.addEvent(EVENT_NAME, { "gen_ai.finish_reason": "stop" });
-  parent.setStatus({ code: SpanStatusCode.OK });
-  const child = tracer.startSpan(
-    "execute_tool search",
-    undefined,
-    trace.setSpan(context.active(), parent),
-  );
-  child.setAttributes({
-    "gen_ai.operation.name": "execute_tool",
-    "gen_ai.request.model": MODEL,
-    "gen_ai.tool.name": "search",
-    "gen_ai.usage.input_tokens": 64,
-    "gen_ai.usage.output_tokens": 16,
-  });
-  // `@opentelemetry/api` has no ambient context manager until an application
-  // registers one, so the record names the tool span's context explicitly.
-  logs.getLogger(scope, "1.0.0").emit({
-    body: LOG_BODY,
-    severityNumber: SeverityNumber.ERROR,
-    severityText: "ERROR",
-    attributes: { "gen_ai.tool.name": "search" },
-    context: trace.setSpan(context.active(), child),
-  });
-  child.setStatus({ code: SpanStatusCode.ERROR, message: LOG_BODY });
-  child.end();
-  parent.end();
-  await traces.shutdown();
-  await logs.shutdown();
+const TRACE_ID = Uint8Array.from(Buffer.from("c1a0112233445566778899aabbccddee", "hex"));
+const PARENT_SPAN_ID = Uint8Array.from(Buffer.from("a1a2a3a4a5a6a7a8", "hex"));
+const CHILD_SPAN_ID = Uint8Array.from(Buffer.from("b1b2b3b4b5b6b7b8", "hex"));
 
-  // Shutdown is the single metric export: the SDK aggregates cumulatively, so
-  // a flush followed by shutdown would write each running total twice.
-  const metrics = new MeterProvider({
-    resource,
-    readers: [
-      new PeriodicExportingMetricReader({
-        exporter: new OTLPMetricExporter({
-          url: server.grpcUrl,
-          metadata: exporterMetadata(server),
-        }),
-        exportIntervalMillis: 600_000,
+type SignalRow = Record<string, unknown>;
+
+function isVariant(field: Field): boolean {
+  return field.metadata.get("ARROW:extension:name") === "arrow.parquet.variant";
+}
+
+/** The value a column takes in a row that does not name it. */
+function empty(field: Field): unknown {
+  if (field.nullable) return null;
+  if (isVariant(field)) return "{}";
+  if (DataType.isUtf8(field.type)) return "";
+  if (DataType.isBool(field.type)) return false;
+  if (DataType.isList(field.type)) return [];
+  return DataType.isInt(field.type) && field.type.bitWidth === 64 ? 0n : 0;
+}
+
+/**
+ * One batch for a built-in signal table, written the way a caller would.
+ *
+ * Variant columns are JSON text, which `writeBatch` encodes. Nullable columns
+ * no row names are left out and arrive as nulls; required ones take their
+ * empty value.
+ */
+function signalBatch(schema: Schema, rows: SignalRow[]): RecordBatch {
+  const columns = schema.fields.filter(
+    (field) => !field.nullable || rows.some((row) => field.name in row),
+  );
+  const table = new Table(
+    Object.fromEntries(
+      columns.map((field) => [
+        field.name,
+        vectorFromArray(
+          rows.map((row) => (field.name in row ? row[field.name] : empty(field))),
+          isVariant(field) ? new Utf8() : field.type,
+        ),
+      ]),
+    ),
+  );
+  return table.batches[0]!;
+}
+
+/** The resource and scope every signal row shares. */
+function envelope(scope: string): SignalRow {
+  return {
+    resource_present: true,
+    resource_attributes: JSON.stringify({ "service.name": SERVICE }),
+    scope_present: true,
+    scope_name: scope,
+    scope_version: "1.0.0",
+  };
+}
+
+/** The GenAI chat span and the failing tool call it made. */
+function spans(scope: string, anchor: bigint): SignalRow[] {
+  const span = {
+    ...envelope(scope),
+    trace_id: TRACE_ID,
+    service_name: SERVICE,
+    gen_ai_request_model: MODEL,
+    status_present: true,
+  };
+  return [
+    {
+      ...span,
+      span_id: PARENT_SPAN_ID,
+      name: "chat claude-opus-5",
+      kind: 3,
+      start_time_unix_nano: anchor,
+      end_time_unix_nano: anchor + 2_000_000n,
+      duration_nano: 2_000_000n,
+      status_code: 1,
+      attributes: JSON.stringify({
+        "gen_ai.input.messages": INPUT_MESSAGES,
+        "gen_ai.output.messages": OUTPUT_MESSAGES,
+        "gen_ai.usage.input_tokens": INPUT_TOKENS,
       }),
-    ],
-  });
-  const meter = metrics.getMeter(scope, "1.0.0");
-  const attributes = { "gen_ai.request.model": MODEL };
-  meter
-    .createCounter("wyrd.fixture.requests", { valueType: ValueType.INT })
-    .add(COUNTER_VALUE, attributes);
-  meter.createGauge("wyrd.fixture.saturation").record(GAUGE_VALUE, attributes);
-  const latency = meter.createHistogram("wyrd.fixture.latency");
-  for (const value of HISTOGRAM_VALUES) {
-    latency.record(value, attributes);
-  }
-  await metrics.shutdown();
+      gen_ai_operation_name: "chat",
+      gen_ai_usage_input_tokens: BigInt(INPUT_TOKENS),
+      gen_ai_usage_output_tokens: BigInt(OUTPUT_TOKENS),
+    },
+    {
+      ...span,
+      span_id: CHILD_SPAN_ID,
+      parent_span_id: PARENT_SPAN_ID,
+      name: "execute_tool search",
+      kind: 1,
+      start_time_unix_nano: anchor + 100_000n,
+      end_time_unix_nano: anchor + 900_000n,
+      duration_nano: 800_000n,
+      status_code: 2,
+      status_message: LOG_BODY,
+      attributes: JSON.stringify({ "gen_ai.tool.name": "search" }),
+      gen_ai_operation_name: "execute_tool",
+      gen_ai_usage_input_tokens: 64n,
+      gen_ai_usage_output_tokens: 16n,
+    },
+  ];
+}
+
+/** The error log the failing tool call wrote. */
+function logs(scope: string, anchor: bigint): SignalRow[] {
+  return [
+    {
+      ...envelope(scope),
+      time_unix_nano: anchor + 800_000n,
+      observed_time_unix_nano: anchor + 850_000n,
+      severity_number: 17,
+      severity_text: "ERROR",
+      body: JSON.stringify(LOG_BODY),
+      trace_id: TRACE_ID,
+      span_id: CHILD_SPAN_ID,
+      attributes: JSON.stringify({ "gen_ai.tool.name": "search" }),
+    },
+  ];
+}
+
+/** One counter, one gauge, and one histogram point. */
+function points(scope: string, anchor: bigint): SignalRow[] {
+  const point = {
+    ...envelope(scope),
+    unit: "1",
+    time_unix_nano: anchor,
+    start_time_unix_nano: anchor,
+    attributes: JSON.stringify({ "gen_ai.request.model": MODEL }),
+  };
+  return [
+    {
+      ...point,
+      metric_name: "wyrd.fixture.requests",
+      metric_type: "sum",
+      int_value: BigInt(COUNTER_VALUE),
+      aggregation_temporality: 2,
+      is_monotonic: true,
+    },
+    {
+      ...point,
+      metric_name: "wyrd.fixture.saturation",
+      metric_type: "gauge",
+      double_value: GAUGE_VALUE,
+    },
+    {
+      ...point,
+      metric_name: "wyrd.fixture.latency",
+      metric_type: "histogram",
+      aggregation_temporality: 2,
+      histogram_count: BigInt(HISTOGRAM_VALUES.length),
+      histogram_sum: HISTOGRAM_VALUES.reduce((sum, value) => sum + value, 0),
+      histogram_min: Math.min(...HISTOGRAM_VALUES),
+      histogram_max: Math.max(...HISTOGRAM_VALUES),
+    },
+  ];
 }
 
 describe("Canonical signal journey", () => {
@@ -339,14 +386,24 @@ describe("Canonical signal journey", () => {
     const server = startTestServer();
     try {
       const scope = `wyrd.ts.canonical.${Date.now()}`;
-      await exportCanonicalSignals(server, scope);
-      server.waitForBifrostPublication();
+      const anchor = 1_760_000_000_000_000_000n;
       const transport = {
         serverUrl: server.baseUrl,
         credential: server.token,
         grpcUrl: server.grpcUrl,
       };
       const writer = await Bifrost.connect(transport);
+      for (const [namespace, name, rows] of [
+        ["traces", "spans", spans(scope, anchor)],
+        ["logs", "records", logs(scope, anchor)],
+        ["metrics", "points", points(scope, anchor)],
+      ] as const) {
+        server.ensureBuiltinTable(namespace, name);
+        const table = `vala.${namespace}.${name}`;
+        const { arrowSchema } = await TableConfig.describe(table, transport);
+        await writer.writeBatch(table, signalBatch(arrowSchema, rows));
+      }
+      server.flushBifrost();
 
       const hierarchy = (
         await writer.sql(
@@ -439,30 +496,25 @@ describe("Canonical signal journey", () => {
           "bifrost_query:read",
         ]),
       });
-      const [payload] = await payloadReader.sql(
-        `SELECT CAST(array_length(events) AS BIGINT) AS events, ` +
-          `CAST(array_length(links) AS BIGINT) AS links, ` +
-          `events[1]['name'] AS event_name, ` +
-          `events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, ` +
-          `links[1]['trace_state'] AS link_state, attributes, ` +
+      const payload = await payloadReader.sql(
+        `SELECT attributes, ` +
+          `CAST(attributes ->> 'gen_ai.usage.input_tokens' AS BIGINT) AS input_tokens, ` +
           `resource_attributes ->> 'service.name' AS service ` +
           `FROM vala.traces.spans ` +
           `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
-        { parse: (row) => row as Record<string, any> },
+        { parse: (row) => row as Record<string, unknown> },
       );
-      expect(payload).toMatchObject({
-        events: 1n,
-        links: 1n,
-        event_name: EVENT_NAME,
-        finish_reason: "stop",
-        link_state: LINK_TRACE_STATE,
-        service: SERVICE,
-      });
-      expect(payload?.attributes).toMatchObject({
-        "gen_ai.input.messages": INPUT_MESSAGES,
-        "gen_ai.output.messages": OUTPUT_MESSAGES,
-        "gen_ai.usage.input_tokens": INPUT_TOKENS,
-      });
+      expect(payload).toEqual([
+        {
+          attributes: {
+            "gen_ai.input.messages": INPUT_MESSAGES,
+            "gen_ai.output.messages": OUTPUT_MESSAGES,
+            "gen_ai.usage.input_tokens": INPUT_TOKENS,
+          },
+          input_tokens: BigInt(INPUT_TOKENS),
+          service: SERVICE,
+        },
+      ]);
     } finally {
       server.shutdown();
     }

@@ -282,8 +282,9 @@ No fallible schema or value conversion remains after reservation.
 of the async call it invokes the existing authoritative `describe(table)`
 operation, then conforms the batch to that returned logical schema before
 direct-send admission, matching row `insert`: user columns are matched by name
-and sent in declared order; a missing nullable column is sent as nulls; a
-missing non-nullable column is `WYRD_VALA_400_SCHEMA_PARSE`; a column the table
+and sent in declared order with their declared nullability; a missing nullable
+column is sent as nulls; a missing non-nullable column, or a null in one, is
+`WYRD_VALA_400_SCHEMA_PARSE`; a column the table
 does not declare is `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` naming it at row
 0; reserved correlation and managed columns pass through for the server to
 judge; and only fields declared Variant are normalized. A describe or
@@ -777,7 +778,8 @@ string; it is not parsed as JSON.
 Arrow Variant extension or a Utf8/LargeUtf8 column of JSON text, which the
 shared client converts to Variant before sending. As with row `insert`, a
 batch names its columns: their order does not matter, an omitted nullable
-column is written as nulls, an omitted required column is refused with
+column is written as nulls, a supplied column takes its declared nullability,
+an omitted required column or a null in one is refused with
 `WYRD_VALA_400_SCHEMA_PARSE`, and a column the table does not declare is
 refused with `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD`. The shared client
 applies these rules once for every SDK. The server wire contract stays exact:
@@ -1181,8 +1183,9 @@ None.
 
 - **Revision 12 (2026-10-06, approved):** From TASK-002 implementation. Arrow
   `write_batch` follows the same column rules as row `insert`: columns match by
-  name in any order, an omitted nullable column is written as nulls, an omitted
-  required column is `SCHEMA_PARSE`, and an undeclared column is
+  name in any order and take their declared nullability, an omitted nullable
+  column is written as nulls, an omitted required column or a null in one is
+  `SCHEMA_PARSE`, and an undeclared column is
   `UNDECLARED_FIELD`. The shared client conforms the batch in the same
   describe-then-normalize step, so every SDK has one behavior; the server wire
   contract is unchanged and stays exact.

@@ -80,7 +80,7 @@ async fn strings(
     })?;
     let result = wyrd_client::Bifrost::connect(&client)
         .await?
-        .sql(sql)
+        .sql(sql, &[])
         .await?;
     let mut values = Vec::new();
     for batch in result.batches() {

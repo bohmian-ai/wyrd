@@ -291,6 +291,7 @@ async fn query_rows(
 ) -> Vec<RecordBatch> {
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(60_000),
         })
@@ -538,6 +539,7 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     let reader = tenant_writer(server, tenant).await;
     let mut empty = wyrd_client::Bifrost::query_only(reader.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM {table}"),
             deadline_ms: Some(60_000),
         })
@@ -663,6 +665,7 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     let window = telemetry.checkpoint().expect("query telemetry window");
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM {table}"),
             deadline_ms: Some(5_000),
         })
@@ -1091,6 +1094,7 @@ async fn read_correlation(
     let sql = format!("SELECT value, card_uid, principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.clone(),
             deadline_ms: Some(120_000),
         })

@@ -250,6 +250,7 @@ impl QueryArguments {
     /// Project the SQL and optional deadline onto the public query request.
     pub(crate) fn to_request(&self) -> BifrostQueryRequest {
         BifrostQueryRequest {
+            params: Vec::new(),
             sql: self.sql.clone(),
             deadline_ms: self.deadline_ms.map(i64::from),
         }

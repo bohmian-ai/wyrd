@@ -1318,6 +1318,7 @@ impl crate::WyrdTestServer {
         let query = wyrd_client::Bifrost::query_only(&client);
         let mut stream = query
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+                params: Vec::new(),
                 sql: format!("SELECT value FROM {table_fqn}"),
                 deadline_ms: Some(60_000),
             })

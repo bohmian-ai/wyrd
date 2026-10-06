@@ -219,6 +219,7 @@ pub(super) async fn read_values(client: &wyrd_client::WyrdClient, table: &str) -
 pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec<i64> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(120_000),
         })

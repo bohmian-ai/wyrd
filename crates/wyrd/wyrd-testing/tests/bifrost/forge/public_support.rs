@@ -299,6 +299,7 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
 /// Builds the one customer read shape this journey is allowed to use.
 fn public_query(sql: String) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql,
         deadline_ms: Some(120_000),
     }

@@ -777,6 +777,7 @@ mod tests {
                 None,
                 query_caller(),
                 Json(BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: "SELECT 1".to_owned(),
                     deadline_ms: Some(1_000),
                 }),

@@ -442,6 +442,36 @@ pub enum QueryContractError {
         /// Closed validation reason.
         reason: &'static str,
     },
+    /// One bind value is outside the supported scalar domain.
+    #[error("params[{index}] must be a finite number")]
+    InvalidParam {
+        /// Zero-based position of the rejected bind value.
+        index: usize,
+    },
+}
+
+/// One typed scalar bind value for a positional SQL placeholder.
+///
+/// `params[i]` binds placeholder `$(i + 1)` in [`BifrostQueryRequest::sql`].
+/// Values travel as data next to the SQL text and are never spliced into it,
+/// so a string containing SQL stays a string. On the JSON wire each value is
+/// the bare JSON scalar (`null`, `true`, `42`, `1.5`, `"text"`); an integral
+/// JSON number is an [`QueryParam::Int`] and any other number a
+/// [`QueryParam::Float`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum QueryParam {
+    /// SQL `NULL`.
+    Null,
+    /// SQL `BOOLEAN`.
+    Bool(bool),
+    /// SQL `BIGINT`.
+    Int(i64),
+    /// SQL `DOUBLE`; must be finite.
+    Float(f64),
+    /// SQL `VARCHAR`.
+    String(String),
 }
 
 /// Public synchronous Oracle query request.
@@ -451,12 +481,18 @@ pub enum QueryContractError {
 /// source, freshness, or class selector, and unknown fields are rejected so a
 /// client that still sends one learns the contract changed instead of silently
 /// receiving different semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BifrostQueryRequest {
     /// SELECT-only SQL text.
     pub sql: String,
+    /// Ordered bind values for the `$1..$n` placeholders in `sql`.
+    ///
+    /// Omitted on the wire when empty, so a request without placeholders keeps
+    /// its original shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<QueryParam>,
     /// Optional caller deadline in milliseconds, valid in `1..=u32::MAX`.
     ///
     /// The field is a wide signed integer so ordinary below- and above-range
@@ -471,11 +507,19 @@ impl BifrostQueryRequest {
     /// Validates request fields whose limits are part of the pure protocol.
     ///
     /// # Errors
-    /// Returns [`QueryContractError`] when SQL is empty or the deadline is
-    /// outside `1..=u32::MAX` milliseconds.
+    /// Returns [`QueryContractError`] when SQL is empty, a bind value is a
+    /// non-finite float, or the deadline is outside `1..=u32::MAX`
+    /// milliseconds.
     pub fn validate(&self) -> Result<(), QueryContractError> {
         if self.sql.trim().is_empty() {
             return Err(QueryContractError::Empty { field: "sql" });
+        }
+        if let Some(index) = self
+            .params
+            .iter()
+            .position(|param| matches!(param, QueryParam::Float(value) if !value.is_finite()))
+        {
+            return Err(QueryContractError::InvalidParam { index });
         }
         if self
             .deadline_ms
@@ -1114,6 +1158,7 @@ mod query_terminal_tests {
         }
 
         let invalid = BifrostQueryRequest {
+            params: Vec::new(),
             sql: " ".into(),
             deadline_ms: Some(0),
         };
@@ -1129,6 +1174,7 @@ mod query_terminal_tests {
     #[test]
     fn query_request_deadline_range_is_closed_and_published() {
         let request = |deadline_ms| BifrostQueryRequest {
+            params: Vec::new(),
             sql: "SELECT 1".into(),
             deadline_ms: Some(deadline_ms),
         };
@@ -2151,6 +2197,50 @@ mod tests {
 
     use super::*;
 
+    /// Bind values keep their order and scalar types across the JSON wire.
+    ///
+    /// A string holding SQL text stays one string value rather than becoming
+    /// part of the statement, and a non-finite float fails validation at the
+    /// contract edge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value changes type or position, or validation drifts.
+    #[test]
+    fn query_bind_values_round_trip_in_order() {
+        let body = serde_json::json!({
+            "sql": "SELECT * FROM t WHERE a = $1 AND b = $2 AND c = $3 AND d = $4 AND e = $5",
+            "params": [null, true, 42, 1.5, "x'; DROP TABLE t; --"],
+            "deadline_ms": null
+        });
+        let request: BifrostQueryRequest =
+            serde_json::from_value(body.clone()).expect("request deserializes");
+        assert_eq!(
+            request.params,
+            [
+                QueryParam::Null,
+                QueryParam::Bool(true),
+                QueryParam::Int(42),
+                QueryParam::Float(1.5),
+                QueryParam::String("x'; DROP TABLE t; --".into()),
+            ]
+        );
+        request.validate().expect("finite scalars validate");
+        assert_eq!(
+            serde_json::to_value(&request).expect("request serializes"),
+            body
+        );
+
+        let invalid = BifrostQueryRequest {
+            params: vec![QueryParam::Int(1), QueryParam::Float(f64::NAN)],
+            ..request
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(QueryContractError::InvalidParam { index: 1 })
+        );
+    }
+
     /// Terminal Arrow IPC end-of-stream presence is closed over the outcome.
     ///
     /// The public query stream is one Arrow IPC stream split across frames, so
@@ -2271,7 +2361,7 @@ mod tests {
         request_properties.sort_unstable();
         assert_eq!(
             request_properties,
-            ["deadline_ms", "sql"],
+            ["deadline_ms", "params", "sql"],
             "the request must not accept a source, freshness, path, class, worker, or plan selector"
         );
 

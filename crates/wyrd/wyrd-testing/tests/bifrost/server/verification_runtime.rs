@@ -916,6 +916,7 @@ async fn query_texts(
     )
     .run_with(
         BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: Some(30_000),
         },
@@ -963,6 +964,7 @@ async fn query_rows(
         CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
+        params: Vec::new(),
         sql,
         deadline_ms: Some(30_000),
     })

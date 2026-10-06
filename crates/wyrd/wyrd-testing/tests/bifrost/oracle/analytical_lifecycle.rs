@@ -68,6 +68,7 @@ async fn execute_analytical(
         .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 sql: sql.to_owned(),
                 deadline_ms: Some(30_000),
             },
@@ -128,6 +129,7 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -178,6 +180,7 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
         .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 deadline_ms: Some(1),
                 ..request(&sql)
             },

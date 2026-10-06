@@ -633,6 +633,7 @@ async fn prove_query_stream_telemetry(
     let client_clock = std::time::Instant::now();
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id FROM {fqn} ORDER BY id"),
             deadline_ms: None,
         })
@@ -936,6 +937,7 @@ async fn query_ids_between(
 async fn collect_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: None,
         })

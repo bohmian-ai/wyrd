@@ -1212,6 +1212,7 @@ async fn system_read_authority_reads_only_the_named_table() {
             CancellationToken::new(),
         );
         let request = wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(30_000),
         };

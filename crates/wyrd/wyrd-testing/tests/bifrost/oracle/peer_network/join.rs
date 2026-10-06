@@ -202,6 +202,7 @@ async fn fused_row_count(
     let client = public_client(node, api_key)?;
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: None,
         })

@@ -64,6 +64,7 @@ const SELF_JOIN_RESULT: [(i64, i64); 8] = [
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -1181,6 +1182,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // release, and a short deadline expires while it waits; what it may never
     // do is settle Analytical while the class is fully owned.
     let queued = BifrostQueryRequest {
+        params: Vec::new(),
         sql: analytical_sql.clone(),
         deadline_ms: Some(2_000),
     };

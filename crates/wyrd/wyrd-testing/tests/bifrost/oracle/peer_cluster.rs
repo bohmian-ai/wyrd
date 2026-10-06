@@ -1613,6 +1613,7 @@ async fn drive_sql(
         .query_sql(
             context,
             wyrd_spec::vala::api::BifrostQueryRequest {
+                params: Vec::new(),
                 sql,
                 deadline_ms: Some(STATEMENT_DEADLINE_MS),
             },

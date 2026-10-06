@@ -1073,6 +1073,7 @@ async fn public_query(
 ) -> Result<Vec<std::collections::BTreeMap<String, String>>, PeerJourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: None,
         })
@@ -1446,6 +1447,7 @@ async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let query = wyrd_client::Bifrost::query_only(&client);
     let mut stream = query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
             deadline_ms: Some(LIVE_OPEN_DEADLINE_MS),
         })
@@ -1516,6 +1518,7 @@ async fn open_paused_remote_live(
     cluster.arm_live_production_pause();
     query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         })

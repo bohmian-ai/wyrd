@@ -1,6 +1,6 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
@@ -22,6 +22,9 @@ class DataTypeSpecVariants(TypedDict, total=False):
     Decimal128: dict[str, int]
     List: FieldSpec
     Struct: list[FieldSpec]
+
+QueryParam = None | bool | int | float | str
+"""One positional SQL bind value: ``params[i]`` binds placeholder ``$(i + 1)``."""
 
 DataTypeSpec = str | DataTypeSpecVariants
 """One column's logical type: a scalar variant name or a parameterized form."""
@@ -278,12 +281,15 @@ class Bifrost(_BifrostBase):
     def flush(self) -> None: ...
     def shutdown(self) -> None: ...
     @overload
-    def sql(self, query: str) -> QueryResult: ...
+    def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
     @overload
-    def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]: ...
     def stream(
         self,
         query: str,
+        params: Sequence[QueryParam] | None = None,
         *,
         deadline_ms: int | None = None,
     ) -> BifrostBatchIterator: ...
@@ -301,12 +307,15 @@ class AsyncBifrost(_BifrostBase):
     async def flush(self) -> None: ...
     async def shutdown(self) -> None: ...
     @overload
-    async def sql(self, query: str) -> QueryResult: ...
+    async def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
     @overload
-    async def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    async def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]: ...
     async def stream(
         self,
         query: str,
+        params: Sequence[QueryParam] | None = None,
         *,
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream: ...
@@ -326,6 +335,7 @@ __all__ = [
     "DataTypeSpecVariants",
     "FieldSpec",
     "PhysicalLayout",
+    "QueryParam",
     "QueryResult",
     "ResolvedTable",
     "RowModel",

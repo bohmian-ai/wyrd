@@ -5140,6 +5140,7 @@ mod tests {
         for sql in ["", "UPDATE x SET y = 1", "SELECT 1; SELECT 2"] {
             let request = BifrostQueryRequest {
                 sql: sql.to_owned(),
+                params: Vec::new(),
                 deadline_ms: None,
             };
             assert!(planner.validate_query(&request).is_err());

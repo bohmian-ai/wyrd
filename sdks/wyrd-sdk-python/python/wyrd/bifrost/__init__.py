@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
@@ -13,6 +13,9 @@ from .. import _wyrd as _native
 from ..client import WyrdClient
 
 _Row = TypeVar("_Row", bound="RowModel")
+
+QueryParam = None | bool | int | float | str
+"""One positional SQL bind value: ``params[i]`` binds placeholder ``$(i + 1)``."""
 
 
 class RowModel(Protocol):
@@ -555,13 +558,24 @@ class Bifrost(_BifrostBase):
         self._native.shutdown()
 
     @overload
-    def sql(self, query: str) -> QueryResult: ...
+    def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
 
     @overload
-    def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]: ...
 
-    def sql(self, query: str, model: type[_Row] | None = None) -> QueryResult | list[_Row]:
+    def sql(
+        self,
+        query: str,
+        params: Sequence[QueryParam] | None = None,
+        *,
+        model: type[_Row] | None = None,
+    ) -> QueryResult | list[_Row]:
         """Run one SQL SELECT over any authorized table and collect every batch.
+
+        ``params`` bind the ``$1..$n`` placeholders in order as typed values;
+        they are never interpolated into ``query``.
 
         Passing ``model`` validates every row through it and returns model
         instances instead of the Arrow-backed ``QueryResult``. That projection
@@ -574,18 +588,19 @@ class Bifrost(_BifrostBase):
 
         """
 
-        result = QueryResult(self._native.sql(query))
+        result = QueryResult(self._native.sql(query, params))
         return result if model is None else _validated_rows(result, model)
 
     def stream(
         self,
         query: str,
+        params: Sequence[QueryParam] | None = None,
         *,
         deadline_ms: int | None = None,
     ) -> BifrostBatchIterator:
         """Run one SQL SELECT and iterate its batches as they arrive."""
 
-        return BifrostBatchIterator(self._native.stream(query, deadline_ms))
+        return BifrostBatchIterator(self._native.stream(query, deadline_ms, params))
 
     def running(self) -> list[RunningQuery]:
         """List active queries visible to the authenticated tenant."""
@@ -651,12 +666,20 @@ class AsyncBifrost(_BifrostBase):
         await asyncio.to_thread(self._native.shutdown)
 
     @overload
-    async def sql(self, query: str) -> QueryResult: ...
+    async def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
 
     @overload
-    async def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    async def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]: ...
 
-    async def sql(self, query: str, model: type[_Row] | None = None) -> QueryResult | list[_Row]:
+    async def sql(
+        self,
+        query: str,
+        params: Sequence[QueryParam] | None = None,
+        *,
+        model: type[_Row] | None = None,
+    ) -> QueryResult | list[_Row]:
         """Run one SQL SELECT over any authorized table and collect every batch.
 
         As ``Bifrost.sql``, including the optional ``model`` projection; only
@@ -668,12 +691,13 @@ class AsyncBifrost(_BifrostBase):
 
         """
 
-        result = QueryResult(await asyncio.to_thread(self._native.sql, query))
+        result = QueryResult(await asyncio.to_thread(self._native.sql, query, params))
         return result if model is None else _validated_rows(result, model)
 
     async def stream(
         self,
         query: str,
+        params: Sequence[QueryParam] | None = None,
         *,
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream:
@@ -683,6 +707,7 @@ class AsyncBifrost(_BifrostBase):
             self._native.stream,
             query,
             deadline_ms,
+            params,
         )
         return BifrostQueryStream(native_stream)
 
@@ -845,6 +870,7 @@ __all__ = [
     "DataTypeSpecVariants",
     "FieldSpec",
     "PhysicalLayout",
+    "QueryParam",
     "QueryResult",
     "ResolvedTable",
     "RowModel",

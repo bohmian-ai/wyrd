@@ -90,6 +90,7 @@ async fn published_values(
     )
     .run_with(
         wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM vala.bifrost.{table} ORDER BY value"),
             deadline_ms: Some(30_000),
         },

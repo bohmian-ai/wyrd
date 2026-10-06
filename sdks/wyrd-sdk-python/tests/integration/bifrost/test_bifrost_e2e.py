@@ -602,18 +602,18 @@ def test_sql_returns_model_instances_when_a_model_is_supplied(
     assert raw.terminal["outcome"] == "success"
     assert len(raw) == len(INFERENCES)
 
-    typed = bifrost.sql(select, Inference)
+    typed = bifrost.sql(select, model=Inference)
     assert typed == INFERENCES
     assert all(isinstance(row, Inference) for row in typed)
 
-    assert bifrost.sql(f"SELECT * FROM {fqn} WHERE call_id = 9999", Inference) == []
+    assert bifrost.sql(f"SELECT * FROM {fqn} WHERE call_id = 9999", model=Inference) == []
 
     with pytest.raises(ValidationError):
-        bifrost.sql(f"SELECT call_id FROM {fqn}", MistypedInference)
+        bifrost.sql(f"SELECT call_id FROM {fqn}", model=MistypedInference)
 
     async def read_typed() -> list[Inference]:
         client = AsyncBifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
-        return await client.sql(select, Inference)
+        return await client.sql(select, model=Inference)
 
     assert asyncio.run(read_typed()) == INFERENCES
 

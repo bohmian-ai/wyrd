@@ -535,6 +535,7 @@ impl BifrostReader {
         let mut batches = Vec::new();
         Box::pin(self.waits.wait(self.caller.run_with(
             BifrostQueryRequest {
+                params: Vec::new(),
                 sql,
                 deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
             },

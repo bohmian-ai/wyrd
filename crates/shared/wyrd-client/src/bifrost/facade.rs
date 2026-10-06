@@ -20,8 +20,8 @@ use wyrd_queue::QueueConfig;
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryTerminalFrame,
-    RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryParam,
+    QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
 
 use crate::bifrost::BifrostMetrics;
@@ -593,6 +593,8 @@ impl Bifrost {
     ///
     /// Any authorized table, not just the active one. Bounded by the server's
     /// query floor; use [`Self::stream`] for a result set larger than memory.
+    /// `params[i]` binds placeholder `$(i + 1)` in `query`; values travel as
+    /// typed data beside the SQL text and are never interpolated into it.
     ///
     /// # Errors
     ///
@@ -605,8 +607,12 @@ impl Bifrost {
     ///
     /// Abandoning the future abandons the request; the server cancels the query
     /// when the response body is dropped.
-    pub async fn sql(&self, query: &str) -> Result<QueryResult, BifrostClientError> {
-        let mut stream = self.stream(query).await?;
+    pub async fn sql(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<QueryResult, BifrostClientError> {
+        let mut stream = self.stream(query, params).await?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.next_batch().await? {
             batches.push(batch);
@@ -645,8 +651,9 @@ impl Bifrost {
     pub async fn sql_as<T: DeserializeOwned>(
         &self,
         query: &str,
+        params: &[QueryParam],
     ) -> Result<Vec<T>, BifrostClientError> {
-        self.sql(query).await?.deserialize()
+        self.sql(query, params).await?.deserialize()
     }
 
     /// Run one SQL SELECT and return its batches as they arrive.
@@ -654,6 +661,7 @@ impl Bifrost {
     /// The stream owns the HTTP response body: dropping it propagates
     /// cancellation. The terminal frame is required, so a stream that ends
     /// without one fails rather than presenting partial rows as success.
+    /// `params` bind positionally exactly as in [`Self::sql`].
     ///
     /// # Errors
     ///
@@ -662,8 +670,13 @@ impl Bifrost {
     /// # Cancellation
     ///
     /// Abandoning the future abandons the request before any row is read.
-    pub async fn stream(&self, query: &str) -> Result<QueryResultStream, BifrostClientError> {
+    pub async fn stream(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<QueryResultStream, BifrostClientError> {
         self.query(&BifrostQueryRequest {
+            params: params.to_vec(),
             sql: query.to_owned(),
             deadline_ms: None,
         })

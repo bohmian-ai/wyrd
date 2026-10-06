@@ -387,6 +387,7 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let state = state_without_oracle().await;
             let request = BifrostQueryRequest {
+                params: Vec::new(),
                 sql: "SELECT 1".to_owned(),
                 deadline_ms: Some(1_000),
             };

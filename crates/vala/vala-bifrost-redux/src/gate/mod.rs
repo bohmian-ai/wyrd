@@ -2184,6 +2184,7 @@ mod tests {
     fn query_request() -> wyrd_spec::vala::api::BifrostQueryRequest {
         wyrd_spec::vala::api::BifrostQueryRequest {
             sql: "SELECT 1".to_owned(),
+            params: Vec::new(),
             deadline_ms: None,
         }
     }

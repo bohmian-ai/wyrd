@@ -69,6 +69,7 @@ fn table(fqn: &str) -> TableConfig {
 /// query error so a refused read is not mistaken for an empty one.
 async fn await_ids(bifrost: &Bifrost, fqn: &str, expected: &[i64]) {
     let request = BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT id FROM {fqn} ORDER BY id"),
         deadline_ms: Some(30_000),
     };

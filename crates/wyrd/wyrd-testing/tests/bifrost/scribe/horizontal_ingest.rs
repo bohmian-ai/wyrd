@@ -468,6 +468,7 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
     let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.clone(),
             deadline_ms: Some(120_000),
         })

@@ -31,7 +31,7 @@ use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire};
+use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire, QueryParam};
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -58,6 +58,48 @@ fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
         message: format!("{field} is invalid: {reason}"),
         details: serde_json::json!({ "field": field, "reason": reason.to_string() }),
     })
+}
+
+/// Converts optional Python bind values into the shared typed scalars.
+///
+/// `None`, `bool`, `int`, `float`, and `str` map onto [`QueryParam`] in order;
+/// `bool` is checked before `int` because Python booleans are integers. Range
+/// and finiteness are left to `BifrostQueryRequest::validate`, except an `int`
+/// outside `i64`, which cannot be represented at all.
+///
+/// # Errors
+///
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `params[i]` for an unsupported
+/// type or an out-of-range integer.
+fn query_params(params: Option<Vec<Bound<'_, PyAny>>>) -> WyrdPyResult<Vec<QueryParam>> {
+    use pyo3::types::{PyBool, PyFloat, PyInt, PyString};
+    params
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let field = format!("params[{index}]");
+            if value.is_none() {
+                Ok(QueryParam::Null)
+            } else if let Ok(value) = value.cast::<PyBool>() {
+                Ok(QueryParam::Bool(value.is_true()))
+            } else if value.is_instance_of::<PyInt>() {
+                value
+                    .extract::<i64>()
+                    .map(QueryParam::Int)
+                    .map_err(|error| invalid_argument(&field, error))
+            } else if let Ok(value) = value.cast::<PyFloat>() {
+                Ok(QueryParam::Float(value.value()))
+            } else if let Ok(value) = value.cast::<PyString>() {
+                Ok(QueryParam::String(value.to_string()))
+            } else {
+                Err(invalid_argument(
+                    &field,
+                    "must be None, bool, int, float, or str",
+                ))
+            }
+        })
+        .collect()
 }
 
 /// Sentinel the native poll uses to distinguish a missing terminal from a
@@ -461,33 +503,47 @@ impl Bifrost {
 
     /// Runs one SQL SELECT and collects every batch.
     ///
+    /// `params` bind the `$1..$n` placeholders in order as typed data; they
+    /// are never interpolated into `query`.
+    ///
     /// # Errors
     ///
     /// Raises `WyrdError` carrying `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE`
     /// when the response ends without its required terminal, and the catalog
     /// code for invalid SQL, the query floor's refusal, or transport and
     /// authorization failures.
-    fn sql(&self, py: Python<'_>, query: &str) -> WyrdPyResult<PyQueryResult> {
+    #[pyo3(signature = (query, params=None))]
+    fn sql(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        params: Option<Vec<Bound<'_, PyAny>>>,
+    ) -> WyrdPyResult<PyQueryResult> {
+        let params = query_params(params)?;
         let inner = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query, &params)))
             .map_err(client_error)?;
         Ok(PyQueryResult { inner })
     }
 
     /// Starts one query and returns its terminal-validating native stream.
     ///
+    /// `params` bind positionally exactly as in [`PyBifrost::sql`].
+    ///
     /// # Errors
     ///
-    /// Raises `WyrdError` with the catalog code for request-contract or
-    /// transport failures.
-    #[pyo3(signature = (sql, deadline_ms=None))]
+    /// Raises `WyrdError` with the catalog code for request-contract, bind
+    /// value, or transport failures.
+    #[pyo3(signature = (sql, deadline_ms=None, params=None))]
     fn stream(
         &self,
         py: Python<'_>,
         sql: &str,
         deadline_ms: Option<i64>,
+        params: Option<Vec<Bound<'_, PyAny>>>,
     ) -> WyrdPyResult<PyBifrostQueryStream> {
         let request = BifrostQueryRequest {
+            params: query_params(params)?,
             sql: sql.to_owned(),
             deadline_ms,
         };

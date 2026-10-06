@@ -657,7 +657,7 @@ mod pg_tests {
 
         // A first read authenticates the client and creates the chain head;
         // publishing it leaves nothing owed.
-        oracle.sql(&sql).await?;
+        oracle.sql(&sql, &[]).await?;
         let deadline = tokio::time::Instant::now() + WAIT;
         while pending(&metrics) > 0.0 {
             assert!(
@@ -684,7 +684,7 @@ mod pg_tests {
                 let scrape = vec![Metrics::parse(&metrics.render())];
                 scrapes += 1;
                 if scrapes == 1 {
-                    oracle.sql(&sql).await?;
+                    oracle.sql(&sql, &[]).await?;
                     await_blocked_writer(&queue).await?;
                 }
                 Ok(scrape)
@@ -694,7 +694,7 @@ mod pg_tests {
             late.audit, 1,
             "a decision created after the first scrape refuses the empty durable read"
         );
-        oracle.sql(&sql).await?;
+        oracle.sql(&sql, &[]).await?;
         let stopped = queue.now().await?;
 
         let held = drain_read(&queue, &metrics, stopped).await?;
@@ -759,7 +759,7 @@ mod pg_tests {
                         0.0,
                         "the decision is created after the first scrape"
                     );
-                    oracle.sql(&sql).await?;
+                    oracle.sql(&sql, &[]).await?;
                     await_blocked_writer(&queue).await?;
                     return Ok(scrape);
                 }

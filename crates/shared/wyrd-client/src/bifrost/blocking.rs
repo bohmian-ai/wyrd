@@ -12,8 +12,8 @@ use arrow::record_batch::RecordBatch;
 use wyrd_queue::QueueConfig;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, RegisterOutcome,
-    RunningQuerySummary,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryParam,
+    RegisterOutcome, RunningQuerySummary,
 };
 
 use crate::bifrost::facade::QueryResult;
@@ -152,8 +152,12 @@ impl Bifrost {
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::sql`].
-    pub fn sql(&self, query: &str) -> Result<QueryResult, BifrostClientError> {
-        block_on(self.inner.sql(query))
+    pub fn sql(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<QueryResult, BifrostClientError> {
+        block_on(self.inner.sql(query, params))
     }
 
     /// Run one SQL SELECT and deserialize every row into `T`.
@@ -164,8 +168,9 @@ impl Bifrost {
     pub fn sql_as<T: serde::de::DeserializeOwned>(
         &self,
         query: &str,
+        params: &[QueryParam],
     ) -> Result<Vec<T>, BifrostClientError> {
-        block_on(self.inner.sql_as(query))
+        block_on(self.inner.sql_as(query, params))
     }
 
     /// Run one SQL SELECT and iterate its batches as they arrive.
@@ -173,9 +178,13 @@ impl Bifrost {
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::stream`].
-    pub fn stream(&self, query: &str) -> Result<BlockingQueryStream, BifrostClientError> {
+    pub fn stream(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<BlockingQueryStream, BifrostClientError> {
         Ok(BlockingQueryStream {
-            inner: block_on(self.inner.stream(query))?,
+            inner: block_on(self.inner.stream(query, params))?,
         })
     }
 

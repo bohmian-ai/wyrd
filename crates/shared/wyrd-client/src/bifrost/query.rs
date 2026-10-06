@@ -1786,6 +1786,121 @@ mod tests {
         (format!("http://{address}"), seen)
     }
 
+    /// Serves the token exchange and captures the first `POST /v1/query` body.
+    ///
+    /// The query is answered with an empty `503`, so the caller fails fast
+    /// after its request has been fully written; the captured JSON body is the
+    /// proof of exactly what the client put on the wire.
+    fn query_body_server() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        listener
+            .set_nonblocking(true)
+            .expect("listener converts to tokio");
+        let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(std::sync::Mutex::new(Some(sender)));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sender = Arc::clone(&sender);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let (head, body) = loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&request).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break (head.to_owned(), body.to_owned());
+                        }
+                    };
+                    let response = if head.starts_with("POST /auth/token") {
+                        let token = "{\"access_token\":\"test-token\",\"token_type\":\"Bearer\",\"expires_at\":\"2099-01-01T00:00:00Z\"}";
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{token}",
+                            token.len()
+                        )
+                    } else {
+                        if head.starts_with("POST /v1/query ")
+                            && let Some(sender) =
+                                sender.lock().ok().and_then(|mut slot| slot.take())
+                        {
+                            let _ = sender.send(
+                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// `sql(query, params)` sends bind values as ordered typed data.
+    ///
+    /// A parameter holding SQL text must reach the server as one JSON string
+    /// in `params` while `sql` stays byte-for-byte the caller's placeholder
+    /// template, so no client path can splice a value into the statement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request never reaches the query route, or when the SQL
+    /// text or the ordered params differ from what the caller supplied.
+    #[tokio::test]
+    async fn sql_forwards_bind_values_without_interpolation() {
+        let (base_url, body) = query_body_server();
+        let config = crate::config::ClientConfig {
+            credential: Some(secrecy::SecretString::from("test-key")),
+            http: crate::transport::config::HttpConfig {
+                base_url,
+                timeout_ms: 2_000,
+                ..crate::transport::config::HttpConfig::default()
+            },
+            ..crate::config::ClientConfig::default()
+        };
+        let client = WyrdClient::with_config(config).expect("static config builds a client");
+        let template = "SELECT v FROM t WHERE name = $1 AND n = $2";
+        let injection = "x'); DROP TABLE t; --";
+        let _ = crate::bifrost::Bifrost::query_only(&client)
+            .sql(
+                template,
+                &[
+                    wyrd_spec::vala::api::QueryParam::String(injection.to_owned()),
+                    wyrd_spec::vala::api::QueryParam::Int(7),
+                ],
+            )
+            .await;
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), body)
+            .await
+            .expect("the query request arrives")
+            .expect("the query body is captured");
+        assert_eq!(
+            body,
+            serde_json::json!({ "sql": template, "params": [injection, 7], "deadline_ms": null })
+        );
+    }
+
     /// A described canonical table builds its insertable Arrow schema directly.
     ///
     /// The three describe classes are exactly what a writer needs: it declares

@@ -25,6 +25,7 @@ const FIXTURE_VALUES: [i64; 4] = [1, 2, 3, 4];
 /// Builds one published-only strict request with an explicit deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -1308,7 +1309,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     own_writer.flush().await?;
     server.flush_bifrost().await?;
     let written = own_writer
-        .sql(&format!("SELECT value FROM {events}"))
+        .sql(&format!("SELECT value FROM {events}"), &[])
         .await?;
     let values: Vec<i64> = written
         .batches()

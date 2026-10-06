@@ -1063,6 +1063,7 @@ mod tests {
             expires_at_ms: (now + chrono::Duration::seconds(5)).timestamp_millis(),
             context,
             request: BifrostQueryRequest {
+                params: Vec::new(),
                 sql: "SELECT value FROM vala.bifrost.events".to_owned(),
                 deadline_ms: Some(5_000),
             },

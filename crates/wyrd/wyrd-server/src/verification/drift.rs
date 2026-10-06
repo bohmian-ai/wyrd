@@ -941,6 +941,7 @@ impl Reader<'_> {
             CancellationToken::new(),
         );
         let request = BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: Some(
                 i64::try_from(self.engine.query_timeout.as_millis()).unwrap_or(i64::MAX),

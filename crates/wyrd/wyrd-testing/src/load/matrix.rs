@@ -481,6 +481,7 @@ impl BifrostClusterLoad {
         wyrd_client::Bifrost::query_only(&setup_client)
             .collect_bounded(
                 &BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
                     deadline_ms: Some(5_000),
                 },
@@ -655,6 +656,7 @@ async fn exercise_query_cancellation(
         query
             .collect_bounded(
                 &BifrostQueryRequest {
+                    params: Vec::new(),
                     sql,
                     deadline_ms: Some(5_000),
                 },
@@ -923,6 +925,7 @@ async fn run_public_matrix(
         // already holds rather than by guessing at the newest staged row.
         let final_stream = query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: final_sql,
                 deadline_ms: Some(5_000),
             })
@@ -1824,6 +1827,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                 let response = query
                     .collect_bounded(
                         &BifrostQueryRequest {
+                            params: Vec::new(),
                             sql,
                             deadline_ms: Some(deadline_ms),
                         },

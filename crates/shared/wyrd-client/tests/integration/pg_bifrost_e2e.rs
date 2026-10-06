@@ -333,6 +333,7 @@ mod pg_tests {
         srv.stall_next_query_after_schema();
         let stream = query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: format!("SELECT value FROM {table_fqn}"),
                 deadline_ms: Some(30_000),
             })
@@ -811,6 +812,7 @@ mod pg_tests {
         srv.flush_bifrost().await.expect("flush Scribe");
 
         let request = BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
             deadline_ms: None,
         };
@@ -908,6 +910,7 @@ mod pg_tests {
         }
 
         let request = BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
             deadline_ms: None,
         };
@@ -1197,6 +1200,7 @@ mod pg_tests {
         // no Card, which is exactly what optional correlation has to mean.
         let mut stream = query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: format!(
                     "SELECT id, card_uid, principal_id \
                      FROM vala.bifrost.{table_name} ORDER BY id"
@@ -1813,14 +1817,20 @@ mod pg_tests {
             .expect("publish the server-owned Scribe");
 
         let collected = bifrost
-            .sql(&format!("SELECT id, value FROM {first_fqn} ORDER BY id"))
+            .sql(
+                &format!("SELECT id, value FROM {first_fqn} ORDER BY id"),
+                &[],
+            )
             .await
             .expect("collect the first table");
         assert_eq!(collected.terminal().outcome, QueryTerminalOutcome::Success);
         assert_eq!(id_value_rows(collected.batches()), first_rows);
 
         let mut stream = bifrost
-            .stream(&format!("SELECT id, value FROM {second_fqn} ORDER BY id"))
+            .stream(
+                &format!("SELECT id, value FROM {second_fqn} ORDER BY id"),
+                &[],
+            )
             .await
             .expect("stream the second table");
         let mut streamed = Vec::new();
@@ -1946,20 +1956,20 @@ mod pg_tests {
             .expect("publish the server-owned Scribe");
 
         let collected = bifrost
-            .sql(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .sql(&format!("SELECT id, value FROM {fqn} ORDER BY id"), &[])
             .expect("collect through the blocking door");
         assert_eq!(collected.terminal().outcome, QueryTerminalOutcome::Success);
         assert_eq!(id_value_rows(collected.batches()), rows);
 
         let streamed = bifrost
-            .stream(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .stream(&format!("SELECT id, value FROM {fqn} ORDER BY id"), &[])
             .expect("stream through the blocking door")
             .collect::<Result<Vec<_>, _>>()
             .expect("every streamed batch");
         assert_eq!(id_value_rows(&streamed), rows);
 
         let typed: Vec<IdValueRow> = bifrost
-            .sql_as(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .sql_as(&format!("SELECT id, value FROM {fqn} ORDER BY id"), &[])
             .expect("deserialize through the blocking door");
         assert_eq!(
             typed,
@@ -2224,11 +2234,11 @@ mod pg_tests {
         );
 
         // Raw `sql` is unchanged: the same query still collects Arrow batches.
-        let raw = reader.sql(&select).await.expect("raw Arrow result");
+        let raw = reader.sql(&select, &[]).await.expect("raw Arrow result");
         assert_eq!(raw.terminal().outcome, QueryTerminalOutcome::Success);
         assert_eq!(raw.num_rows(), 2);
 
-        let typed: Vec<InferenceRow> = reader.sql_as(&select).await.expect("typed rows");
+        let typed: Vec<InferenceRow> = reader.sql_as(&select, &[]).await.expect("typed rows");
         assert_eq!(
             typed,
             vec![
@@ -2252,13 +2262,13 @@ mod pg_tests {
         let empty: Vec<InferenceRow> = reader
             .sql_as(&format!(
                 "SELECT call_id, model, tokens, latency_ms, status FROM {facts} WHERE call_id = 9999"
-            ))
+            ), &[])
             .await
             .expect("a query matching nothing is an empty typed result");
         assert!(empty.is_empty());
 
         let mismatch = reader
-            .sql_as::<MistypedRow>(&format!("SELECT model FROM {facts}"))
+            .sql_as::<MistypedRow>(&format!("SELECT model FROM {facts}"), &[])
             .await
             .expect_err("a row that does not fit the declared type fails the read");
         assert_eq!(sdk_code(&mismatch), "WYRD_CLIENT_422_ROW_DESERIALIZATION");
@@ -2309,8 +2319,9 @@ mod pg_tests {
 
         // Aggregates with a HAVING filter: the per-group summary table.
         let grouped = reader
-            .sql(&format!(
-                "SELECT model, \
+            .sql(
+                &format!(
+                    "SELECT model, \
                         CAST(COUNT(*) AS BIGINT) AS runs, \
                         CAST(SUM(tokens) AS BIGINT) AS total_tokens, \
                         CAST(AVG(tokens) AS DOUBLE) AS avg_tokens, \
@@ -2318,7 +2329,9 @@ mod pg_tests {
                         CAST(MAX(latency_ms) AS DOUBLE) AS slowest \
                  FROM {facts} \
                  GROUP BY model HAVING COUNT(*) > 1 ORDER BY total_tokens DESC"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("grouped aggregate");
         assert_eq!(grouped.terminal().outcome, QueryTerminalOutcome::Success);
@@ -2353,7 +2366,7 @@ mod pg_tests {
                         CAST(SUM(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS running_tokens, \
                         CAST(LAG(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS prev_tokens \
                  FROM {facts} ORDER BY call_id"
-            ))
+            ), &[])
             .await
             .expect("windowed projection");
         let windowed = windowed.batches();
@@ -2372,13 +2385,16 @@ mod pg_tests {
 
         // Join to the dimension table, with a filtering aggregate on the facts.
         let joined = reader
-            .sql(&format!(
-                "SELECT d.vendor, f.model, \
+            .sql(
+                &format!(
+                    "SELECT d.vendor, f.model, \
                         CAST(COUNT(*) FILTER (WHERE f.status = 'ok') AS BIGINT) AS successes, \
                         CAST(COUNT(*) AS BIGINT) AS attempts \
                  FROM {facts} AS f INNER JOIN {dims} AS d ON f.model = d.model \
                  GROUP BY d.vendor, f.model ORDER BY f.model"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("joined aggregate");
         let joined = joined.batches();
@@ -2395,15 +2411,18 @@ mod pg_tests {
 
         // Scalar expressions over a CTE: the reshaping step before a chart.
         let scalars = reader
-            .sql(&format!(
-                "WITH labelled AS ( \
+            .sql(
+                &format!(
+                    "WITH labelled AS ( \
                      SELECT call_id, UPPER(model) AS model_label, \
                             CAST(ROUND(latency_ms) AS DOUBLE) AS latency_whole, \
                             CASE WHEN latency_ms > 100 THEN 'slow' ELSE 'fast' END AS bucket, \
                             CAST(CHARACTER_LENGTH(status) AS BIGINT) AS status_len \
                      FROM {facts} \
                  ) SELECT * FROM labelled ORDER BY call_id LIMIT 3"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("scalar projection");
         let scalars = scalars.batches();
@@ -2492,13 +2511,16 @@ mod pg_tests {
 
         // The trace hierarchy: one root and one child, both in one trace.
         let hierarchy = bifrost
-            .sql(&format!(
-                "SELECT name, gen_ai_operation_name, status_code, \
+            .sql(
+                &format!(
+                    "SELECT name, gen_ai_operation_name, status_code, \
                         CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) \
                           AS is_root \
                  FROM vala.traces.spans WHERE scope_name = '{scope}' \
                  ORDER BY start_time_unix_nano"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("read the trace hierarchy");
         assert_eq!(hierarchy.terminal().outcome, QueryTerminalOutcome::Success);
@@ -2521,14 +2543,17 @@ mod pg_tests {
 
         // GenAI model filtering and token aggregation over the same spans.
         let tokens = bifrost
-            .sql(&format!(
-                "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
+            .sql(
+                &format!(
+                    "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
                         CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, \
                         CAST(COUNT(*) AS BIGINT) AS spans \
                  FROM vala.traces.spans \
                  WHERE scope_name = '{scope}' AND gen_ai_request_model = '{model}'",
-                model = fixture::MODEL
-            ))
+                    model = fixture::MODEL
+                ),
+                &[],
+            )
             .await
             .expect("aggregate GenAI tokens");
         let tokens = tokens.batches();
@@ -2548,12 +2573,15 @@ mod pg_tests {
 
         // The correlated error log, joined to the span it belongs to by id.
         let correlated = bifrost
-            .sql(&format!(
-                "SELECT l.severity_text, l.event_name, s.name AS span_name \
+            .sql(
+                &format!(
+                    "SELECT l.severity_text, l.event_name, s.name AS span_name \
                  FROM vala.logs.records l JOIN vala.traces.spans s \
                    ON l.trace_id = s.trace_id AND l.span_id = s.span_id \
                  WHERE l.scope_name = '{scope}'"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("read the correlated error log");
         let correlated = correlated.batches();
@@ -2570,14 +2598,17 @@ mod pg_tests {
 
         // One metric aggregate across the three representative kinds.
         let metrics = bifrost
-            .sql(&format!(
-                "SELECT metric_type, \
+            .sql(
+                &format!(
+                    "SELECT metric_type, \
                         CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, \
                         CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, \
                         CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations \
                  FROM vala.metrics.points WHERE scope_name = '{scope}' \
                  GROUP BY metric_type ORDER BY metric_type"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("aggregate the metric points");
         let metrics = metrics.batches();
@@ -2602,13 +2633,16 @@ mod pg_tests {
         let payload_reader =
             reader_with_permissions(&srv, "sdk_canonical_reader", &["bifrost_query:read"]).await;
         let nested = payload_reader
-            .sql(&format!(
-                "SELECT CAST(array_length(events) AS BIGINT) AS events, \
+            .sql(
+                &format!(
+                    "SELECT CAST(array_length(events) AS BIGINT) AS events, \
                  CAST(array_length(links) AS BIGINT) AS links, \
                  events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state \
                  FROM vala.traces.spans \
                  WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("an authorized caller reads the nested event and link");
         assert_eq!(
@@ -2631,10 +2665,13 @@ mod pg_tests {
         );
 
         let messages = payload_reader
-            .sql(&format!(
-                "SELECT attributes FROM vala.traces.spans \
+            .sql(
+                &format!(
+                    "SELECT attributes FROM vala.traces.spans \
                  WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("an authorized caller reads the structured GenAI messages");
         let batches = messages.batches();

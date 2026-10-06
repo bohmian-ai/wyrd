@@ -1112,6 +1112,7 @@ fn assert_complete(run: &WorkflowRun) {
 async fn query_rows(fixture: &Fixture, token: &str, sql: &str) -> usize {
     let mut stream = wyrd_client::Bifrost::query_only(&fixture.client(token))
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(30_000),
         })

@@ -214,6 +214,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         .query_sql(
             query_context(tenant_a)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 // A distributed join and grouped aggregate that fits its grant:
                 // this journey needs a live Analytical query holding its
                 // envelope, not one that must spill. Exceeding the grant and
@@ -379,6 +380,7 @@ async fn prove_interactive_window(
 
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             // A flat bounded projection on purpose. Any global operator — a
             // sort, an aggregate, a join — is a "complex" plan, which the
             // planner classifies Analytical however few rows it reads, and an
@@ -1261,6 +1263,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         let holder_query = wyrd_client::Bifrost::query_only(&holder);
         let stream = holder_query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: format!("SELECT id FROM vala.bifrost.{table}"),
                 deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
             })
@@ -1326,6 +1329,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let next = client(server, "memory-refusal-next").await?;
     let mut stream = wyrd_client::Bifrost::query_only(&next)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id FROM vala.bifrost.{table}"),
             deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
         })
@@ -1371,6 +1375,7 @@ async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
 async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         })
@@ -1471,6 +1476,7 @@ async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
     let reader = client(&server, "memory-failure-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&reader);
     let request = BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT id FROM vala.bifrost.{table}"),
         deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
     };
@@ -1779,6 +1785,7 @@ async fn hold_envelope(
     server.stall_next_query_after_schema();
     let stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
@@ -2787,6 +2794,7 @@ async fn grpc_query(
     };
     let mut request = wyrd_tonic::tonic::Request::new(
         wyrd_tonic::wyrd::v1::BifrostQueryRequest::from(BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         }),

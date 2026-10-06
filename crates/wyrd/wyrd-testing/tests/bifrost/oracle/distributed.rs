@@ -385,6 +385,7 @@ async fn query_terminal_either_surface(
 ) -> Result<(u64, QueryTerminalOutcome, Option<QueryTerminalErrorCode>), JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: None,
         })
@@ -859,6 +860,7 @@ fn expected_marked_ids() -> Vec<i64> {
 async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: None,
         })
@@ -1057,6 +1059,7 @@ async fn grouped_counts(
 ) -> Result<(Vec<(String, i64)>, QueryClass), JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: Some(30_000),
         })
@@ -1313,6 +1316,7 @@ async fn open_paused_live_query(
     pause.arm();
     let stream = query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(LIVE_DEADLINE_MS),
         })
@@ -1589,6 +1593,7 @@ async fn observe_query_within(
 ) -> Result<ObservedQuery, JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms,
         })

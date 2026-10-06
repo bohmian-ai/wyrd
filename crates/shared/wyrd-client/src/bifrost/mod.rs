@@ -62,6 +62,8 @@ pub use sink::{BifrostIngestSink, IngestTransport};
 pub use table::{Correlation, ResolvedTable, TableConfig, WriterTable};
 /// The bounded producer-queue configuration a Bifrost writer is connected with.
 pub use wyrd_queue::QueueConfig;
+/// One typed positional bind value for [`Bifrost::sql`] and its siblings.
+pub use wyrd_spec::vala::api::QueryParam;
 
 // C4a forward schema helpers, re-exported so SDK users build the user Arrow
 // schema from a `FieldSpec` set or a JSON-Schema value without reaching into

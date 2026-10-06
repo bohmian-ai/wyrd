@@ -387,6 +387,7 @@ pub(crate) async fn seed_foreign_hot_row(
 pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"
             ),

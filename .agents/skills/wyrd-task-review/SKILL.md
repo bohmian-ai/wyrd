@@ -55,10 +55,12 @@ Run independent discovery, conditional follow-up, and validation:
 2. **Compare claims:** after discovery reports are complete, group findings by
    violated behavior or invariant rather than line number. Agreement is useful
    corroboration, not proof; unique findings still require validation. If
-   reports materially conflict, reveal an unreviewed reachable path, or repeat
-   remediation suggests a common source the reviewers did not trace, spawn one
-   fresh focused `followup-rev` to investigate only that uncertainty. Record
-   why it was or was not needed.
+   reports materially conflict or reveal an unreviewed reachable path, spawn
+   one fresh focused `followup-rev` to investigate only that uncertainty.
+   Record why it was or was not needed. On a repeat review (any earlier review
+   directory exists for this task), always spawn a fresh `followup-rev` in
+   root-cause mode, whatever the discovery reports contain; it may also carry
+   any conflict above.
 3. **Independent validation:** after any follow-up, always spawn one fresh
    structured Ponytail reviewer (`ponytail-rev`). It validates every proposed
    finding against source and produces the final finding ledger and
@@ -67,8 +69,11 @@ Run independent discovery, conditional follow-up, and validation:
 Discovery reviewers receive the immutable subject and inputs needed for their
 own scope, but not another reviewer's conclusions or an intended verdict. The
 `followup-rev`, when needed, receives the conflicting claims and source paths,
-without an intended verdict. The `ponytail-rev` receives the complete diff,
-applicable authorities, and every discovery and follow-up report. The
+without an intended verdict; in root-cause mode it also receives every earlier
+review directory's `verdict.md` and remediation task, and the remediation
+commits since the first reviewed candidate. The `ponytail-rev` receives the
+complete diff, applicable authorities, and every discovery and follow-up
+report. The
 orchestrator establishes the subject, routes inputs, compares claims, checks
 report completeness, and writes final artifacts from the validated ledger; it
 does not validate its own findings. If a required agent or report is missing,
@@ -93,9 +98,8 @@ acceptance criteria, negative flows, and regression boundaries. The
 `invariant-rev` follows values and state from producer to sink across shared
 owners, sibling consumers, lifecycle transitions, and failure paths. Both trace
 a failure at a consumer back to its producer before locating the defect. On a
-repeat review, use prior findings as hypotheses: determine whether apparently
-separate failures share the same source, including one introduced by an earlier
-remediation.
+repeat review, report each finding's relationship to prior findings you notice;
+the root-cause `followup-rev` owns that analysis.
 
 Apply the Ponytail ladder to every changed abstraction, dependency,
 configuration surface, compatibility path, generic layer, and speculative
@@ -278,6 +282,27 @@ discovery pass, not a vote on existing findings. A new or unique finding still
 goes to independent validation. Do not run extra passes merely to reach a
 predetermined count or obtain agreement.
 
+### Root-cause mode (repeat reviews)
+
+This pass owns the question of whether separate findings across rounds have
+one cause. For every finding in this round's discovery reports, and every
+prior-round finding and its remediation commits, identify findings that touch
+the same owner, value, or invariant, or code that an earlier remediation
+changed. For each such group, trace each symptom back through source to its
+producer and decide:
+
+- **shared root** — name the root (owner, mechanism, or decision) and show the
+  source path from it to each symptom, including symptoms an earlier round
+  already patched; or
+- **independent** — show the evidence that the causes differ.
+
+Proximity, timing, or a plausible story is not a shared root; without a traced
+path, record `independent` or `UNRESOLVED`. Return `root-cause.md` with one row
+per finding: related prior findings and remediation commits, the decision,
+source evidence, and for a shared root the correction site at the root and
+every symptom it closes. New findings at the root still go to independent
+validation.
+
 ## Structured Ponytail validation (`ponytail-rev`)
 
 Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
@@ -321,8 +346,11 @@ finding the `ponytail-rev` must:
 4. ask whether the finding or remediation can be deleted, whether existing
    behavior already satisfies the task, and whether the proposed proof is the
    smallest credible check without a new dependency or test harness;
-5. compare prior findings and remediations for a shared source, consolidating
-   related failures into one correction when the same invariant owns them; and
+5. on a repeat review, validate every `root-cause.md` decision against source.
+   For a confirmed shared root, consolidate its symptoms into one correction at
+   the root. A correction or earlier remediation that patches a symptom of a
+   confirmed shared root is `INCORRECT`, and the correction removes the symptom
+   patches it makes redundant; and
 6. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
    smallest safe correction boundary. Explain why any retained consumer guard
    belongs there.
@@ -354,10 +382,11 @@ blocks the review. Preserve its final ledger and recommendations as
 In the established review directory, preserve both task-review reports,
 `standards-review.md`, `maintainer-review.md`, `system-review.md`,
 `reuse-review.md`, every `domain-review-<domain>.md`,
-any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
-containing the immutable subject, reconciled acceptance matrix, independent
-review results, the follow-up decision, validated finding ledger, verification
-limits, prior-finding closure, and one verdict:
+any `followup-review.md`, any `root-cause.md`, and `findings-validation.md`,
+then write `verdict.md` containing the immutable subject, reconciled acceptance
+matrix, independent review results, the follow-up decision, validated finding
+ledger, the validated root-cause groups on a repeat review, verification limits,
+prior-finding closure, and one verdict:
 
 - `PASS` — all required reports are complete, the independently validated ledger
   is empty, every obligation passes after reconciling proposed findings with
@@ -376,7 +405,9 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
 1. the approved spec path, original task path, and candidate identities;
 2. an issue diagnosis for each material finding: the violated obligation,
    current behavior, exact evidence, observable consequence, and why the
-   candidate or its existing proof falls short;
+   candidate or its existing proof falls short; for a confirmed shared root,
+   one diagnosis at the root that lists every symptom it closes, including
+   symptoms patched in earlier rounds;
 3. the intended correction outcome;
 4. a decision-complete recommendation within the approved behavior: select the
    minimal correction approach, name the existing owner or mechanism to reuse,

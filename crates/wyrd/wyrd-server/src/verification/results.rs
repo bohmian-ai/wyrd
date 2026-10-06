@@ -13,20 +13,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, StructArray,
     TimestampMicrosecondArray,
 };
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Error as JsonError;
-use vala_bifrost_redux::tables::verification::ResultsTable;
+use serde_json::{Error as JsonError, Value};
+use vala_bifrost_redux::tables::verification::{DRIFT_REPORT, EVAL_SUMMARY, ResultsTable};
 use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable};
 use vala_drift::{DriftReport, DriftVerdict};
-use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
+use vala_eval::executor::{EvalReport, EvalWorkflowSummary, SkipReason, TaskRunOutcome};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
@@ -55,6 +58,9 @@ pub enum ResultPayloadError {
     /// A report value could not be encoded as canonical JSON.
     #[error("result JSON encoding failed")]
     Json(#[from] JsonError),
+    /// A report value exceeds a Variant limit and cannot be stored.
+    #[error("result Variant value refused")]
+    Variant(#[from] BifrostError),
     /// The mapped columns did not form a valid batch.
     #[error("result batch assembly failed")]
     Arrow(#[from] ArrowError),
@@ -207,41 +213,53 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Map `report` to its ordered batches.
     ///
     /// Drift writes one `result_features` row per scored feature and records
-    /// the report (or null when unscored) as `details`; Eval writes one
-    /// `result_items` row per task outcome and records the workflow summary
-    /// as `details`. A report with no detail rows writes only the summary.
+    /// the typed report (or null when unscored) as `drift_report`; Eval writes
+    /// one `result_items` row per task outcome and records the typed workflow
+    /// summary as `eval_summary`. The other summary column stays null. A
+    /// report with no detail rows writes only the summary.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::InputMismatch`] when the report's
     /// implementation cannot consume the run's frozen input,
     /// [`ResultPayloadError::OutOfRange`] when a value overflows its column,
     /// [`ResultPayloadError::ColumnMismatch`] when authored columns do not
-    /// name each table field exactly once, and a JSON or Arrow error when
+    /// name each table field exactly once, [`ResultPayloadError::Variant`]
+    /// when a payload exceeds a Variant limit, and a JSON or Arrow error when
     /// encoding fails.
     pub fn build(&self, report: &VerifierReport) -> Result<ResultPayload, ResultPayloadError> {
         let implementation = report.implementation();
         let verdict = report.verdict();
         let mut batches = Vec::with_capacity(2);
-        let (window, record_id, details) = match (report, self.run.input) {
+        let (window, record_id, drift, workflow) = match (report, self.run.input) {
             (VerifierReport::Drift(drift), RunInput::DriftWindow(window)) => {
                 if let Some(drift) = drift
                     && let Some(features) = self.drift_features(drift, window)?
                 {
                     batches.push(self.finish::<ResultFeaturesTable>(features)?);
                 }
-                let details = drift.as_ref().map(canonical_json).transpose()?;
-                (Some(window), None, details)
+                (Some(window), None, drift_report(drift.as_ref())?, None)
             }
             (VerifierReport::Eval { report, .. }, RunInput::EvalRecord { record_id, .. }) => {
                 if let Some(items) = self.eval_items(report, record_id)? {
                     batches.push(self.finish::<ResultItemsTable>(items)?);
                 }
-                let details = canonical_json(&report.workflow_summary())?;
-                (None, Some(record_id.as_str()), Some(details))
+                (
+                    None,
+                    Some(record_id.as_str()),
+                    drift_report(None)?,
+                    Some(report.workflow_summary()),
+                )
             }
             _ => return Err(ResultPayloadError::InputMismatch { implementation }),
         };
-        let summary = self.summary(implementation, verdict, window, record_id, details)?;
+        let summary = self.summary(
+            implementation,
+            verdict,
+            window,
+            record_id,
+            drift,
+            eval_summary(workflow.as_ref()),
+        )?;
         batches.push(self.finish::<ResultsTable>(summary)?);
         Ok(ResultPayload {
             result_id: self.result_id,
@@ -252,6 +270,9 @@ impl<'a> ResultPayloadBuilder<'a> {
 
     /// Author the named columns of the one `vala.verification.results` row.
     ///
+    /// `drift_report` and `eval_summary` are the already-built one-row Struct
+    /// columns of the two implementation summaries.
+    ///
     /// # Errors
     /// Returns a JSON error when the frozen Trigger cannot be encoded.
     fn summary(
@@ -260,7 +281,8 @@ impl<'a> ResultPayloadBuilder<'a> {
         verdict: VerificationVerdict,
         window: Option<&DriftWindow>,
         record_id: Option<&str>,
-        details: Option<String>,
+        drift_report: ArrayRef,
+        eval_summary: ArrayRef,
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
         let verdict: &'static str = verdict.into();
@@ -285,7 +307,8 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("window_end", timestamps([window.map(|window| window.end)])),
             ("started_at", timestamps([Some(self.started_at)])),
             ("ended_at", timestamps([Some(self.ended_at)])),
-            ("details", text([details])),
+            (DRIFT_REPORT, drift_report),
+            (EVAL_SUMMARY, eval_summary),
         ])
     }
 
@@ -374,7 +397,8 @@ impl<'a> ResultPayloadBuilder<'a> {
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::OutOfRange`] when a stage or duration
-    /// overflows its column, or a JSON error when encoding fails.
+    /// overflows its column, [`ResultPayloadError::Variant`] when a captured
+    /// value exceeds a Variant limit, or a JSON error when encoding fails.
     fn eval_items(
         &self,
         report: &EvalReport,
@@ -426,11 +450,19 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "actual",
-                text(items.iter().map(|item| item.actual.as_deref())),
+                VariantColumnBuilder::encode(
+                    "actual",
+                    items.iter().map(|item| item.actual.as_ref()),
+                    EncodedVariant::from_json,
+                )?,
             ),
             (
                 "expected",
-                text(items.iter().map(|item| item.expected.as_deref())),
+                VariantColumnBuilder::encode(
+                    "expected",
+                    items.iter().map(|item| item.expected.as_ref()),
+                    EncodedVariant::from_json,
+                )?,
             ),
             (
                 "operator",
@@ -565,10 +597,10 @@ struct EvalItem<'a> {
     outcome_kind: &'static str,
     /// Whether an executed task passed.
     passed: Option<bool>,
-    /// JSON of the captured actual value; `null` text for a captured null.
-    actual: Option<String>,
-    /// Canonical JSON of the expected value.
-    expected: Option<String>,
+    /// The captured actual value; a captured null is `Some(Value::Null)`.
+    actual: Option<Value>,
+    /// The expected value.
+    expected: Option<Value>,
     /// Canonical JSON of the comparison operator.
     operator: Option<String>,
     /// Executed task's message.
@@ -598,8 +630,12 @@ impl<'a> EvalItem<'a> {
                 task_id: result.task_id.as_str(),
                 outcome_kind: "ran",
                 passed: Some(result.passed),
-                actual: result.actual.as_ref().map(canonical_json).transpose()?,
-                expected: Some(canonical_json(&result.expected)?),
+                actual: result
+                    .actual
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+                expected: Some(serde_json::to_value(&result.expected)?),
                 operator: Some(canonical_json(&result.operator)?),
                 message: result.message.as_deref(),
                 stage: Some(
@@ -643,13 +679,75 @@ impl<'a> EvalItem<'a> {
 
 /// Encode `value` as canonical (RFC 8785) JSON.
 ///
-/// Routes through [`serde_json::Value`] first so a non-finite float, which
+/// Routes through [`Value`] first so a non-finite float, which
 /// canonical JSON cannot represent, becomes `null` instead of failing.
 ///
 /// # Errors
 /// Returns the JSON error when `value` cannot be serialized.
 fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
     serde_jcs::to_string(&serde_json::to_value(value)?)
+}
+
+/// Build the one-row `drift_report` Struct column; null when unscored.
+///
+/// `method` and `verdict` are the enums' serialized names and `features` is
+/// the per-feature map as a Variant, so the row decodes to the same JSON the
+/// report serializes to (a non-finite score becomes JSON null).
+///
+/// # Errors
+/// Returns a JSON error when the report cannot be serialized and
+/// [`ResultPayloadError::Variant`] when the features exceed a Variant limit.
+fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadError> {
+    let (features, method, verdict) = match report {
+        Some(report) => (
+            serde_json::to_value(&report.features)?,
+            serialized_name(&report.method)?,
+            serialized_name(&report.verdict)?,
+        ),
+        // The children are non-nullable, so a null report holds placeholder
+        // values under its null parent rather than child nulls.
+        None => (Value::Null, Some(String::new()), Some(String::new())),
+    };
+    let features =
+        VariantColumnBuilder::encode(DRIFT_REPORT, [Some(&features)], EncodedVariant::from_json)?;
+    Ok(Arc::new(StructArray::try_new(
+        ResultsTable::drift_report_fields(),
+        vec![text([method]), features, text([verdict])],
+        report.is_none().then(|| NullBuffer::new_null(1)),
+    )?))
+}
+
+/// Build the one-row `eval_summary` Struct column; null when absent.
+fn eval_summary(summary: Option<&EvalWorkflowSummary>) -> ArrayRef {
+    Arc::new(StructArray::new(
+        ResultsTable::eval_summary_fields(),
+        vec![
+            Arc::new(Int32Array::from(vec![
+                summary.map_or(0, |summary| summary.total_tasks),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                summary.map_or(0, |summary| summary.passed_tasks),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                summary.map_or(0, |summary| summary.failed_tasks),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                summary.map_or(0.0, |summary| summary.pass_rate),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                summary.map_or(0, |summary| summary.duration_ms),
+            ])),
+        ],
+        summary.is_none().then(|| NullBuffer::new_null(1)),
+    ))
+}
+
+/// The serialized name of a unit enum value, such as `Psi` or `NoDrift`.
+///
+/// # Errors
+/// Returns a JSON error when the value cannot be serialized.
+fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError> {
+    Ok(serde_json::to_value(value)?.as_str().map(str::to_owned))
 }
 
 /// The stored value of a Drift feature verdict.
@@ -688,7 +786,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::TimestampMicrosecondType;
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
     use chrono::TimeZone;
     use vala_drift::FeatureDriftReport;
     use wyrd_spec::card::drift::DriftMethod;
@@ -805,7 +903,8 @@ mod tests {
                 VerificationVerdict::Inconclusive,
                 Some(window),
                 None,
-                None,
+                drift_report(None).expect("null report builds"),
+                eval_summary(None),
             )
             .expect("summary columns author")
     }
@@ -817,6 +916,28 @@ mod tests {
             .unwrap_or_else(|| panic!("{column} column exists"))
             .as_string::<i32>();
         array.is_valid(row).then(|| array.value(row).to_owned())
+    }
+
+    /// Decode one Variant cell of a top-level column to JSON.
+    ///
+    /// # Panics
+    /// Panics when the column is absent or the cell is not a valid Variant.
+    fn variant_cell(batch: &RecordBatch, column: &str, row: usize) -> Value {
+        let array = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("{column} column exists"));
+        wyrd_queue::variant::variant_cell_to_json(array.as_ref(), row).expect("Variant decodes")
+    }
+
+    /// Borrow one Struct column of a batch.
+    ///
+    /// # Panics
+    /// Panics when the column is absent or not a Struct.
+    fn struct_column<'b>(batch: &'b RecordBatch, column: &str) -> &'b StructArray {
+        batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("{column} column exists"))
+            .as_struct()
     }
 
     /// Read every row's event time.
@@ -893,7 +1014,7 @@ mod tests {
         let scores = features
             .column_by_name("score")
             .expect("score column")
-            .as_primitive::<arrow::datatypes::Float64Type>();
+            .as_primitive::<Float64Type>();
         assert!(scores.is_valid(0) && scores.is_null(1), "NaN score is null");
         assert_eq!(cell(summary, "implementation", 0).as_deref(), Some("drift"));
         assert_eq!(
@@ -906,18 +1027,22 @@ mod tests {
             cell(summary, "trigger_identity", 0).as_deref(),
             Some(r#"{"digest":"sha256:t"}"#)
         );
-        let details: serde_json::Value =
-            serde_json::from_str(&cell(summary, "details", 0).expect("details present"))
-                .expect("details are JSON");
-        assert_eq!(
-            details["features"]["tokens"]["score"],
-            serde_json::Value::Null
+        let report = struct_column(summary, DRIFT_REPORT);
+        assert!(report.is_valid(0), "a scored Drift sets drift_report");
+        assert!(
+            struct_column(summary, EVAL_SUMMARY).is_null(0),
+            "a scored Drift leaves eval_summary null"
         );
-        assert_eq!(details["verdict"], "Drift");
+        let report = RecordBatch::from(report.clone());
+        assert_eq!(cell(&report, "method", 0).as_deref(), Some("Psi"));
+        assert_eq!(cell(&report, "verdict", 0).as_deref(), Some("Drift"));
+        let features = variant_cell(&report, "features", 0);
+        assert_eq!(features["tokens"]["score"], Value::Null);
+        assert_eq!(features["latency"]["verdict"], "Drift");
     }
 
     /// An unscored Drift execution writes only an inconclusive summary with
-    /// null details, and never an empty detail batch.
+    /// neither summary Struct set, and never an empty detail batch.
     #[test]
     fn unscored_drift_writes_only_the_summary() {
         let run = drift_run();
@@ -926,11 +1051,19 @@ mod tests {
         let summary = &payload.batches()[0].batch;
         assert_eq!(payload.batches()[0].table, "vala.verification.results");
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("inconclusive"));
-        assert_eq!(cell(summary, "details", 0), None);
+        for column in [DRIFT_REPORT, EVAL_SUMMARY] {
+            let report = struct_column(summary, column);
+            assert!(report.is_null(0), "{column} is null");
+            assert!(
+                report.columns().iter().all(|child| child.null_count() == 0),
+                "{column}'s non-nullable children hold placeholders, not nulls, \
+                 under the null parent, as native ingest requires"
+            );
+        }
     }
 
     /// Eval writes one item per ran and skipped outcome before the summary,
-    /// whose details are the executed-only workflow summary.
+    /// whose `eval_summary` is the executed-only workflow summary.
     #[test]
     fn eval_result_writes_ran_and_skipped_items_then_summary() {
         let run = eval_run();
@@ -940,7 +1073,7 @@ mod tests {
                 TaskRunOutcome::Ran(Box::new(AssertionResult {
                     task_id: task("exact"),
                     passed: true,
-                    actual: Some(serde_json::Value::Null),
+                    actual: Some(Value::Null),
                     expected: serde_json::json!({"b": 2, "a": 1}),
                     operator: ComparisonOperator::Equals,
                     message: None,
@@ -970,10 +1103,11 @@ mod tests {
         );
         let items = &payload.batches()[0].batch;
         assert_eq!(cell(items, "outcome_kind", 0).as_deref(), Some("ran"));
-        assert_eq!(cell(items, "actual", 0).as_deref(), Some("null"));
+        assert!(items.column_by_name("actual").expect("actual").is_valid(0));
+        assert_eq!(variant_cell(items, "actual", 0), Value::Null);
         assert_eq!(
-            cell(items, "expected", 0).as_deref(),
-            Some(r#"{"a":1,"b":2}"#)
+            variant_cell(items, "expected", 0),
+            serde_json::json!({"a": 1, "b": 2})
         );
         assert_eq!(
             cell(items, "source_record_id", 1).as_deref(),
@@ -985,20 +1119,29 @@ mod tests {
             Some("dependency_skipped")
         );
         assert_eq!(cell(items, "upstream_task_id", 1).as_deref(), Some("exact"));
-        assert_eq!(cell(items, "expected", 1), None);
+        assert!(
+            items
+                .column_by_name("expected")
+                .expect("expected")
+                .is_null(1)
+        );
         let summary = &payload.batches()[1].batch;
         assert_eq!(
             cell(summary, "source_record_id", 0).as_deref(),
             Some("record-1")
         );
-        let details: serde_json::Value =
-            serde_json::from_str(&cell(summary, "details", 0).expect("details present"))
-                .expect("details are JSON");
-        assert_eq!(details["total_tasks"], 1);
-        assert_eq!(details["passed_tasks"], 1);
+        assert!(struct_column(summary, DRIFT_REPORT).is_null(0));
+        let eval = RecordBatch::from(struct_column(summary, EVAL_SUMMARY).clone());
+        let count = |name: &str| {
+            eval.column_by_name(name)
+                .expect("count column")
+                .as_primitive::<Int32Type>()
+                .value(0)
+        };
+        assert_eq!((count("total_tasks"), count("passed_tasks")), (1, 1));
     }
 
-    /// A sampled-out Eval writes only the summary with the zero-count details.
+    /// A sampled-out Eval writes only the summary with a zero-count `eval_summary`.
     #[test]
     fn sampled_out_eval_writes_zero_count_summary_only() {
         let run = eval_run();
@@ -1010,10 +1153,27 @@ mod tests {
             },
         );
         assert_eq!(payload.batches().len(), 1);
-        let details = cell(&payload.batches()[0].batch, "details", 0).expect("details present");
+        let summary = struct_column(&payload.batches()[0].batch, EVAL_SUMMARY);
+        assert!(
+            summary.is_valid(0),
+            "a sampled-out Eval still sets eval_summary"
+        );
+        let summary = RecordBatch::from(summary.clone());
         assert_eq!(
-            details,
-            r#"{"duration_ms":0,"failed_tasks":0,"pass_rate":0,"passed_tasks":0,"total_tasks":0}"#
+            summary
+                .column_by_name("pass_rate")
+                .expect("pass rate")
+                .as_primitive::<Float64Type>()
+                .value(0),
+            0.0
+        );
+        assert_eq!(
+            summary
+                .column_by_name("duration_ms")
+                .expect("duration")
+                .as_primitive::<Int64Type>()
+                .value(0),
+            0
         );
     }
 

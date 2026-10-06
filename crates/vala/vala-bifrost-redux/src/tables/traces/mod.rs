@@ -9,24 +9,25 @@ pub use spans::SpansTable;
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray,
+        Array, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
+        StructArray,
     };
     use arrow::record_batch::RecordBatch;
+    use serde_json::json;
     use std::sync::Arc;
+    use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{
         AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
     };
     use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::span::Event;
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
 
     use super::spans::SPAN_FIELDS;
     use super::{canonical_span_schema, project_resource_spans};
     use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
-    use crate::tables::signal::{
-        encode_attributes, validate_canonical_user_batch, without_correlation_columns,
-    };
+    use crate::tables::signal::{validate_canonical_user_batch, without_correlation_columns};
 
     /// Build one attribute entry with the supplied protocol value.
     fn attribute(key: &str, value: Value) -> KeyValue {
@@ -68,7 +69,36 @@ mod tests {
             ),
             attribute("gen_ai.usage.input_tokens", Value::IntValue(1_024)),
             attribute("gen_ai.usage.output_tokens", Value::IntValue(-1)),
+            attribute("http.request.method", Value::StringValue("POST".to_owned())),
+            attribute("http.route", Value::StringValue("/chat".to_owned())),
+            attribute("http.response.status_code", Value::IntValue(502)),
+            attribute(
+                "url.full",
+                Value::StringValue("https://api/chat".to_owned()),
+            ),
         ]
+    }
+
+    /// The span event whose `exception.*` attributes the span promotes.
+    ///
+    /// Its stack trace is deliberately not a string, so the promotion is null.
+    fn exception_event() -> Event {
+        Event {
+            time_unix_nano: 1_700_000_000_000_000_300,
+            name: "exception".to_owned(),
+            attributes: vec![
+                attribute(
+                    "exception.type",
+                    Value::StringValue("TimeoutError".to_owned()),
+                ),
+                attribute(
+                    "exception.message",
+                    Value::StringValue("upstream timed out".to_owned()),
+                ),
+                attribute("exception.stacktrace", Value::IntValue(3)),
+            ],
+            dropped_attributes_count: 0,
+        }
     }
 
     /// Build the maximal supported resource-span fixture.
@@ -78,6 +108,15 @@ mod tests {
                 attributes: vec![
                     attribute("service.name", Value::StringValue("checkout".to_owned())),
                     attribute("host.id", Value::IntValue(7)),
+                    attribute("service.version", Value::StringValue("1.4.0".to_owned())),
+                    attribute(
+                        "deployment.environment",
+                        Value::StringValue("legacy".to_owned()),
+                    ),
+                    attribute(
+                        "deployment.environment.name",
+                        Value::StringValue("prod".to_owned()),
+                    ),
                 ],
                 dropped_attributes_count: 3,
                 entity_refs: vec![
@@ -129,6 +168,7 @@ mod tests {
                             attributes: Vec::new(),
                             dropped_attributes_count: 0,
                         },
+                        exception_event(),
                     ],
                     dropped_events_count: 13,
                     links: vec![
@@ -230,10 +270,7 @@ mod tests {
             typed::<StringArray>(&batch, "status_message").value(0),
             "upstream refused"
         );
-        assert_eq!(
-            typed::<BinaryArray>(&batch, "attributes").value(0),
-            encode_attributes(&attributes).as_slice()
-        );
+        assert_span_attributes(&batch);
         assert_eq!(
             typed::<Int64Array>(&batch, "dropped_attributes_count").value(0),
             11
@@ -249,6 +286,7 @@ mod tests {
 
         assert_span_children(&batch);
         assert_span_context_and_promotions(&batch);
+        assert_semantic_promotions(&batch);
         for declared in SPAN_FIELDS {
             let field = batch
                 .schema()
@@ -285,6 +323,32 @@ mod tests {
         assert_eq!(revalidated, ledger);
     }
 
+    /// Assert the span attributes decode to every typed source value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value changes type, an integer is not exact, or bytes do
+    /// not round-trip.
+    fn assert_span_attributes(batch: &RecordBatch) {
+        assert_eq!(
+            variant_cell_to_json(column(batch, "attributes"), 0).expect("attributes decode"),
+            json!({
+                "payload.bytes": "AP9/",
+                "payload.nested": {"inner": 1.5},
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": "claude",
+                "gen_ai.conversation.id": "conversation-1",
+                "gen_ai.usage.input_tokens": 1_024,
+                "gen_ai.usage.output_tokens": -1,
+                "http.request.method": "POST",
+                "http.route": "/chat",
+                "http.response.status_code": 502,
+                "url.full": "https://api/chat",
+            })
+        );
+    }
+
     /// Assert the nested event and link collections survive intact.
     ///
     /// # Panics
@@ -297,7 +361,7 @@ mod tests {
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("events are structs");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         let event_names = events
             .column_by_name("name")
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
@@ -312,14 +376,14 @@ mod tests {
         assert_eq!(event_times.value(1), 1_700_000_000_000_000_200);
         let event_attributes = events
             .column_by_name("attributes")
-            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
             .expect("event attribute column");
         assert_eq!(
-            event_attributes.value(0),
-            encode_attributes(&[attribute("index", Value::IntValue(0))]).as_slice()
+            variant_cell_to_json(event_attributes.as_ref(), 0).expect("event attributes decode"),
+            json!({"index": 0})
         );
-        assert!(
-            event_attributes.value(1).is_empty(),
+        assert_eq!(
+            variant_cell_to_json(event_attributes.as_ref(), 1).expect("event attributes decode"),
+            json!({}),
             "an empty event attribute collection stays present and empty"
         );
 
@@ -346,8 +410,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a presence bit, context scalar, entity-reference count, or
-    /// promoted `GenAI` value differs.
+    /// Panics when a presence bit, context scalar, entity reference, or
+    /// promoted value differs.
     fn assert_span_context_and_promotions(batch: &RecordBatch) {
         assert!(typed::<BooleanArray>(batch, "resource_present").value(0));
         assert_eq!(
@@ -361,9 +425,30 @@ mod tests {
         let entity_refs = typed::<ListArray>(batch, "resource_entity_refs").value(0);
         let entity_refs = entity_refs
             .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("entity refs are binary");
+            .downcast_ref::<StructArray>()
+            .expect("entity refs are structs");
         assert_eq!(entity_refs.len(), 2);
+        let entity_types = entity_refs
+            .column_by_name("type")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .expect("entity type column");
+        assert_eq!(entity_types.value(0), "service");
+        assert_eq!(entity_types.value(1), "host");
+        let description_keys = entity_refs
+            .column_by_name("description_keys")
+            .and_then(|column| column.as_any().downcast_ref::<ListArray>())
+            .expect("entity description keys column");
+        assert_eq!(description_keys.value(0).len(), 1);
+        assert_eq!(
+            description_keys.value(1).len(),
+            0,
+            "an empty key list stays present and empty"
+        );
+        assert_eq!(
+            variant_cell_to_json(column(batch, "resource_attributes"), 0)
+                .expect("resource attributes decode")["host.id"],
+            json!(7)
+        );
         assert!(typed::<BooleanArray>(batch, "scope_present").value(0));
         assert_eq!(
             typed::<StringArray>(batch, "scope_name").value(0),
@@ -409,6 +494,36 @@ mod tests {
         assert_eq!(
             typed::<Int64Array>(batch, "gen_ai_usage_output_tokens").value(0),
             -1
+        );
+    }
+
+    /// Assert the resource, HTTP, and exception semantic-convention columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a promoted value differs or a wrongly typed source is not
+    /// promoted to null.
+    fn assert_semantic_promotions(batch: &RecordBatch) {
+        for (name, expected) in [
+            ("service_version", Some("1.4.0")),
+            ("deployment_environment", Some("prod")),
+            ("http_request_method", Some("POST")),
+            ("http_route", Some("/chat")),
+            ("url_full", Some("https://api/chat")),
+            ("exception_type", Some("TimeoutError")),
+            ("exception_message", Some("upstream timed out")),
+            ("exception_stacktrace", None),
+        ] {
+            let values = typed::<StringArray>(batch, name);
+            assert_eq!(
+                values.is_valid(0).then(|| values.value(0)),
+                expected,
+                "{name} promotes its convention, or null for a wrongly typed source"
+            );
+        }
+        assert_eq!(
+            typed::<Int64Array>(batch, "http_response_status_code").value(0),
+            502
         );
     }
 
@@ -533,14 +648,7 @@ mod tests {
         assert_eq!(run_ids.value(1), RUN);
         assert!(run_ids.is_null(2));
 
-        let attributes = typed::<BinaryArray>(&batch, "attributes");
-        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
-            assert_eq!(
-                attributes.value(row),
-                encode_attributes(source).as_slice(),
-                "row {row} retains every ordered source attribute byte for byte"
-            );
-        }
+        correlation_fixture::assert_attribute_rows(&batch, &[&missing, &valid, &duplicate]);
     }
 
     /// A wrongly typed pinned `GenAI` attribute rejects its whole span.

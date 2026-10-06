@@ -30,6 +30,7 @@ use datafusion::physical_plan::{
 };
 use futures_util::StreamExt as _;
 use sha2::{Digest as _, Sha256};
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     ClusterRole, FollowerScanAssignment, NodeId, PersistedFileAssignment, ScribeProviderCut,
     TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
@@ -41,7 +42,7 @@ use super::dispatcher::{
     PhysicalDispatchFragment,
 };
 use super::exec::RemoteScanMetrics;
-use super::{DegradedPartition, DegradedSourceAccumulator};
+use super::{DegradedPartition, DegradedSourceAccumulator, QueryCatalogError};
 use crate::catalog::event_time::EventTimeStatistics;
 use crate::catalog::layout::TimePartition;
 use crate::oracle::pruning::EventTimeQueryInterval;
@@ -545,9 +546,7 @@ impl LiveFragmentRead {
                         // this timer and the leader's own deadline fires first.
                         () = tokio::time::sleep(remaining(grant.deadline)) => Err(DataFusionError::Context(
                             "Oracle query deadline elapsed during a live Scribe read".to_owned(),
-                            Box::new(DataFusionError::External(Box::new(
-                                wyrd_spec::vala::error::BifrostError::QueryTimeout,
-                            ))),
+                            Box::new(QueryCatalogError::external(BifrostError::QueryTimeout)),
                         )),
                         frame = frames.next() => Ok(frame),
                     };
@@ -635,9 +634,9 @@ const fn is_availability_loss(error: &DispatchError) -> bool {
 /// an execution failure.
 fn live_error(stage: &str, error: &DispatchError) -> DataFusionError {
     match error {
-        DispatchError::TenantInvariant => DataFusionError::External(Box::new(
-            wyrd_spec::vala::BifrostError::QueryTenantInvariant,
-        )),
+        DispatchError::TenantInvariant => {
+            QueryCatalogError::external(BifrostError::QueryTenantInvariant)
+        }
         DispatchError::Capacity => DataFusionError::ResourcesExhausted(format!(
             "live Scribe fragment {stage} was refused for capacity"
         )),

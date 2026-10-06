@@ -9,11 +9,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
+use parquet_variant_compute::VariantType;
 use serde_json::{Map, Value};
 use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit};
 
 use crate::error::WyrdQueueError;
+use crate::variant::{is_variant, variant_storage_type};
 
 /// Walk a JSON-Schema object (a Pydantic `model_json_schema()` output) into the
 /// wire `Vec<FieldSpec>`, per the locked mapping table.
@@ -34,8 +37,11 @@ pub fn json_schema_to_fieldspec(schema: &Value) -> Result<Vec<FieldSpec>, WyrdQu
 /// The precision path: a caller who needs `Int32`, a non-UTC `tz`, `Decimal128`,
 /// or `FixedSizeBinary` supplies an explicit Arrow schema. Field order and
 /// nullability are taken verbatim from the Arrow fields.
-#[must_use]
-pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] naming the first field whose Arrow
+/// type is outside the register-accepted wire set.
+pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Result<Vec<FieldSpec>, WyrdQueueError> {
     schema.fields().iter().map(|f| field_to_spec(f)).collect()
 }
 
@@ -43,7 +49,8 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 /// direction that mirrors `arrow_schema_to_fieldspec`.
 ///
 /// Every `DataTypeSpec` variant in the register-accepted set maps to exactly the
-/// `arrow::DataType` the server twin `data_type_to_arrow` would produce. A list
+/// `arrow::DataType` the server's register path produces through the same
+/// [`spec_to_field`]. A list
 /// element and a struct child are full declarations, so their names,
 /// nullability are reproduced rather than synthesized. Field metadata is
 /// dropped at every depth: see [`spec_to_field`].
@@ -53,7 +60,10 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 /// signature returns `Result` for symmetry with `json_schema_to_arrow`.
 pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError> {
     Ok(Schema::new(
-        fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+        fields
+            .iter()
+            .map(|spec| spec_to_field(spec, false))
+            .collect::<Vec<_>>(),
     ))
 }
 
@@ -94,7 +104,7 @@ pub fn writable_schema(
                 spec.name
             )));
         }
-        fields.push(spec_to_field(spec));
+        fields.push(spec_to_field(spec, false));
     }
     Ok(Schema::new(fields))
 }
@@ -237,43 +247,84 @@ fn free_form_dict() -> WyrdQueueError {
 
 /// Project one Arrow field onto its wire declaration, metadata included.
 ///
+/// This is the one Arrow-to-wire field mapping: the client schema door, the
+/// server's register path, and the catalog's describe projection all call it.
 /// Metadata is carried verbatim so a stable `PARQUET:field_id` survives at
-/// every nesting depth rather than only on top-level columns.
-fn field_to_spec(field: &Field) -> FieldSpec {
-    FieldSpec {
+/// every nesting depth rather than only on top-level columns. A Variant is
+/// recognized by its extension marker and reported as
+/// [`DataTypeSpec::Variant`], so the marker's own keys are dropped as type
+/// rather than identity metadata.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] when the field, or any nested
+/// child, has an Arrow type outside the register-accepted wire set.
+pub fn field_to_spec(field: &Field) -> Result<FieldSpec, WyrdQueueError> {
+    let variant = is_variant(field);
+    Ok(FieldSpec {
         name: field.name().clone(),
-        data_type: dtspec_from_arrow(field.data_type()),
+        data_type: if variant {
+            DataTypeSpec::Variant
+        } else {
+            dtspec_from_arrow(field.data_type())?
+        },
         nullable: field.is_nullable(),
         metadata: field
             .metadata()
             .iter()
+            .filter(|(key, _)| !variant || !is_extension_key(key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
+    })
+}
+
+/// Project one wire declaration onto its Arrow field.
+///
+/// This is the one wire-to-Arrow field mapping. Name, nullability, and the
+/// exact type — everything that shapes an Arrow buffer — are reproduced at
+/// every depth, and a Variant declaration always carries the
+/// `arrow.parquet.variant` extension marker, which is its type.
+///
+/// `carry_metadata` selects whether declared field metadata is kept at every
+/// depth. The server's register path keeps it, so a stable `PARQUET:field_id`
+/// round-trips through [`field_to_spec`]. A client writer drops it: a
+/// `PARQUET:field_id` is the server's own physical identity, which it assigns
+/// at registration, re-derives on every stamp, and ignores on an incoming
+/// batch, so repeating it would put a value on the wire that looks
+/// load-bearing and is not.
+#[must_use]
+pub fn spec_to_field(spec: &FieldSpec, carry_metadata: bool) -> Field {
+    let field = Field::new(
+        spec.name.as_str(),
+        data_type_to_arrow(&spec.data_type, carry_metadata),
+        spec.nullable,
+    );
+    let field = if carry_metadata {
+        field.with_metadata(spec.metadata.clone().into_iter().collect())
+    } else {
+        field
+    };
+    match spec.data_type {
+        DataTypeSpec::Variant => field.with_extension_type(VariantType),
+        _ => field,
     }
 }
 
-/// Project one wire declaration onto its Arrow field, metadata dropped.
+/// Report whether a metadata key is one of Arrow's extension-type keys.
 ///
-/// Name, nullability, and the exact type — everything that shapes an Arrow
-/// buffer — are reproduced at every depth. Field metadata is not: a
-/// `PARQUET:field_id` is the server's own physical identity, which it assigns
-/// at registration, re-derives on every stamp, and ignores on an incoming
-/// batch. Emitting it here would put a value on the wire that looks
-/// load-bearing and is not, which is exactly what a client cannot be right or
-/// wrong about. `describe_table` still reports it; a writer does not repeat it.
-///
-/// This is therefore the lossy forward half of [`field_to_spec`], not its
-/// inverse.
-fn spec_to_field(spec: &FieldSpec) -> Field {
-    Field::new(
-        spec.name.as_str(),
-        data_type_to_arrow(&spec.data_type),
-        spec.nullable,
-    )
+/// Schema identities and wire descriptions express a Variant through its type,
+/// so they drop these keys rather than committing the extension spelling.
+#[must_use]
+pub fn is_extension_key(key: &str) -> bool {
+    key == EXTENSION_TYPE_NAME_KEY || key == EXTENSION_TYPE_METADATA_KEY
 }
 
-fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
-    match dt {
+/// Map one Arrow type onto its wire form, recursing through nested fields.
+///
+/// # Errors
+/// Returns [`WyrdQueueError::SchemaParse`] for a type outside the
+/// register-accepted wire set.
+fn dtspec_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdQueueError> {
+    Ok(match dt {
         DataType::Boolean => DataTypeSpec::Bool,
         DataType::Int8 => DataTypeSpec::Int8,
         DataType::Int16 => DataTypeSpec::Int16,
@@ -306,14 +357,19 @@ fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
             precision: *precision,
             scale: *scale,
         },
-        DataType::List(element) => DataTypeSpec::List(Box::new(field_to_spec(element))),
-        DataType::Struct(fields) => {
-            DataTypeSpec::Struct(fields.iter().map(|f| field_to_spec(f)).collect())
+        DataType::List(element) => DataTypeSpec::List(Box::new(field_to_spec(element)?)),
+        DataType::Struct(fields) => DataTypeSpec::Struct(
+            fields
+                .iter()
+                .map(|f| field_to_spec(f))
+                .collect::<Result<_, _>>()?,
+        ),
+        other => {
+            return Err(WyrdQueueError::SchemaParse(format!(
+                "Arrow type {other} is not representable on the wire"
+            )));
         }
-        // A valid, register-accepted Arrow schema only carries the representable
-        // set above; an out-of-set type is coerced to Utf8 rather than dropped.
-        _ => DataTypeSpec::Utf8,
-    }
+    })
 }
 
 fn time_unit_from_arrow(unit: ArrowTimeUnit) -> TimeUnit {
@@ -334,7 +390,12 @@ fn time_unit_to_arrow(unit: TimeUnit) -> ArrowTimeUnit {
     }
 }
 
-fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
+/// Map one wire type onto its Arrow form, recursing through nested fields.
+///
+/// A Variant maps to its unshredded storage struct; the extension marker is
+/// stamped on the enclosing field by [`spec_to_field`], which also receives
+/// `carry_metadata` for every nested child.
+fn data_type_to_arrow(spec: &DataTypeSpec, carry_metadata: bool) -> DataType {
     match spec {
         DataTypeSpec::Bool => DataType::Boolean,
         DataTypeSpec::Int8 => DataType::Int8,
@@ -360,10 +421,18 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
-        DataTypeSpec::List(element) => DataType::List(Arc::new(spec_to_field(element))),
+        DataTypeSpec::List(element) => {
+            DataType::List(Arc::new(spec_to_field(element, carry_metadata)))
+        }
         DataTypeSpec::Struct(fields) => DataType::Struct(Fields::from(
-            fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+            fields
+                .iter()
+                .map(|field| spec_to_field(field, carry_metadata))
+                .collect::<Vec<_>>(),
         )),
+        // The unshredded `arrow.parquet.variant` storage; the extension marker
+        // is stamped on the enclosing field by `spec_to_field`.
+        DataTypeSpec::Variant => variant_storage_type(),
     }
 }
 
@@ -371,11 +440,12 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
 mod schema_tests {
     //! `schema_to_fieldspec` mapping-table proof: JSON-Schema and Arrow → C2 `FieldSpec`.
 
+    use crate::WyrdQueueError;
     use crate::schema::{
         arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow,
         json_schema_to_fieldspec,
     };
-    use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
     use serde_json::json;
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
@@ -519,7 +589,8 @@ mod schema_tests {
                 true,
             ),
         ]);
-        let specs = arrow_schema_to_fieldspec(&schema);
+        let specs =
+            arrow_schema_to_fieldspec(&schema).expect("every precision type is representable");
 
         assert_eq!(field(&specs, "small").data_type, DataTypeSpec::Int32);
         assert!(!field(&specs, "small").nullable);
@@ -539,6 +610,26 @@ mod schema_tests {
         );
     }
 
+    /// An Arrow type outside the wire set is refused, never coerced, even
+    /// when it is nested.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an unrepresentable type maps to a declaration.
+    #[test]
+    fn arrow_schema_refuses_unrepresentable_types() {
+        let nested = DataType::Struct(Fields::from(vec![Field::new(
+            "half",
+            DataType::Float16,
+            true,
+        )]));
+        let schema = Schema::new(vec![Field::new("outer", nested, true)]);
+        assert!(matches!(
+            arrow_schema_to_fieldspec(&schema),
+            Err(WyrdQueueError::SchemaParse(_))
+        ));
+    }
+
     // ── fieldspec_to_arrow round-trip tests ───────────────────────────────────────
 
     fn make_field(name: &str, dt: DataTypeSpec, nullable: bool) -> FieldSpec {
@@ -553,7 +644,7 @@ mod schema_tests {
 
     fn round_trip(specs: Vec<FieldSpec>) -> Vec<FieldSpec> {
         let schema = fieldspec_to_arrow(&specs).expect("fieldspec_to_arrow");
-        arrow_schema_to_fieldspec(&schema)
+        arrow_schema_to_fieldspec(&schema).expect("a projected schema maps back")
     }
 
     #[test]
@@ -780,7 +871,8 @@ mod schema_tests {
             "a struct child sends no field id"
         );
 
-        let round_tripped = arrow_schema_to_fieldspec(&arrow);
+        let round_tripped =
+            arrow_schema_to_fieldspec(&arrow).expect("a projected schema maps back");
         assert_eq!(
             round_tripped,
             specs.iter().map(strip_ids).collect::<Vec<_>>(),

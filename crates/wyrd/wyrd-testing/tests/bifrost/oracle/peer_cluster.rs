@@ -30,7 +30,7 @@ use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-use crate::support::JourneyError;
+use crate::support::{JourneyError, seed_foreign_hot_row};
 
 /// How long one pod may take to report every readiness probe passing.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -1050,6 +1050,35 @@ impl PeerCluster {
         }
     }
 
+    /// Seeds one hot file under `table` whose footer names a new foreign tenant.
+    ///
+    /// Delegates to [`seed_foreign_hot_row`] with this topology's private
+    /// cluster and fixture tenant, attributing the file-list row to pod
+    /// `index`. Every read of `table` that scans the file must then refuse
+    /// with the tenant invariant. `slug` names the foreign tenant and the
+    /// object, so it must be unique within one topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tenant provisioning failure or any seeding error.
+    pub(crate) async fn seed_foreign_hot_row(
+        &self,
+        index: usize,
+        table: &str,
+        slug: &str,
+    ) -> Result<(), JourneyError> {
+        let foreign = self.cluster.add_tenant(slug).await?;
+        seed_foreign_hot_row(
+            &self.cluster,
+            self.tenant(),
+            table,
+            foreign,
+            slug,
+            self.node_id(index).as_uuid(),
+        )
+        .await
+    }
+
     /// Deletes one object from the shared local object store.
     ///
     /// `relative_object_key` resolves under [`Self::storage_root`]; an
@@ -1787,8 +1816,8 @@ fn settled_analytical_evidence(
 #[test]
 fn sql_terminal_rejects_failed_output_after_rows() {
     use wyrd_spec::vala::api::{
-        QuerySource, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
-        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        QuerySource, QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion,
+        SourceCompletionOutcome,
     };
 
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -1829,10 +1858,12 @@ fn sql_terminal_rejects_failed_output_after_rows() {
             complete(QuerySource::HotSealed),
             complete(QuerySource::LiveTail),
         ],
-        error: Some(QueryTerminalError {
-            code: QueryTerminalErrorCode::QueryExecutionFailed,
-            detail: None,
-        }),
+        error: Some(Box::new(
+            wyrd_spec::error::WyrdError::from(
+                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+            )
+            .problem(),
+        )),
         arrow_ipc_eos: Vec::new(),
     };
     failed

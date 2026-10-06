@@ -491,9 +491,8 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalFrame,
+        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
 
@@ -814,10 +813,16 @@ mod tests {
             row_count: 1,
             warnings: Vec::new(),
             source_completion: Vec::new(),
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: Some(QueryErrorDetail::new("worker failed").expect("scrubbed detail")),
-            }),
+            error: Some(Box::new(
+                wyrd_spec::error::WyrdError::from(
+                    wyrd_spec::vala::BifrostError::VariantInvalidJson {
+                        field: "parse_json".to_owned(),
+                        row: 1,
+                        path: String::new(),
+                    },
+                )
+                .problem(),
+            )),
             // A failed stream never calls `finish`, so it has no end-of-stream.
             arrow_ipc_eos: Vec::new(),
         });

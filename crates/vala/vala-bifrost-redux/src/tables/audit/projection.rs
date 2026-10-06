@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use vala_sql::row_types::audit_staging::AuditStagingRow;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::AuditLogTable;
@@ -69,6 +71,11 @@ pub enum AuditProjectionError {
     },
     #[error("audit range sequence overflow")]
     SequenceOverflow,
+    /// A staged `detail` is not JSON or exceeds a Variant limit, so it cannot
+    /// be stored in the Variant `detail` column.
+    /// The error names the row's position within the projected range.
+    #[error("audit detail cannot be stored as a Variant: {0}")]
+    InvalidDetail(BifrostError),
     #[error("audit content schema construction failed: {0}")]
     Schema(String),
 }
@@ -167,8 +174,9 @@ fn validate_range(
 /// schema change and is caught by registration rather than accepted.
 ///
 /// # Errors
-/// Returns [`AuditProjectionError`] when a row's stored hash is not valid hex
-/// or the Arrow batch cannot be assembled from the projected columns.
+/// Returns [`AuditProjectionError`] when a row's stored hash is not valid hex,
+/// a staged detail cannot be encoded as a Variant, or the Arrow batch cannot
+/// be assembled from the projected columns.
 fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditProjectionError> {
     let seq_values = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
     let entry_hash_values = rows
@@ -221,10 +229,7 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .iter()
         .map(|row| row.permission.clone())
         .collect::<Vec<_>>();
-    let detail_values = rows
-        .iter()
-        .map(|row| row.detail.clone())
-        .collect::<Vec<_>>();
+    let detail_values = detail_column(rows)?;
     // The decision instant travels as the event time rather than as content, so
     // a retained row partitions by when the boundary decided, not by when the
     // publisher happened to ship it.
@@ -252,7 +257,7 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(principal_kind_values)),
         Arc::new(StringArray::from(permission_values)),
         Arc::new(StringArray::from(outcome_values)),
-        Arc::new(StringArray::from(detail_values)),
+        detail_values,
         Arc::new(StringArray::from(credential_id_values)),
         Arc::new(
             TimestampMicrosecondArray::from(event_time_values).with_timezone(Arc::from("UTC")),
@@ -262,6 +267,24 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .map_err(|error| AuditProjectionError::Schema(error.to_string()))?;
 
     Ok(rows)
+}
+
+/// Encodes each row's staged canonical JSON `detail` as the Variant `detail`
+/// column, keeping its JSON types; an absent detail is a null row.
+///
+/// The text is the same canonical JSON the row's `entry_hash` covers, so the
+/// stored Variant decodes back to the hashed value.
+///
+/// # Errors
+/// Returns [`AuditProjectionError::InvalidDetail`] naming the first row whose
+/// detail is not JSON or exceeds a Variant limit.
+fn detail_column(rows: &[AuditStagingRow]) -> Result<ArrayRef, AuditProjectionError> {
+    VariantColumnBuilder::encode(
+        "detail",
+        rows.iter().map(|row| row.detail.as_deref()),
+        EncodedVariant::from_json_text,
+    )
+    .map_err(AuditProjectionError::InvalidDetail)
 }
 
 fn hash_hex(
@@ -325,6 +348,8 @@ fn derive_batch_id(tenant: DataTenantId, seq_lo: i64, seq_hi: i64) -> Uuid {
 mod tests {
     use arrow::array::{Array, StringArray};
     use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use wyrd_queue::variant::variant_cell_to_json;
 
     use super::*;
 
@@ -393,6 +418,37 @@ mod tests {
             projection.rows.column(13).is_null(0),
             "a decision made with no credential projects a null credential"
         );
+    }
+
+    /// Proves a staged canonical JSON detail projects into the Variant
+    /// `detail` column with its JSON types, so it decodes to the hashed value,
+    /// and that a detail which is not JSON refuses the range by row.
+    ///
+    /// # Panics
+    /// Panics when the projection refuses a valid detail, the stored Variant
+    /// does not decode to the staged JSON, or invalid JSON is accepted.
+    #[test]
+    fn detail_projects_as_variant_of_the_hashed_json() {
+        let authenticated = tenant(1);
+        let mut first = row(authenticated, 7);
+        first.detail = Some(r#"{"limit":2,"reason":"quota","tags":["a",null]}"#.to_owned());
+        let projection = project_audit_rows(authenticated, &[first, row(authenticated, 8)])
+            .expect("valid projection");
+        let detail = projection.rows.column(12);
+        assert_eq!(
+            variant_cell_to_json(detail.as_ref(), 0).expect("decodes"),
+            json!({"limit": 2, "reason": "quota", "tags": ["a", null]})
+        );
+        assert!(detail.is_null(1), "an absent detail is a null row");
+
+        let mut bad = row(authenticated, 9);
+        bad.detail = Some("{not json".to_owned());
+        assert!(matches!(
+            project_audit_rows(authenticated, &[row(authenticated, 8), bad]),
+            Err(AuditProjectionError::InvalidDetail(
+                BifrostError::VariantInvalidJson { row: 1, .. }
+            ))
+        ));
     }
 
     #[test]

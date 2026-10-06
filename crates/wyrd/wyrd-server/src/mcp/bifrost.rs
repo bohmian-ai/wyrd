@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
+use wyrd_queue::variant::VariantJsonEncoderFactory;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{BifrostQueryRequest, BifrostTableEntry};
@@ -591,13 +592,8 @@ impl ResultCollector {
                     }
                     if frame.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(frame.clone());
-                        return Err(frame.error.as_ref().map_or(
-                            WyrdError::from(ValaError::QueryExecutionFailed),
-                            |error| {
-                                WyrdError::from(crate::query::service::terminal_error_to_bifrost(
-                                    error.code,
-                                ))
-                            },
+                        return Err(crate::query::service::terminal_error(
+                            frame.error.as_deref(),
                         ));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
@@ -641,7 +637,8 @@ impl ResultCollector {
             return Err(ValaError::QueryResultTooLarge.into());
         }
         let schema = batch.schema();
-        let options = EncoderOptions::default();
+        let options =
+            EncoderOptions::default().with_encoder_factory(Arc::new(VariantJsonEncoderFactory));
         let mut encoders = Vec::with_capacity(batch.num_columns());
         for (field, array) in schema.fields().iter().zip(batch.columns()) {
             encoders.push(
@@ -772,8 +769,7 @@ mod tests {
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
         QueryBatchFrame, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
 
     /// One synthetic batch carrying every shape the projection must survive.
@@ -913,10 +909,9 @@ mod tests {
                     "EOS" => terminal.arrow_ipc_eos = vec![1],
                     "failed" => {
                         terminal.outcome = QueryTerminalOutcome::Failed;
-                        terminal.error = Some(QueryTerminalError {
-                            code: QueryTerminalErrorCode::QueryTimeout,
-                            detail: None,
-                        });
+                        terminal.error = Some(Box::new(
+                            WyrdError::from(BifrostError::QueryTimeout).problem(),
+                        ));
                         terminal.arrow_ipc_eos.clear();
                     }
                     "duplicate" => frames.push(frames[2].clone()),

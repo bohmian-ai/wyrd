@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::DataTenantId;
 use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::error::WyrdProblem;
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
@@ -269,7 +270,29 @@ pub enum DataTypeSpec {
     /// Nested struct of named fields.
     #[cfg_attr(feature = "server", schema(no_recursion))]
     Struct(Vec<FieldSpec>),
+    /// Self-describing semi-structured value stored in the Parquet/Iceberg
+    /// Variant encoding.
+    ///
+    /// On the Arrow wire it is the canonical `arrow.parquet.variant` extension
+    /// type over a `metadata`/`value` binary struct. Each value keeps its own
+    /// type: integers stay integers, objects keep missing keys distinct from
+    /// null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and
+    /// [`VARIANT_MAX_ENCODED_BYTES`].
+    Variant,
 }
+
+/// Maximum Variant nesting depth, counting the root container as one.
+///
+/// A fixed contract constant, not configuration: a deeper value is refused
+/// with `WYRD_VALA_400_VARIANT_TOO_DEEP`.
+pub const VARIANT_MAX_DEPTH: u32 = 64;
+
+/// Maximum canonical encoded Variant bytes, metadata plus value.
+///
+/// A fixed contract constant, not configuration: a larger value is refused
+/// with `WYRD_VALA_413_VARIANT_TOO_LARGE` before queue reservation or durable
+/// write.
+pub const VARIANT_MAX_ENCODED_BYTES: u64 = 8_388_608;
 
 /// Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
 /// but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
@@ -447,8 +470,6 @@ pub struct RegisterTableResponse {
 pub const MAX_QUERY_TERMINAL_WARNINGS: usize = 16;
 /// Maximum number of closed source-completion entries.
 pub const MAX_QUERY_SOURCE_COMPLETIONS: usize = 3;
-/// Maximum byte length of scrubbed terminal error detail.
-pub const MAX_QUERY_ERROR_DETAIL_BYTES: usize = 1_024;
 
 /// Error returned when an Oracle query contract violates its closed protocol.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -466,12 +487,6 @@ pub enum QueryContractError {
         field: &'static str,
         /// Protocol maximum.
         maximum: usize,
-    },
-    /// A bounded scrubbed value is invalid.
-    #[error("{field} is not a valid scrubbed value")]
-    InvalidDetail {
-        /// Invalid scrubbed field.
-        field: &'static str,
     },
     /// Terminal fields form an invalid state.
     #[error("invalid query terminal: {reason}")]
@@ -785,94 +800,6 @@ pub struct SourceCompletion {
     pub outcome: SourceCompletionOutcome,
 }
 
-/// Closed stable codes allowed in late failed terminals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum QueryTerminalErrorCode {
-    /// The query deadline elapsed.
-    QueryTimeout,
-    /// A required visibility source was unavailable.
-    QueryVisibilityUnavailable,
-    /// A tenant isolation invariant failed.
-    QueryTenantInvariant,
-    /// Equal row identities contained unequal values.
-    QueryReconciliationInvariant,
-    /// Peer authentication, fencing, or replay validation failed.
-    QueryPeerSecurity,
-    /// The read-decision audit dependency failed.
-    QueryAuditUnavailable,
-    /// The table catalog was unavailable.
-    CatalogUnreachable,
-    /// Object storage was unavailable.
-    StorageUnreachable,
-    /// Query execution failed after framing began.
-    QueryExecutionFailed,
-    /// The admitted query could not obtain the execution memory it needed.
-    QueryResourcesExhausted,
-}
-
-/// Scrubbed detail attached to a failed terminal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct QueryErrorDetail(
-    /// Normalized bounded detail text.
-    String,
-);
-
-impl QueryErrorDetail {
-    /// Constructs bounded, control-free terminal detail.
-    ///
-    /// # Errors
-    /// Returns [`QueryContractError`] for empty, overlong, control-bearing, or
-    /// secret-like input.
-    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
-        let value = value.into();
-        let value = value.trim();
-        let lower = value.to_ascii_lowercase();
-        if value.is_empty()
-            || value.len() > MAX_QUERY_ERROR_DETAIL_BYTES
-            || value.chars().any(char::is_control)
-            || lower.contains("bearer ")
-            || lower.contains("token=")
-            || lower.contains("password=")
-            || lower.contains("secret=")
-            || lower.contains("-----begin ")
-        {
-            return Err(QueryContractError::InvalidDetail { field: "detail" });
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    /// Borrows the scrubbed detail.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for QueryErrorDetail {
-    /// Deserializes diagnostic text while reapplying redaction invariants.
-    ///
-    /// # Errors
-    /// Returns a deserializer error when the input is not text or contains
-    /// forbidden secret-bearing material.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Stable late-stream error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct QueryTerminalError {
-    /// Closed stable error code.
-    pub code: QueryTerminalErrorCode,
-    /// Optional scrubbed diagnostic.
-    pub detail: Option<QueryErrorDetail>,
-}
-
 /// Terminal frame retaining immutable cut metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -892,8 +819,14 @@ pub struct QueryTerminalFrame {
     pub warnings: Vec<QueryWarning>,
     /// Exactly one entry for each source present in the cut.
     pub source_completion: Vec<SourceCompletion>,
-    /// Required only for failed terminals.
-    pub error: Option<QueryTerminalError>,
+    /// Catalog error that failed the query, as its RFC 9457 problem.
+    ///
+    /// Required for [`QueryTerminalOutcome::Failed`] and absent otherwise. It
+    /// is the same problem, code and details included, the query would have
+    /// returned had it failed before the first frame, so a caller reads one
+    /// error whatever the row on which the failure happened. A failure with
+    /// no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+    pub error: Option<Box<WyrdProblem>>,
     /// Arrow IPC end-of-stream delta closing the query's single IPC stream.
     ///
     /// The public query stream is one Arrow IPC stream split across Wyrd
@@ -1033,6 +966,14 @@ mod query_terminal_tests {
         ]
     }
 
+    /// The generic execution failure a failed fixture terminal carries.
+    fn execution_failed() -> Box<WyrdProblem> {
+        Box::new(
+            crate::error::WyrdError::from(crate::vala::error::BifrostError::QueryExecutionFailed)
+                .problem(),
+        )
+    }
+
     /// Builds one terminal from its independently varied fields.
     fn terminal(
         outcome: QueryTerminalOutcome,
@@ -1046,10 +987,7 @@ mod query_terminal_tests {
             row_count: 1,
             warnings,
             source_completion: sources(live),
-            error: failed.then_some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
+            error: failed.then(execution_failed),
             arrow_ipc_eos: if failed { Vec::new() } else { EOS.to_vec() },
         }
     }
@@ -2206,10 +2144,12 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
+            error: Some(Box::new(
+                crate::error::WyrdError::from(
+                    crate::vala::error::BifrostError::QueryExecutionFailed,
+                )
+                .problem(),
+            )),
             arrow_ipc_eos: Vec::new(),
             ..base.clone()
         };

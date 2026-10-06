@@ -280,6 +280,15 @@ pub enum ScribeError {
     #[error("ingest frame validation failed")]
     InvalidFrame,
 
+    /// The batch matches the table's schema but breaks a catalogued rule of
+    /// its declared contract, such as a Variant field missing its extension or
+    /// holding a value that cannot be stored.
+    ///
+    /// The catalogued error is carried unchanged so the caller receives its
+    /// exact code and details; the whole batch is refused before admission.
+    #[error("ingest contract violation: {0}")]
+    ContractViolation(BifrostError),
+
     /// A caller-supplied `wyrd_event_time` value falls outside the server
     /// acceptance window evaluated against per-batch receipt time.
     ///
@@ -349,6 +358,7 @@ impl ScribeError {
                 table: table.clone(),
             },
             Self::InvalidFrame => Self::InvalidFrame,
+            Self::ContractViolation(error) => Self::ContractViolation(error.clone()),
             Self::EventTimeOutOfRange {
                 value_micros,
                 past_bound_micros,

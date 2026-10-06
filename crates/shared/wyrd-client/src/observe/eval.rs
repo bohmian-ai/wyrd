@@ -6,8 +6,10 @@
 use arrow_schema::DataType;
 use chrono::Utc;
 use opentelemetry::trace::TraceContextExt;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use wyrd_queue::variant::variant_storage_type;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
@@ -90,7 +92,7 @@ fn projection_columns() -> [ProjectedColumn; 7] {
     [
         ("record_id", DataType::Utf8, false),
         ("session_id", DataType::Utf8, true),
-        ("context", DataType::Utf8, false),
+        ("context", variant_storage_type(), false),
         ("trace_id", DataType::FixedSizeBinary(16), true),
         ("span_id", DataType::FixedSizeBinary(8), true),
         (
@@ -98,7 +100,7 @@ fn projection_columns() -> [ProjectedColumn; 7] {
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
-        ("media", DataType::Utf8, true),
+        ("media", variant_storage_type(), true),
     ]
 }
 
@@ -148,18 +150,18 @@ pub(crate) fn observation(
 
 /// Project the canonical Eval record into its one fixed-schema row.
 ///
-/// `context` and `media` become canonical JSON text because the fixed table
-/// declares them as scalar strings; trace and span identities become the
-/// canonical lower-case hex the schema-driven row builder decodes into
-/// `FixedSizeBinary`, matching `vala.traces.spans` byte for byte.
+/// `context` and `media` stay JSON values, which the schema-driven row
+/// builder encodes into the table's Variant columns with their JSON types;
+/// trace and span identities become the canonical lower-case hex the row
+/// builder decodes into `FixedSizeBinary`, matching `vala.traces.spans` byte
+/// for byte.
 ///
 /// # Errors
-/// Returns `WYRD_SDK_400_INVALID_OBSERVATION` when `context` or a media
-/// descriptor cannot be encoded as canonical JSON text.
+/// Returns `WYRD_SDK_400_INVALID_OBSERVATION` when a media descriptor cannot
+/// be encoded as JSON.
 pub(crate) fn row(record: &EvalRecordObservation) -> Result<Vec<u8>, WyrdError> {
-    let context = json_text(&record.context, "context")?;
     let media = match &record.media {
-        Some(media) => Value::String(json_text(media, "media")?),
+        Some(media) => json_value(media, "media")?,
         None => Value::Null,
     };
     let created_at = serde_json::to_value(record.created_at).map_err(|error| {
@@ -171,7 +173,7 @@ pub(crate) fn row(record: &EvalRecordObservation) -> Result<Vec<u8>, WyrdError> 
     row_bytes(&json!({
         "record_id": record.record_id.0.to_string(),
         "session_id": record.session_id.as_ref().map(|session| session.0.to_string()),
-        "context": context,
+        "context": &record.context,
         "trace_id": record.trace_id.as_ref().map(TraceId::to_hex),
         "span_id": record.span_id.as_ref().map(SpanId::to_hex),
         "created_at": created_at,
@@ -179,13 +181,13 @@ pub(crate) fn row(record: &EvalRecordObservation) -> Result<Vec<u8>, WyrdError> 
     }))
 }
 
-/// Encode one nested value as the canonical JSON text a scalar column holds.
+/// Convert one nested value into the JSON value its Variant column holds.
 ///
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` when the value is not
-/// serializable, which for `context` includes a non-finite float.
-fn json_text<T: serde::Serialize>(value: &T, field: &str) -> Result<String, WyrdError> {
-    serde_json::to_string(value).map_err(|error| {
+/// serializable as JSON.
+fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, WyrdError> {
+    serde_json::to_value(value).map_err(|error| {
         invalid_observation(
             "eval observation field is not serializable as JSON",
             json!({ "field": field, "source": error.to_string() }),

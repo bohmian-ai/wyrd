@@ -2,13 +2,16 @@
 //!
 //! Each variant carries a stable Wyrd error code and a gRPC status code. The
 //! stable code is attached to the `tonic::Status` details via
-//! `google.rpc.ErrorInfo` (`tonic-types`), so the Wyrd client maps a gRPC
-//! `Status` and an HTTP `problem+json` to the same taxonomy.
+//! `google.rpc.ErrorInfo` (`tonic-types`), and the full `problem+json` rides
+//! in the `wyrd-error-bin` header, so the Wyrd client maps a gRPC `Status`
+//! and an HTTP `problem+json` to the same taxonomy and details.
 
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_tonic::tonic::{Code, Status, metadata::MetadataValue};
+use wyrd_tonic::error::wyrd_error_to_status;
+use wyrd_tonic::tonic::metadata::MetadataValue;
+use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
 /// Error domain used in the attached `google.rpc.ErrorInfo`.
@@ -103,6 +106,10 @@ pub enum IngestError {
     /// Arrow IPC decode failed.
     #[error("ingest arrow decode failed: {0}")]
     Decode(String),
+    /// A schema-valid batch broke a catalogued rule of the table's declared
+    /// contract; the catalogued error is the public identity.
+    #[error("ingest contract violation: {0}")]
+    ContractViolation(BifrostError),
     /// A caller-supplied `wyrd_event_time` value falls outside the server
     /// acceptance window evaluated against per-batch receipt time.
     ///
@@ -184,9 +191,10 @@ impl IngestError {
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_) | Self::Decode(_) | Self::EventTimeOutOfRange { .. } => {
-                "validation"
-            }
+            Self::RequestValidation(_)
+            | Self::Decode(_)
+            | Self::ContractViolation(_)
+            | Self::EventTimeOutOfRange { .. } => "validation",
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
@@ -218,6 +226,7 @@ impl IngestError {
             }
             .into(),
             Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
+            Self::ContractViolation(error) => error.clone().into(),
             Self::RequestValidation(detail) | Self::Decode(detail) => {
                 BifrostError::OtlpRequestMalformed {
                     table: fallback_table(),
@@ -313,6 +322,9 @@ impl IngestError {
             crate::contracts::ScribeError::InvalidFrame => {
                 Self::Decode("ingest frame validation failed".to_owned())
             }
+            crate::contracts::ScribeError::ContractViolation(error) => {
+                Self::ContractViolation(error)
+            }
             crate::contracts::ScribeError::EventTimeOutOfRange {
                 value_micros,
                 past_bound_micros,
@@ -350,6 +362,11 @@ impl IngestError {
 
     /// Render as a `tonic::Status` with the canonical code in `ErrorInfo`.
     ///
+    /// The public error's `problem+json` header comes from the shared
+    /// `wyrd_error_to_status` producer every Wyrd gRPC surface uses, so a typed
+    /// refusal such as a Variant violation reaches the client with its exact
+    /// details rather than only its code.
+    ///
     /// The Gate's native gRPC adapter has no endpoint table argument, so only
     /// errors carrying their own table retain one here; OTLP/HTTP supplies its
     /// endpoint table to [`Self::to_wyrd_error`] before response rendering.
@@ -362,8 +379,10 @@ impl IngestError {
             WYRD_ERROR_DOMAIN,
             [] as [(String, String); 0],
         );
-        let mut status =
-            Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details);
+        let code = grpc_code_for_wyrd(&public);
+        let message = public.to_string();
+        let metadata = wyrd_error_to_status(public, None).metadata().clone();
+        let mut status = Status::with_error_details_and_metadata(code, message, details, metadata);
         if retryable_busy {
             status
                 .metadata_mut()
@@ -424,6 +443,8 @@ impl From<IngestError> for Status {
 mod tests {
     use super::IngestError;
     use crate::contracts::ScribeError;
+    use wyrd_spec::vala::error::BifrostError;
+    use wyrd_tonic::error::wyrd_error_to_status;
     use wyrd_tonic::tonic::Code;
     use wyrd_tonic::tonic_types::StatusExt;
 
@@ -539,6 +560,16 @@ mod tests {
                 409,
                 Code::FailedPrecondition,
             ),
+            (
+                IngestError::ContractViolation(BifrostError::VariantInvalidJson {
+                    field: "messages".to_owned(),
+                    row: 0,
+                    path: String::new(),
+                }),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                400,
+                Code::InvalidArgument,
+            ),
         ]
     }
 
@@ -626,11 +657,16 @@ mod tests {
     }
 
     /// Assert that every ingest condition has one Wyrd identity and matching
-    /// gRPC status/ErrorInfo projection.
+    /// gRPC status, `ErrorInfo`, and shared `problem+json` header projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a code, status, `ErrorInfo` reason, or header body drifts
+    /// from the public error.
     #[test]
     fn every_ingest_error_has_one_transport_projection() {
         for (error, expected_code, expected_status, expected_grpc) in ingest_cases() {
-            let public = error.to_wyrd_error("vala.traces.spans");
+            let public = error.to_wyrd_error("unknown");
             assert_eq!(public.code(), expected_code, "identity drift for {error}");
             assert_eq!(public.status(), expected_status, "status drift for {error}");
 
@@ -640,6 +676,15 @@ mod tests {
                 .get_details_error_info()
                 .expect("canonical ingest status carries ErrorInfo");
             assert_eq!(info.reason, expected_code, "ErrorInfo drift for {public}");
+            let headers = grpc.metadata().clone().into_headers();
+            let shared = wyrd_error_to_status(public.clone(), None)
+                .metadata()
+                .clone()
+                .into_headers();
+            assert!(!shared.is_empty(), "shared producer attaches the problem");
+            for (name, value) in &shared {
+                assert_eq!(headers.get(name), Some(value), "problem drift for {public}");
+            }
         }
     }
 

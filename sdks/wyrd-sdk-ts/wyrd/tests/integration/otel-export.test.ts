@@ -80,17 +80,21 @@ function hex(value: unknown): string {
   return Buffer.from(value as Uint8Array).toString("hex");
 }
 
-/**
- * Reads a stored attribute blob as text.
- *
- * The canonical `KeyValueList` encoding embeds every string value literally,
- * and the TypeScript SDK ships no protobuf decoder, so a payload assertion
- * looks for the exact JSON the application emitted rather than adding a
- * decoder to the test tree. Exact structural fidelity of the same blob is
- * proven by the raw OTLP suite in Rust.
- */
-function blobText(value: unknown): string {
-  return Buffer.from(value as Uint8Array).toString("utf8");
+/** One signal row as the typed terminal decoded it, Variants as native values. */
+type DecodedRow = Record<string, any>;
+
+/** Reads one canonical query through the typed row terminal. */
+async function readDecoded(
+  server: NativeWyrdTestServer,
+  sql: string,
+): Promise<DecodedRow[]> {
+  server.waitForBifrostPublication();
+  const client = await Bifrost.connect({
+    serverUrl: server.baseUrl,
+    credential: server.token,
+    grpcUrl: server.grpcUrl,
+  });
+  return client.sql(sql, { parse: (row) => row as DecodedRow });
 }
 
 describe("stock OpenTelemetry exporters", () => {
@@ -196,13 +200,15 @@ describe("stock OpenTelemetry exporters", () => {
         Number(values(table, "gen_ai_usage_output_tokens")[parentRow]),
       ).toBe(GEN_AI.outputTokens);
 
-      const attributes = blobText(values(table, "attributes")[parentRow]);
-      expect(attributes).toContain("typescript-trace");
-      expect(attributes).toContain(GEN_AI.inputMessages);
-      expect(attributes).toContain(GEN_AI.outputMessages);
-      expect(blobText(values(table, "resource_attributes")[parentRow])).toContain(
-        SERVICE_NAME,
+      const [decoded] = await readDecoded(
+        server,
+        `SELECT attributes, resource_attributes FROM vala.traces.spans ` +
+          `WHERE scope_name = '${TRACE_SCOPE}' AND name = 'stock-ts-parent'`,
       );
+      expect(decoded?.attributes["wyrd.test.marker"]).toBe("typescript-trace");
+      expect(decoded?.attributes["gen_ai.input.messages"]).toBe(GEN_AI.inputMessages);
+      expect(decoded?.attributes["gen_ai.output.messages"]).toBe(GEN_AI.outputMessages);
+      expect(decoded?.resource_attributes["service.name"]).toBe(SERVICE_NAME);
 
       const events = table.getChild("events")?.get(parentRow);
       expect(events?.length).toBe(1);
@@ -258,13 +264,16 @@ describe("stock OpenTelemetry exporters", () => {
         `SELECT * FROM vala.logs.records WHERE scope_name = '${LOG_SCOPE}'`,
       );
       expect(table.numRows).toBe(1);
-      expect(blobText(values(table, "body")[0])).toContain("order delayed");
+      const [decoded] = await readDecoded(
+        server,
+        `SELECT body, attributes, resource_attributes FROM vala.logs.records ` +
+          `WHERE scope_name = '${LOG_SCOPE}'`,
+      );
+      expect(decoded?.body).toBe("order delayed");
       expect(values(table, "severity_number")[0]).toBe(SeverityNumber.ERROR);
       expect(values<string>(table, "severity_text")[0]).toBe("ERROR");
-      expect(blobText(values(table, "attributes")[0])).toContain("typescript-log");
-      expect(blobText(values(table, "resource_attributes")[0])).toContain(
-        SERVICE_NAME,
-      );
+      expect(decoded?.attributes["wyrd.test.marker"]).toBe("typescript-log");
+      expect(decoded?.resource_attributes["service.name"]).toBe(SERVICE_NAME);
       expect(hex(values(table, "trace_id")[0])).toBe(
         correlated.spanContext().traceId,
       );
@@ -359,11 +368,13 @@ describe("stock OpenTelemetry exporters", () => {
         ),
       ).toBe(1);
 
-      for (const index of [created, active, depth, duration]) {
-        expect(blobText(values(table, "attributes")[index])).toContain(
-          "typescript-metric",
-        );
-      }
+      const decoded = await readDecoded(
+        server,
+        `SELECT attributes FROM vala.metrics.points WHERE scope_name = '${METRIC_SCOPE}'`,
+      );
+      expect(decoded.map((row) => row.attributes)).toEqual(
+        decoded.map(() => attributes),
+      );
     } finally {
       server.shutdown();
     }

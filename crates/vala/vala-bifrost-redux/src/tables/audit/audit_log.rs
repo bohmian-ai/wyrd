@@ -1,5 +1,7 @@
 use arrow::datatypes::{DataType, Field};
 
+use wyrd_queue::variant::variant_field;
+
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
 use crate::tables::fields::utf8;
@@ -34,6 +36,11 @@ impl AuditLogTable {
     }
 }
 
+/// The content column holding the decision's structured detail as a Variant.
+///
+/// The value decodes to exactly the canonical JSON the entry hash covered.
+pub const DETAIL: &str = "detail";
+
 /// The content column naming the credential a decision was made against.
 pub const CREDENTIAL_ID: &str = "credential_id";
 
@@ -58,7 +65,7 @@ impl DomainTable for AuditLogTable {
             utf8("principal_kind", false),
             utf8("permission", false),
             utf8("outcome", false),
-            utf8("detail", true),
+            variant_field(DETAIL, true),
             utf8(CREDENTIAL_ID, true),
         ]
     }

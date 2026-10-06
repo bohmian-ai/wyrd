@@ -456,7 +456,10 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
 ///
 /// The credential segment is encoded like every other optional column —
 /// present or absent — so one preimage covers every row the chain holds.
-fn entry_hash(
+/// Readers that verify a retained row recompute its hash through this same
+/// function rather than restating the preimage.
+#[must_use]
+pub fn entry_hash(
     prev_hash: &[u8],
     seq: i64,
     event: &AuditEvent,

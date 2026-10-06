@@ -449,12 +449,19 @@ mod tests {
     use crate::transport::credential::ResolvedCredential;
     use secrecy::SecretString;
     use tokio::sync::Mutex;
+    use wyrd_spec::vala::error::BifrostError;
+    use wyrd_tonic::error::wyrd_error_to_status;
     use wyrd_tonic::tonic::Response;
     use wyrd_tonic::tonic::transport::Server;
     use wyrd_tonic::wyrd::v1::InsertBatchResponse;
     use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
         BifrostIngestService, BifrostIngestServiceServer,
     };
+
+    /// Renders `error` through the server's own gRPC problem producer.
+    fn refusal(error: BifrostError) -> Status {
+        wyrd_error_to_status(WyrdError::from(error), None)
+    }
 
     /// Scripted real gRPC service that returns busy, ACK, then permanent capacity.
     #[derive(Clone, Default)]
@@ -501,16 +508,9 @@ mod tests {
                 attempt
             } {
                 0 => {
-                    use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
-                    let mut status = Status::with_error_details(
-                        Code::ResourceExhausted,
-                        "ingest coordinator busy for table events — local buffer full",
-                        ErrorDetails::with_error_info(
-                            "WYRD_VALA_429_INGEST_BUSY",
-                            "wyrd.dev",
-                            [] as [(String, String); 0],
-                        ),
-                    );
+                    let mut status = refusal(BifrostError::IngestBusy {
+                        table: "events".to_owned(),
+                    });
                     status
                         .metadata_mut()
                         .insert("retry-after-ms", MetadataValue::from_static("1000"));
@@ -519,18 +519,7 @@ mod tests {
                 1 => Ok(Response::new(InsertBatchResponse {
                     wyrd_batch_id: request.wyrd_batch_id,
                 })),
-                _ => {
-                    use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
-                    Err(Status::with_error_details(
-                        Code::ResourceExhausted,
-                        "ingest WAL storage is unavailable",
-                        ErrorDetails::with_error_info(
-                            "WYRD_VALA_507_WAL_DISK_FULL",
-                            "wyrd.dev",
-                            [] as [(String, String); 0],
-                        ),
-                    ))
-                }
+                _ => Err(refusal(BifrostError::WalDiskFull)),
             }
         }
     }
@@ -573,8 +562,6 @@ mod tests {
     /// attempts under one UUID and request ID.
     #[tokio::test]
     async fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
-        use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
-
         let service = ScriptedIngest::default();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
         let address = listener.local_addr().expect("test address resolves");
@@ -679,27 +666,18 @@ mod tests {
 
         // Pin the classifier independently so malformed capacity identities
         // cannot become transport retries if the scripted server changes.
-        let busy = Status::with_error_details(
-            Code::ResourceExhausted,
-            "ingest coordinator busy for table events — local buffer full",
-            ErrorDetails::with_error_info(
-                "WYRD_VALA_429_INGEST_BUSY",
-                "wyrd.dev",
-                [] as [(String, String); 0],
-            ),
-        );
+        let busy = refusal(BifrostError::IngestBusy {
+            table: "events".to_owned(),
+        });
         assert!(AttemptError::from_status(busy).retryable);
 
-        for reason in [
-            "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-            "WYRD_VALA_507_WAL_DISK_FULL",
+        for permanent in [
+            BifrostError::PayloadTooLarge { bytes: 2, limit: 1 },
+            BifrostError::WalDiskFull,
         ] {
-            let status = Status::with_error_details(
-                Code::ResourceExhausted,
-                "permanent capacity refusal",
-                ErrorDetails::with_error_info(reason, "wyrd.dev", [] as [(String, String); 0]),
-            );
-            assert!(!AttemptError::from_status(status).retryable, "{reason}");
+            let status = refusal(permanent);
+            assert_eq!(status.code(), Code::ResourceExhausted);
+            assert!(!AttemptError::from_status(status).retryable);
         }
     }
 

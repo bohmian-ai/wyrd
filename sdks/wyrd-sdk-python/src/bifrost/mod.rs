@@ -303,6 +303,28 @@ impl PyQueryResult {
     fn __len__(&self) -> usize {
         self.inner.num_rows()
     }
+
+    /// Decodes one Variant cell's `metadata`/`value` bytes into its native
+    /// Python value.
+    ///
+    /// The typed row terminal calls this for every Variant cell it finds while
+    /// walking the result schema, so decoding stays in the shared `wyrd-queue`
+    /// owner: objects become `dict`, arrays `list`, and integers exact `int`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` carrying `WYRD_SPEC_500_INTERNAL` when the bytes are not a
+    /// valid Variant, which only a faulty server result can produce.
+    #[staticmethod]
+    fn variant_to_python(py: Python<'_>, metadata: &[u8], value: &[u8]) -> WyrdPyResult<Py<PyAny>> {
+        let json =
+            wyrd_queue::variant::variant_bytes_to_json(metadata, value).map_err(|violation| {
+                boundary_internal(format!(
+                    "query result Variant does not decode: {violation:?}"
+                ))
+            })?;
+        Ok(json_to_pyobject(py, &json)?)
+    }
 }
 
 /// Python-facing [`NativeBifrost`]: query any authorized table, write to the

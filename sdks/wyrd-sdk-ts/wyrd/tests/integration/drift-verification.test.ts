@@ -30,12 +30,19 @@ const BASELINE_PARQUET = fileURLToPath(
   new URL("../fixtures/drift-baseline.parquet", import.meta.url),
 );
 
+/** The `drift_report` Struct, its open `features` decoded to native values. */
+interface DriftReport {
+  method: string;
+  features: Record<string, any>;
+  verdict: string;
+}
+
 /** One result summary and its `feature/method/verdict` rows. */
 interface Outcome {
   readonly result: {
     execution_status: string;
     verdict: string;
-    details: string | null;
+    drift_report: DriftReport | null;
     owner_card_uid: string | null;
     binding_id: string | null;
     subject_card_uid: string;
@@ -313,10 +320,7 @@ async function emitRows(
 
 /** Materialize every row of one query as plain objects. */
 async function rows(query: Bifrost, sql: string): Promise<Record<string, unknown>[]> {
-  return (await query.sql(sql))
-    .toArrow()
-    .toArray()
-    .map((row) => row.toJSON());
+  return query.sql(sql, { parse: (row) => row as Record<string, unknown> });
 }
 
 /**
@@ -333,7 +337,7 @@ async function readResult(
   server.flushBifrost();
   const results = await rows(
     query,
-    `SELECT execution_status, verdict, details, owner_card_uid, binding_id, subject_card_uid
+    `SELECT execution_status, verdict, drift_report, owner_card_uid, binding_id, subject_card_uid
        FROM vala.verification.results WHERE result_id = '${resultId}'`,
   );
   expect(results).toHaveLength(1);
@@ -356,14 +360,18 @@ async function readResult(
 }
 
 /**
- * Assert the persisted SPC evidence of `latency` in a result's `details`.
+ * Assert the persisted SPC evidence of `latency` in a result's `drift_report`.
  *
  * The baseline's twenty subgroups of five consecutive integers fix the X-bar
  * center at 49.5 and the S center at `sqrt(2.5)`; the limits must be the NIST
  * X-bar/S limits around them, and SPC compares signals with zero.
  */
-function assertSpcEvidence(details: string | null, subgroups: number, xBarSignals: number): void {
-  const feature = JSON.parse(details ?? "null").features.latency;
+function assertSpcEvidence(
+  report: DriftReport | null,
+  subgroups: number,
+  xBarSignals: number,
+): void {
+  const feature = report?.features.latency;
   const spc = feature.evidence.Spc;
   expect([spc.subgroup_size, spc.subgroups], JSON.stringify(spc)).toEqual([5, subgroups]);
   expect(spc.x_bar.signals).toBe(xBarSignals);
@@ -376,14 +384,14 @@ function assertSpcEvidence(details: string | null, subgroups: number, xBarSignal
 }
 
 /**
- * Assert the persisted PSI bin evidence of a baseline-like window in `details`.
+ * Assert the persisted PSI bin evidence of a baseline-like window in `drift_report`.
  *
  * The window mirrors the baseline's 100 rows: `tier` lands 50/50 in its two
  * labeled bins with nothing in the reserved unseen-label bin, and every
  * `latency` row lands in exactly one equal-width bin.
  */
-function assertPsiEvidence(details: string | null): void {
-  const features = JSON.parse(details ?? "null").features;
+function assertPsiEvidence(report: DriftReport | null): void {
+  const features = report?.features ?? {};
   const tier = features.tier.evidence.Psi;
   expect(tier.sample, JSON.stringify(tier)).toBe(BASELINE_ROWS);
   expect(
@@ -413,10 +421,10 @@ async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
   return error as WyrdError;
 }
 
-/** Assert a result completed inconclusive before scoring: null details, no features. */
+/** Assert a result completed inconclusive before scoring: no report, no features. */
 function assertUnscored({ result, features }: Outcome): void {
   expect([result.execution_status, result.verdict]).toEqual(["completed", "inconclusive"]);
-  expect(result.details).toBeNull();
+  expect(result.drift_report).toBeNull();
   expect(features).toEqual([]);
 }
 
@@ -528,7 +536,7 @@ spec: {}
       let outcome = await run(psi, steady);
       expect(outcome.result.verdict).toBe("passed");
       expect(outcome.features).toEqual(["latency/Psi/no_drift", "tier/Psi/no_drift"]);
-      assertPsiEvidence(outcome.result.details);
+      assertPsiEvidence(outcome.result.drift_report);
       const outsider = await rejection(
         Verification.connect({
           serverUrl: server.baseUrl,
@@ -550,7 +558,7 @@ spec: {}
       outcome = await run(spc, calm);
       expect(outcome.result.verdict, "two in-control subgroups pass").toBe("passed");
       expect(outcome.features).toEqual(["latency/Spc/no_drift"]);
-      assertSpcEvidence(outcome.result.details, 2, 0);
+      assertSpcEvidence(outcome.result.drift_report, 2, 0);
       await emitRows(server, cards, calm, join(bundles, "calm-partial"), latencies([50, 50]));
       assertUnscored(await run(spc, calm));
 
@@ -591,7 +599,7 @@ spec: {}
         ]);
         expect(outcome.result.verdict).toBe("failed");
         expect(outcome.features).toEqual(["latency/Spc/drift"]);
-        assertSpcEvidence(outcome.result.details, 4, 4);
+        assertSpcEvidence(outcome.result.drift_report, 4, 4);
       }
 
       server.retireFittedFormat(spc.uid ?? "");
@@ -611,7 +619,7 @@ spec: {}
       expect(refused.result_id ?? null, "a refused legacy run is never scored").toBeNull();
       outcome = await readResult(server, query, failed.result_id ?? "");
       expect(outcome.result.verdict, "the historical result stays readable").toBe("failed");
-      assertSpcEvidence(outcome.result.details, 4, 4);
+      assertSpcEvidence(outcome.result.drift_report, 4, 4);
 
       const retired = join(root, "ts-edge-weco.yaml");
       writeFileSync(
@@ -1021,7 +1029,7 @@ describe("continuous verification journey", () => {
         [agentUid, run.runId],
       ]);
       const recordOf = new Map(
-        evals.map((row) => [row.record_id, JSON.parse(String(row.context)).answer as string]),
+        evals.map((row) => [row.record_id, (row.context as { answer: string }).answer]),
       );
       const verdicts = await rows(
         query,
@@ -1083,7 +1091,7 @@ describe("continuous verification journey", () => {
       expect([outcome.result.owner_card_uid, outcome.result.binding_id, outcome.result.subject_card_uid]).toEqual(
         [service.uid, bindings.get("ts-edge-psi")?.binding_id, modelUid],
       );
-      assertPsiEvidence(outcome.result.details);
+      assertPsiEvidence(outcome.result.drift_report);
       outcome = await readResult(server, query, drifted.get("ts-edge-spc")?.result_id ?? "");
       expect(outcome.result.verdict, "uniform latencies signal the X-bar chart").toBe("failed");
       expect(outcome.features).toEqual(["latency/Spc/drift"]);

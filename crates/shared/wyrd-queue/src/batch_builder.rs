@@ -22,6 +22,7 @@ use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
+use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -237,16 +238,21 @@ fn collect<T>(
 /// that column; a missing value becomes null only when the field is nullable.
 /// `FixedSizeBinary` columns take canonical lowercase hex text and decode it to
 /// exactly the declared width, so trace and span ids land as the same bytes
-/// `vala.traces.spans` stores.
+/// `vala.traces.spans` stores. A Variant column takes any JSON value and keeps
+/// its JSON types; JSON `null` or an absent key is a null row.
 ///
 /// # Errors
 ///
 /// Returns [`WyrdQueueError::SchemaParse`] when a value does not convert to
 /// the column type (including malformed or wrong-width hex), when a required
-/// value is null or missing, or when the data type is unsupported.
+/// value is null or missing, or when the data type is unsupported, and
+/// [`WyrdQueueError::Variant`] when a Variant value exceeds a Variant limit.
 fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueError> {
     let name = field.name();
     let nullable = field.is_nullable();
+    if is_variant(field) {
+        return build_variant_column(name, rows, nullable);
+    }
     let array: ArrayRef = match field.data_type() {
         DataType::Boolean => Arc::new(BooleanArray::from(collect(
             name,
@@ -328,6 +334,27 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
         }
     };
     Ok(array)
+}
+
+/// Build one Variant column from each row's JSON value for `name`.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::SchemaParse`] when a non-nullable column has a
+/// null or absent value, and [`WyrdQueueError::Variant`] naming the field and
+/// row when a value exceeds a Variant limit.
+fn build_variant_column(
+    name: &str,
+    rows: &[BuiltRow],
+    nullable: bool,
+) -> Result<ArrayRef, WyrdQueueError> {
+    let values = collect(name, rows, nullable, |value| Some(value.clone()))?;
+    VariantColumnBuilder::encode(
+        name,
+        values.iter().map(Option::as_ref),
+        EncodedVariant::from_json,
+    )
+    .map_err(WyrdQueueError::Variant)
 }
 
 /// Decode exactly `width` bytes from canonical lowercase hex.

@@ -6565,7 +6565,17 @@ impl ForgeCompactionPlanRunner {
             .shared
             .rewrite
             .rewrite_plan(plan, &self.shared.table, &self.shared.policy)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    worker = %self.owner,
+                    task_id = %self.task_id,
+                    plan_index = self.plan_index,
+                    operation_id = %self.operation_id,
+                    error = %error,
+                    "Forge compaction plan rewrite failed"
+                );
+            })?;
         let metadata = self.shared.table.metadata();
         let context = RewritePublication {
             claim: &self.claim,

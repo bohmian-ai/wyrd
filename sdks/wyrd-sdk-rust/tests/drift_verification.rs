@@ -8,7 +8,7 @@
 //! observations through `WyrdState`; direct runs of every method then score
 //! the window server-side through Oracle and persist their results, PSI bin
 //! and SPC X-bar/S evidence, and feature rows, an empty window completes
-//! inconclusive with null details and no features, one due occurrence of the
+//! inconclusive with no report and no features, one due occurrence of the
 //! shared Trigger runs each binding once, fails on SPC signals, and
 //! dispatches only that binding's Operators, and a manual run of one binding
 //! dispatches through the same Operator path. Negative flows cover an unready
@@ -72,8 +72,9 @@ struct ResultRow {
     execution_status: String,
     /// Common verdict.
     verdict: String,
-    /// Implementation summary; null for an unscored inconclusive result.
-    details: Option<String>,
+    /// The typed Drift report Struct, its open `features` decoded to JSON;
+    /// null for an unscored inconclusive result.
+    drift_report: Option<Value>,
     /// Exact subject Card UID the window was read for.
     subject_card_uid: String,
     /// Binding of a binding-created run; null for a direct run.
@@ -386,7 +387,7 @@ async fn read_result(
     server.flush_bifrost().await.expect("flush server Scribe");
     let mut results: Vec<ResultRow> = query
         .sql_as(&format!(
-            "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
+            "SELECT execution_status, verdict, drift_report, subject_card_uid, binding_id, \
                     owner_card_uid \
              FROM vala.verification.results WHERE result_id = '{result_id}'"
         ))
@@ -768,23 +769,19 @@ fn verdicts(features: &[FeatureRow]) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
-/// The persisted typed evidence of `feature` in `result`'s details.
+/// The persisted typed evidence of `feature` in `result`'s `drift_report`.
 ///
 /// # Panics
-/// Panics when the details are absent, not JSON, or carry no evidence for
-/// `feature`.
+/// Panics when the report is absent.
 fn evidence(result: &ResultRow, feature: &str) -> Value {
-    let details: Value = serde_json::from_str(
-        result
-            .details
-            .as_deref()
-            .expect("a scored report has details"),
-    )
-    .expect("details are JSON");
-    details["features"][feature]["evidence"].clone()
+    let report = result
+        .drift_report
+        .as_ref()
+        .expect("a scored result has a report");
+    report["features"][feature]["evidence"].clone()
 }
 
-/// Assert `result` completed inconclusive before scoring: null details and
+/// Assert `result` completed inconclusive before scoring: no report and
 /// no feature rows.
 ///
 /// # Panics
@@ -795,7 +792,7 @@ fn assert_unscored((result, features): &(ResultRow, Vec<FeatureRow>)) {
         ("completed", "inconclusive"),
         "{result:?}"
     );
-    assert!(result.details.is_none(), "{result:?}");
+    assert!(result.drift_report.is_none(), "{result:?}");
     assert!(features.is_empty(), "{features:?}");
 }
 
@@ -803,7 +800,7 @@ fn assert_unscored((result, features): &(ResultRow, Vec<FeatureRow>)) {
 /// runtime, Oracle, and Bifrost persistence.
 ///
 /// Before the tenant's first Drift write a Custom run completes inconclusive
-/// with no details, features, or dispatch. Separate subjects then isolate
+/// with no report, features, or dispatch. Separate subjects then isolate
 /// each case in the one shared observation table: a window matching the
 /// baseline distribution passes PSI and Custom, with the Custom mean exactly
 /// at its threshold; two in-control subgroups pass SPC with zero-signal
@@ -1012,7 +1009,7 @@ impl EdgeJourney<'_> {
 
     /// Records carrying no PSI feature are unrelated and leave a passing
     /// window passing; one selected record omitting a configured feature
-    /// makes the run inconclusive with no details or feature rows.
+    /// makes the run inconclusive with no report or feature rows.
     ///
     /// # Panics
     /// Panics when unrelated records change the verdict or an incomplete
@@ -1087,8 +1084,8 @@ impl EdgeJourney<'_> {
         assert_eq!(after.result_id, before.result_id);
         let (reread, _) = read_result(self.server, &self.query, &result_id.to_string()).await;
         assert_eq!(
-            (reread.verdict.as_str(), reread.details.as_deref()),
-            (scored.verdict.as_str(), scored.details.as_deref()),
+            (reread.verdict.as_str(), reread.drift_report.as_ref()),
+            (scored.verdict.as_str(), scored.drift_report.as_ref()),
             "the historical report reads unchanged"
         );
         assert!(evidence(&reread, "tier")["Psi"]["bins"].is_array());
@@ -1168,7 +1165,7 @@ impl EdgeJourney<'_> {
 /// Prove each direct run scores server-side and persists its result rows.
 ///
 /// PSI, SPC, and Custom each fail the drifted window with their feature rows;
-/// Custom over an empty window is inconclusive with null details and no
+/// Custom over an empty window is inconclusive with no report and no
 /// feature rows.
 ///
 /// # Panics
@@ -1193,8 +1190,8 @@ async fn assert_direct_scores(
         "a direct run copies no caller, subject, or Verifier as its owner"
     );
     assert!(
-        result.details.is_some(),
-        "a scored report persists its details"
+        result.drift_report.is_some(),
+        "a scored result persists its report"
     );
     assert_eq!(
         features
@@ -1242,8 +1239,8 @@ async fn assert_direct_scores(
         "{result:?}"
     );
     assert!(
-        result.details.is_none(),
-        "an unscored window has null details"
+        result.drift_report.is_none(),
+        "an unscored window has no report"
     );
     assert!(features.is_empty(), "an unscored window writes no features");
 }
@@ -1583,7 +1580,7 @@ async fn assert_refusals(
     );
     let leaked = Bifrost::query_only(&other)
         .sql_as::<ResultRow>(
-            "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
+            "SELECT execution_status, verdict, drift_report, subject_card_uid, binding_id, \
                     owner_card_uid \
              FROM vala.verification.results",
         )
@@ -1658,8 +1655,8 @@ struct SubjectCount {
 struct EvalObservationRow {
     /// Logical record identity a run's `source_record_id` names.
     record_id: String,
-    /// The emitted JSON context.
-    context: String,
+    /// The emitted context, decoded from its Variant column.
+    context: Value,
     /// Managed subject Card UID stamped from the authorized scope.
     card_uid: Option<String>,
 }
@@ -2288,7 +2285,7 @@ impl<'a> IntegratedJourney<'a> {
             let result = owned[0];
             assert_eq!(result.implementation, "eval");
             assert_eq!(result.subject_card_uid, self.agent_uid);
-            let failed = observation.context.contains("\"answer\":\"no\"");
+            let failed = observation.context["answer"] == "no";
             assert_eq!(
                 result.verdict,
                 if failed { "failed" } else { "passed" },

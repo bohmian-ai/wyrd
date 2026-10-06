@@ -20,6 +20,7 @@ mod pg_tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
+    use serde_json::Value;
     use tokio::sync::Notify;
     use tokio::task::JoinHandle;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
@@ -40,6 +41,7 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome, RegisterOutcome};
+    use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
     use wyrd_tonic::tonic::Request;
@@ -2462,8 +2464,6 @@ mod pg_tests {
     /// refuses the wrong caller.
     #[tokio::test]
     async fn canonical_signal_arrow_write_and_sql_read_round_trip() {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");
@@ -2671,23 +2671,204 @@ mod pg_tests {
         let stored = batches[0]
             .column_by_name("attributes")
             .expect("column `attributes`");
-        let stored = arrow::compute::cast(stored, &arrow_schema::DataType::Binary)
-            .expect("the canonical attribute payload reads back as bytes");
-        let payload = stored
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .expect("the cast payload is Binary")
-            .value(0)
-            .to_vec();
-        let payload = String::from_utf8_lossy(&payload);
-        assert!(
-            payload.contains(fixture::INPUT_MESSAGES),
+        let payload = wyrd_queue::variant::variant_cell_to_json(stored.as_ref(), 0)
+            .expect("the Variant attribute payload decodes");
+        assert_eq!(
+            payload["gen_ai.input.messages"],
+            fixture::INPUT_MESSAGES,
             "the structured GenAI input messages survive the round trip verbatim"
         );
-        assert!(
-            payload.contains(fixture::OUTPUT_MESSAGES),
+        assert_eq!(
+            payload["gen_ai.output.messages"],
+            fixture::OUTPUT_MESSAGES,
             "the structured GenAI output messages survive the round trip verbatim"
         );
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// One typed row of the built-in Variant and Struct journey.
+    ///
+    /// Each field is the native value one SQL access form must produce: `->>`
+    /// as text, `->` and a whole Variant column as JSON values, and a Struct
+    /// child through exact field access.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct VariantSpanRow {
+        /// `attributes ->> 'gen_ai.input.messages'`: the string attribute.
+        input_messages: String,
+        /// `resource_attributes ->> 'service.name'`: a second Variant column.
+        service: String,
+        /// `attributes -> 'absent'`: an absent key is SQL null.
+        absent: Option<Value>,
+        /// The whole `attributes` Variant column as its JSON object.
+        attributes: Value,
+        /// `events[1]['name']`: a Struct child read by exact field access.
+        event_name: String,
+        /// `events[1]['attributes'] ->> 'gen_ai.finish_reason'`: a Variant
+        /// nested inside a Struct.
+        finish_reason: String,
+        /// A parsed JSON literal holding an integer beyond 2^53 and
+        /// `u64::MAX`, which must both read back exactly.
+        parsed: Value,
+        /// `try_parse_json` over invalid JSON: null rather than an error.
+        lenient: Option<Value>,
+    }
+
+    /// Built-in Variant and Struct payloads are queryable through the SDK.
+    ///
+    /// Writes the canonical span fixture, whose attribute collections are
+    /// Variant and whose events are Structs, then reads it through raw `sql`
+    /// and typed `sql_as`. The raw result keeps the Variant extension, the
+    /// typed result decodes every Variant into native JSON, Struct access
+    /// stays exact, and invalid JSON in `parse_json` is the stable Variant
+    /// error, before the first batch or after a delivered one, while
+    /// `try_parse_json` is null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture is refused, a value reads back differently, or
+    /// an early or late failure does not carry its catalog problem.
+    #[tokio::test]
+    async fn builtin_variant_and_struct_payloads_are_queryable() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        srv.ensure_builtin_table_for_test(srv.data_tenant_id(), "traces", "spans")
+            .await
+            .expect("provision the span table");
+        let client = admin_client(&srv, "sdk-variant-journey").await;
+        let bifrost = Bifrost::connect(&client).await.expect("writer connects");
+        let scope = format!("wyrd.sdk.variant.{}", uuid::Uuid::now_v7().simple());
+        let described = TableConfig::describe(&client, "vala.traces.spans")
+            .await
+            .expect("describe the span table");
+        bifrost
+            .write_batch(
+                "vala.traces.spans",
+                &fixture::spans(described.user_schema(), &scope, 1_760_000_000_000_000_000),
+            )
+            .await
+            .expect("the canonical span batch is accepted");
+        srv.flush_bifrost().await.expect("publish the spans");
+
+        let parent = format!(
+            "FROM vala.traces.spans WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        );
+        let raw = bifrost
+            .sql(&format!("SELECT attributes {parent}"))
+            .await
+            .expect("read the raw Variant column");
+        assert_eq!(
+            raw.batches()[0]
+                .schema()
+                .field_with_name("attributes")
+                .expect("attributes column")
+                .extension_type_name(),
+            Some("arrow.parquet.variant"),
+            "the Arrow terminal keeps the Variant extension"
+        );
+
+        let rows: Vec<VariantSpanRow> = bifrost
+            .sql_as(&format!(
+                "SELECT attributes ->> 'gen_ai.input.messages' AS input_messages, \
+                        resource_attributes ->> 'service.name' AS service, \
+                        attributes -> 'absent' AS absent, \
+                        attributes, \
+                        events[1]['name'] AS event_name, \
+                        events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
+                        parse_json('{{\"n\": 9007199254740993, \"u\": 18446744073709551615, \"a\": [1, \"x\", null]}}') AS parsed, \
+                        try_parse_json('{{bad') AS lenient \
+                 {parent}"
+            ))
+            .await
+            .expect("typed Variant rows");
+        assert_eq!(
+            rows,
+            vec![VariantSpanRow {
+                input_messages: fixture::INPUT_MESSAGES.to_owned(),
+                service: "wyrd.fixture.service".to_owned(),
+                absent: None,
+                attributes: serde_json::json!({
+                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+                }),
+                event_name: fixture::EVENT_NAME.to_owned(),
+                finish_reason: "stop".to_owned(),
+                parsed: serde_json::json!({
+                    "n": 9_007_199_254_740_993_i64,
+                    "u": u64::MAX,
+                    "a": [1, "x", null],
+                }),
+                lenient: None,
+            }]
+        );
+
+        let invalid = bifrost
+            .sql(&format!("SELECT parse_json('{{bad') AS v {parent}"))
+            .await
+            .expect_err("invalid JSON in parse_json is a query error");
+        assert_eq!(sdk_code(&invalid), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+
+        // A failure after a delivered batch keeps the pre-stream problem: the
+        // one published object streams 8192-row batches in id order, so rows
+        // from id 8192 fail only in the second batch. An unrelated late cast
+        // failure stays generic, and neither result is returned partially.
+        let late_fqn = owned_fqn("variant_late");
+        let late_table = Bifrost::connect_with_table(&client, table(&late_fqn))
+            .await
+            .expect("late-failure writer connects");
+        late_table
+            .register()
+            .await
+            .expect("register the late-failure table");
+        let ids: Vec<i64> = (0..10_000).collect();
+        let late_batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.clone())),
+                Arc::new(arrow::array::StringArray::from(vec!["batch"; ids.len()])),
+            ],
+        )
+        .expect("late-failure batch");
+        late_table
+            .write_batch(&late_fqn, &late_batch)
+            .await
+            .expect("the late-failure batch is accepted");
+        srv.flush_bifrost()
+            .await
+            .expect("publish the late-failure rows");
+        let BifrostClientError::Transport(early) = invalid else {
+            panic!("invalid JSON in one row is refused before the stream opens");
+        };
+        for (sql, expected) in [
+            (
+                format!(
+                    "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
+                     FROM {late_fqn}"
+                ),
+                early.problem(),
+            ),
+            (
+                format!(
+                    "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
+                     FROM {late_fqn}"
+                ),
+                wyrd_spec::error::WyrdError::from(
+                    wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+                )
+                .problem(),
+            ),
+        ] {
+            let late = bifrost
+                .sql(&sql)
+                .await
+                .expect_err("a late failure refuses the whole result");
+            let terminal = late
+                .terminal()
+                .expect("the failure arrives on the terminal");
+            assert_eq!(terminal.row_count, 8192, "one valid batch preceded it");
+            assert_eq!(wyrd_spec::error::WyrdError::from(&late).problem(), expected);
+        }
 
         srv.shutdown().await.expect("server shutdown");
     }

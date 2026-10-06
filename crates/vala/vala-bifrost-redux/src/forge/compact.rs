@@ -517,7 +517,7 @@ mod tests {
     /// parquet-rs row cap and the soft 128 MiB encoded row-group target.
     #[test]
     fn compacted_output_uses_shared_writer_properties() {
-        let properties = crate::parquet::writer_properties::bifrost_writer_properties(10, &[]);
+        let properties = crate::parquet::writer_properties::bifrost_writer_properties(&[]);
         assert_eq!(
             properties.max_row_group_row_count(),
             Some(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT)

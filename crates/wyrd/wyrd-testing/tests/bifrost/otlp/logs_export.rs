@@ -2,19 +2,41 @@
 
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
 use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
-use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
+use wyrd_tonic::otlp::logs_service::{
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::transport::Channel;
 
 use super::support::OtlpJourney;
 use super::trace_export_http::{HttpEncoding, post_otlp};
 
+/// Sends one wholly valid OTLP log export through the bound gRPC route.
+///
+/// # Panics
+///
+/// Panics when the transport cannot be dialed, the export is refused, or the
+/// collector rejects any log record.
+pub(super) async fn export_logs_over_grpc(journey: &OtlpJourney, resource_logs: Vec<ResourceLogs>) {
+    let partial = export_logs_partially_over_grpc(journey, resource_logs).await;
+    assert!(
+        partial.is_none_or(|partial| partial.rejected_log_records == 0),
+        "a wholly valid export reports no rejected log record"
+    );
+}
+
 /// Sends one OTLP log export through the bound gRPC collector route.
+///
+/// Returns the partial success the collector reported, so a caller can
+/// assert which records were rejected and why.
 ///
 /// # Panics
 ///
 /// Panics when the transport cannot be dialed or the export is refused.
-pub(super) async fn export_logs_over_grpc(journey: &OtlpJourney, resource_logs: Vec<ResourceLogs>) {
+pub(super) async fn export_logs_partially_over_grpc(
+    journey: &OtlpJourney,
+    resource_logs: Vec<ResourceLogs>,
+) -> Option<ExportLogsPartialSuccess> {
     let channel = Channel::from_shared(journey.grpc_url())
         .expect("the bound gRPC URL is a valid endpoint")
         .connect()
@@ -27,16 +49,12 @@ pub(super) async fn export_logs_over_grpc(journey: &OtlpJourney, resource_logs: 
             .parse()
             .expect("the minted bearer is valid ASCII metadata"),
     );
-    let partial = LogsServiceClient::new(channel)
+    LogsServiceClient::new(channel)
         .export(request)
         .await
         .expect("the collector accepts the log export")
         .into_inner()
-        .partial_success;
-    assert!(
-        partial.is_none_or(|partial| partial.rejected_log_records == 0),
-        "a wholly valid export reports no rejected log record"
-    );
+        .partial_success
 }
 
 /// Posts one log export in the requested HTTP encoding.
@@ -66,19 +84,21 @@ pub(super) async fn export_logs_over_http(
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
     use arrow::array::{
-        BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray, StringArray,
+        Array, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, StructArray,
     };
+    use arrow::record_batch::RecordBatch;
     use wyrd_runtime::Permission;
-    use wyrd_tonic::prost::Message;
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
+    use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 
     use super::super::support::{
         self, GRPC_SPAN, LOG_DROPPED_ATTRIBUTES, LOG_EVENT_NAME, LOG_FLAGS,
         LOG_OBSERVED_OFFSET_NANOS, LOG_SCOPE_NAME, LOG_SEVERITY_NUMBER, LOG_SEVERITY_TEXT,
         LOGS_TABLE, OtlpJourney, RESOURCE_DROPPED_ATTRIBUTES, RESOURCE_SCHEMA_URL,
-        SCOPE_DROPPED_ATTRIBUTES, SCOPE_SCHEMA_URL, SCOPE_VERSION, column,
+        SCOPE_DROPPED_ATTRIBUTES, SCOPE_SCHEMA_URL, SCOPE_VERSION, assert_variant_probe, column,
     };
     use super::super::trace_export_http::HttpEncoding;
-    use super::{export_logs_over_grpc, export_logs_over_http};
+    use super::{export_logs_over_grpc, export_logs_over_http, export_logs_partially_over_grpc};
 
     /// A log record round-trips its body and context.
     ///
@@ -134,9 +154,9 @@ mod pg_tests {
                 "{transport} stores the OTel event name rather than folding it away"
             );
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "body").value(0),
-                support::log_body().encode_to_vec(),
-                "{transport} keeps the body as its canonical AnyValue encoding"
+                support::variant_json(column::<StructArray>(&row, "body")),
+                support::expected_any_value(Some(&support::log_body())),
+                "{transport} keeps the body as a Variant of its OTLP value"
             );
             assert_eq!(
                 column::<FixedSizeBinaryArray>(&row, "trace_id").value(0),
@@ -149,8 +169,8 @@ mod pg_tests {
             );
             assert_eq!(column::<Int64Array>(&row, "flags").value(0), LOG_FLAGS);
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "attributes").value(0),
-                support::canonical_attribute_bytes(&support::log_attributes())
+                support::variant_json(column::<StructArray>(&row, "attributes")),
+                support::expected_attributes(&support::log_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "dropped_attributes_count").value(0),
@@ -158,8 +178,8 @@ mod pg_tests {
             );
             assert!(column::<BooleanArray>(&row, "resource_present").value(0));
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "resource_attributes").value(0),
-                support::canonical_attribute_bytes(&support::resource_attributes())
+                support::variant_json(column::<StructArray>(&row, "resource_attributes")),
+                support::expected_attributes(&support::resource_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "resource_dropped_attributes_count").value(0),
@@ -179,8 +199,8 @@ mod pg_tests {
                 SCOPE_VERSION
             );
             assert_eq!(
-                column::<LargeBinaryArray>(&row, "scope_attributes").value(0),
-                support::canonical_attribute_bytes(&support::scope_attributes())
+                support::variant_json(column::<StructArray>(&row, "scope_attributes")),
+                support::expected_attributes(&support::scope_attributes())
             );
             assert_eq!(
                 column::<Int64Array>(&row, "scope_dropped_attributes_count").value(0),
@@ -280,14 +300,9 @@ mod pg_tests {
             .await;
 
         assert_eq!(
-            column::<LargeBinaryArray>(&row, "body").value(0),
-            wyrd_tonic::otlp::common::v1::AnyValue {
-                value: Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
-                    "order delayed".to_owned()
-                )),
-            }
-            .encode_to_vec(),
-            "the emitted body is stored as its canonical AnyValue encoding"
+            support::variant_json(column::<StructArray>(&row, "body")),
+            serde_json::json!("order delayed"),
+            "the emitted body is stored as a Variant string"
         );
         assert_eq!(
             column::<Int32Array>(&row, "severity_number").value(0),
@@ -298,17 +313,15 @@ mod pg_tests {
             "ERROR"
         );
         assert_eq!(
-            support::decode_attributes(column::<LargeBinaryArray>(&row, "attributes").value(0))
+            support::decode_attributes(column::<StructArray>(&row, "attributes"))
                 .get("wyrd.test.marker")
                 .map(String::as_str),
             Some("rust-log")
         );
         assert_eq!(
-            support::decode_attributes(
-                column::<LargeBinaryArray>(&row, "resource_attributes").value(0)
-            )
-            .get("service.name")
-            .map(String::as_str),
+            support::decode_attributes(column::<StructArray>(&row, "resource_attributes"))
+                .get("service.name")
+                .map(String::as_str),
             Some(support::STOCK_SERVICE_NAME)
         );
         assert_eq!(
@@ -330,6 +343,216 @@ mod pg_tests {
         assert_eq!(
             column::<FixedSizeBinaryArray>(&row, "span_id").value(0),
             correlated.span_id().to_bytes()
+        );
+
+        journey.shutdown().await;
+    }
+
+    /// Instrumentation scope of the accepted Variant log export.
+    const VARIANT_LOG_SCOPE: &str = "wyrd.tests.variant.log";
+    /// Instrumentation scope of the mixed export carrying an oversized body.
+    const VARIANT_REJECTED_LOG_SCOPE: &str = "wyrd.tests.variant.log.rejected";
+    /// Text body of the record that proves `body_text` promotion.
+    const VARIANT_BODY_TEXT: &str = "order 7 delayed";
+
+    /// Builds one Variant journey log record named by its event name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor instant is negative.
+    fn variant_record(time: i64, event_name: &str, body: Option<AnyValue>) -> LogRecord {
+        LogRecord {
+            time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),
+            observed_time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),
+            event_name: event_name.to_owned(),
+            body,
+            ..LogRecord::default()
+        }
+    }
+
+    /// Wraps records in the Variant journey resource and the named scope.
+    fn variant_resource_logs(scope: &str, log_records: Vec<LogRecord>) -> Vec<ResourceLogs> {
+        vec![ResourceLogs {
+            resource: Some(support::variant_resource()),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(support::variant_scope(scope)),
+                log_records,
+                schema_url: String::new(),
+            }],
+            schema_url: support::RESOURCE_SCHEMA_URL.to_owned(),
+        }]
+    }
+
+    /// The accepted records: a structured body with exception conventions, a
+    /// text body, a present unset body, and an absent body.
+    fn variant_records(time: i64) -> Vec<LogRecord> {
+        let mut structured = variant_record(
+            time,
+            "structured",
+            Some(AnyValue {
+                value: Some(any_value::Value::KvlistValue(KeyValueList {
+                    values: support::variant_probe_attributes("body"),
+                })),
+            }),
+        );
+        structured.attributes = support::variant_probe_attributes("log");
+        structured.attributes.extend([
+            support::string_attribute("exception.type", "TimeoutError"),
+            support::string_attribute("exception.message", "upstream timed out"),
+            support::string_attribute("exception.stacktrace", "at orders::fetch"),
+        ]);
+        vec![
+            structured,
+            variant_record(
+                time,
+                "text",
+                Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(VARIANT_BODY_TEXT.to_owned())),
+                }),
+            ),
+            variant_record(time, "unset", Some(AnyValue { value: None })),
+            variant_record(time, "absent", None),
+        ]
+    }
+
+    /// Asserts every accepted record's body, attributes, and promotions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a body or attribute Variant loses a probe rule, null and
+    /// missing bodies collapse, or a promoted column differs.
+    fn assert_variant_records(batches: &[RecordBatch]) {
+        let structured = support::row_by_string(batches, "event_name", "structured");
+        assert_variant_probe(
+            &support::variant_json(column::<StructArray>(&structured, "body")),
+            "body",
+        );
+        assert_variant_probe(
+            &support::variant_json(column::<StructArray>(&structured, "attributes")),
+            "log",
+        );
+        support::assert_variant_envelope(&structured);
+        for (name, expected) in [
+            ("exception_type", "TimeoutError"),
+            ("exception_message", "upstream timed out"),
+            ("exception_stacktrace", "at orders::fetch"),
+        ] {
+            assert_eq!(
+                column::<StringArray>(&structured, name).value(0),
+                expected,
+                "the log exception convention is promoted into `{name}`"
+            );
+        }
+        assert!(
+            column::<StringArray>(&structured, "body_text").is_null(0),
+            "a structured body has no text promotion"
+        );
+
+        let text = support::row_by_string(batches, "event_name", "text");
+        assert_eq!(
+            support::variant_json(column::<StructArray>(&text, "body")),
+            VARIANT_BODY_TEXT
+        );
+        assert_eq!(
+            column::<StringArray>(&text, "body_text").value(0),
+            VARIANT_BODY_TEXT,
+            "a text body is promoted into `body_text`"
+        );
+
+        let unset = support::row_by_string(batches, "event_name", "unset");
+        assert!(
+            column::<StructArray>(&unset, "body").is_valid(0),
+            "a present unset body is stored, not dropped"
+        );
+        assert_eq!(
+            support::variant_json(column::<StructArray>(&unset, "body")),
+            serde_json::Value::Null,
+            "a present unset body is a Variant null"
+        );
+        let absent = support::row_by_string(batches, "event_name", "absent");
+        assert!(
+            column::<StructArray>(&absent, "body").is_null(0),
+            "an absent body is a SQL null, distinct from a Variant null"
+        );
+    }
+
+    /// Log Variant bodies, attributes, and promoted conventions are queryable.
+    ///
+    /// Four records exported over OTLP/gRPC cover a structured body carrying
+    /// the fidelity probe, a text body, a present unset body, and an absent
+    /// body, under a resource and scope that also carry the probe and the
+    /// promoted conventions. After the real flush, canonical SQL returns whole
+    /// Variant columns that decode to exactly those values, keeps an unset
+    /// body distinct from an absent one, and promotes the exception and text
+    /// conventions.
+    ///
+    /// A second export over OTLP/gRPC pairs a valid sibling with a
+    /// record whose body exceeds the Variant size limit: the collector reports
+    /// exactly that record rejected under the stable Variant code, and only the
+    /// sibling is stored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export is refused, a stored value differs, or the
+    /// oversized record is not rejected with its code.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn log_variant_body_attributes_and_promotions_are_queryable() {
+        let journey = OtlpJourney::start().await;
+        let time = support::anchor_nanos();
+
+        export_logs_over_grpc(
+            &journey,
+            variant_resource_logs(VARIANT_LOG_SCOPE, variant_records(time)),
+        )
+        .await;
+
+        let oversized = AnyValue {
+            value: support::oversized_attribute()
+                .value
+                .and_then(|value| value.value),
+        };
+        let partial = export_logs_partially_over_grpc(
+            &journey,
+            variant_resource_logs(
+                VARIANT_REJECTED_LOG_SCOPE,
+                vec![
+                    variant_record(time, "sibling", None),
+                    variant_record(time, "oversized", Some(oversized)),
+                ],
+            ),
+        )
+        .await
+        .expect("an export with an oversized body reports partial success");
+        assert_eq!(
+            partial.rejected_log_records, 1,
+            "only the oversized record is rejected"
+        );
+        support::assert_too_large_reason(&partial.error_message);
+
+        journey.publish().await;
+        let batches = journey
+            .query(&format!(
+                "SELECT * FROM {LOGS_TABLE} WHERE scope_name = '{VARIANT_LOG_SCOPE}'"
+            ))
+            .await;
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            4,
+            "every accepted record is stored once"
+        );
+        assert_variant_records(&batches);
+
+        let stored = journey
+            .query_one_row(&format!(
+                "SELECT event_name FROM {LOGS_TABLE} \
+                 WHERE scope_name = '{VARIANT_REJECTED_LOG_SCOPE}'"
+            ))
+            .await;
+        assert_eq!(
+            column::<StringArray>(&stored, "event_name").value(0),
+            "sibling",
+            "the valid sibling commits and the oversized record is absent"
         );
 
         journey.shutdown().await;

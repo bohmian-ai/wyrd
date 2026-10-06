@@ -5,7 +5,7 @@
 //! manifest rewrite, snapshot expiry, and cleanup on its maintenance timer.
 
 use chrono::Duration as ChronoDuration;
-use iceberg::spec::{FormatVersion, Operation};
+use iceberg::spec::Operation;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -157,42 +157,6 @@ async fn leader_timer_skips_manifest_rewrite_when_disabled() {
         after.snapshots.len() < before.snapshots.len(),
         "default expiry still retired aged ancestors: {before:?} -> {after:?}"
     );
-}
-
-/// A format-v3 table is skipped by manifest rewrite, as `RisingWave` does.
-///
-/// # Panics
-///
-/// Panics when the table cannot be loaded or upgraded to format v3, or when
-/// the pass committed a rewrite or changed the manifest count.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn leader_timer_skips_manifest_rewrite_on_format_v3() {
-    let table = fragmented_table(
-        "timer_v3",
-        &[
-            ("wyrd.forge.enable-manifest-rewrite", "true"),
-            ("commit.manifest.min-count-to-merge", "2"),
-            ("wyrd.forge.enable-snapshot-expiration", "false"),
-        ],
-    )
-    .await;
-    let catalog = table.fixture.catalog.iceberg_catalog();
-    let loaded = catalog
-        .load_table(&table.fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads");
-    let tx = Transaction::new(&loaded);
-    tx.upgrade_table_version()
-        .set_format_version(FormatVersion::V3)
-        .apply(tx)
-        .expect("upgrade applies")
-        .commit(catalog.as_ref())
-        .await
-        .expect("the table upgrades to v3");
-    let (before, after) = maintain_once(&table).await;
-    assert_eq!(after.snapshot_id, before.snapshot_id, "no rewrite commit");
-    assert_eq!(after.data_manifests, before.data_manifests);
 }
 
 /// Builds the validated logical identity of the fixture's one table.

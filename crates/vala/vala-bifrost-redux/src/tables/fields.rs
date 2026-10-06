@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
+use parquet_variant_compute::VariantType;
+use wyrd_queue::variant::variant_storage_type;
 
 /// Arrow field metadata key Parquet and Iceberg read a field id from.
 ///
@@ -126,6 +128,11 @@ pub enum CanonicalType {
     List(&'static CanonicalField),
     /// Nested record whose children declare its fields in order.
     Struct(&'static [CanonicalField]),
+    /// Self-describing semi-structured value in the Parquet/Iceberg Variant
+    /// encoding, carried on Arrow as the `arrow.parquet.variant` extension
+    /// over [`variant_storage_type`]. Its fingerprint commits only the type tag:
+    /// the storage children and any per-file shredding are not logical shape.
+    Variant,
 }
 
 impl CanonicalType {
@@ -156,6 +163,7 @@ impl CanonicalType {
                     .collect::<Vec<_>>()
                     .into(),
             ),
+            Self::Variant => variant_storage_type(),
         }
     }
 
@@ -227,16 +235,25 @@ impl CanonicalField {
 
     /// Project this entry into its Arrow field, stamping its semantic metadata.
     ///
+    /// A Variant entry also carries the `arrow.parquet.variant` extension
+    /// marker, which is what distinguishes it from a plain storage struct.
+    ///
     /// The `wyrd:sensitive` metadata is written on this field and, through
     /// [`CanonicalType::to_arrow`], on every nested child, so the whole tree
     /// carries its sensitivity into every schema-only consumer. No field id is
     /// written: the registered Iceberg table owns ids.
     #[must_use]
     pub fn to_arrow(&self) -> Field {
-        Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(HashMap::from([(
-            WYRD_SENSITIVE.to_owned(),
-            self.class.is_sensitive().to_string(),
-        )]))
+        let field = Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(
+            HashMap::from([(
+                WYRD_SENSITIVE.to_owned(),
+                self.class.is_sensitive().to_string(),
+            )]),
+        );
+        match self.ty {
+            CanonicalType::Variant => field.with_extension_type(VariantType),
+            _ => field,
+        }
     }
 }
 

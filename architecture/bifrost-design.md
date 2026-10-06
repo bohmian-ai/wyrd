@@ -67,8 +67,10 @@ Required, non-null `principal_id` identifies the authenticated publisher. None
 participates in row identity.
 
 For OTLP records, table-owned projection reads correlation only from the final
-record-level `wyrd.card_ref` and `wyrd.run_id` attributes, retaining all source
-attributes losslessly. The values use the existing `CardRef` and `RunId` text
+record-level `wyrd.card_ref` and `wyrd.run_id` attributes. Every source
+attribute is retained in the record's Variant attribute column; when a
+collection repeats a key, the final occurrence is the one stored, matching the
+OTel data model and the correlation rule. The values use the existing `CardRef` and `RunId` text
 grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
 verified principal scope.
 
@@ -118,6 +120,72 @@ fixed table before it writes — an SDK describing `vala.drift.observations` and
 `vala.eval.observations` at startup — therefore sees the same table a first
 ingest would create, instead of a missing-table error in a tenant that has not
 written yet.
+
+## Storage format and Variant
+
+Every Bifrost table, built-in and user-defined, is created as Iceberg format
+v3, and physical-table validation refuses a table that is not v3. There is no
+other format and no mixed-version state. Appends assign row ids through the v3
+first-row-id mechanism. The hidden lineage columns `_row_id` and
+`_last_updated_sequence_number` are Iceberg metadata, never logical columns:
+they are absent from the table schema, its fingerprints, and every query
+result, and a Forge rewrite preserves both for every surviving row.
+
+Variant is a canonical column type (`DataTypeSpec::Variant`) for open,
+self-describing values. On the Arrow wire a Variant column is the
+`arrow.parquet.variant` extension over the unshredded `metadata`/`value`
+binary Struct; Iceberg and Parquet store it as the v3 Variant type. A field
+declared Variant must carry that extension at every nesting level: missing or
+foreign extension metadata is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, even
+when the storage Struct matches. Extension metadata is not part of a
+fingerprint, so files with different shredding layouts share one table and one
+fingerprint.
+
+A Variant value reads back with the type, nesting, and value it was written
+with. Integers stay integers and never pass through floating point; doubles
+keep their IEEE meaning; strings, booleans, bytes, arrays, and objects keep
+their type; and an absent object key stays distinct from a key whose value is
+null. Object keys are unique: when an OTel attribute collection repeats a key,
+the final occurrence is stored. JSON input converts an integer in the signed
+64-bit (`i64`) range to an integer, an integer from `i64::MAX + 1` through
+`u64::MAX` to a scale-zero Variant decimal, and a non-integer number to a
+double; every other integer is refused with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`, so every accepted integer reads
+back exactly without `serde_json` `arbitrary_precision`. A value
+nested beyond 64 containers is `WYRD_VALA_400_VARIANT_TOO_DEEP`, one whose
+encoded metadata plus value exceeds 8,388,608 bytes is
+`WYRD_VALA_413_VARIANT_TOO_LARGE`, and undecodable bytes are
+`WYRD_VALA_400_VARIANT_INVALID_JSON`. Scribe repeats the extension, size,
+encoding, and depth checks over every declared Variant of a built-in table at
+its admission boundary, before the batch is acknowledged, because a raw Arrow
+writer can skip client preparation and the fingerprint compares storage types
+only. Extension identity is checked across all fields first, then each value
+in row and field order for size, encoding, and depth; the first failure names
+the field, row, and path.
+
+Built-in tables store open caller content as Variant and closed shapes as
+typed columns:
+
+- `vala.traces.spans`, `vala.logs.records`, and `vala.metrics.points` store
+  their attribute collections (record, resource, scope, span event and link,
+  and exemplar filtered attributes), the log `body`, and the metric `metadata`
+  as Variant. `resource_entity_refs` is a list of Structs with `type`,
+  `id_keys`, `description_keys`, and `schema_url`. Well-known
+  semantic-convention values are copied into nullable promoted columns, each
+  null when its source is absent or has another type: `service_name`,
+  `service_version`, and `deployment_environment` on all three signals;
+  `gen_ai_*`, `http_request_method`, `http_route`,
+  `http_response_status_code`, `url_full`, and the `exception_*` columns of the
+  span's last `exception` event on spans; the record's own `exception_*`
+  attributes and `body_text` (the body when it is a string) on logs.
+- `vala.verification.results` replaces its JSON `details` text with two
+  nullable Structs: `drift_report` (`method`, Variant `features`, `verdict`) and
+  `eval_summary` (task counts, `pass_rate`, `duration_ms`). A scored result sets
+  exactly the one its implementation owns.
+- `vala.dev.agent_traces` `messages` and `tool_io`, `vala.eval.observations`
+  `context` and `media`, `vala.eval.result_items` `actual` and `expected`,
+  `vala.gateway.calls` `request_payload` and `response_payload`, and
+  `vala.system.audit_log` `detail` are Variant.
 
 ## Durability and visibility
 
@@ -370,6 +438,34 @@ return a stable structured failure. Representative end-to-end queries prove
 scan/filter/projection, grouped aggregation, join, sort/limit, exchange, and
 spill behavior without claiming exhaustive operator coverage.
 
+### Variant SQL
+
+Every Oracle session — leader planning, admission execution, follower,
+analytical leader, analytical planning, and distributed worker — installs one
+Variant SQL owner before it plans, decodes, or executes:
+
+- `v -> 'key'` and `v -> n` return the Variant at an object key or array index,
+  or null when absent; chains such as `attributes -> 'http' ->> 'route'` follow
+  nested keys.
+- `v ->> 'key'` and `v ->> n` return the same value as text: a string as
+  itself, any other non-null value as its JSON text, and SQL null when absent or
+  JSON null. Its result casts to numeric, boolean, and timestamp types with
+  ordinary SQL cast semantics.
+- `parse_json(text)` returns the Variant for JSON text and fails with
+  `WYRD_VALA_400_VARIANT_INVALID_JSON` on invalid input; `try_parse_json(text)`
+  returns null instead. `to_json(v)` returns a Variant's JSON text.
+
+`->` and `->>` apply only to Variant operands; a JSON text column is queried as
+`parse_json(column) ->> 'key'`. Literal paths lower to one semantic
+`variant_get` UDF backed by Arrow-rs `variant_get`, and `->>` adds text
+conversion after it; a non-literal path element is evaluated per row from the
+full root value. Struct access stays DataFusion's exact `s['field']`
+`get_field`. Every Variant result keeps the `arrow.parquet.variant` extension
+on the wire. The functions travel in physical plans by name, so the function
+set's version is bound into the plan and stage digests peers verify before
+decoding. Variant failures, like every catalogued query failure, keep their
+stable code and details across interactive and distributed execution.
+
 ### Distributed analytical execution
 
 The analytical path uses streamed exchanges parameterized by DataFusion
@@ -620,6 +716,17 @@ exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.
 
+A query failure carries the same complete derive-backed catalog problem, code
+and details, whether it occurs before the first frame or after rows were sent,
+in Interactive and Analytical execution over HTTP and gRPC. The failure
+terminal holds that problem, every SDK raises it unchanged, and collecting a
+result returns no partial rows. Distributed workers forward an execution error
+only as text, so a catalogued Oracle error crosses as its tagged serde form
+inside the existing external `DataFusion` error, and the coordinator
+reconstructs it in one place before mapping the failure; no failure is
+classified from its human message. Only a failure with no catalog identity
+becomes `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+
 A public distributed-plan or execution-path `EXPLAIN` surface is deferred and
 is not part of this delivery. Selected-path evidence reaches callers only
 through the success terminal of the one public query operation. The public
@@ -797,6 +904,14 @@ than being hidden. Applied delete vectors are evidence-only sets and may
 deduplicate by their complete canonical identity. Reading a delete file does
 not make it removable because it may still apply to unselected live data.
 Forge does not reselect, regroup, reconstruct, edit, or rewrite handoff files.
+
+Forge reads the hidden `_row_id` and `_last_updated_sequence_number` beside
+the logical projection, carries them in its internal physical batch, and
+writes those exact values for every surviving row, so a row keeps its lineage
+identity across any number of rewrites. Lineage evidence stays in the output
+`DataFile`s; the five-field handoff is unchanged. A missing, null, or
+mistyped lineage column in any input batch fails the rewrite before commit and
+publishes nothing.
 
 The commit adapter derives delete-file disposition from the immutable base
 snapshot and the applied-delete evidence; the handoff remains exactly five

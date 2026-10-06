@@ -22,6 +22,7 @@ mod pg_tests {
     use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
+    use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::seed_query_fixture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
 
@@ -584,8 +585,6 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()
     -> Result<(), McpJourneyError> {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let server = WyrdTestServer::start_bound().await?;
         let seeded = fixture::seed_canonical_signals(&server, "mcp-canonical-signals").await?;
         let scope = seeded.scope.as_str();
@@ -702,22 +701,101 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({"sql": payload_sql})))
                 .await?,
         )?;
-        // The tool renders a binary column as hex, so the expected structured
-        // messages are compared in the same encoding the agent receives.
-        let payload = messages["rows"][0][0]
-            .as_str()
-            .ok_or("the attribute payload is a JSON string")?;
-        let hex_of = |text: &str| {
-            text.bytes()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        assert!(
-            payload.contains(&hex_of(fixture::INPUT_MESSAGES))
-                && payload.contains(&hex_of(fixture::OUTPUT_MESSAGES)),
-            "an authorized agent reads the structured GenAI messages: {payload}"
+        // The tool renders a Variant cell as its JSON value.
+        assert_eq!(
+            messages["rows"][0][0],
+            serde_json::json!({
+                "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+            }),
+            "an authorized agent reads the structured GenAI messages"
         );
         reader.cancel().await?;
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An agent reads built-in Variant and Struct payloads as JSON values.
+    ///
+    /// The canonical span fixture stores Variant attribute collections and
+    /// Struct events. Through `bifrost.query` an agent reads `->>` text, `->`
+    /// and whole Variant cells as JSON values, a Struct child by exact field
+    /// access, a Variant nested in a Struct, and parsed integers beyond 2^53
+    /// and at `u64::MAX` exactly; invalid JSON in `parse_json` is the stable Variant error and
+    /// `try_parse_json` is null.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value renders differently or the invalid-JSON query is
+    /// not refused with `WYRD_VALA_400_VARIANT_INVALID_JSON`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn builtin_variant_and_struct_payloads_are_queryable() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let seeded = fixture::seed_canonical_signals(&server, "mcp-variant-payloads").await?;
+        let parent = format!(
+            "FROM vala.traces.spans WHERE scope_name = '{}' AND parent_span_id IS NULL",
+            seeded.scope
+        );
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(seeded.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let payloads = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT attributes ->> 'gen_ai.input.messages' AS input_messages, \
+                         attributes -> 'absent' AS absent, attributes, \
+                         events[1]['name'] AS event_name, \
+                         events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
+                         parse_json('{{\"n\": 9007199254740993, \"u\": 18446744073709551615}}') AS parsed, \
+                         try_parse_json('{{bad') AS lenient {parent}"
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            payloads["rows"],
+            serde_json::json!([[
+                fixture::INPUT_MESSAGES,
+                null,
+                {
+                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+                },
+                fixture::EVENT_NAME,
+                "stop",
+                {"n": 9_007_199_254_740_993_i64, "u": u64::MAX},
+                null,
+            ]]),
+            "Variant cells render as their JSON values and Struct access stays exact"
+        );
+
+        let invalid = client
+            .call_tool(query(serde_json::json!({
+                "sql": format!("SELECT parse_json('{{bad') AS v {parent}"),
+            })))
+            .await?;
+        assert_eq!(
+            problem(invalid)?["code"],
+            serde_json::json!("WYRD_VALA_400_VARIANT_INVALID_JSON"),
+            "invalid JSON in parse_json is the stable Variant error"
+        );
 
         client.cancel().await?;
         server.shutdown().await?;

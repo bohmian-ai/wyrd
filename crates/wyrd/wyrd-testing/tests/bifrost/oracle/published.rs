@@ -11,10 +11,12 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
+use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::storage::{
@@ -22,14 +24,22 @@ use vala_bifrost_redux::storage::{
     StorageOperationBarrier, StorageRequestOutcome,
 };
 use wyrd_client::WyrdClient;
+use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::error::WyrdProblem;
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::{BifrostMetricKind, BifrostTelemetryDelta};
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster, shared_process_telemetry_for_test,
 };
 
+use crate::analytical_activation::{
+    COORDINATOR, PEER_FOLLOWERS, PEER_SCRIBE, RemoteWork, sdk_code,
+};
+use crate::peer_cluster::PeerCluster;
 use crate::support::*;
 
 /// The published read path is governed end to end by the node's storage owner.
@@ -1071,4 +1081,431 @@ async fn expired_process_shutdown_aborts_storage_and_returns_failure() {
         .shutdown()
         .await
         .expect("the harness releases its fixtures");
+}
+
+/// One Variant value per fixture row, built from the row's own `filter_key`.
+///
+/// Deriving the document from a column keeps every Variant expression a
+/// per-row computation the planner cannot fold to a constant, so it runs in
+/// whichever session executes the scan: the leader for an Interactive query
+/// and every worker for an Analytical one.
+const ROW_VARIANT: &str = "parse_json('{\"k\":\"' || filter_key || \
+     '\",\"n\":9007199254740993,\"o\":{\"a\":[1,\"x\",null]}}')";
+
+/// Every production Oracle session exposes the one Variant SQL surface.
+///
+/// One four-pod topology runs the same operator and function matrix through
+/// the Interactive leader session and through an Analytical graph whose stages
+/// round-trip the distributed plan to both followers, so each session decodes
+/// and executes the Variant UDFs itself. Invalid `parse_json` text is the
+/// stable Variant error on both paths, before the first batch or after a
+/// delivered one, while `try_parse_json` is null, and a
+/// Variant read of a sensitive gateway payload is refused before any remote
+/// work. Plan shape (`variant_get` for Variant, `get_field` for Struct) is the
+/// shared installer's contract, pinned by
+/// `oracle::variant_sql::tests::variant_operators_and_functions_follow_the_contract`;
+/// this journey proves every production session runs that installer.
+///
+/// # Panics
+///
+/// Panics when any session diverges from the Variant contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn variant_sql_registry_covers_every_session() {
+    prove_variant_sql_sessions()
+        .await
+        .expect("Variant SQL session journey");
+}
+
+/// Drives the Variant matrix through every session of one peer topology.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
+    let cluster = PeerCluster::start_with_slots(&[
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Scribe, None),
+    ])
+    .await?;
+    let suffix = uuid::Uuid::now_v7().simple();
+    // Two published objects give the grouped statement remote work to
+    // distribute; one object keeps the filtered read a leader-only leaf.
+    let table = format!("variant_sql_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
+    let ui_table = format!("variant_sql_ui_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &ui_table).await?;
+    cluster
+        .ingest_rows(PEER_SCRIBE, &ui_table, 0, 12, 3)
+        .await?;
+    let coordinator = cluster.server(COORDINATOR)?;
+    coordinator
+        .ensure_builtin_table_for_test(cluster.tenant(), "gateway", "calls")
+        .await?;
+    cluster.refresh_snapshots().await?;
+
+    let api_key = cluster
+        .provision_public_api_key("variant-sql-caller")
+        .await?;
+    let client = public_client(coordinator, &api_key)?;
+
+    // Interactive: the leader session plans and executes every operator,
+    // including a residual Variant predicate and exact Struct access.
+    let (path, rows) = run_rows(
+        &client,
+        &format!(
+            "SELECT {ROW_VARIANT} ->> 'k' AS k, \
+             CAST({ROW_VARIANT} ->> 'n' AS BIGINT) AS n, \
+             to_json({ROW_VARIANT} -> 'o') AS o, to_json({ROW_VARIANT}) AS root, \
+             named_struct('m', filter_key)['m'] AS s, \
+             try_parse_json('{{bad') IS NULL AS lenient \
+             FROM vala.bifrost.{ui_table} WHERE ({ROW_VARIANT} ->> 'k') = 'group_0' ORDER BY id"
+        ),
+    )
+    .await?;
+    expect_path("Interactive matrix", path, QueryClass::Interactive)?;
+    let expected = [
+        "group_0",
+        "9007199254740993",
+        r#"{"a":[1,"x",null]}"#,
+        r#"{"k":"group_0","n":9007199254740993,"o":{"a":[1,"x",null]}}"#,
+        "group_0",
+        "true",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if rows != vec![expected; 4] {
+        return Err(format!("the Interactive Variant matrix returned {rows:?}").into());
+    }
+
+    // Analytical: both followers decode the distributed plan, so the Variant
+    // UDFs resolve in their worker sessions, not only on the leader.
+    let remote_before = RemoteWork::observe(&cluster)?;
+    let (path, rows) = run_rows(
+        &client,
+        &format!(
+            "SELECT {ROW_VARIANT} ->> 'k' AS k, COUNT(*) AS matched, \
+             MAX(to_json({ROW_VARIANT} -> 'o')) AS o \
+             FROM vala.bifrost.{table} WHERE ({ROW_VARIANT} ->> 'n') IS NOT NULL \
+             GROUP BY 1 ORDER BY 1"
+        ),
+    )
+    .await?;
+    expect_path("Analytical matrix", path, QueryClass::Analytical)?;
+    remote_before.expect_advanced(&cluster, "Analytical Variant matrix")?;
+    let expected: Vec<Vec<String>> = (0..3)
+        .map(|group| {
+            vec![
+                format!("group_{group}"),
+                "8".to_owned(),
+                r#"{"a":[1,"x",null]}"#.to_owned(),
+            ]
+        })
+        .collect();
+    if rows != expected {
+        return Err(format!("the Analytical Variant matrix returned {rows:?}").into());
+    }
+
+    // Invalid text is the stable Variant error whichever session meets it,
+    // before any batch or after a valid one: the late terminal carries the
+    // same catalog problem, and the whole result is refused.
+    let invalid_json = wyrd_spec::error::WyrdError::from(BifrostError::VariantInvalidJson {
+        field: "parse_json".to_owned(),
+        row: 0,
+        path: String::new(),
+    })
+    .problem();
+    for (case, sql) in [
+        (
+            "Interactive invalid JSON",
+            format!("SELECT parse_json('{{bad' || filter_key) AS v FROM vala.bifrost.{ui_table}"),
+        ),
+        (
+            "Analytical invalid JSON",
+            format!(
+                "SELECT parse_json('{{bad' || filter_key) ->> 'k' AS k, COUNT(*) AS matched \
+                 FROM vala.bifrost.{table} GROUP BY 1"
+            ),
+        ),
+    ] {
+        match run_rows(&client, &sql).await {
+            Err(error) => {
+                let problem = error
+                    .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+                    .map(|error| wyrd_spec::error::WyrdError::from(error).problem());
+                if problem.as_ref() != Some(&invalid_json) {
+                    return Err(format!("{case} failed as {problem:?}: {error}").into());
+                }
+            }
+            Ok(rows) => return Err(format!("{case} settled {rows:?}").into()),
+        }
+    }
+    prove_late_failures(&cluster, &client, &suffix, &invalid_json).await?;
+    prove_worker_tenant_refusal(&cluster, &client, &suffix).await?;
+
+    // A caller without gateway payload authority is refused at the logical
+    // plan, before any peer or provider work.
+    let unprivileged = client_from_bootstrap(
+        coordinator,
+        coordinator
+            .bootstrap_service_in_tenant(
+                cluster.tenant(),
+                "variant-sql-unprivileged",
+                &[WORKLOAD_ROLE],
+            )
+            .await?,
+    )
+    .await?;
+    let remote_before = RemoteWork::observe(&cluster)?;
+    match run_rows(
+        &unprivileged,
+        "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls",
+    )
+    .await
+    {
+        Err(error)
+            if error
+                .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+                .map(sdk_code)
+                == Some("WYRD_VALA_403_QUERY_FORBIDDEN") => {}
+        Err(error) => {
+            return Err(format!("the sensitive Variant read failed as {error}").into());
+        }
+        Ok(rows) => return Err(format!("the sensitive Variant read settled {rows:?}").into()),
+    }
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        if cluster.graph_leases(index)?.0 != remote_before.leases[offset] {
+            return Err(format!("the refused read leased a graph on follower {index}").into());
+        }
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Proves a failure after a delivered batch keeps its catalog problem.
+///
+/// One object read in id order streams 8192-row batches through the
+/// Interactive leader, so rows from id 8192 fail in the second batch. Two
+/// objects read through a bounded sort run as an Analytical graph whose
+/// coordinator merges ten sorted batches before projecting them, so rows from
+/// id 36864 fail only in the last batch. Each late Variant failure must match
+/// the pre-stream problem exactly, an unrelated late cast failure must stay
+/// the generic execution failure, and every collected result is refused
+/// rather than returned partially.
+///
+/// # Errors
+///
+/// Returns the first case that settled, ran on the wrong path, failed before
+/// a batch was delivered, or carried a different problem.
+async fn prove_late_failures(
+    cluster: &PeerCluster,
+    client: &WyrdClient,
+    suffix: &impl Display,
+    invalid_json: &WyrdProblem,
+) -> Result<(), JourneyError> {
+    let interactive = format!("variant_late_one_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &interactive).await?;
+    cluster
+        .ingest_rows(PEER_SCRIBE, &interactive, 0, 10_000, 3)
+        .await?;
+    let analytical = format!("variant_late_two_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &analytical).await?;
+    for _ in 0..2 {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &analytical, 0, 40_960, 3)
+            .await?;
+    }
+    cluster.refresh_snapshots().await?;
+    let generic = wyrd_spec::error::WyrdError::from(BifrostError::QueryExecutionFailed).problem();
+    let sorted =
+        format!("(SELECT id FROM vala.bifrost.{analytical} ORDER BY id LIMIT 81920) AS sorted");
+    for (case, path, sql, expected) in [
+        (
+            "Interactive late invalid JSON",
+            QueryClass::Interactive,
+            format!(
+                "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
+                 FROM vala.bifrost.{interactive}"
+            ),
+            invalid_json,
+        ),
+        (
+            "Analytical late invalid JSON",
+            QueryClass::Analytical,
+            format!(
+                "SELECT id, parse_json(CASE WHEN id < 36864 THEN '1' ELSE '{{bad' END) AS v \
+                 FROM {sorted}"
+            ),
+            invalid_json,
+        ),
+        (
+            "Interactive late cast failure",
+            QueryClass::Interactive,
+            format!(
+                "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
+                 FROM vala.bifrost.{interactive}"
+            ),
+            &generic,
+        ),
+    ] {
+        let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+            Err(error) => error,
+            Ok(result) => {
+                return Err(format!("{case} returned {} rows", result.num_rows()).into());
+            }
+        };
+        let terminal = error
+            .terminal()
+            .ok_or_else(|| format!("{case} failed before the stream opened: {error}"))?;
+        expect_path(case, terminal.query_class, path)?;
+        if terminal.row_count == 0 {
+            return Err(format!("{case} failed before a batch was delivered").into());
+        }
+        let problem = wyrd_spec::error::WyrdError::from(&error).problem();
+        if &problem != expected {
+            return Err(format!("{case} failed as {problem:?}").into());
+        }
+    }
+    Ok(())
+}
+
+/// Proves a worker's tenant refusal reaches the caller with its full problem.
+///
+/// Two published objects plus one hot file whose footer names a foreign
+/// tenant are read through a bounded sort, so the statement runs as an
+/// Analytical graph whose remote leaf stage scans the foreign file on a
+/// follower. The refusal is raised on that worker and must cross the peer
+/// boundary as the complete `QueryTenantInvariant` problem, with no rows
+/// returned and every Oracle back at its pre-query ownership.
+///
+/// The refusal is accepted on either surface: the footer check fails on the
+/// first poll of the partition holding the foreign file, so whether a clean
+/// batch is delivered first depends on scheduling, and ordering it
+/// deterministically would need a new execution hook. When a terminal frame
+/// is present it must report Analytical execution.
+///
+/// # Errors
+///
+/// Returns the first claim that broke: a settled query, a different problem,
+/// a non-Analytical terminal, no remote work, or an Oracle that did not
+/// settle.
+async fn prove_worker_tenant_refusal(
+    cluster: &PeerCluster,
+    client: &WyrdClient,
+    suffix: &impl Display,
+) -> Result<(), JourneyError> {
+    let table = format!("variant_late_tenant_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    for _ in 0..2 {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &table, 0, 4_096, 3)
+            .await?;
+    }
+    cluster
+        .seed_foreign_hot_row(
+            PEER_SCRIBE,
+            &table,
+            &format!("variant-late-foreign-{suffix}"),
+        )
+        .await?;
+    cluster.refresh_snapshots().await?;
+    let baseline = cluster
+        .indices_of(BifrostTarget::Oracle)
+        .into_iter()
+        .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    let remote_before = RemoteWork::observe(cluster)?;
+    let case = "worker tenant refusal";
+    let sql = format!(
+        "SELECT id FROM (SELECT id FROM vala.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
+    );
+    let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+        Err(error) => error,
+        Ok(result) => return Err(format!("{case} returned {} rows", result.num_rows()).into()),
+    };
+    if let Some(terminal) = error.terminal() {
+        expect_path(case, terminal.query_class, QueryClass::Analytical)?;
+    }
+    let problem = wyrd_spec::error::WyrdError::from(&error).problem();
+    let expected = wyrd_spec::error::WyrdError::from(BifrostError::QueryTenantInvariant).problem();
+    if problem != expected {
+        return Err(format!("{case} failed as {problem:?}").into());
+    }
+    // Every task of the scanning stage routes to one follower, so remote work
+    // is proven by any follower leasing the graph.
+    let mut leased = false;
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        leased |= cluster.graph_leases(index)?.0 > remote_before.leases[offset];
+    }
+    if !leased {
+        return Err(format!("{case} leased no graph on any follower").into());
+    }
+    for (index, before) in baseline {
+        await_baseline(cluster, index, before).await?;
+    }
+    Ok(())
+}
+
+/// Requires a settled query to have run on the expected execution path.
+///
+/// # Errors
+///
+/// Returns a message naming `case` and both paths when they differ.
+fn expect_path(case: &str, path: QueryClass, expected: QueryClass) -> Result<(), JourneyError> {
+    if path == expected {
+        Ok(())
+    } else {
+        Err(format!("{case}: expected {expected:?} execution, settled {path:?}").into())
+    }
+}
+
+/// Runs one public query to its terminal and renders every cell as text.
+///
+/// Rendering through Arrow's display formatter lets one comparison cover
+/// strings, integers, and booleans without a per-column downcast.
+///
+/// # Errors
+///
+/// Returns the SDK error unchanged so a caller can read its catalog code, or a
+/// message when the stream ends without a terminal or a cell cannot render.
+async fn run_rows(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<(QueryClass, Vec<Vec<String>>), JourneyError> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(30_000),
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        rows.extend(render_rows(&batch)?);
+    }
+    let terminal = stream
+        .terminal()
+        .ok_or("public query produced no terminal frame")?;
+    Ok((terminal.query_class, rows))
+}
+
+/// Renders every cell of one batch with Arrow's display formatter.
+///
+/// # Errors
+///
+/// Returns the formatter error for a column it cannot render.
+fn render_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>, JourneyError> {
+    (0..batch.num_rows())
+        .map(|row| {
+            batch
+                .columns()
+                .iter()
+                .map(|column| Ok(arrow::util::display::array_value_to_string(column, row)?))
+                .collect()
+        })
+        .collect()
 }

@@ -535,8 +535,10 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         }
         config.set_extension(Arc::clone(&self.detached_local_worker));
         builder = builder.with_config(config);
-        Ok(builder
-            .with_runtime_env(Arc::clone(graph.runtime()))
+        // The stage plan names Variant functions; the worker must resolve them
+        // from the same registry the leader planned with.
+        Ok(super::variant_sql::OracleVariantSql::shared()
+            .install(builder.with_runtime_env(Arc::clone(graph.runtime())))
             .build())
     }
 }
@@ -7679,10 +7681,13 @@ impl AnalyticalExecutionHandle {
         // codec that matched, so a second entry shifts every position past the
         // one a follower builds from its own single install, and the follower
         // then refuses the plan with "Can't find required codec in codec list".
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_runtime_env(Arc::clone(runtime.runtime()))
+        let state = super::variant_sql::OracleVariantSql::shared()
+            .install(
+                datafusion::execution::session_state::SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_config(config)
+                    .with_runtime_env(Arc::clone(runtime.runtime())),
+            )
             .with_distributed_planner()
             .build();
         Ok(SessionContext::new_with_state(state))

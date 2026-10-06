@@ -1,5 +1,7 @@
 use arrow::datatypes::Field;
 
+use wyrd_queue::variant::variant_field;
+
 use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
@@ -27,8 +29,8 @@ impl DomainTable for AgentTracesTable {
             utf8("role", false),
             utf8("model", false),
             utf8("provider", false),
-            utf8("messages", false),
-            utf8("tool_io", true),
+            variant_field("messages", false),
+            variant_field("tool_io", true),
             ts_us_utc("started_at", false),
             ts_us_utc("ended_at", false),
         ]

@@ -285,9 +285,8 @@ mod tests {
     use vala_bifrost_redux::oracle::OracleQueryStream;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        QueryWarning, SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalFrame,
+        QueryTerminalOutcome, QueryWarning, SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
     use wyrd_tonic::tonic::Code;
@@ -599,10 +598,14 @@ mod tests {
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
-                error: Some(QueryTerminalError {
-                    code: QueryTerminalErrorCode::QueryExecutionFailed,
-                    detail: Some(QueryErrorDetail::new("worker failed").expect("scrubbed detail")),
-                }),
+                error: Some(Box::new(
+                    wyrd_spec::error::WyrdError::from(BifrostError::VariantInvalidJson {
+                        field: "parse_json".to_owned(),
+                        row: 1,
+                        path: String::new(),
+                    })
+                    .problem(),
+                )),
                 // A failed stream never calls `finish`, so it has no end-of-stream.
                 arrow_ipc_eos: Vec::new(),
             }),

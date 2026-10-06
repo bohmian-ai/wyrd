@@ -296,8 +296,8 @@ impl Drop for RunningQueryTerminalOwner {
 enum QueryStreamEvent {
     /// Next physical batch result, or `None` when execution completed.
     Batch(Option<Result<RecordBatch, datafusion::error::DataFusionError>>),
-    /// Stable terminal failure selected before another batch is exposed.
-    Failed(QueryTerminalErrorCode),
+    /// Catalog failure selected before another batch is exposed.
+    Failed(BifrostError),
 }
 
 /// Inputs retained by the lazy frame stream until terminal cleanup.
@@ -353,7 +353,7 @@ async fn next_frame_event(
     deadline: std::time::Instant,
 ) -> QueryStreamEvent {
     if cancellation_requested(stream_cancellation, request_cancellation) {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
+        return QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed);
     }
     if let Some(value) = next.take() {
         return QueryStreamEvent::Batch(Some(value));
@@ -470,7 +470,7 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
                         &mut row_count,
                     ) {
                         Err(()) => break failed_terminal_on_path(
-                            QueryTerminalErrorCode::QueryExecutionFailed,
+                            BifrostError::QueryExecutionFailed,
                             row_count,
                             query_class,
                         ),
@@ -490,17 +490,17 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
                     }
                 }
                 QueryStreamEvent::Batch(Some(Err(error))) => {
-                    let code = terminal_error_code(&error);
-                    tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                    break failed_terminal_on_path(code, row_count, query_class);
+                    let error = map_datafusion_error(&error);
+                    tracing::error!(error_code = error.code(), "Oracle query stream execution failed");
+                    break failed_terminal_on_path(error, row_count, query_class);
                 }
                 QueryStreamEvent::Batch(None) => break exhausted_terminal(
                     &degraded_sources,
                                 row_count,
                     query_class,
                 ),
-                QueryStreamEvent::Failed(code) => {
-                    break failed_terminal_on_path(code, row_count, query_class);
+                QueryStreamEvent::Failed(error) => {
+                    break failed_terminal_on_path(error, row_count, query_class);
                 }
             }
         };
@@ -691,11 +691,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     let candidate = if settlement.clean {
         candidate
     } else {
-        failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryExecutionFailed,
-            row_count,
-            query_class,
-        )
+        failed_terminal_on_path(BifrostError::QueryExecutionFailed, row_count, query_class)
     };
     let candidate = close_ipc_stream(ipc, candidate, row_count, query_class);
     let terminal = release_and_finish_terminal(
@@ -761,20 +757,20 @@ async fn next_query_stream_event(
     deadline: Instant,
 ) -> QueryStreamEvent {
     if cancellation.is_cancelled() || request_cancellation.is_cancelled() {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
+        return QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed);
     }
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout);
+        return QueryStreamEvent::Failed(BifrostError::QueryTimeout);
     };
     tokio::select! {
         () = cancellation.cancelled() => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+            QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed)
         }
         () = request_cancellation.cancelled() => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+            QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed)
         }
         () = tokio::time::sleep(remaining) => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
+            QueryStreamEvent::Failed(BifrostError::QueryTimeout)
         }
         value = batches.next() => QueryStreamEvent::Batch(value),
     }
@@ -944,7 +940,7 @@ fn successful_terminal(
         .any(|source| *source != QuerySource::LiveTail);
     if published_lost {
         return failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryVisibilityUnavailable,
+            BifrostError::QueryVisibilityUnavailable,
             row_count,
             query_class,
         );
@@ -1314,47 +1310,6 @@ impl QueryIpcDecoder {
     }
 }
 
-/// Maps a late `DataFusion` failure to the closed terminal-code catalog.
-///
-/// A typed resource refusal or query deadline anywhere in the chain is
-/// selected structurally before any message classification. The deadline is
-/// typed because a live source enforces the same query deadline as the leader
-/// on its own timer, and whichever fires first must report the same timeout.
-fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
-    if super::datafusion_resources_exhausted(error) {
-        return QueryTerminalErrorCode::QueryResourcesExhausted;
-    }
-    if datafusion_query_timeout(error) {
-        return QueryTerminalErrorCode::QueryTimeout;
-    }
-    let message = error.to_string().to_ascii_lowercase();
-    if super::is_tenant_refusal(error) {
-        QueryTerminalErrorCode::QueryTenantInvariant
-    } else if message.contains("reconciliation invariant") {
-        QueryTerminalErrorCode::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        QueryTerminalErrorCode::QueryAuditUnavailable
-    } else {
-        QueryTerminalErrorCode::QueryExecutionFailed
-    }
-}
-
-/// Reports whether a typed [`BifrostError::QueryTimeout`] sits anywhere in an
-/// execution error chain, including contextual wrappers added by plans.
-fn datafusion_query_timeout(error: &datafusion::error::DataFusionError) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if matches!(
-            current.downcast_ref::<BifrostError>(),
-            Some(BifrostError::QueryTimeout)
-        ) {
-            return true;
-        }
-        source = current.source();
-    }
-    false
-}
-
 /// Selects the terminal outcome for a stream that observed a failed step.
 fn failed_stream_outcome(explicit_cancelled: &std::sync::atomic::AtomicBool) -> &'static str {
     if explicit_cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -1404,11 +1359,7 @@ fn close_ipc_stream(
         },
         Err(error) => {
             tracing::error!(%error, "Oracle query stream could not close its Arrow IPC stream");
-            failed_terminal_on_path(
-                QueryTerminalErrorCode::QueryExecutionFailed,
-                row_count,
-                query_class,
-            )
+            failed_terminal_on_path(BifrostError::QueryExecutionFailed, row_count, query_class)
         }
     }
 }
@@ -1677,6 +1628,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
+    use datafusion::error::DataFusionError;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
@@ -1687,8 +1639,8 @@ mod tests {
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::failed_terminal_on_path;
     use crate::oracle::{
-        BifrostError, OracleTelemetry, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        BifrostError, OracleTelemetry, QueryCatalogError, QueryClass, QuerySchemaFrame,
+        QuerySource, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -1700,19 +1652,67 @@ mod tests {
     /// Panics when the typed chain is not selected before message text.
     #[test]
     fn late_resource_exhaustion_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "tenant invariant".to_owned(),
             Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),
         );
         assert_eq!(
-            super::terminal_error_code(&wrapped),
-            QueryTerminalErrorCode::QueryResourcesExhausted
+            crate::oracle::map_datafusion_error(&wrapped),
+            BifrostError::QueryResourcesExhausted
         );
         assert_eq!(
-            super::terminal_error_code(&DataFusionError::Internal("private".to_owned())),
-            QueryTerminalErrorCode::QueryExecutionFailed
+            crate::oracle::map_datafusion_error(&DataFusionError::Internal("private".to_owned())),
+            BifrostError::QueryExecutionFailed
         );
+    }
+
+    /// A late catalog failure keeps its exact code and details, whether its
+    /// envelope is in the local chain or crossed from a worker, and the failed
+    /// terminal carries that error's complete problem.
+    ///
+    /// The remote form is the pinned distributed wire shape: the worker's
+    /// `External` envelope is reduced to its display text and rebuilt as a
+    /// generic `External` under the structurally preserved `Context` frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the late mapping or terminal loses the catalog identity.
+    #[test]
+    fn late_catalog_error_keeps_its_identity() {
+        for error in [
+            BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 1,
+                path: String::new(),
+            },
+            BifrostError::QueryTenantInvariant,
+        ] {
+            let envelope = QueryCatalogError::external(error.clone());
+            let DataFusionError::External(inner) = &envelope else {
+                panic!("the envelope is an external error");
+            };
+            let text = inner.to_string();
+            let local = DataFusionError::Context("late batch".to_owned(), Box::new(envelope));
+            let forwarded = DataFusionError::Context(
+                "remote stage".to_owned(),
+                Box::new(DataFusionError::Context(
+                    "late batch".to_owned(),
+                    Box::new(DataFusionError::External(text.into())),
+                )),
+            );
+            for late in [local, forwarded] {
+                let mapped = crate::oracle::map_datafusion_error(&late);
+                assert_eq!(mapped, error);
+                let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);
+                assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
+                assert_eq!(
+                    terminal.error,
+                    Some(Box::new(
+                        wyrd_spec::error::WyrdError::from(error.clone()).problem()
+                    ))
+                );
+            }
+        }
     }
 
     /// A typed query deadline raised by a live source, under its context
@@ -1723,7 +1723,6 @@ mod tests {
     /// Panics when the typed deadline is not selected.
     #[test]
     fn late_query_deadline_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "Oracle query deadline elapsed during a live Scribe read".to_owned(),
             Box::new(DataFusionError::External(Box::new(
@@ -1731,8 +1730,8 @@ mod tests {
             ))),
         );
         assert_eq!(
-            super::terminal_error_code(&wrapped),
-            QueryTerminalErrorCode::QueryTimeout
+            crate::oracle::map_datafusion_error(&wrapped),
+            BifrostError::QueryTimeout
         );
     }
 
@@ -1820,8 +1819,8 @@ mod tests {
                 "{source:?} loss must fail"
             );
             assert_eq!(
-                failed.error.as_ref().map(|error| error.code),
-                Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
+                failed.error.as_ref().map(|error| error.code.as_str()),
+                Some("WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE")
             );
             failed
                 .validate()
@@ -1976,7 +1975,7 @@ mod tests {
             super::QueryIpcEncoder::new(schema).expect("failed stream opens");
         drop(dropped);
         let failed = failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryExecutionFailed,
+            BifrostError::QueryExecutionFailed,
             0,
             QueryClass::Interactive,
         );

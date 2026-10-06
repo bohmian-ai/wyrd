@@ -3,14 +3,17 @@ use futures_util::StreamExt as _;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
-use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
+use vala_bifrost_redux::oracle::{
+    AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder, failed_terminal,
+};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass};
+use wyrd_spec::vala::BifrostError;
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass, QueryStreamFrame};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
@@ -143,10 +146,6 @@ pub(super) async fn audit_rows(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJourneyError> {
-    use vala_bifrost_redux::oracle::{OracleQueryStream, failed_terminal};
-    use wyrd_spec::vala::BifrostError;
-    use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalErrorCode};
-
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let controls = server
@@ -180,7 +179,7 @@ async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJou
             OracleQueryStream::test_new("settlement-fixture".to_owned(), frames, token.clone());
         stream.deadline_ms =
             chrono::Utc::now().timestamp_millis() + if case == "deadline" { 200 } else { 5_000 };
-        let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 0);
+        let terminal = failed_terminal(BifrostError::QueryExecutionFailed, 0);
         let observed = (case == "consumed failed").then(|| terminal.clone());
         let controls = controls.clone();
         let settlement = tokio::spawn(async move {

@@ -500,9 +500,10 @@ impl ScribeImpl {
     /// definition is what carries the table's declared correlation policy and
     /// past-event-time exemption, and a table that appends no correlation
     /// envelope must be stamped as such or its physical object would carry
-    /// columns its registered schema does not. The narrower canonical contract
-    /// — the value validator and the canonical physical fingerprint — is keyed
-    /// off `canonical_validator` at its own sites. A dynamic table resolves to
+    /// columns its registered schema does not. Every built-in's value validator
+    /// runs from it, and the narrower canonical contract — the ledger order and
+    /// the canonical physical fingerprint — is keyed off `canonical_fields` at
+    /// its own sites. A dynamic table resolves to
     /// `None` and keeps the default envelope.
     fn builtin_definition(
         table: &crate::catalog::TableRef,

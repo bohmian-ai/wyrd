@@ -525,8 +525,11 @@ pub(crate) struct DecodeContext<'a> {
 ///
 /// Returns a stable Scribe refusal for a duplicated column name, reserved
 /// columns, fingerprint mismatch, card-scope failure, invalid event
-/// time, or managed column construction failure, and a fingerprint mismatch
-/// when a stamped field has no registered counterpart.
+/// time, or managed column construction failure, a fingerprint mismatch
+/// when a stamped field has no registered counterpart, and
+/// [`ScribeError::ContractViolation`] carrying the catalogued error when a
+/// built-in's declared Variant arrives without its extension or holds a value
+/// that cannot be stored.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -553,17 +556,15 @@ fn decode_rows(
             return Err(ScribeError::InvalidFrame);
         }
     }
-    let actual_source_fingerprint = source_schema_fingerprint(rows.schema().as_ref());
+    if let Some(definition) = context.definition {
+        enforce_builtin_source_contract(rows, definition)?;
+    }
+    let actual_source_fingerprint =
+        source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
     if actual_source_fingerprint != context.expected_schema_fingerprint {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
-    }
-    if let Some(definition) = context
-        .definition
-        .filter(|definition| definition.canonical_validator.is_some())
-    {
-        enforce_canonical_source_contract(rows, definition)?;
     }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
@@ -576,72 +577,59 @@ fn decode_rows(
     }
 }
 
-/// Enforces one canonical built-in's exact user contract before stamping.
+/// Enforces one built-in's user contract before the fingerprint check.
 ///
-/// The caller of a canonical signal table owns exactly the table's declared
-/// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
-/// optional `wyrd_event_time`). This rejects any unknown `wyrd_*` field, runs
-/// the table's own registered value validator over
-/// the remaining user block, and then requires that block to match
-/// `(definition.arrow_fields)()` in order, name, nullability, and type shape,
-/// so no structurally different Arrow spelling reaches the physical schema.
-/// Field metadata is not compared: the field id and sensitivity tag are the
-/// server's own physical identity, stamped downstream from the registered
-/// table and the definition, so
-/// a writer building from the published description neither supplies them nor
+/// The caller's user block — the batch without server-owned columns — goes
+/// through the table's own value validator, the one seam every built-in
+/// owns, so the Variant contract and a canonical signal's ledger refuse with
+/// their catalogued code before the storage fingerprint could reduce them to
+/// a mismatch. A canonical signal table additionally refuses any unknown
+/// `wyrd_*` field first, and afterwards requires its user block to match
+/// `(definition.arrow_fields)()` in order, so no structurally different Arrow
+/// spelling reaches the physical schema. Field metadata is not compared: the
+/// field id and sensitivity tag are the server's own physical identity,
+/// stamped downstream from the registered table and the definition, so a
+/// writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column, and
-/// [`ScribeError::FingerprintMismatch`] when the table's value
-/// validator refuses the batch or the remaining user fields differ from the
-/// table's declared fields.
-fn enforce_canonical_source_contract(
+/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
+/// [`ScribeError::ContractViolation`] carrying the validator's catalogued
+/// refusal, and [`ScribeError::FingerprintMismatch`] when a canonical user
+/// block is not in the declared order.
+fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
 ) -> Result<(), ScribeError> {
+    let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
-    for field in schema.fields() {
-        if field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME {
-            return Err(ScribeError::InvalidFrame);
-        }
+    if canonical
+        && schema
+            .fields()
+            .iter()
+            .any(|field| field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME)
+    {
+        return Err(ScribeError::InvalidFrame);
     }
-    let permitted = [CARD_REF, RUN_ID, WYRD_EVENT_TIME];
-    let mut fields = Vec::with_capacity(schema.fields().len());
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for (index, field) in schema.fields().iter().enumerate() {
-        if permitted.contains(&field.name().as_str()) {
-            continue;
-        }
-        fields.push(field.as_ref().clone());
-        columns.push(Arc::clone(rows.column(index)));
-    }
+    let policy = definition.correlation_policy;
+    let user = RecordBatch::try_new(
+        Arc::new(Schema::new(user_fields(rows, policy))),
+        user_columns(rows, policy),
+    )
+    .map_err(|_| ScribeError::InvalidFrame)?;
+    (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
     let declared = (definition.arrow_fields)();
-    let shape_matches = fields.len() == declared.len()
-        && fields.iter().zip(&declared).all(|(supplied, expected)| {
-            supplied.name() == expected.name()
-                && supplied.is_nullable() == expected.is_nullable()
-                && supplied.data_type().equals_datatype(expected.data_type())
-        });
-    if !shape_matches {
+    let in_order = user
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .eq(declared.iter().map(Field::name));
+    if canonical && !in_order {
         return Err(ScribeError::FingerprintMismatch {
             table: format!("{}.{}", definition.namespace, definition.name),
         });
-    }
-    let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|_| ScribeError::InvalidFrame)?;
-    if let Some(validate) = definition.canonical_validator {
-        validate(&user).map_err(|reason| {
-            tracing::warn!(
-                table = %format!("{}.{}", definition.namespace, definition.name),
-                %reason,
-                "canonical user block was refused by the table's value validator"
-            );
-            ScribeError::FingerprintMismatch {
-                table: format!("{}.{}", definition.namespace, definition.name),
-            }
-        })?;
     }
     Ok(())
 }
@@ -681,15 +669,21 @@ fn enforce_canonical_physical_identity(
     }
 }
 
-fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+/// Fingerprints the caller-owned block of one source schema.
+///
+/// Server-owned correlation (`card_ref`, `card_uid`, `principal_id`, and
+/// `run_id` unless `policy` declares it as content) and every `wyrd_*` column
+/// are dropped first, so the result is comparable with the registered
+/// table's user-field fingerprint.
+fn source_schema_fingerprint(schema: &Schema, policy: CorrelationPolicy) -> SchemaFingerprint {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
         .filter(|field| {
-            !matches!(
-                field.name().as_str(),
-                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id"
-            ) && !field.name().starts_with("wyrd_")
+            let name = field.name().as_str();
+            let correlation = matches!(name, CARD_REF | CARD_UID | PRINCIPAL_ID)
+                || (name == RUN_ID && !policy.owns_run_id());
+            !correlation && !name.starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
         .collect();
@@ -889,17 +883,9 @@ fn stamp_correlation_columns(
         .ok()
         .map(|index| Arc::clone(rows.column(index)));
     let caller_run_id = caller_run_id_column(rows)?;
-    let mut fields = user_fields(rows);
-    let mut columns = user_columns(rows);
-    // A table whose rows carry their own identity declares
-    // `CorrelationPolicy::None`, and its registered physical schema has no
-    // correlation or request slots. Stamping them anyway would seal an object
-    // with more columns than the table it is promoted into.
-    let policy = if correlation_envelope_applies(context) {
-        CorrelationPolicy::Observation
-    } else {
-        CorrelationPolicy::None
-    };
+    let policy = correlation_policy(context);
+    let mut fields = user_fields(rows, policy);
+    let mut columns = user_columns(rows, policy);
     fields.extend(ensure_managed_columns(Vec::new(), policy));
     columns.extend(managed_arrays(
         rows,
@@ -951,7 +937,7 @@ fn stamp_correlation_columns(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stamped = RecordBatch::try_new(physical, columns).map_err(|_| ScribeError::InvalidFrame)?;
-    if definition.canonical_validator.is_some() {
+    if (definition.canonical_fields)().is_some() {
         enforce_canonical_physical_identity(&stamped, definition)?;
     }
     Ok(stamped)
@@ -1081,29 +1067,34 @@ fn enforce_event_time_window(
 /// excluded: when the caller supplied a valid value it is reinserted verbatim
 /// in its slot, and when it is absent the server stamps the admission instant
 /// there. `run_id` is excluded for the same reason, so the canonical nullable
-/// physical column is stamped exactly once. `card_ref` is a Gate input that
-/// resolves to `card_uid` and is never stored.
-fn is_server_owned(name: &str) -> bool {
+/// physical column is stamped exactly once — unless `policy` declares
+/// `run_id` as table content, in which case it stays in the user block in its
+/// declared position. `card_ref` is a Gate input that resolves to `card_uid`
+/// and is never stored.
+fn is_server_owned(name: &str, policy: CorrelationPolicy) -> bool {
+    if name == RUN_ID && policy.owns_run_id() {
+        return false;
+    }
     name == CARD_REF || is_managed_column(name)
 }
 
 /// Returns the caller's user fields, in order, without server-owned columns.
-fn user_fields(rows: &RecordBatch) -> Vec<Field> {
+fn user_fields(rows: &RecordBatch, policy: CorrelationPolicy) -> Vec<Field> {
     rows.schema()
         .fields()
         .iter()
-        .filter(|field| !is_server_owned(field.name()))
+        .filter(|field| !is_server_owned(field.name(), policy))
         .map(|field| field.as_ref().clone())
         .collect()
 }
 
 /// Returns the caller's user columns, in order, without server-owned columns.
-fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
+fn user_columns(rows: &RecordBatch, policy: CorrelationPolicy) -> Vec<ArrayRef> {
     rows.schema()
         .fields()
         .iter()
         .zip(rows.columns())
-        .filter(|(field, _)| !is_server_owned(field.name()))
+        .filter(|(field, _)| !is_server_owned(field.name(), policy))
         .map(|(_, column)| Arc::clone(column))
         .collect()
 }
@@ -1176,17 +1167,21 @@ pub(crate) fn resolve_card_uids(
     Ok(resolved)
 }
 
-/// Reports whether this write appends the universal correlation envelope.
+/// Resolves the correlation policy this write is decoded and stamped under.
 ///
-/// The envelope is the default: a dynamic table has no declaration to consult
-/// and keeps it. A built-in that declares [`CorrelationPolicy::None`] carries
-/// its own identity columns instead, and its registered physical schema has no
-/// envelope slots — so stamping one would seal an object wider than the table
-/// it is promoted into.
-fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
-    context.definition.is_none_or(|definition| {
-        definition.correlation_policy != crate::tables::CorrelationPolicy::None
-    })
+/// The full envelope ([`CorrelationPolicy::Observation`]) is the default: a
+/// dynamic table has no declaration to consult and keeps it. A built-in
+/// stamps exactly the envelope its registered physical schema declares — a
+/// [`CorrelationPolicy::CodeAxis`] table owns `run_id` as content and a
+/// [`CorrelationPolicy::None`] table carries its own identity columns — so the
+/// sealed object is never wider or narrower than the table it is promoted
+/// into.
+fn correlation_policy(context: &DecodeContext<'_>) -> CorrelationPolicy {
+    context
+        .definition
+        .map_or(CorrelationPolicy::Observation, |definition| {
+            definition.correlation_policy
+        })
 }
 
 /// The per-batch values the managed columns are stamped from.
@@ -2166,6 +2161,7 @@ mod tests {
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
         CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
@@ -2273,6 +2269,92 @@ mod tests {
         assert_eq!(
             SchemaFingerprint::from_arrow_schema(stamped.schema().as_ref()),
             SchemaFingerprint::from_arrow_schema(&expected),
+        );
+    }
+
+    /// A `CodeAxis` built-in owns `run_id` as declared content.
+    ///
+    /// A writer's batch carrying exactly the table's declared fields — `run_id`
+    /// included — matches the registered user fingerprint, keeps `run_id` in its
+    /// declared slot, and stamps to the table's own physical schema with no
+    /// second correlation `run_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the definition is missing, the decode fails, or `run_id`
+    /// leaves its declared slot.
+    #[test]
+    fn code_axis_decode_keeps_declared_run_id_content() {
+        let definition =
+            crate::tables::builtin_table("dev", "agent_traces").expect("agent_traces is built in");
+        assert_eq!(definition.correlation_policy, CorrelationPolicy::CodeAxis);
+        let rows = RecordBatch::new_empty(Arc::new(Schema::new((definition.arrow_fields)())));
+
+        let stamped = decode(
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: Some(definition),
+                registered_schema: None,
+            },
+        )
+        .expect("a declared CodeAxis batch decodes");
+
+        assert_eq!(stamped.schema(), (definition.schema)());
+        assert_eq!(
+            stamped
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == "run_id")
+                .count(),
+            1,
+        );
+    }
+
+    /// A canonical built-in's validator refusal reaches the caller unchanged.
+    ///
+    /// An undeclared column also changes the storage fingerprint, so this
+    /// proves the table's validator runs first and its catalogued
+    /// `UndeclaredField` is not reduced to a fingerprint mismatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the definition is missing or the decode does not refuse
+    /// with the catalogued `UndeclaredField`.
+    #[test]
+    fn canonical_validator_refusal_keeps_its_catalogued_code() {
+        let definition =
+            crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+        let mut fields = (definition.arrow_fields)();
+        fields.push(Field::new("surprise", DataType::Utf8, true));
+        let rows = RecordBatch::new_empty(Arc::new(Schema::new(fields)));
+
+        let refusal = decode(
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: Some(definition),
+                registered_schema: None,
+            },
+        )
+        .expect_err("an undeclared column is refused");
+
+        assert!(
+            matches!(
+                refusal,
+                ScribeError::ContractViolation(BifrostError::UndeclaredField { ref field, row: 0 })
+                    if field == "surprise"
+            ),
+            "{refusal:?}"
         );
     }
 
@@ -2687,7 +2769,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -2732,7 +2817,10 @@ mod tests {
             payload,
             &DecodeContext {
                 principal,
-                expected_schema_fingerprint: source_schema_fingerprint(schema),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    schema,
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -2860,7 +2948,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -2906,7 +2997,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -2944,7 +3038,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -2996,7 +3093,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3109,7 +3209,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3150,7 +3253,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3195,7 +3301,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3244,7 +3353,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3316,8 +3428,11 @@ mod tests {
             ],
         );
         assert_eq!(
-            source_schema_fingerprint(rows_with.schema().as_ref()),
-            source_schema_fingerprint(rows_without.schema().as_ref()),
+            source_schema_fingerprint(rows_with.schema().as_ref(), CorrelationPolicy::Observation),
+            source_schema_fingerprint(
+                rows_without.schema().as_ref(),
+                CorrelationPolicy::Observation
+            ),
             "caller event time must not perturb the registered-schema fingerprint",
         );
 
@@ -3325,7 +3440,10 @@ mod tests {
             ipc_payload(&rows_with),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows_with.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows_with.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3378,7 +3496,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3485,7 +3606,10 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
-                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    expected_schema_fingerprint: source_schema_fingerprint(
+                        rows.schema().as_ref(),
+                        CorrelationPolicy::Observation,
+                    ),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
                     receipt_micros: receipt_now(),
@@ -3550,7 +3674,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3597,7 +3724,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window,
                 receipt_micros: receipt_now(),
@@ -3636,7 +3766,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window,
                 receipt_micros: receipt_now(),
@@ -3676,7 +3809,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3726,7 +3862,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3767,7 +3906,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3806,7 +3948,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
@@ -3851,7 +3996,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    rows.schema().as_ref(),
+                    CorrelationPolicy::Observation,
+                ),
                 request_id: &RequestId::now_v7(),
                 window: tight_window,
                 receipt_micros: receipt_now(),
@@ -3931,7 +4079,10 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
-                    expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
+                    expected_schema_fingerprint: source_schema_fingerprint(
+                        rows.schema().as_ref(),
+                        CorrelationPolicy::Observation,
+                    ),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
                     receipt_micros: receipt_now(),

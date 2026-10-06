@@ -23,11 +23,16 @@ pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
 pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 
 /// Fingerprints the exact versioned physical-plan bytes shared by all followers.
+///
+/// The Oracle Variant SQL version is bound in, so a follower built against a
+/// different Variant function set computes a different fingerprint and refuses
+/// the plan in preflight, before any decode.
 #[must_use]
 pub fn physical_plan_fingerprint(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"wyrd.oracle.physical-plan.v1\0");
     digest.update(ORACLE_PHYSICAL_CODEC_VERSION.to_be_bytes());
+    digest.update(super::variant_sql::ORACLE_VARIANT_SQL_VERSION.to_be_bytes());
     digest.update(bytes);
     format!("sha256:{:x}", digest.finalize())
 }

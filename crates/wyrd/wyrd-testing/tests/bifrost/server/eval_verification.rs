@@ -581,7 +581,8 @@ async fn record_id(
             server,
             tenant,
             format!(
-                "SELECT record_id FROM vala.eval.observations WHERE context LIKE '%\"{marker}\"%'"
+                "SELECT record_id FROM vala.eval.observations \
+                 WHERE (context ->> 'marker') = '{marker}'"
             ),
         )
         .await?,
@@ -909,7 +910,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
             &server,
             tenant,
             format!(
-                "SELECT actual FROM vala.eval.result_items WHERE result_id = '{}'",
+                "SELECT to_json(actual) FROM vala.eval.result_items WHERE result_id = '{}'",
                 ungated.state.result_id.ok_or("no result")?
             ),
         )
@@ -1024,7 +1025,7 @@ fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) 
         .append_json_row(
             &json!({
                 "record_id": record,
-                "context": json!({ "answer": "yes" }).to_string(),
+                "context": { "answer": "yes" },
                 "created_at": chrono::Utc::now().to_rfc3339(),
             })
             .to_string(),
@@ -1544,26 +1545,26 @@ impl TraceJourney {
         runs
     }
 
-    /// Every canonical result item of `result` as `task_id=actual`, sorted.
+    /// Every canonical result item of `result` as `task_id=actual`, sorted, with
+    /// `actual` rendered by the Oracle's `to_json`.
     ///
     /// # Errors
     /// Returns the query error.
     async fn items(&self, result: Option<uuid::Uuid>) -> Result<Vec<String>, ServerJourneyError> {
         let result = result.ok_or("the run has no result")?;
-        let mut items: Vec<String> = texts(
-            &query(
-                &self.server,
-                self.tenant,
-                format!(
-                    "SELECT task_id || '=' || actual FROM vala.eval.result_items \
-                     WHERE result_id = '{result}'"
-                ),
-            )
-            .await?,
-        )?
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect();
+        let batches = query(
+            &self.server,
+            self.tenant,
+            format!(
+                "SELECT concat(task_id, '=', to_json(actual)) FROM vala.eval.result_items \
+                 WHERE result_id = '{result}'"
+            ),
+        )
+        .await?;
+        let mut items: Vec<String> = texts(&batches)?
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect();
         items.sort();
         Ok(items)
     }
@@ -1605,7 +1606,7 @@ fn stamped_observation(
         .append_json_row(
             &json!({
                 "record_id": record,
-                "context": json!({ "marker": record }).to_string(),
+                "context": { "marker": record },
                 "trace_id": trace,
                 "created_at": at.to_rfc3339(),
             })

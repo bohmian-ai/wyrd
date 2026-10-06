@@ -5,6 +5,7 @@
 //! join, aggregate, or limit.
 
 use datafusion::common::tree_node::TreeNodeRecursion;
+use std::error::Error;
 use std::fmt;
 #[cfg(test)]
 use std::fs::File;
@@ -76,7 +77,7 @@ use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
-use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry};
+use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry, QueryCatalogError};
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -1201,12 +1202,19 @@ struct OracleIcebergStaleObject {
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-/// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
+/// Maps an Iceberg scan failure into the `DataFusion` error the scan raises.
+///
+/// A catalogued [`BifrostError`] in the chain, such as the footer tenant
+/// refusal, is raised through [`QueryCatalogError`] so it keeps its identity
+/// across peers. Otherwise a typed Iceberg-only stale marker is preserved
+/// without classifying adjacent IO.
 pub(super) fn iceberg_datafusion_error<E>(error: E) -> DataFusionError
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
 {
-    if error_chain_contains_not_found(&error) {
+    if let Some(catalog) = QueryCatalogError::find(&error) {
+        QueryCatalogError::external(catalog)
+    } else if error_chain_contains_not_found(&error) {
         DataFusionError::External(Box::new(OracleIcebergStaleObject {
             source: Box::new(error),
         }))
@@ -1523,9 +1531,9 @@ impl OracleIcebergScanExec {
         // Bifrost writes no encrypted data file. One that claims key metadata
         // would bypass the tenant-proving loader, so it is refused outright.
         if planned.iter().any(|task| task.key_metadata.is_some()) {
-            return Err(DataFusionError::External(Box::new(
+            return Err(QueryCatalogError::external(
                 BifrostError::QueryTenantInvariant,
-            )));
+            ));
         }
         let sizes = planned.iter().map(|task| task.length).collect::<Vec<_>>();
         let partitions = self.properties.partitioning.partition_count();
@@ -1671,7 +1679,7 @@ impl ExecutionPlan for OracleIcebergScanExec {
         let footers = self
             .footers
             .as_ref()
-            .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?
+            .ok_or_else(|| QueryCatalogError::external(BifrostError::QueryTenantInvariant))?
             .loader(self.table.file_io().clone(), context.as_ref())?;
         let source = self.clone();
         let future = async move { source.start_stream(partition, footers).await };
@@ -3130,8 +3138,7 @@ fn hot_piece_metadata(
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     metrics: &OracleScanMetricsHandle,
 ) -> DataFusionResult<Option<(ArrowReaderMetadata, Vec<usize>)>> {
-    verify_scanned_footer_tenant(metadata, tenant)
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    verify_scanned_footer_tenant(metadata, tenant).map_err(QueryCatalogError::external)?;
     let owned = row_groups_in_byte_range(metadata, range);
     if owned.is_empty() {
         return Ok(None);
@@ -4335,9 +4342,8 @@ mod tests {
 
     /// Builds the production writer recipe with a footer proving
     /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
-    fn fixture_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
+    fn fixture_writer_properties(bloom_columns: &[String]) -> WriterProperties {
         crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
-            row_count,
             vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
             bloom_columns,
         )
@@ -4587,8 +4593,7 @@ mod tests {
     /// the production row-group target is 128 MiB of encoded bytes, so no
     /// size-driven fixture could produce two groups at unit scale.
     fn write_grouped_fixture(schema: &SchemaRef, blocks: &[RecordBatch]) -> bytes::Bytes {
-        let rows: usize = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = fixture_writer_properties(rows, &["service_name".to_owned()]);
+        let properties = fixture_writer_properties(&["service_name".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(schema), Some(properties))
@@ -4912,8 +4917,7 @@ mod tests {
                 .expect("trace id block")
             })
             .collect::<Vec<_>>();
-        let rows = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = fixture_writer_properties(rows, &["trace_id".to_owned()]);
+        let properties = fixture_writer_properties(&["trace_id".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(&schema), Some(properties))
@@ -5170,7 +5174,7 @@ mod tests {
         batch: &RecordBatch,
         context: &str,
     ) {
-        let properties = fixture_writer_properties(batch.num_rows(), &[]);
+        let properties = fixture_writer_properties(&[]);
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).unwrap_or_else(|error| panic!("{context} file: {error}")),
             schema,
@@ -5664,7 +5668,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot writer");
         writer.write(&batch).expect("hot batch write");
@@ -5769,7 +5773,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot causal file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot causal writer");
         writer.write(&batch).expect("hot causal write");
@@ -5986,10 +5990,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("compressible file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(
-                usize::try_from(requests * rows_per_request).expect("rows fit usize"),
-                &[],
-            )),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("compressible writer");
         for request in 0..requests {
@@ -6631,7 +6632,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot batch fixture file"),
             Arc::clone(&schema),
-            Some(fixture_writer_properties(batch.num_rows(), &[])),
+            Some(fixture_writer_properties(&[])),
         )
         .expect("hot batch fixture writer");
         writer.write(&batch).expect("hot batch fixture write");

@@ -288,6 +288,13 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "description": "Self-describing semi-structured value stored in the Parquet/Iceberg Variant encoding.\n\nOn the Arrow wire it is the canonical `arrow.parquet.variant` extension type over a `metadata`/`value` binary struct. Each value keeps its own type: integers stay integers, objects keep missing keys distinct from null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and [`VARIANT_MAX_ENCODED_BYTES`].",
+      "type": "string",
+      "enum": [
+        "Variant"
+      ]
     }
   ],
   "definitions": {
@@ -579,6 +586,13 @@
             }
           },
           "additionalProperties": false
+        },
+        {
+          "description": "Self-describing semi-structured value stored in the Parquet/Iceberg Variant encoding.\n\nOn the Arrow wire it is the canonical `arrow.parquet.variant` extension type over a `metadata`/`value` binary struct. Each value keeps its own type: integers stay integers, objects keep missing keys distinct from null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and [`VARIANT_MAX_ENCODED_BYTES`].",
+          "type": "string",
+          "enum": [
+            "Variant"
+          ]
         }
       ]
     },

@@ -884,7 +884,9 @@ impl BifrostCatalog {
 
     /// Resolve one canonical layout and register the tenant-qualified table.
     ///
-    /// The order is fixed and fail-closed: caller input is rejected, the
+    /// The order is fixed and fail-closed: caller fields that name a managed
+    /// column are rejected (a built-in's server-owned definition may declare
+    /// one as content, as the code-axis `run_id` does), the
     /// binding and physical schema are resolved, the layout is canonicalized —
     /// all before a transaction opens. Inside the tenant transaction the
     /// advisory lock serializes concurrent registrations of the same FQN; an
@@ -915,7 +917,9 @@ impl BifrostCatalog {
         canonical_schema: Option<SchemaRef>,
         compaction: CompactionRegistration,
     ) -> Result<TableUid, BifrostCatalogError> {
-        reject_reserved_field_names(&request.user_fields)?;
+        if canonical_schema.is_none() {
+            reject_reserved_field_names(&request.user_fields)?;
+        }
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let fqn = binding.table_ref.fqn();
@@ -992,7 +996,9 @@ impl BifrostCatalog {
     /// Create the physical Iceberg table for one canonical layout.
     ///
     /// Called only when registration has established that no physical table
-    /// exists yet. Every physical decision — schema ids, partition spec, sort
+    /// exists yet. The table is always Iceberg format v3, so appends assign
+    /// row lineage through the first-row-id mechanism and Forge rewrites carry
+    /// it forward. Every physical decision — schema ids, partition spec, sort
     /// order, location, and the Bloom and Forge data-path properties — is
     /// derived from `layout` and `binding`, so the canonical layout stays the
     /// single authority for the table's shape. The Forge data path is written
@@ -1042,7 +1048,7 @@ impl BifrostCatalog {
             .name(binding.table_name.clone())
             .location(location)
             .schema(iceberg_schema)
-            .format_version(FormatVersion::V2)
+            .format_version(FormatVersion::V3)
             .partition_spec(partition_spec)
             .sort_order(sort_order)
             .properties(properties)
@@ -1060,11 +1066,13 @@ impl BifrostCatalog {
     /// a table with a different location, schema, time partition, or Forge sort
     /// recipe. Every physical assertion is derived from `layout`, so the
     /// canonical layout is the single authority for what "correct" means.
+    /// Bifrost tables exist only as Iceberg format v3, so any other format
+    /// version is refused rather than migrated.
     ///
     /// # Errors
     ///
-    /// Returns a metadata mismatch when the location, schema, partition, or
-    /// sort recipe diverges, or an Iceberg error when its schema cannot be
+    /// Returns a metadata mismatch when the location, format version, schema,
+    /// partition, or sort recipe diverges, or an Iceberg error when its schema cannot be
     /// converted for shape validation.
     fn validate_physical_table(
         &self,
@@ -1082,6 +1090,12 @@ impl BifrostCatalog {
             return Err(BifrostCatalogError::MetadataMismatch(format!(
                 "physical table location mismatch: expected {expected_location}, found {}",
                 table.metadata().location()
+            )));
+        }
+        if table.metadata().format_version() != FormatVersion::V3 {
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "physical table format version mismatch: expected v3, found {}",
+                table.metadata().format_version()
             )));
         }
         let actual_schema =

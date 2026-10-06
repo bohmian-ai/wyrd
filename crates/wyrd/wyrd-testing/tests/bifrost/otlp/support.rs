@@ -7,10 +7,17 @@
 //! order, or normalizes a query result: doing so would let a projection defect
 //! agree with a matching test defect and pass.
 
+use std::collections::HashMap;
+
+use arrow::array::{Array, ListArray, StringArray, StructArray};
 use arrow::record_batch::RecordBatch;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use serde_json::Value as Json;
+use wyrd_spec::vala::api::VARIANT_MAX_ENCODED_BYTES;
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{
-    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
+    AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
 use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::metrics::v1::{
@@ -22,7 +29,6 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
-use wyrd_tonic::prost::Message as _;
 
 /// The canonical span ledger every trace case reads.
 pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
@@ -1164,36 +1170,279 @@ pub(super) fn column<'batch, A: arrow::array::Array + 'static>(
     })
 }
 
-/// Encodes one attribute collection exactly as the canonical ledger stores it.
+/// The JSON form one attribute collection must decode to from its Variant.
 ///
-/// This calls the production encoder rather than restating prost framing: the
-/// bytes under test are a pinned protocol encoding, and a second hand-rolled
-/// encoder in the fixture would prove only that two encoders agree.
-pub(super) fn canonical_attribute_bytes(attributes: &[KeyValue]) -> Vec<u8> {
-    vala_bifrost_redux::tables::signal::encode_attributes(attributes)
+/// This restates the documented `OTLP`-to-Variant mapping independently of the
+/// production projection, so a projection defect cannot agree with itself: a
+/// repeated key keeps its final occurrence, an integer stays an exact integer,
+/// a double stays a double, bytes render as standard base64, an array becomes
+/// a list, a key-value list becomes an object, and an unset value is a null.
+pub(super) fn expected_attributes(attributes: &[KeyValue]) -> Json {
+    Json::Object(
+        attributes
+            .iter()
+            .map(|entry| (entry.key.clone(), expected_any_value(entry.value.as_ref())))
+            .collect(),
+    )
 }
 
-/// Decodes a stored attribute blob's string-valued entries by key.
-///
-/// A stock-exporter journey cannot compare the blob byte-for-byte the way the
-/// pinned dataset does, because the SDK — not the test — decides which
-/// attributes it emits and in what order. Reading the blob back as a map lets
-/// those cases name the attributes they set without asserting anything about
-/// the ones the SDK added on its own.
+/// The JSON form one `OTLP` value must decode to from its Variant.
 ///
 /// # Panics
 ///
-/// Panics when the column does not hold a canonical `KeyValueList` encoding.
-pub(super) fn decode_attributes(bytes: &[u8]) -> std::collections::HashMap<String, String> {
-    use wyrd_tonic::otlp::common::v1::{KeyValueList, any_value};
-    KeyValueList::decode(bytes)
-        .expect("a stored attribute column is a canonical KeyValueList encoding")
-        .values
+/// Panics when a double is not finite, which no fixture sends.
+pub(super) fn expected_any_value(value: Option<&AnyValue>) -> Json {
+    match value.and_then(|value| value.value.as_ref()) {
+        None => Json::Null,
+        Some(any_value::Value::StringValue(text)) => Json::String(text.clone()),
+        Some(any_value::Value::BoolValue(flag)) => Json::Bool(*flag),
+        Some(any_value::Value::IntValue(number)) => Json::from(*number),
+        Some(any_value::Value::DoubleValue(number)) => {
+            Json::Number(serde_json::Number::from_f64(*number).expect("a fixture double is finite"))
+        }
+        Some(any_value::Value::BytesValue(bytes)) => Json::String(STANDARD.encode(bytes)),
+        Some(any_value::Value::ArrayValue(array)) => Json::Array(
+            array
+                .values
+                .iter()
+                .map(|item| expected_any_value(Some(item)))
+                .collect(),
+        ),
+        Some(any_value::Value::KvlistValue(list)) => expected_attributes(&list.values),
+    }
+}
+
+/// Decodes the first row of one stored Variant column or child to JSON.
+///
+/// # Panics
+///
+/// Panics when the array is not Variant storage or its value does not decode.
+pub(super) fn variant_json(array: &StructArray) -> Json {
+    wyrd_queue::variant::variant_cell_to_json(array, 0)
+        .expect("a stored Variant value decodes to JSON")
+}
+
+/// Decodes a stored attribute object's string- and integer-valued entries.
+///
+/// A stock-exporter journey cannot compare the whole object the way the
+/// pinned dataset does, because the SDK — not the test — decides which
+/// attributes it emits. Reading the object back as a map lets those cases name
+/// the attributes they set without asserting anything about the ones the SDK
+/// added on its own.
+///
+/// # Panics
+///
+/// Panics when the array does not hold a Variant attribute object.
+pub(super) fn decode_attributes(array: &StructArray) -> HashMap<String, String> {
+    let Json::Object(entries) = variant_json(array) else {
+        panic!("a stored attribute column holds a Variant object");
+    };
+    entries
         .into_iter()
-        .filter_map(|entry| match entry.value.and_then(|value| value.value) {
-            Some(any_value::Value::StringValue(text)) => Some((entry.key, text)),
-            Some(any_value::Value::IntValue(number)) => Some((entry.key, number.to_string())),
+        .filter_map(|(key, value)| match value {
+            Json::String(text) => Some((key, text)),
+            Json::Number(number) if number.is_i64() => Some((key, number.to_string())),
             _ => None,
         })
         .collect()
+}
+
+/// Stable code a record carries when one of its Variant values is too large.
+pub(super) const VARIANT_TOO_LARGE: &str = "WYRD_VALA_413_VARIANT_TOO_LARGE";
+/// Promoted `service.version` of the Variant journey resource.
+pub(super) const VARIANT_SERVICE_VERSION: &str = "1.4.2";
+/// Promoted `deployment.environment.name` of the Variant journey resource.
+pub(super) const VARIANT_ENVIRONMENT: &str = "variant-journey";
+/// Service name the Variant journey resource declares.
+pub(super) const VARIANT_SERVICE_NAME: &str = "wyrd-variant-journey";
+/// Entity type of the Variant journey resource's one entity reference.
+pub(super) const VARIANT_ENTITY_TYPE: &str = "service";
+
+/// Builds one OTLP attribute that is present but carries no value.
+///
+/// The OTLP data model distinguishes this from an absent key, so the stored
+/// Variant object must keep the key with a JSON null.
+pub(super) fn unset_attribute(key: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue { value: None }),
+    }
+}
+
+/// An attribute collection probing the Variant fidelity rules.
+///
+/// It carries the two `i64` extremes a float encoding would round, a present
+/// key with an unset value, and a repeated key whose final occurrence must be
+/// the one stored. `marker` keeps each collection distinguishable.
+pub(super) fn variant_probe_attributes(marker: &str) -> Vec<KeyValue> {
+    vec![
+        string_attribute("wyrd.variant.marker", marker),
+        int_attribute("wyrd.variant.max", i64::MAX),
+        int_attribute("wyrd.variant.min", i64::MIN),
+        unset_attribute("wyrd.variant.unset"),
+        string_attribute("wyrd.variant.repeated", "first"),
+        string_attribute("wyrd.variant.repeated", "last"),
+    ]
+}
+
+/// Asserts one decoded Variant object holds the probe `marker` sent.
+///
+/// The comparison is per key rather than whole-object so a failure names the
+/// rule that broke: integer exactness, null versus missing, or duplicate
+/// resolution.
+///
+/// # Panics
+///
+/// Panics when the value is not an object or any probe rule does not hold.
+pub(super) fn assert_variant_probe(value: &Json, marker: &str) {
+    let Json::Object(object) = value else {
+        panic!("a Variant attribute collection decodes to an object, got {value}");
+    };
+    assert_eq!(object["wyrd.variant.marker"], marker);
+    assert_eq!(
+        object["wyrd.variant.max"].as_i64(),
+        Some(i64::MAX),
+        "`{marker}` keeps the largest i64 exactly"
+    );
+    assert_eq!(
+        object["wyrd.variant.min"].as_i64(),
+        Some(i64::MIN),
+        "`{marker}` keeps the smallest i64 exactly"
+    );
+    assert_eq!(
+        object.get("wyrd.variant.unset"),
+        Some(&Json::Null),
+        "`{marker}` keeps a present unset key as a JSON null"
+    );
+    assert!(
+        !object.contains_key("wyrd.variant.absent"),
+        "`{marker}` invents no key that was never sent"
+    );
+    assert_eq!(
+        object["wyrd.variant.repeated"], "last",
+        "`{marker}` keeps the final occurrence of a repeated key"
+    );
+}
+
+/// The resource every Variant journey signal is exported under.
+///
+/// It carries the promoted resource conventions, the legacy environment key
+/// the stable one must win over, the fidelity probe, and one entity reference
+/// so the typed reference list is exercised.
+pub(super) fn variant_resource() -> Resource {
+    let mut attributes = vec![
+        string_attribute("service.name", VARIANT_SERVICE_NAME),
+        string_attribute("service.version", VARIANT_SERVICE_VERSION),
+        string_attribute("deployment.environment", "legacy-ignored"),
+        string_attribute("deployment.environment.name", VARIANT_ENVIRONMENT),
+    ];
+    attributes.extend(variant_probe_attributes("resource"));
+    Resource {
+        attributes,
+        dropped_attributes_count: 0,
+        entity_refs: vec![EntityRef {
+            schema_url: RESOURCE_SCHEMA_URL.to_owned(),
+            r#type: VARIANT_ENTITY_TYPE.to_owned(),
+            id_keys: vec!["service.name".to_owned()],
+            description_keys: vec!["service.version".to_owned()],
+        }],
+    }
+}
+
+/// The instrumentation scope every Variant journey signal is exported under.
+pub(super) fn variant_scope(name: &str) -> InstrumentationScope {
+    InstrumentationScope {
+        name: name.to_owned(),
+        version: SCOPE_VERSION.to_owned(),
+        attributes: variant_probe_attributes("scope"),
+        dropped_attributes_count: 0,
+    }
+}
+
+/// One attribute whose string alone exceeds the Variant size limit.
+///
+/// It fits the OTLP request ceiling, so only the Variant limit can refuse it.
+///
+/// # Panics
+///
+/// Panics when the Variant limit does not fit `usize`.
+pub(super) fn oversized_attribute() -> KeyValue {
+    let limit =
+        usize::try_from(VARIANT_MAX_ENCODED_BYTES).expect("the Variant size limit fits usize");
+    string_attribute("wyrd.variant.oversized", &"x".repeat(limit))
+}
+
+/// Asserts the resource, scope, and promoted resource columns of one row.
+///
+/// # Panics
+///
+/// Panics when a Variant envelope loses a probe rule, the entity reference
+/// does not keep its typed fields, or a promoted resource column differs.
+pub(super) fn assert_variant_envelope(row: &RecordBatch) {
+    assert_variant_probe(
+        &variant_json(column::<StructArray>(row, "resource_attributes")),
+        "resource",
+    );
+    assert_variant_probe(
+        &variant_json(column::<StructArray>(row, "scope_attributes")),
+        "scope",
+    );
+    for (name, expected) in [
+        ("service_name", VARIANT_SERVICE_NAME),
+        ("service_version", VARIANT_SERVICE_VERSION),
+        ("deployment_environment", VARIANT_ENVIRONMENT),
+    ] {
+        assert_eq!(
+            column::<StringArray>(row, name).value(0),
+            expected,
+            "the resource convention is promoted into `{name}`"
+        );
+    }
+
+    let refs = column::<ListArray>(row, "resource_entity_refs").value(0);
+    assert_eq!(refs.len(), 1, "the one entity reference is stored once");
+    let refs = refs
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("an entity reference is a struct");
+    let text = |name: &str| {
+        refs.column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .unwrap_or_else(|| panic!("the entity reference has a text `{name}`"))
+            .value(0)
+            .to_owned()
+    };
+    let keys = |name: &str| {
+        let list = refs
+            .column_by_name(name)
+            .and_then(|array| array.as_any().downcast_ref::<ListArray>())
+            .unwrap_or_else(|| panic!("the entity reference has a key list `{name}`"))
+            .value(0);
+        let list = list
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("an entity key is text");
+        list.iter()
+            .map(|key| key.map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(text("type"), VARIANT_ENTITY_TYPE);
+    assert_eq!(text("schema_url"), RESOURCE_SCHEMA_URL);
+    assert_eq!(keys("id_keys"), vec![Some("service.name".to_owned())]);
+    assert_eq!(
+        keys("description_keys"),
+        vec![Some("service.version".to_owned())]
+    );
+}
+
+/// Asserts a partial-success reason starts with the Variant size code.
+///
+/// # Panics
+///
+/// Panics when the reason does not lead with the stable code.
+pub(super) fn assert_too_large_reason(reason: &str) {
+    assert!(
+        reason.starts_with(&format!("{VARIANT_TOO_LARGE}: ")),
+        "the rejection reason leads with the stable Variant code: {reason}"
+    );
 }

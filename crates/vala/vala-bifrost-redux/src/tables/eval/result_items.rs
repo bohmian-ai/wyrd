@@ -5,6 +5,8 @@
 
 use arrow::datatypes::Field;
 
+use wyrd_queue::variant::variant_field;
+
 use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
@@ -18,7 +20,8 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// `vala.verification.results` counts executed tasks alone, so a skipped task
 /// is visible only in this table. Rows join their parent result on
 /// `result_id` inside the tenant's own namespace. `actual`, `expected`, and `message` carry
-/// captured task payloads and are classified sensitive.
+/// captured task payloads and are classified sensitive; `actual` and `expected`
+/// are Variants that keep the captured JSON value's types.
 pub struct ResultItemsTable;
 
 impl DomainTable for ResultItemsTable {
@@ -44,8 +47,8 @@ impl DomainTable for ResultItemsTable {
             utf8("task_id", false),
             utf8("outcome_kind", false),
             boolean("passed", true),
-            utf8("actual", true),
-            utf8("expected", true),
+            variant_field("actual", true),
+            variant_field("expected", true),
             utf8("operator", true),
             utf8("message", true),
             int32("stage", true),

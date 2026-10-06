@@ -27,6 +27,7 @@ pub mod queue;
 pub mod schema;
 pub mod sealed_sender;
 pub mod sink;
+pub mod variant;
 
 pub use batch_builder::{BatchBuilder, is_reserved_column};
 pub use bounded_arrow::{
@@ -40,7 +41,8 @@ pub use producer::{
 };
 pub use queue::{Flushable, RecordQueue, Row};
 pub use schema::{
-    arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,
+    arrow_schema_to_fieldspec, field_to_spec, fieldspec_to_arrow, is_extension_key,
+    json_schema_to_arrow, json_schema_to_fieldspec, spec_to_field,
 };
 pub use sealed_sender::SealedBatchSender;
 pub use sink::{

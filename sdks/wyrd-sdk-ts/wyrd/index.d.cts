@@ -938,3 +938,19 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * hyphenated wire spelling.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfig
+
+/**
+ * Decodes one Variant cell's `metadata`/`value` bytes into its native
+ * JavaScript value.
+ *
+ * The typed row terminal calls this for every Variant cell it finds while
+ * walking the result schema, so decoding stays in the shared `wyrd-queue`
+ * owner. napi's JSON projection makes objects plain objects, arrays arrays,
+ * and an integer outside the IEEE-754 safe range a `bigint`.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the bytes are not a valid Variant, which only a
+ * faulty server result can produce.
+ */
+export declare function variantToValue(metadata: Uint8Array, value: Uint8Array): any

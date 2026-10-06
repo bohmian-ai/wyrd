@@ -14,7 +14,7 @@ pub mod derive {
 }
 
 /// RFC 9457 problem value emitted by every public Wyrd error boundary.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WyrdProblem {

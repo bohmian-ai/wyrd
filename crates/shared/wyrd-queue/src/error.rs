@@ -8,6 +8,7 @@
 //! translation in `wyrd_client::bifrost`).
 
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::BifrostError;
 
 /// Concrete error produced by the producer, queue, and batch builder.
 #[derive(thiserror::Error, Debug)]
@@ -60,6 +61,11 @@ pub enum WyrdQueueError {
     #[error("reserved column: {0}")]
     ReservedColumn(String),
 
+    /// A Variant value is out of range, too deep, or too large to store.
+    /// Carries the stable catalogued Variant error with its field and row.
+    #[error("variant value refused: {0}")]
+    Variant(#[source] BifrostError),
+
     /// A sink-reported server error, already mapped to the stable catalog.
     #[error("sink error: {0}")]
     Sink(#[source] WyrdError),
@@ -77,29 +83,45 @@ impl WyrdQueueError {
             Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",
             Self::ReservedColumn(_) => "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            Self::Variant(err) => err.code(),
             Self::Sink(err) => err.code(),
         }
     }
 }
 
-impl From<WyrdQueueError> for WyrdError {
+impl From<&WyrdQueueError> for WyrdError {
     /// Map to the stable [`WyrdError`] catalog at the surface boundary.
     ///
-    /// The queue-domain codes project onto typed `WyrdError` variants via the
-    /// shared `WyrdError::from_code` reconstruction (so the client boundary
-    /// reports the real status/code); the `Sink` variant passes its already-mapped
-    /// error straight through.
-    fn from(err: WyrdQueueError) -> Self {
-        if let WyrdQueueError::Sink(inner) = err {
-            return inner;
-        }
-        let code = err.code();
-        let message = err.to_string();
-        WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(
-            WyrdError::Internal {
+    /// Saturation, drain, payload, and configuration refusals keep their own
+    /// `WYRD_CLIENT_*` codes so a caller can retry a full queue without parsing
+    /// error text; the serialization-domain refusals become their catalogued
+    /// Bifrost error with its details, and a sink failure is already a catalog
+    /// error and passes through unchanged.
+    fn from(error: &WyrdQueueError) -> Self {
+        let message = error.to_string();
+        let details = serde_json::json!({});
+        match error {
+            WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
+                WyrdError::ClientQueueFull { message, details }
+            }
+            WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
+            WyrdQueueError::PayloadTooLarge => {
+                WyrdError::ClientPayloadTooLarge { message, details }
+            }
+            WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
                 message,
-                details: serde_json::json!({ "original_code": code }),
+                details: serde_json::json!({ "field": field, "reason": reason }),
             },
-        )
+            WyrdQueueError::SchemaParse(detail) => BifrostError::SchemaParse {
+                detail: detail.clone(),
+            }
+            .into(),
+            WyrdQueueError::ReservedColumn(column) => BifrostError::ReservedColumn {
+                column: column.clone(),
+            }
+            .into(),
+            WyrdQueueError::Variant(error) => error.clone().into(),
+            WyrdQueueError::Sink(inner) => inner.clone(),
+        }
     }
 }

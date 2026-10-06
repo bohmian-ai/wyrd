@@ -110,6 +110,16 @@ impl CorrelationPolicy {
         }
     }
 
+    /// Report whether `run_id` is declared table content under this policy.
+    ///
+    /// A `CodeAxis` table declares `run_id` among its own fields, so a writer's
+    /// `run_id` is part of its user block and source fingerprint rather than
+    /// correlation the server lifts out and restamps.
+    #[must_use]
+    pub fn owns_run_id(self) -> bool {
+        matches!(self, Self::CodeAxis)
+    }
+
     /// The managed columns a table under this policy appends, in physical order.
     pub fn managed_columns(self) -> impl Iterator<Item = &'static ManagedColumn> {
         MANAGED_COLUMNS

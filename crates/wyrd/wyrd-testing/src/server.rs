@@ -13,6 +13,7 @@ use std::time::Duration;
 use wyrd_sql::OperatorPool;
 use wyrd_storage::StorageError;
 
+use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -57,6 +58,7 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
+use wyrd_queue::variant::{variant_cell_to_json, variant_storage_type};
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
@@ -123,6 +125,33 @@ const READ_DECISION: &str = "bifrost.query.read_decision";
 /// constant is public because a test that pins two Oracle replicas to one
 /// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
+/// Renders one retained audit cell as text: a text column as its value and the
+/// Variant `detail` column as its JSON text, so assertions parse it like any
+/// other JSON. A null cell is `None`.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Audit`] when the column is neither text nor
+/// Variant, or a Variant cell does not decode.
+fn audit_cell_text(column: &dyn Array, row: usize) -> Result<Option<String>, WyrdTestServerError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(text) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(text.value(row).to_owned()));
+    }
+    if column.data_type() != &variant_storage_type() {
+        return Err(WyrdTestServerError::Audit(
+            "retained audit projection is neither text nor Variant".to_owned(),
+        ));
+    }
+    let value = variant_cell_to_json(column, row).map_err(|violation| {
+        WyrdTestServerError::Audit(format!(
+            "retained audit detail does not decode: {violation:?}"
+        ))
+    })?;
+    Ok(Some(value.to_string()))
+}
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -1694,8 +1723,9 @@ impl WyrdTestServer {
 
     /// Reads retained audit rows, every selected column projected as text.
     ///
-    /// `projection` is the `SELECT` list and must cast each column to text, so
-    /// one decoder serves every assertion shape. Rows come back in the tenant's
+    /// `projection` is the `SELECT` list and must cast each scalar column to
+    /// text, so one decoder serves every assertion shape; the Variant `detail`
+    /// column is selected as is and rendered as its JSON text. Rows come back in the tenant's
     /// own `seq` order — the order the decisions were made — and the inspector's
     /// own reads are excluded by principal exactly as they are for a count.
     ///
@@ -1709,7 +1739,6 @@ impl WyrdTestServer {
         projection: &str,
         predicate: &str,
     ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
-        use arrow::array::Array as _;
         use futures_util::StreamExt as _;
         use vala_bifrost_redux::oracle::QueryIpcDecoder;
         use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1751,30 +1780,13 @@ impl WyrdTestServer {
                     let batch = decoder
                         .accept_batch(&batch.arrow_ipc_batch)
                         .map_err(|error| audit(&error))?;
-                    let columns: Vec<_> = batch
-                        .columns()
-                        .iter()
-                        .map(|column| {
-                            column
-                                .as_any()
-                                .downcast_ref::<arrow::array::StringArray>()
-                                .ok_or_else(|| {
-                                    WyrdTestServerError::Audit(
-                                        "retained audit projection is not text".to_owned(),
-                                    )
-                                })
-                        })
-                        .collect::<Result<_, _>>()?;
                     for index in 0..batch.num_rows() {
                         records.push(
-                            columns
+                            batch
+                                .columns()
                                 .iter()
-                                .map(|column| {
-                                    column
-                                        .is_valid(index)
-                                        .then(|| column.value(index).to_owned())
-                                })
-                                .collect(),
+                                .map(|column| audit_cell_text(column.as_ref(), index))
+                                .collect::<Result<_, _>>()?,
                         );
                     }
                 }

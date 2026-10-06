@@ -2,11 +2,15 @@
 
 use std::sync::Arc;
 
+use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
 use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use wyrd_queue::is_extension_key;
+use wyrd_queue::variant::{EncodedVariant, is_variant};
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
@@ -144,13 +148,14 @@ pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> Phy
     }
 }
 
-/// A table-owned canonical value validator.
+/// A table-owned value validator: Scribe's one validation seam for built-ins.
 ///
-/// A canonical signal table supplies one of these so the registry can enforce
-/// the value-level rules its Arrow schema alone cannot express — canonical
-/// payload encoding, and for metrics the kind/column agreement — without any
-/// caller matching on a table name.
-pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, String>;
+/// Every built-in carries one, so the registry enforces the rules its storage
+/// fingerprint alone cannot express — the Variant contract, a canonical
+/// signal's exact ledger, and for metrics the kind/column agreement — without
+/// any caller matching on a table name. A refusal is the catalogued error the
+/// caller receives unchanged.
+pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, BifrostError>;
 
 /// Canonical immutable definition for one built-in table.
 #[derive(Debug, Clone, Copy)]
@@ -177,8 +182,8 @@ pub struct BuiltinTableDefinition {
     pub canonical_fields: fn() -> Option<&'static [fields::CanonicalField]>,
     /// Canonical physical fingerprint constructor, `None` when not canonical.
     pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
-    /// Canonical value validator, `None` for a pre-declared table.
-    pub canonical_validator: Option<CanonicalBatchValidator>,
+    /// Value validator Scribe runs over every supplied user block.
+    pub canonical_validator: CanonicalBatchValidator,
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -187,6 +192,163 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
+}
+
+/// Enforce the Variant contract over one supplied batch at the trust boundary.
+///
+/// Clients prepare Variant values before sending, but a raw Arrow IPC writer
+/// can skip that, and the schema fingerprint compares storage types only.
+/// Every table validator runs this walk over its declared fields, top level
+/// and nested inside Structs and Lists: every field holding a Variant must
+/// match its declaration on the wire, where `wyrd_queue::field_to_spec` keeps
+/// the `arrow.parquet.variant` extension that storage types drop, and every
+/// present Variant value must pass [`EncodedVariant::from_bytes`]. Fields are
+/// checked in logical order first, then values row by row in input order and
+/// field order, so the first failure follows the locked precedence. A
+/// declared field the batch does not supply is left to the fingerprint check.
+/// It reads the batch only and has no side effects.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UnsupportedType`] naming the top-level field when
+/// a field holding a Variant arrives without the extension or in a storage
+/// layout other than the declared one, and the catalogued Variant error
+/// (size, encoding, or depth) for the first stored value that fails.
+pub(crate) fn validate_declared_variants(
+    declared: &[Field],
+    batch: &RecordBatch,
+) -> Result<(), BifrostError> {
+    let schema = batch.schema();
+    let wire = |field: &Field| {
+        wyrd_queue::field_to_spec(field)
+            .ok()
+            .map(|spec| wyrd_queue::spec_to_field(&spec, false))
+    };
+    let mut variant_columns = Vec::new();
+    for declared in declared {
+        if !holds_variant(declared) {
+            continue;
+        }
+        let Ok(index) = schema.index_of(declared.name()) else {
+            continue;
+        };
+        let supplied = schema.field(index);
+        let matches = matches!(
+            (wire(declared), wire(supplied)),
+            (Some(declared), Some(supplied))
+                if declared.data_type() == supplied.data_type()
+                    && is_variant(&declared) == is_variant(&supplied)
+        );
+        if !matches {
+            return Err(unsupported_variant(declared.name(), supplied.data_type()));
+        }
+        variant_columns.push((declared, Arc::clone(batch.column(index))));
+    }
+    for index in 0..batch.num_rows() {
+        let row = u64::try_from(index).unwrap_or(u64::MAX);
+        for (declared, column) in &variant_columns {
+            validate_variant_values(declared, declared.name(), column.as_ref(), index, row)?;
+        }
+    }
+    Ok(())
+}
+
+/// The value validator of a pre-declared built-in: its Variant contract.
+///
+/// A pre-declared table's fingerprint already fixes every other column's
+/// storage type, so the Variant walk over its declared fields is its only
+/// value rule. The batch is returned unchanged.
+///
+/// # Errors
+///
+/// Returns the refusal of [`validate_declared_variants`].
+fn validate_predeclared<T: DomainTable + ?Sized>(
+    batch: &RecordBatch,
+) -> Result<RecordBatch, BifrostError> {
+    validate_declared_variants(&T::arrow_fields(), batch)?;
+    Ok(batch.clone())
+}
+
+/// Report whether a declared field is or nests a Variant.
+fn holds_variant(field: &Field) -> bool {
+    is_variant(field)
+        || match field.data_type() {
+            DataType::Struct(children) => children.iter().any(|child| holds_variant(child)),
+            DataType::List(element) => holds_variant(element),
+            _ => false,
+        }
+}
+
+/// The refusal for a declared Variant supplied in another wire type.
+fn unsupported_variant(field: &str, data_type: &DataType) -> BifrostError {
+    BifrostError::UnsupportedType {
+        field: field.to_owned(),
+        data_type: data_type.to_string(),
+    }
+}
+
+/// Validate every Variant value one input row holds under one declaration.
+///
+/// `index` is the position of the value inside `column`: a list descends into
+/// the element range the value owns and a struct into each child at the same
+/// position, so a nested Variant is checked with its own input row. A null at
+/// any level holds no value, which also skips the empty placeholder a Variant
+/// child keeps under a null parent. `label` is the top-level field a refusal
+/// names and `row` the input row.
+///
+/// # Errors
+///
+/// Returns the catalogued Variant error for the first value that cannot be
+/// stored, and [`BifrostError::UnsupportedType`] when a value's storage is not
+/// the declared layout.
+fn validate_variant_values(
+    declared: &Field,
+    label: &str,
+    column: &dyn Array,
+    index: usize,
+    row: u64,
+) -> Result<(), BifrostError> {
+    if column.is_null(index) {
+        return Ok(());
+    }
+    let malformed = || unsupported_variant(label, column.data_type());
+    if is_variant(declared) {
+        let storage = column.as_struct_opt().ok_or_else(malformed)?;
+        let child = |name: &str| {
+            storage
+                .column_by_name(name)
+                .and_then(|bytes| bytes.as_binary_opt::<i32>())
+                .map(|bytes| bytes.value(index))
+        };
+        let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
+            return Err(malformed());
+        };
+        return EncodedVariant::from_bytes(metadata, value)
+            .map(drop)
+            .map_err(|violation| violation.into_error(label, row));
+    }
+    match declared.data_type() {
+        DataType::Struct(children) => {
+            let nested = column.as_struct_opt().ok_or_else(malformed)?;
+            children
+                .iter()
+                .zip(nested.columns())
+                .filter(|(child, _)| holds_variant(child))
+                .try_for_each(|(child, values)| {
+                    validate_variant_values(child, label, values.as_ref(), index, row)
+                })
+        }
+        DataType::List(element) => {
+            let list = column.as_list_opt::<i32>().ok_or_else(malformed)?;
+            let offsets = list.value_offsets();
+            let start = usize::try_from(offsets[index]).map_err(|_| malformed())?;
+            let end = usize::try_from(offsets[index + 1]).map_err(|_| malformed())?;
+            (start..end).try_for_each(|item| {
+                validate_variant_values(element, label, list.values().as_ref(), item, row)
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A table definition implemented by the canonical registry.
@@ -222,12 +384,12 @@ pub trait DomainTable: Send + Sync + 'static {
         None
     }
 
-    /// The table-owned canonical value validator, when this table is canonical.
+    /// The table-owned value validator Scribe runs over every user block.
     ///
     /// A canonical signal table sets this to the function that enforces its
-    /// value-level rules; a pre-declared table leaves it `None` and is value
-    /// validated by its declared Arrow schema alone.
-    const CANONICAL_VALIDATOR: Option<CanonicalBatchValidator> = None;
+    /// ledger and value-level rules; a pre-declared table keeps the Variant
+    /// contract over its declared Arrow fields.
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -457,6 +619,9 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
         ))
     };
     let data_type = match (field.data_type(), registered.field_type.as_ref()) {
+        // A Variant's `metadata`/`value` storage children carry no Iceberg
+        // field ids: the Variant is one logical Iceberg field.
+        (DataType::Struct(_), Type::Variant(_)) if is_variant(field) => field.data_type().clone(),
         (DataType::List(element), Type::List(list)) => {
             DataType::List(Arc::new(with_registered_id(element, &list.element_field)?))
         }
@@ -499,7 +664,9 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
             DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(..),
             _,
         )
-        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_)) => return Err(mismatch()),
+        | (_, Type::List(_) | Type::Struct(_) | Type::Map(_) | Type::Variant(_)) => {
+            return Err(mismatch());
+        }
         (scalar, _) => scalar.clone(),
     };
     let mut metadata = field.metadata().clone();
@@ -627,9 +794,11 @@ const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
 ///
 /// The encoding is a version byte, the top-level field count, and then each
 /// field in declared order as: length-prefixed name, type bytes, nullability,
-/// sensitivity, its metadata entries other than `PARQUET:field_id` in
-/// ascending raw key-byte order, and finally its nested child count followed
-/// depth-first by the same record for each child. Every count and length is an
+/// sensitivity, its metadata entries other than `PARQUET:field_id` and the
+/// Arrow extension keys in ascending raw key-byte order, and finally its
+/// nested child count followed depth-first by the same record for each child.
+/// A Variant field writes the single tag `0x0d` and a zero child count, so
+/// only the logical schema is committed. Every count and length is an
 /// unsigned big-endian `u32`; fixed-binary widths are signed big-endian `i32`.
 /// Field ids are excluded because the registered Iceberg table, not the
 /// declaration, owns them.
@@ -667,15 +836,20 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 /// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
 /// or its type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
+    let variant = is_variant(field);
     encode_len_prefixed(field.name().as_bytes(), out)?;
-    encode_data_type(field.data_type(), out)?;
+    if variant {
+        out.push(VARIANT_TYPE_TAG);
+    } else {
+        encode_data_type(field.data_type(), out)?;
+    }
     out.push(u8::from(field.is_nullable()));
     out.push(u8::from(sensitivity(field)?));
 
     let mut entries: Vec<(&String, &String)> = field
         .metadata()
         .iter()
-        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID)
+        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID && !is_extension_key(key))
         .collect();
     out.extend_from_slice(&count_u32(entries.len())?.to_be_bytes());
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
@@ -684,13 +858,24 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
         encode_len_prefixed(value.as_bytes(), out)?;
     }
 
-    let children = child_fields(field.data_type());
+    let children = if variant {
+        None
+    } else {
+        child_fields(field.data_type())
+    };
     match children {
         Some(children) => encode_field_sequence(&children, out)?,
         None => out.extend_from_slice(&0_u32.to_be_bytes()),
     }
     Ok(())
 }
+
+/// Fingerprint tag of a Variant field.
+///
+/// A Variant commits only this byte: no storage children and no extension
+/// metadata, so per-file shredding layouts and the storage spelling of the
+/// `metadata`/`value` struct never change a table's fingerprint.
+const VARIANT_TYPE_TAG: u8 = 0x0d;
 
 /// Encode one pinned type tag and its inline parameters.
 ///
@@ -864,6 +1049,7 @@ pub fn builtin_fqns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{BinaryArray, Int64Array, StructArray};
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
@@ -873,6 +1059,8 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
+    use wyrd_queue::variant::{VariantViolation, variant_field};
+    use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -1015,36 +1203,15 @@ mod tests {
                 columns: vec![
                     utf8("record_id", false),
                     utf8("session_id", true),
-                    utf8("context", false),
+                    variant_field("context", false),
                     fields::fixed_binary("trace_id", 16, true),
                     fields::fixed_binary("span_id", 8, true),
                     ts_us_utc("created_at", false),
-                    utf8("media", true),
+                    variant_field("media", true),
                 ],
                 blooms: &[],
             },
-            VerificationContract {
-                namespace: "verification",
-                name: "results",
-                columns: vec![
-                    utf8("result_id", false),
-                    utf8("implementation", false),
-                    utf8("execution_status", false),
-                    utf8("verdict", false),
-                    utf8("verifier_version", false),
-                    utf8("owner_card_uid", true),
-                    utf8("subject_card_uid", false),
-                    utf8("binding_id", true),
-                    utf8("trigger_identity", true),
-                    utf8("source_record_id", true),
-                    ts_us_utc("window_start", true),
-                    ts_us_utc("window_end", true),
-                    ts_us_utc("started_at", false),
-                    ts_us_utc("ended_at", false),
-                    utf8("details", true),
-                ],
-                blooms: &["result_id", "subject_card_uid", "binding_id"],
-            },
+            verification_results_contract(),
             VerificationContract {
                 namespace: "drift",
                 name: "result_features",
@@ -1075,8 +1242,8 @@ mod tests {
                     utf8("task_id", false),
                     utf8("outcome_kind", false),
                     boolean("passed", true),
-                    utf8("actual", true),
-                    utf8("expected", true),
+                    variant_field("actual", true),
+                    variant_field("expected", true),
                     utf8("operator", true),
                     utf8("message", true),
                     int32("stage", true),
@@ -1088,6 +1255,58 @@ mod tests {
                 blooms: &["result_id"],
             },
         ]
+    }
+
+    /// The approved contract for `verification.results`, whose typed
+    /// summaries are nullable Structs written exclusively per implementation.
+    fn verification_results_contract() -> VerificationContract {
+        VerificationContract {
+            namespace: "verification",
+            name: "results",
+            columns: vec![
+                utf8("result_id", false),
+                utf8("implementation", false),
+                utf8("execution_status", false),
+                utf8("verdict", false),
+                utf8("verifier_version", false),
+                utf8("owner_card_uid", true),
+                utf8("subject_card_uid", false),
+                utf8("binding_id", true),
+                utf8("trigger_identity", true),
+                utf8("source_record_id", true),
+                ts_us_utc("window_start", true),
+                ts_us_utc("window_end", true),
+                ts_us_utc("started_at", false),
+                ts_us_utc("ended_at", false),
+                Field::new(
+                    "drift_report",
+                    DataType::Struct(
+                        vec![
+                            utf8("method", false),
+                            variant_field("features", false),
+                            utf8("verdict", false),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+                Field::new(
+                    "eval_summary",
+                    DataType::Struct(
+                        vec![
+                            int32("total_tasks", false),
+                            int32("passed_tasks", false),
+                            int32("failed_tasks", false),
+                            float64("pass_rate", false),
+                            int64("duration_ms", false),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ],
+            blooms: &["result_id", "subject_card_uid", "binding_id"],
+        }
     }
 
     /// The managed envelope Bifrost appends after a verification table's
@@ -1119,7 +1338,7 @@ mod tests {
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and Drift `details`, is what makes that break
+    /// nullable `owner_card_uid` and the typed `drift_report`, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -1954,17 +2173,17 @@ mod tests {
             .collect()
     }
 
-    /// The registry dispatches one canonical value validator per signal table.
+    /// The registry dispatches one canonical value validator per signal table,
+    /// and each signal definition refuses invalid Variant bytes with the
+    /// catalogued error through the shared Variant pass.
     ///
     /// # Panics
     ///
-    /// Panics when a canonical built-in carries no validator, when a validator
-    /// admits a schema-valid but value-invalid batch, or when a pre-declared
-    /// built-in claims a canonical validator it cannot own.
+    /// Panics when a canonical built-in carries no validator, when invalid
+    /// Variant bytes or a foreign metric kind column are admitted, or when a
+    /// pre-declared built-in claims a canonical validator it cannot own.
     #[test]
     fn builtin_registry_dispatches_canonical_value_validation() {
-        use arrow::array::{Array, BinaryArray, Int64Array};
-
         let (spans, _) =
             crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
                 .expect("the span fixture projects");
@@ -1981,9 +2200,7 @@ mod tests {
             ("metrics", "points", points),
         ] {
             let definition = builtin_table(namespace, name).expect("canonical built-in");
-            let validate = definition
-                .canonical_validator
-                .expect("a canonical signal table owns a value validator");
+            let validate = definition.canonical_validator;
             let batch = crate::tables::signal::without_correlation_columns(&projected)
                 .expect("the correlation columns split off cleanly");
             validate(&batch).expect("the table's own projection validates");
@@ -1997,10 +2214,19 @@ mod tests {
                     .zip(batch.columns())
                     .map(|(field, column)| {
                         if field.name() == "attributes" {
-                            Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
-                                [0xff_u8].as_slice(),
-                                batch.num_rows(),
-                            ))) as Arc<dyn Array>
+                            let invalid = || {
+                                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                                    [0xff_u8].as_slice(),
+                                    batch.num_rows(),
+                                ))) as Arc<dyn Array>
+                            };
+                            let DataType::Struct(children) =
+                                wyrd_queue::variant::variant_storage_type()
+                            else {
+                                panic!("Variant storage is a struct");
+                            };
+                            Arc::new(StructArray::new(children, vec![invalid(), invalid()], None))
+                                as Arc<dyn Array>
                         } else {
                             Arc::clone(column)
                         }
@@ -2008,9 +2234,11 @@ mod tests {
                     .collect(),
             )
             .expect("the corrupted batch still assembles");
-            assert!(
-                validate(&corrupted).is_err(),
-                "{namespace}.{name} rejects non-canonical payload bytes"
+            let refusal = validate(&corrupted).expect_err("invalid Variant bytes are refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                "{namespace}.{name} refuses invalid Variant bytes with the catalogued code"
             );
         }
 
@@ -2041,19 +2269,18 @@ mod tests {
         .expect("the kind-violating batch still assembles");
         let validate = builtin_table("metrics", "points")
             .expect("points definition")
-            .canonical_validator
-            .expect("the points table owns a value validator");
+            .canonical_validator;
         assert!(
             validate(&kind_violation).is_err(),
             "a point may not populate a foreign kind's column"
         );
 
-        assert!(
-            builtin_table("drift", "observations")
-                .expect("drift observations definition")
-                .canonical_validator
-                .is_none(),
-            "a pre-declared built-in owns no canonical value validation"
+        let drift = builtin_table("drift", "observations").expect("drift observations definition");
+        let empty = RecordBatch::new_empty(Arc::new(Schema::new((drift.arrow_fields)())));
+        assert_eq!(
+            (drift.canonical_validator)(&empty).expect("a declared batch validates"),
+            empty,
+            "a pre-declared built-in's validator returns its batch unchanged"
         );
     }
 
@@ -2199,5 +2426,235 @@ mod tests {
             baseline,
             "a duplicated reserved field drifts the canonical physical identity"
         );
+    }
+
+    /// Pins the revision-10 Variant contract and every built-in Variant/Struct layout.
+    ///
+    /// One test owns the persisted shapes a reader depends on: the `0x0d`
+    /// fingerprint tag with no storage children, the fixed depth and size
+    /// limits, each catalogued Variant error's code and detail fields, the
+    /// exact `drift_report`, `eval_summary`, and `resource_entity_refs`
+    /// layouts, and every built-in column revision 10 stores as Variant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any locked value, layout, code, or detail field drifts.
+    #[test]
+    fn variant_contract_and_builtin_schemas_are_stable() {
+        assert_variant_identity_and_errors();
+        assert_result_struct_layouts();
+        assert_builtin_variant_columns();
+    }
+
+    /// Pins the Variant tag, limits, fingerprint bytes, and each catalogued
+    /// Variant error's code and detail fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those locked values drifts.
+    fn assert_variant_identity_and_errors() {
+        assert_eq!(VARIANT_TYPE_TAG, 0x0d);
+        assert_eq!(VARIANT_MAX_DEPTH, 64);
+        assert_eq!(VARIANT_MAX_ENCODED_BYTES, 8_388_608);
+
+        // A Variant commits its name, tag, and zero children; neither the
+        // storage children nor the extension keys enter the identity.
+        let payload = variant_field("payload", true);
+        let mut metadata = payload.metadata().clone();
+        metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
+        let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![
+            payload.with_metadata(metadata),
+        ]))
+        .expect("a Variant schema encodes");
+        let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        assert_eq!(
+            hex,
+            "0200000001000000077061796c6f61640d0100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
+        );
+
+        for (violation, code, detail_keys) in [
+            (
+                VariantViolation::InvalidJson { path: "/a".into() },
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                &["field", "path", "row"][..],
+            ),
+            (
+                VariantViolation::NumericOutOfRange {
+                    path: "/n".into(),
+                    numeric_kind: "integer",
+                },
+                "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
+                &["field", "numeric_kind", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooDeep {
+                    path: "/d".into(),
+                    depth: 65,
+                },
+                "WYRD_VALA_400_VARIANT_TOO_DEEP",
+                &["depth", "field", "limit", "path", "row"][..],
+            ),
+            (
+                VariantViolation::TooLarge { bytes: 9_000_000 },
+                "WYRD_VALA_413_VARIANT_TOO_LARGE",
+                &["bytes", "field", "limit", "row"][..],
+            ),
+        ] {
+            let error = violation.into_error("payload", 3);
+            assert_eq!(error.code(), code);
+            let wire = serde_json::to_value(&error).expect("the error serializes");
+            let mut keys: Vec<&str> = wire["data"]
+                .as_object()
+                .expect("the error carries detail fields")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, detail_keys, "{code} detail fields");
+        }
+    }
+
+    /// Pins the exact `drift_report` and `eval_summary` Struct layouts of
+    /// `vala.verification.results` and the absence of a `details` column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either layout drifts or `details` reappears.
+    fn assert_result_struct_layouts() {
+        let results = (builtin_table("verification", "results")
+            .expect("verification results")
+            .schema)();
+        let layout = |name: &str| -> Vec<(String, bool, bool)> {
+            let field = results.field_with_name(name).expect("the Struct column");
+            assert!(field.is_nullable(), "{name} is a nullable Struct");
+            let DataType::Struct(children) = field.data_type() else {
+                panic!("{name} is a Struct");
+            };
+            children
+                .iter()
+                .map(|child| (child.name().clone(), child.is_nullable(), is_variant(child)))
+                .collect()
+        };
+        let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
+            entries
+                .iter()
+                .map(|(name, variant)| ((*name).to_owned(), false, *variant))
+                .collect()
+        };
+        assert_eq!(
+            layout("drift_report"),
+            owned(&[("method", false), ("features", true), ("verdict", false)])
+        );
+        assert_eq!(
+            layout("eval_summary"),
+            owned(&[
+                ("total_tasks", false),
+                ("passed_tasks", false),
+                ("failed_tasks", false),
+                ("pass_rate", false),
+                ("duration_ms", false),
+            ])
+        );
+        assert!(results.field_with_name("details").is_err());
+    }
+
+    /// Pins every built-in column stored as Variant and the locked
+    /// `resource_entity_refs` Struct list of each signal table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a column is not Variant or an entity-reference shape drifts.
+    fn assert_builtin_variant_columns() {
+        let entity_ref = DataType::List(Arc::new(Field::new(
+            "entity_ref",
+            DataType::Struct(Fields::from(vec![
+                Field::new("type", DataType::Utf8, false),
+                Field::new(
+                    "id_keys",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    false,
+                ),
+                Field::new(
+                    "description_keys",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    false,
+                ),
+                Field::new("schema_url", DataType::Utf8, false),
+            ])),
+            false,
+        )));
+        for (namespace, name, variants) in [
+            (
+                "traces",
+                "spans",
+                &["attributes", "resource_attributes", "scope_attributes"][..],
+            ),
+            (
+                "logs",
+                "records",
+                &[
+                    "body",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            (
+                "metrics",
+                "points",
+                &[
+                    "metadata",
+                    "attributes",
+                    "resource_attributes",
+                    "scope_attributes",
+                ][..],
+            ),
+            ("eval", "observations", &["context", "media"][..]),
+            ("eval", "result_items", &["actual", "expected"][..]),
+            (
+                "gateway",
+                "calls",
+                &["request_payload", "response_payload"][..],
+            ),
+            ("dev", "agent_traces", &["messages", "tool_io"][..]),
+            ("system", "audit_log", &["detail"][..]),
+        ] {
+            let schema = (builtin_table(namespace, name).expect("built-in").schema)();
+            for column in variants {
+                let field = schema
+                    .field_with_name(column)
+                    .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
+                assert!(
+                    is_variant(field),
+                    "vala.{namespace}.{name}.{column} is Variant"
+                );
+            }
+            if matches!(namespace, "traces" | "logs" | "metrics") {
+                let refs = schema
+                    .field_with_name("resource_entity_refs")
+                    .expect("signal tables carry entity references");
+                assert!(!refs.is_nullable());
+                assert!(
+                    arrow_type_shape_matches(refs.data_type(), &entity_ref),
+                    "vala.{namespace}.{name}.resource_entity_refs is the locked Struct list"
+                );
+                let DataType::List(element) = refs.data_type() else {
+                    panic!("resource_entity_refs is a list");
+                };
+                let DataType::Struct(children) = element.data_type() else {
+                    panic!("each entity reference is a Struct");
+                };
+                let order: Vec<&str> = children.iter().map(|child| child.name().as_str()).collect();
+                assert_eq!(
+                    order,
+                    ["type", "id_keys", "description_keys", "schema_url"],
+                    "entity reference field order"
+                );
+            }
+        }
     }
 }

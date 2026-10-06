@@ -1,6 +1,6 @@
 //! One fixed canonical trace/log/metric dataset, built as public Arrow batches.
 //!
-//! The canonical signal tables declare binary, fixed-size-binary and nested
+//! The canonical signal tables declare Variant, fixed-size-binary and nested
 //! list/struct columns, so a caller writes them through the public Arrow batch
 //! door rather than the JSON row path. Every batch here is assembled against a
 //! schema the caller obtained from `describe_table`, never against a second
@@ -22,9 +22,8 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use vala_bifrost_redux::tables::signal::encode_attributes;
-use wyrd_tonic::otlp::common::v1::any_value::Value;
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
+use serde_json::{Map, Value};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, variant_storage_type};
 
 /// The trace every fixture span, and the correlated error log, belong to.
 pub const TRACE_ID: [u8; 16] = [
@@ -81,8 +80,10 @@ pub enum Cell {
     Float64(f64),
     /// A boolean value.
     Bool(bool),
-    /// Opaque bytes, already in their canonical encoding.
+    /// Opaque bytes, for a binary or fixed-size-binary column.
     Bytes(Vec<u8>),
+    /// A JSON value, encoded under the Bifrost rules into a Variant column.
+    Variant(Value),
     /// A present but empty collection.
     Empty,
     /// A present collection of nested rows, for a `List<Struct<..>>` column.
@@ -94,23 +95,18 @@ pub enum Cell {
 /// One fixture row: the columns it names, keyed by canonical column name.
 pub type Row = BTreeMap<&'static str, Cell>;
 
-/// Encode one attribute collection of string values as canonical bytes.
+/// Build one attribute object of string values for a Variant column.
 ///
-/// The canonical encoding is the server's own, reached through the published
-/// helper rather than restated here, so a fixture cannot drift from the
-/// encoding ingress verifies.
+/// The returned JSON object is encoded by the same Bifrost Variant rules a
+/// canonical writer uses when the fixture batch is assembled.
 #[must_use]
-pub fn attributes(pairs: &[(&str, &str)]) -> Vec<u8> {
-    let values: Vec<KeyValue> = pairs
-        .iter()
-        .map(|(key, value)| KeyValue {
-            key: (*key).to_owned(),
-            value: Some(AnyValue {
-                value: Some(Value::StringValue((*value).to_owned())),
-            }),
-        })
-        .collect();
-    encode_attributes(&values)
+pub fn attributes(pairs: &[(&str, &str)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), Value::String((*value).to_owned())))
+            .collect::<Map<String, Value>>(),
+    )
 }
 
 /// Build one Arrow batch over `schema` from rows that name only some columns.
@@ -118,7 +114,7 @@ pub fn attributes(pairs: &[(&str, &str)]) -> Vec<u8> {
 /// Every described column is produced: a named one takes the supplied value,
 /// an unnamed nullable one becomes null, and an unnamed non-null one takes the
 /// canonical empty value for its type - empty text, zero, `false`, zero bytes,
-/// or an empty list. That keeps a fixture to the handful of values its
+/// an empty Variant object, or an empty list. That keeps a fixture to the handful of values its
 /// assertions depend on while still satisfying the table's full ledger.
 ///
 /// # Panics
@@ -146,6 +142,9 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
                 .unwrap_or_else(|| default_cell(field))
         })
         .collect();
+    if is_variant_storage(field) {
+        return variant_column(field, &cells);
+    }
     match field.data_type() {
         DataType::Utf8 => {
             let mut builder = StringBuilder::new();
@@ -249,6 +248,35 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
     }
 }
 
+/// Report whether a described column stores a Variant.
+///
+/// A top-level Variant carries the extension marker while a nested one is
+/// described by its storage alone, so the unshredded storage struct is the one
+/// shape both share.
+fn is_variant_storage(field: &Field) -> bool {
+    field.data_type() == &variant_storage_type()
+}
+
+/// Build one Variant column, encoding each JSON cell under the Bifrost rules.
+///
+/// # Panics
+///
+/// Panics when a cell is not a JSON value or null, or a value cannot be
+/// stored as Variant; both are fixture authoring errors.
+fn variant_column(field: &Field, cells: &[Cell]) -> ArrayRef {
+    let mut builder = VariantColumnBuilder::with_capacity(cells.len());
+    for cell in cells {
+        match cell {
+            Cell::Variant(value) => builder.append(
+                &EncodedVariant::from_json(value).expect("a fixture value is a storable Variant"),
+            ),
+            Cell::Null => builder.append_null(),
+            other => panic!("column {} cannot take {other:?}", field.name()),
+        }
+    }
+    builder.finish()
+}
+
 /// Build a `List<Struct<..>>` column from the nested rows each cell names.
 ///
 /// The element struct's own children are produced by the same column builder
@@ -319,6 +347,9 @@ fn default_cell(field: &Field) -> Cell {
     if field.is_nullable() {
         return Cell::Null;
     }
+    if is_variant_storage(field) {
+        return Cell::Variant(Value::Object(Map::new()));
+    }
     match field.data_type() {
         DataType::Utf8 => Cell::Text(String::new()),
         DataType::Int32 => Cell::Int32(0),
@@ -357,7 +388,7 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("status_message", Cell::Text("ok".to_owned())),
         (
             "attributes",
-            Cell::Bytes(attributes(&[
+            Cell::Variant(attributes(&[
                 ("gen_ai.input.messages", INPUT_MESSAGES),
                 ("gen_ai.output.messages", OUTPUT_MESSAGES),
             ])),
@@ -365,7 +396,7 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Bytes(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -390,7 +421,7 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
                 ("name", Cell::Text(EVENT_NAME.to_owned())),
                 (
                     "attributes",
-                    Cell::Bytes(attributes(&[("gen_ai.finish_reason", "stop")])),
+                    Cell::Variant(attributes(&[("gen_ai.finish_reason", "stop")])),
                 ),
             ])]),
         ),
@@ -403,7 +434,7 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
                 ("flags", Cell::Int64(1)),
                 (
                     "attributes",
-                    Cell::Bytes(attributes(&[("link.kind", "follows_from")])),
+                    Cell::Variant(attributes(&[("link.kind", "follows_from")])),
                 ),
             ])]),
         ),
@@ -425,12 +456,12 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ),
         (
             "attributes",
-            Cell::Bytes(attributes(&[("gen_ai.tool.name", "search")])),
+            Cell::Variant(attributes(&[("gen_ai.tool.name", "search")])),
         ),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Bytes(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -471,24 +502,17 @@ pub fn logs(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch {
         ("severity_number", Cell::Int32(17)),
         ("severity_text", Cell::Text("ERROR".to_owned())),
         ("event_name", Cell::Text("tool.retry.exhausted".to_owned())),
-        (
-            "body",
-            Cell::Bytes(vala_bifrost_redux::tables::signal::encode_any_value(
-                &AnyValue {
-                    value: Some(Value::StringValue(LOG_BODY.to_owned())),
-                },
-            )),
-        ),
+        ("body", Cell::Variant(Value::String(LOG_BODY.to_owned()))),
         ("trace_id", Cell::Bytes(TRACE_ID.to_vec())),
         ("span_id", Cell::Bytes(CHILD_SPAN_ID.to_vec())),
         (
             "attributes",
-            Cell::Bytes(attributes(&[("gen_ai.tool.name", "search")])),
+            Cell::Variant(attributes(&[("gen_ai.tool.name", "search")])),
         ),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Bytes(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -517,12 +541,12 @@ pub fn points(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch
             ("start_time_unix_nano", Cell::Int64(anchor_nanos)),
             (
                 "attributes",
-                Cell::Bytes(attributes(&[("gen_ai.request.model", MODEL)])),
+                Cell::Variant(attributes(&[("gen_ai.request.model", MODEL)])),
             ),
             ("resource_present", Cell::Bool(true)),
             (
                 "resource_attributes",
-                Cell::Bytes(attributes(&[("service.name", "wyrd.fixture.service")])),
+                Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
             ),
             ("scope_present", Cell::Bool(true)),
             ("scope_name", Cell::Text(scope.to_owned())),

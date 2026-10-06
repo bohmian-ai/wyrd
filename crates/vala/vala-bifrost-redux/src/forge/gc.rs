@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use iceberg::spec::{FormatVersion, ManifestContentType, ManifestFile};
+use iceberg::spec::{ManifestContentType, ManifestFile};
 use iceberg::table::Table;
 use iceberg::transaction::{
     ApplyTransactionAction, MANIFEST_MIN_MERGE_COUNT, MANIFEST_MIN_MERGE_COUNT_DEFAULT,
@@ -223,9 +223,10 @@ impl Forge {
     /// Rewrites one table's fragmented data manifests under its table lease.
     ///
     /// Current settings are re-read first, as `RisingWave` does: a disabled
-    /// table leaves the set. A format v3 table is skipped because row lineage
-    /// forbids this rewrite. The target size and minimum merge count are the
-    /// standard Iceberg commit properties.
+    /// table leaves the set. Bifrost tables are format v3: every rewritten
+    /// entry keeps its explicit `first_row_id`, so row lineage is unchanged and
+    /// only the new manifest consumes fresh row-id space. The target size and
+    /// minimum merge count are the standard Iceberg commit properties.
     ///
     /// `stop` is checked under the lease, immediately before the commit.
     ///
@@ -242,10 +243,6 @@ impl Forge {
         let (binding, table, settings) = self.load_member(key).await?;
         if !settings.manifest_rewrite_enabled {
             schedule.refresh_membership(key, &settings);
-            return Ok(());
-        }
-        if table.metadata().format_version() >= FormatVersion::V3 {
-            tracing::warn!(table = %key.table.table, "Forge manifest rewrite skipped for format v3");
             return Ok(());
         }
         let Some(snapshot) = table.metadata().snapshot_for_ref(PROMOTION_BRANCH) else {

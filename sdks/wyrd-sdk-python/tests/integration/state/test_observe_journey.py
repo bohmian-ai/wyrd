@@ -35,7 +35,6 @@ from uuid import uuid4
 import pytest
 import wyrd
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.proto.common.v1.common_pb2 import KeyValueList
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
@@ -106,11 +105,11 @@ class DriftRow(BaseModel):
 class EvalRow(BaseModel):
     """The Eval row, its trace identity, and the managed identity stamped onto it."""
 
-    context: str
+    context: dict
     session_id: str | None
     trace_id: bytes | None
     span_id: bytes | None
-    media: str | None
+    media: list[dict] | None
     card_uid: str | None
     run_id: str | None
 
@@ -126,9 +125,9 @@ EXPLICIT_TRACE = "0af7651916cd43dd8448eb211c80319c"
 EXPLICIT_SPAN = "b7ad6b7169203331"
 SESSION = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f"
 MEDIA = MediaRef(id="screenshot", kind="image", uri="s3://bucket/shot.png", media_type="image/png")
-MEDIA_TEXT = (
-    '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]'
-)
+MEDIA_VALUE = [
+    {"id": "screenshot", "kind": "image", "uri": "s3://bucket/shot.png", "media_type": "image/png"}
+]
 FIXED_TABLES = ("vala.drift.observations", "vala.eval.observations")
 
 
@@ -306,7 +305,7 @@ def assert_read_back(
         f"FROM vala.eval.observations WHERE run_id = '{run_id}'",
         EvalRow,
     )
-    by_answer = {json.loads(row.context)["answer"]: row for row in evals}
+    by_answer = {row.context["answer"]: row for row in evals}
     assert set(by_answer) == {"yes", "traced", "explicit"}
     assert {row.run_id for row in evals} == {run_id}
     assert {row.card_uid for row in evals} == {agent_uid}
@@ -316,7 +315,7 @@ def assert_read_back(
     assert by_answer["traced"].trace_hex() == active
     assert by_answer["explicit"].trace_hex() == (EXPLICIT_TRACE, EXPLICIT_SPAN)
     # Session and media persist exactly as authored, only where supplied.
-    assert (by_answer["explicit"].session_id, by_answer["explicit"].media) == (SESSION, MEDIA_TEXT)
+    assert (by_answer["explicit"].session_id, by_answer["explicit"].media) == (SESSION, MEDIA_VALUE)
     assert (by_answer["yes"].session_id, by_answer["yes"].media) == (None, None)
 
     # Two tables, two scopes, one invocation: each row keeps the subject of the
@@ -495,31 +494,21 @@ def assert_nested_scopes(
     query = Bifrost(server_url=server.base_url, credential=credential)
     spans = (
         query.sql(
-            "SELECT name, attributes, run_id, card_uid "
+            "SELECT name, attributes ->> 'wyrd.card_ref' AS card_ref, run_id, card_uid "
             f"FROM vala.traces.spans WHERE run_id = '{run.run_id}' ORDER BY name"
         )
         .to_arrow()
         .to_pylist()
     )
-    assert {
-        row["name"]: (asserted_card_ref(row["attributes"]), row["card_uid"]) for row in spans
-    } == {name: (view.card_ref, view.card_ref.split("#", 1)[1]) for name, view in views.items()}, (
-        "one run id across every scope, each span under its own view's Card"
-    )
+    assert {row["name"]: (row["card_ref"], row["card_uid"]) for row in spans} == {
+        name: (view.card_ref, view.card_ref.split("#", 1)[1]) for name, view in views.items()
+    }, "one run id across every scope, each span under its own view's Card"
     outside = (
         query.sql("SELECT run_id, card_uid FROM vala.traces.spans WHERE name = 'nested.outside'")
         .to_arrow()
         .to_pylist()
     )
     assert outside == [{"run_id": None, "card_uid": None}], "no scope outlives its block"
-
-
-def asserted_card_ref(attributes: bytes) -> str:
-    """Read the ``wyrd.card_ref`` a span asserted from its persisted attribute payload."""
-    values = {
-        item.key: item.value.string_value for item in KeyValueList.FromString(attributes).values
-    }
-    return values["wyrd.card_ref"]
 
 
 def assert_scope_joins(
@@ -535,7 +524,7 @@ def assert_scope_joins(
     run_id = agent_run.run_id
     spans = (
         query.sql(
-            "SELECT name, attributes, run_id, card_uid, principal_id "
+            "SELECT name, attributes ->> 'wyrd.card_ref' AS card_ref, run_id, card_uid, principal_id "
             f"FROM vala.traces.spans WHERE run_id = '{run_id}' ORDER BY name"
         )
         .to_arrow()
@@ -544,9 +533,9 @@ def assert_scope_joins(
     assert [row["name"] for row in spans] == ["agent.invoke", "agent.tool"]
     # The asserted CardRef is not a column: Scribe resolves it to `card_uid`
     # and the lossless attribute payload keeps exactly what the client sent.
-    assert {
-        (asserted_card_ref(row["attributes"]), row["run_id"], row["card_uid"]) for row in spans
-    } == {(agent_run.card_ref, run_id, agent_uid)}
+    assert {(row["card_ref"], row["run_id"], row["card_uid"]) for row in spans} == {
+        (agent_run.card_ref, run_id, agent_uid)
+    }
     publishers = {row["principal_id"] for row in spans}
     assert len(publishers) == 1 and None not in publishers, "one authenticated publisher"
     (publisher,) = publishers
@@ -567,7 +556,7 @@ def assert_scope_joins(
 
     evals = (
         query.sql(
-            "SELECT e.context, e.trace_id, e.span_id, e.run_id, e.card_uid, s.name "
+            "SELECT to_json(e.context) AS context, e.trace_id, e.span_id, e.run_id, e.card_uid, s.name "
             "FROM vala.eval.observations e JOIN vala.traces.spans s "
             "ON e.trace_id = s.trace_id AND e.span_id = s.span_id "
             f"WHERE e.run_id = '{run_id}'"

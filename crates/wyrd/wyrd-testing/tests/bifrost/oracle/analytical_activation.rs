@@ -176,7 +176,7 @@ fn is_transport(error: &BifrostClientError) -> bool {
 ///
 /// The SDK owns exactly one public projection, so every assertion here reads
 /// the code through it rather than a second per-variant table.
-fn sdk_code(error: &BifrostClientError) -> &'static str {
+pub(crate) fn sdk_code(error: &BifrostClientError) -> &'static str {
     wyrd_spec::error::WyrdError::from(error).code()
 }
 
@@ -438,13 +438,13 @@ async fn hold_and_release(
 }
 
 /// Index of the pod public queries are addressed to.
-const COORDINATOR: usize = 0;
+pub(crate) const COORDINATOR: usize = 0;
 
 /// Indices of the pods that follow the coordinator's distributed graph.
-const PEER_FOLLOWERS: [usize; 2] = [1, 2];
+pub(crate) const PEER_FOLLOWERS: [usize; 2] = [1, 2];
 
 /// Index of the pod that publishes the data every Oracle reads.
-const PEER_SCRIBE: usize = 3;
+pub(crate) const PEER_SCRIBE: usize = 3;
 
 /// Slot units one admitted Analytical graph charges at the resource root.
 ///
@@ -459,9 +459,9 @@ const ANALYTICAL_GRAPH_UNITS: u32 = 1;
 /// delta attributes remote stages to each follower. The private-plane
 /// body-poll counter is process-wide in the in-process topology, so its delta
 /// proves only that some admitted peer request reached a body.
-struct RemoteWork {
+pub(crate) struct RemoteWork {
     /// Graph-lease activations per follower, in [`PEER_FOLLOWERS`] order.
-    leases: Vec<u64>,
+    pub(crate) leases: Vec<u64>,
     /// Process-wide private-plane body polls.
     polls: u64,
 }
@@ -472,7 +472,7 @@ impl RemoteWork {
     /// # Errors
     ///
     /// Returns a message when a follower is not running.
-    fn observe(cluster: &PeerCluster) -> Result<Self, JourneyError> {
+    pub(crate) fn observe(cluster: &PeerCluster) -> Result<Self, JourneyError> {
         Ok(Self {
             leases: PEER_FOLLOWERS
                 .iter()
@@ -489,7 +489,11 @@ impl RemoteWork {
     ///
     /// Returns a message naming `case` and the follower or counter that did
     /// not advance.
-    fn expect_advanced(&self, cluster: &PeerCluster, case: &str) -> Result<(), JourneyError> {
+    pub(crate) fn expect_advanced(
+        &self,
+        cluster: &PeerCluster,
+        case: &str,
+    ) -> Result<(), JourneyError> {
         for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
             let activated = cluster.graph_leases(index)?.0;
             if activated <= self.leases[offset] {

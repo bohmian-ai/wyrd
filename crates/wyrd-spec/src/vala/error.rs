@@ -234,6 +234,116 @@ pub enum BifrostError {
         detail: String,
     },
 
+    /// A Variant input value, or `parse_json` query text, is not valid JSON or
+    /// not a valid Variant encoding.
+    #[error("invalid Variant JSON in field {field} row {row} at {path}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_INVALID_JSON",
+        status = 400,
+        title = "Invalid Variant JSON",
+        remediation = "Supply valid JSON text or a valid arrow.parquet.variant value for the Variant field; use try_parse_json in SQL to map invalid text to null."
+    )]
+    VariantInvalidJson {
+        /// Logical field (or SQL function) whose value failed to convert.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the failing value inside the row value.
+        path: String,
+    },
+
+    /// A JSON number fits no Variant numeric type.
+    #[error("Variant {numeric_kind} value out of range in field {field} row {row} at {path}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE",
+        status = 400,
+        title = "Variant numeric value out of range",
+        remediation = "Send integers within the signed 64-bit or Variant decimal range, or send the number as a string."
+    )]
+    VariantNumericOutOfRange {
+        /// Logical field whose value failed to convert.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the failing number inside the row value.
+        path: String,
+        /// Numeric family that could not hold the value, such as `integer`.
+        numeric_kind: String,
+    },
+
+    /// A Variant value nests deeper than the fixed Variant depth limit.
+    #[error(
+        "Variant value in field {field} row {row} nests {depth} levels, limit {limit} at {path}"
+    )]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_VARIANT_TOO_DEEP",
+        status = 400,
+        title = "Variant value too deep",
+        remediation = "Flatten the value so it nests at most 64 levels, counting the root container as one."
+    )]
+    VariantTooDeep {
+        /// Logical field whose value is too deep.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// RFC 6901 JSON Pointer to the first container past the limit.
+        path: String,
+        /// Depth reached at `path`, counting the root container as one.
+        depth: u32,
+        /// Fixed maximum Variant depth.
+        limit: u32,
+    },
+
+    /// A Variant value encodes to more bytes than the fixed Variant size limit.
+    #[error("Variant value in field {field} row {row} encodes {bytes} bytes, limit {limit}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_VARIANT_TOO_LARGE",
+        status = 413,
+        title = "Variant value too large",
+        remediation = "Keep each Variant value at most 8388608 encoded bytes (metadata plus value); split large payloads across rows."
+    )]
+    VariantTooLarge {
+        /// Logical field whose value is too large.
+        field: String,
+        /// Zero-based input row of the failing value.
+        row: u64,
+        /// Canonical encoded Variant bytes, metadata plus value.
+        bytes: u64,
+        /// Fixed maximum encoded Variant bytes.
+        limit: u64,
+    },
+
+    /// A write row names a key the table does not declare.
+    #[error("undeclared field {field} in row {row}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD",
+        status = 400,
+        title = "Undeclared Bifrost field",
+        remediation = "Remove the key or declare it on the table; store open data in a Variant field."
+    )]
+    UndeclaredField {
+        /// Key the table does not declare.
+        field: String,
+        /// Zero-based input row that carried the key.
+        row: u64,
+    },
+
+    /// A table field uses a type Bifrost cannot store, or a write supplies a
+    /// type that does not match the declared field.
+    #[error("unsupported type {data_type} for field {field}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
+        status = 400,
+        title = "Unsupported Bifrost type",
+        remediation = "Use a supported Bifrost column type; store open data in a Variant field."
+    )]
+    UnsupportedType {
+        /// Field whose type is unsupported.
+        field: String,
+        /// Rendered Arrow or declared type that was refused.
+        data_type: String,
+    },
+
     /// A user-supplied schema field uses a reserved system column name.
     #[error("reserved system column: {column}")]
     #[wyrd_error(

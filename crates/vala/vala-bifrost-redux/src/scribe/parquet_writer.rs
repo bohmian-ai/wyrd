@@ -560,7 +560,6 @@ impl<'a> RollingArtifactWriter<'a> {
             BufWriter::new(file),
             Arc::clone(&schema),
             Some(bifrost_writer_properties_with_metadata(
-                group.num_rows(),
                 Vec::new(),
                 self.plan.layout.bloom_columns(),
             )),

@@ -278,10 +278,13 @@ async fn assert_read_back(
 ) {
     let query = Bifrost::query_only(client);
     let drift: Vec<DriftRow> = query
-        .sql_as(&format!(
-            "SELECT series, num_value, str_value, card_uid, run_id \
+        .sql_as(
+            &format!(
+                "SELECT series, num_value, str_value, card_uid, run_id \
              FROM vala.drift.observations WHERE run_id = '{run_id}' ORDER BY series"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("drift rows read back");
     assert_eq!(drift.len(), 2, "one tall row per feature: {drift:?}");
@@ -301,10 +304,13 @@ async fn assert_read_back(
     }
 
     let evals: Vec<EvalRow> = query
-        .sql_as(&format!(
-            "SELECT context, session_id, trace_id, span_id, media, card_uid, run_id \
+        .sql_as(
+            &format!(
+                "SELECT context, session_id, trace_id, span_id, media, card_uid, run_id \
              FROM vala.eval.observations WHERE run_id = '{run_id}'"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("eval rows read back");
     assert_eq!(
@@ -331,10 +337,13 @@ async fn assert_read_back(
         (datasets.1, &[42][..], model_uid),
     ] {
         let rows: Vec<DatasetRow> = query
-            .sql_as(&format!(
-                "SELECT value, run_id, card_uid FROM {table} WHERE run_id = '{run_id}' \
+            .sql_as(
+                &format!(
+                    "SELECT value, run_id, card_uid FROM {table} WHERE run_id = '{run_id}' \
                  ORDER BY value"
-            ))
+                ),
+                &[],
+            )
             .await
             .expect("generic rows read back");
         assert_eq!(
@@ -415,12 +424,15 @@ async fn export_explicit_span(server: &WyrdTestServer, token: &str) {
 /// the exported span.
 async fn assert_eval_joins_span(client: &WyrdClient, run_id: &str) {
     let joined: Vec<EvalSpanRow> = Bifrost::query_only(client)
-        .sql_as(&format!(
-            "SELECT e.context, s.name AS span_name \
+        .sql_as(
+            &format!(
+                "SELECT e.context, s.name AS span_name \
              FROM vala.eval.observations e JOIN vala.traces.spans s \
                ON e.trace_id = s.trace_id AND e.span_id = s.span_id \
              WHERE e.run_id = '{run_id}'"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("eval rows join spans");
     assert_eq!(joined.len(), 1, "one Eval row joins its span: {joined:?}");
@@ -487,14 +499,14 @@ async fn assert_negative_flows(run: &Run, agent: &Run) {
 /// unknown alias is accepted.
 fn assert_initial_card_selection(state: &WyrdState, run: &Run, agent: &Run) {
     assert_eq!(
-        run.card_ref(),
+        run.subject(),
         state.root_ref(),
         "no Card argument targets the root"
     );
     let agent_run = state
         .run_for_card("agent")
         .expect("the single-Card form resolves");
-    assert_eq!(agent_run.card_ref(), agent.card_ref());
+    assert_eq!(agent_run.subject(), agent.subject());
     assert_ne!(agent_run.run_id(), run.run_id(), "its own invocation");
     assert_eq!(
         agent_run
@@ -645,13 +657,13 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     assert_eq!(model.run_id().as_str(), run_id, "one invocation, two views");
     assert_initial_card_selection(&state, &run, &agent);
     let model_uid = model
-        .card_ref()
+        .subject()
         .uid
         .clone()
         .expect("hydrated Card carries its UID")
         .to_string();
     let agent_uid = agent
-        .card_ref()
+        .subject()
         .uid
         .clone()
         .expect("hydrated Card carries its UID")
@@ -720,7 +732,7 @@ struct EventTimeRow {
 /// Panics when the query fails.
 async fn event_times(client: &WyrdClient, sql: &str) -> Vec<i64> {
     let rows: Vec<EventTimeRow> = Bifrost::query_only(client)
-        .sql_as(sql)
+        .sql_as(sql, &[])
         .await
         .unwrap_or_else(|error| panic!("{sql} reads back: {error}"));
     rows.into_iter().map(|row| row.event_time).collect()
@@ -892,9 +904,10 @@ fn write_outside_graph(root: &Path) -> PathBuf {
 /// Panics when the query is refused.
 async fn dataset_rows(client: &WyrdClient, table: &str) -> Vec<DatasetRow> {
     Bifrost::query_only(client)
-        .sql_as(&format!(
-            "SELECT value, run_id, card_uid FROM {table} ORDER BY value"
-        ))
+        .sql_as(
+            &format!("SELECT value, run_id, card_uid FROM {table} ORDER BY value"),
+            &[],
+        )
         .await
         .expect("the workload key queries its evidence")
 }
@@ -951,7 +964,7 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
     state.shutdown().await.expect("the write drains");
     server.flush_bifrost().await.expect("flush server Scribe");
     let model_uid = model
-        .card_ref()
+        .subject()
         .uid
         .clone()
         .expect("hydrated Card carries its UID")
@@ -986,7 +999,7 @@ async fn issued_card_key_writes_and_queries_within_its_scope_only() {
             .expect_err("a record for a Card outside the key's scope is refused"),
     };
     let code = match &refusal {
-        wyrd_sdk::verification::WyrdError::UpstreamFailure { details, .. } => details
+        wyrd_sdk::WyrdError::UpstreamFailure { details, .. } => details
             .get("original_code")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
@@ -1106,10 +1119,13 @@ async fn drift_burst_survives_a_byte_budget_override() {
     server.flush_bifrost().await.expect("flush server Scribe");
 
     let groups: Vec<RecordCount> = Bifrost::query_only(&connect(&server, &admin))
-        .sql_as(&format!(
-            "SELECT COUNT(*) AS n FROM vala.drift.observations \
+        .sql_as(
+            &format!(
+                "SELECT COUNT(*) AS n FROM vala.drift.observations \
              WHERE run_id = '{run_id}' GROUP BY record_id"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("burst rows read back");
     assert_eq!(
@@ -1229,10 +1245,13 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
     server.flush_bifrost().await.expect("flush server Scribe");
 
     let groups: Vec<RecordCount> = Bifrost::query_only(&connect(&server, &admin))
-        .sql_as(&format!(
-            "SELECT COUNT(*) AS n FROM vala.drift.observations \
+        .sql_as(
+            &format!(
+                "SELECT COUNT(*) AS n FROM vala.drift.observations \
              WHERE run_id = '{run_id}' GROUP BY record_id"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("sustained rows read back");
     assert_eq!(

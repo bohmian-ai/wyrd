@@ -941,48 +941,6 @@ mod transport_behavior {
         );
     }
 
-    /// Proves a direct execution waits past a shorter configured `timeout_ms`
-    /// so the server's own deadline answer reaches the caller, sent once.
-    ///
-    /// # Panics
-    /// Panics when the delayed 504 is replaced by a client timeout or replayed.
-    #[tokio::test]
-    async fn verification_execute_outlives_the_configured_timeout() {
-        let problem = serde_json::json!({
-            "code": "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",
-            "detail": "the direct execution exceeded its deadline",
-            "details": {},
-        })
-        .to_string();
-        let server = spawn_mock(vec![
-            MockResponse::status(504, &problem).with_body_delay(SLOW_DELAY),
-        ])
-        .await;
-        let client = WyrdClient::from_parts(
-            AuthMiddleware::new(
-                &ClientConfig::default(),
-                ResolvedCredential::BearerToken("test-bearer".to_owned().into()),
-            )
-            .expect("auth builds"),
-            make_short_timeout_transport(server.base_url.clone()),
-            ClientConfig::default().grpc,
-        );
-        let request =
-            wyrd_client::verification::ExecuteVerificationRequest::decode(serde_json::json!({
-                "verifier_uid": "018f4d8e-0000-7000-8000-000000000001",
-                "subject_card_uid": "018f4d8e-0000-7000-8000-000000000002",
-                "input": {"kind": "eval_record", "context": {"answer": "yes"}},
-            }))
-            .expect("request decodes");
-
-        let error = wyrd_client::verification::Verification::with_client(client)
-            .execute(&request)
-            .await
-            .expect_err("the server's deadline answer is an error");
-        assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
-        assert_eq!(server.hits.load(Ordering::SeqCst), 1, "never replayed");
-    }
-
     /// Proves an authenticated streaming GET body outlives `timeout_ms`.
     ///
     /// # Panics

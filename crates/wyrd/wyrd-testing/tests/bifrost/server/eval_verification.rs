@@ -393,6 +393,7 @@ async fn query(
     )
     .run_with(
         BifrostQueryRequest {
+            params: Vec::new(),
             sql,
             deadline_ms: Some(30_000),
         },
@@ -679,7 +680,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     let state = start_state(&bundle, &client).await;
     let run = state.run();
     let agent = run.for_card("agent")?;
-    let agent_uid = agent.card_ref().uid.clone().ok_or("agent has no UID")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
     let object = format!("{tenant}/cards/{agent_uid}/shot.png");
     server
         .state()
@@ -1049,7 +1050,7 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     );
     let client = connect(&server, &writer);
     let state = start_state(&bundle, &client).await;
-    let subject = state.run().for_card("agent")?.card_ref().clone();
+    let subject = state.run().for_card("agent")?.subject().clone();
     state.shutdown().await?;
     let scribe = server.bifrost_scribe().ok_or("the server owns no Scribe")?;
     let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client).await?;
@@ -1219,7 +1220,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
     );
     let client = connect(&server, &writer);
     let state = start_state(&bundle, &client).await;
-    let subject = state.run().for_card("agent")?.card_ref().clone();
+    let subject = state.run().for_card("agent")?.subject().clone();
     state.shutdown().await?;
     let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client).await?;
 
@@ -1302,6 +1303,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
         CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
+        params: Vec::new(),
         sql: "SELECT result_id FROM vala.verification.results".to_owned(),
         deadline_ms: Some(30_000),
     })
@@ -1641,7 +1643,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
         )
         .await?;
     let state = start_state(&journey.bundle, &journey.client).await;
-    let subject = state.run().for_card("traced")?.card_ref().clone();
+    let subject = state.run().for_card("traced")?.subject().clone();
     state.shutdown().await?;
     let past = uuid::Uuid::now_v7().to_string();
     let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&journey.client).await?;
@@ -1766,7 +1768,7 @@ async fn continuous_eval_refuses_a_trace_over_the_span_ceiling() -> Result<(), S
     let agent_uid = state
         .run()
         .for_card("agent")?
-        .card_ref()
+        .subject()
         .uid
         .clone()
         .ok_or("agent has no UID")?;
@@ -1876,6 +1878,7 @@ async fn read_as(
 ) -> Result<u64, wyrd_spec::error::WyrdError> {
     ScheduledQueryCaller::new(server.state().clone(), context, CancellationToken::new())
         .run(BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(30_000),
         })
@@ -2135,7 +2138,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     let state = start_state(&bundle, &client).await;
     let run = state.run();
     let agent = run.for_card("agent")?;
-    let agent_uid = agent.card_ref().uid.clone().ok_or("agent has no UID")?;
+    let agent_uid = agent.subject().uid.clone().ok_or("agent has no UID")?;
     let object = format!("{tenant}/cards/{agent_uid}/shot.png");
     server
         .state()
@@ -2214,8 +2217,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     tokio::time::timeout(WAIT, task).await??;
     let runs = runs?;
 
-    let verification =
-        wyrd_client::verification::Verification::with_client(connect(&server, &admin));
+    let verification = connect(&server, &admin);
     for (record, code) in [
         (&provider_id, "eval_execution_failed"),
         (&locator_id, "eval_execution_failed"),
@@ -2223,7 +2225,15 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     ] {
         let run = run_of(&runs, "eval-gated", record)?;
         assert_unresulted(&server, tenant, run, "errored").await?;
-        let status = serde_json::to_string(&verification.get_run(&run.run).await?)?;
+        let status = serde_json::to_string(
+            &verification
+                .request_json::<(), wyrd_spec::verification::VerificationRunStatus>(
+                    reqwest::Method::GET,
+                    &format!("/v1/verification/runs/{}", run.run),
+                    None,
+                )
+                .await?,
+        )?;
         if !status.contains(&format!("\"code\":\"{code}\""))
             || [PROVIDER_SENTINEL, LOCATOR_SENTINEL, SQL_SENTINEL]
                 .iter()

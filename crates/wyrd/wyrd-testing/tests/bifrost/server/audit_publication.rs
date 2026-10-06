@@ -58,6 +58,7 @@ async fn retained_rows(
         tokio_util::sync::CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE {predicate}"),
         deadline_ms: Some(60_000),
     })
@@ -814,6 +815,7 @@ async fn retained_matching(
         tokio_util::sync::CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}' AND {predicate}"),
         deadline_ms: Some(60_000),
     })
@@ -1187,11 +1189,11 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
         .and_then(|status| status.verification)
         .ok_or("a binding owner serves verification status")?
         .binding_ids[0];
-    let runner = wyrd_client::Verification::with_client(client(&machine_key(
+    let runner = client(&machine_key(
         server
             .credential_registered_service(&receipt.root, &["writer"])
             .await?,
-    )?)?);
+    )?)?;
     let dataset = format!("vala.datasets.audit_loss_{}", uuid::Uuid::now_v7().simple());
     let table = wyrd_client::bifrost::TableConfig::from_json_schema(
         &dataset,
@@ -1220,7 +1222,7 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
         wyrd_client::bifrost::Correlation::default(),
     )?;
     writer.flush().await?;
-    let run_request: wyrd_client::verification::StartVerificationRunRequest =
+    let run_request: wyrd_spec::verification::StartVerificationRunRequest =
         serde_json::from_value(serde_json::json!({
             "target": { "kind": "binding", "binding_id": binding_id.to_string() },
             "input": {
@@ -1229,12 +1231,22 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
                 "end": "2026-09-17T01:00:00Z",
             },
         }))?;
-    let run_id = runner.start_run(&run_request, None).await?;
-    assert_eq!(
-        runner.get_run(&run_id).await?.run_id,
-        run_id,
-        "the run started"
-    );
+    let run_id = runner
+        .submit_idempotent::<_, wyrd_spec::verification::StartVerificationRunResponse>(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            &run_request,
+        )
+        .await?
+        .run_id;
+    let run: wyrd_spec::verification::VerificationRunStatus = runner
+        .request_json::<(), _>(
+            reqwest::Method::GET,
+            &format!("/v1/verification/runs/{run_id}"),
+            None,
+        )
+        .await?;
+    assert_eq!(run.run_id, run_id, "the run started");
     writer.shutdown().await?;
     failures
         .await_failure(std::time::Duration::from_secs(30))
@@ -1249,7 +1261,7 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
     assert_eq!(staged, 0, "no decision reaches staging while audit fails");
     server.flush_bifrost().await?;
     let rows = wyrd_client::Bifrost::query_only(&admin)
-        .sql(&format!("SELECT value FROM {dataset}"))
+        .sql(&format!("SELECT value FROM {dataset}"), &[])
         .await?;
     assert_eq!(
         rows.num_rows(),

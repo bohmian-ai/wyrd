@@ -11,11 +11,15 @@
 
 use std::path::{Path, PathBuf};
 
+use reqwest::Method;
 use secrecy::ExposeSecret;
 use serde_json::json;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardSelector, Cards};
-use wyrd_sdk::verification::{StartVerificationRunRequest, Verification, VerifierReadiness};
+use wyrd_spec::verification::{
+    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    VerificationRunStatus, VerifierReadiness,
+};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
 
@@ -162,14 +166,18 @@ async fn starts_a_keyed_manual_run_and_reads_its_status() {
         .expect("a binding owner serves verification status")
         .binding_ids[0];
 
-    let writer = Verification::with_client(client(&api_key(
+    let writer = client(&api_key(
         server
             .credential_registered_service(&receipt.root, &["writer"])
             .await
             .expect("service credential issues"),
-    )));
-    let binding = writer
-        .get_binding(&binding_id)
+    ));
+    let binding: VerificationBindingStatus = writer
+        .request_json::<(), _>(
+            Method::GET,
+            &format!("/v1/verification/bindings/{binding_id}"),
+            None,
+        )
         .await
         .expect("binding reads");
     assert_eq!(binding.binding_id, binding_id);
@@ -178,26 +186,54 @@ async fn starts_a_keyed_manual_run_and_reads_its_status() {
 
     let request = run_request(&binding_id.to_string(), "2026-09-17T01:00:00Z");
     let run_id = writer
-        .start_run(&request, Some("rust-journey-0001"))
+        .submit_with_idempotency_key::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &request,
+            "rust-journey-0001",
+        )
         .await
-        .expect("run starts");
+        .expect("run starts")
+        .run_id;
     let replay = writer
-        .start_run(&request, Some("rust-journey-0001"))
+        .submit_with_idempotency_key::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &request,
+            "rust-journey-0001",
+        )
         .await
-        .expect("keyed retry replays");
+        .expect("keyed retry replays")
+        .run_id;
     assert_eq!(replay, run_id, "a keyed retry returns the same run");
-    let run = writer.get_run(&run_id).await.expect("run reads");
+    let run: VerificationRunStatus = writer
+        .request_json::<(), _>(
+            Method::GET,
+            &format!("/v1/verification/runs/{run_id}"),
+            None,
+        )
+        .await
+        .expect("run reads");
     assert_eq!(run.run_id, run_id);
     assert!(run.requested_by_principal_id.is_some());
     let reused = run_request(&binding_id.to_string(), "2026-09-17T02:00:00Z");
     let conflict = writer
-        .start_run(&reused, Some("rust-journey-0001"))
+        .submit_with_idempotency_key::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &reused,
+            "rust-journey-0001",
+        )
         .await
         .expect_err("a reused key with a different body is refused");
     assert_eq!(conflict.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
     let inverted = run_request(&binding_id.to_string(), "2026-09-16T00:00:00Z");
     let invalid = writer
-        .start_run(&inverted, None)
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &inverted,
+        )
         .await
         .expect_err("an inverted window is refused");
     assert_eq!(
@@ -206,14 +242,18 @@ async fn starts_a_keyed_manual_run_and_reads_its_status() {
         "{invalid:?}"
     );
 
-    let reader = Verification::with_client(client(&api_key(
+    let reader = client(&api_key(
         server
             .bootstrap_service("rust_run_reader", &["reader"])
             .await
             .expect("reader bootstraps"),
-    )));
+    ));
     let denied = reader
-        .start_run(&request, None)
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &request,
+        )
         .await
         .expect_err("a caller without evals:run is refused");
     assert_eq!(denied.status(), 403);

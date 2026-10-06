@@ -870,6 +870,92 @@ async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
     );
 }
 
+/// Delay before [`deadline_server`] answers, longer than the client's
+/// configured `timeout_ms` in [`execute_outlives_the_configured_timeout`].
+const DEADLINE_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Bind a stub execute endpoint that answers every request, after
+/// [`DEADLINE_DELAY`], with the server's execution-deadline refusal.
+///
+/// Returns the base URL and the number of requests it served, which proves
+/// the request was sent once and never replayed.
+///
+/// # Panics
+/// Panics when the listener cannot bind or adopt the test runtime.
+fn deadline_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("listener converts to tokio");
+    let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                if socket.read(&mut buffer).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(DEADLINE_DELAY).await;
+                let body = r#"{"code":"WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT","detail":"the direct execution exceeded its deadline","details":{}}"#;
+                let response = format!(
+                    "HTTP/1.1 504 Gateway Timeout\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{address}"), hits)
+}
+
+/// A direct execution waits past a shorter configured `timeout_ms` so the
+/// server's own deadline answer reaches the caller, sent once.
+///
+/// # Panics
+/// Panics when the delayed 504 is replaced by a client timeout or replayed.
+#[tokio::test]
+async fn execute_outlives_the_configured_timeout() {
+    let (url, hits) = deadline_server();
+    let config = crate::config::ClientConfig::default();
+    let auth = crate::auth::AuthMiddleware::new(
+        &config,
+        crate::transport::credential::ResolvedCredential::BearerToken(
+            "test-bearer".to_owned().into(),
+        ),
+    )
+    .expect("auth builds");
+    let transport = crate::transport::HttpTransport::new(
+        &crate::transport::HttpConfig {
+            base_url: url,
+            timeout_ms: 20,
+            ..crate::transport::HttpConfig::default()
+        },
+        Arc::clone(&auth),
+    )
+    .expect("transport builds");
+    let client = crate::WyrdClient::from_parts(auth, transport, config.grpc);
+    let request = wyrd_spec::verification::ExecuteVerificationRequest::decode(json!({
+        "verifier_uid": "018f4d8e-0000-7000-8000-000000000001",
+        "subject_card_uid": "018f4d8e-0000-7000-8000-000000000002",
+        "input": { "kind": "eval_record", "context": { "answer": "yes" } },
+    }))
+    .expect("request decodes");
+
+    let error = super::verify::execute(&client, &request)
+        .await
+        .expect_err("the server's deadline answer is an error");
+    assert_eq!(error.code(), "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "never replayed"
+    );
+}
+
 // ── Scenario 3: the Drift projection ───────────────────────────────────────
 
 /// Parse one projected row's JSON.

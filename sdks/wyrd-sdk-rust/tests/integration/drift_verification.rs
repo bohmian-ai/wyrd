@@ -31,19 +31,22 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use secrecy::ExposeSecret;
+use reqwest::Method;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_sdk::config::ClientConfig;
 use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::verification::{
-    BindingId, ExecuteVerificationRequest, OperatorDispatchState, OperatorDispatchStatus,
-    StartVerificationRunRequest, Verification, VerificationExecutionStatus, VerificationResultId,
-    VerificationRunId, VerificationRunStatus,
+use wyrd_sdk::{Bifrost, GlobalConfig, QueueConfig, WyrdClient};
+use wyrd_spec::ids::{BindingId, VerificationResultId, VerificationRunId};
+use wyrd_spec::verification::{
+    EXECUTION_DEADLINE, ExecuteVerificationRequest, Judgment, OperatorDispatchState,
+    OperatorDispatchStatus, StartVerificationRunRequest, StartVerificationRunResponse,
+    VerificationExecutionStatus, VerificationRunStatus,
 };
-use wyrd_sdk::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
@@ -316,13 +319,17 @@ fn direct(
 ///
 /// # Panics
 /// Panics when the run cannot be read or never settles within [`WAIT`].
-async fn wait_settled(
-    verification: &Verification,
-    run: &VerificationRunId,
-) -> VerificationRunStatus {
+async fn wait_settled(verification: &WyrdClient, run: &VerificationRunId) -> VerificationRunStatus {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let status = verification.get_run(run).await.expect("run reads");
+        let status = verification
+            .request_json::<(), VerificationRunStatus>(
+                Method::GET,
+                &format!("/v1/verification/runs/{run}"),
+                None,
+            )
+            .await
+            .expect("run reads");
         if !matches!(
             status.status,
             VerificationExecutionStatus::Pending
@@ -345,13 +352,18 @@ async fn wait_settled(
 /// Panics when the run does not complete or its rows cannot be read.
 async fn complete(
     server: &WyrdTestServer,
-    verification: &Verification,
+    verification: &WyrdClient,
     query: &Bifrost,
     request: &StartVerificationRunRequest,
 ) -> (ResultRow, Vec<FeatureRow>) {
     let run = verification
-        .start_run(request, None)
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            request,
+        )
         .await
+        .map(|response| response.run_id)
         .expect("run starts");
     let status = wait_settled(verification, &run).await;
     assert_eq!(
@@ -385,26 +397,32 @@ async fn read_result(
 ) -> (ResultRow, Vec<FeatureRow>) {
     server.flush_bifrost().await.expect("flush server Scribe");
     let mut results: Vec<ResultRow> = query
-        .sql_as(&format!(
-            "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
+        .sql_as(
+            &format!(
+                "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
                     owner_card_uid \
              FROM vala.verification.results WHERE result_id = '{result_id}'"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("result reads");
     assert_eq!(results.len(), 1, "one summary per result: {results:?}");
     let features: Vec<FeatureRow> = match query
-        .sql_as(&format!(
-            "SELECT f.feature, f.method, f.verdict \
+        .sql_as(
+            &format!(
+                "SELECT f.feature, f.method, f.verdict \
              FROM vala.drift.result_features f JOIN vala.verification.results r \
                ON f.result_id = r.result_id \
              WHERE r.result_id = '{result_id}' ORDER BY f.feature"
-        ))
+            ),
+            &[],
+        )
         .await
     {
         Ok(features) => features,
         Err(error)
-            if wyrd_sdk::verification::WyrdError::from(&error).code()
+            if wyrd_sdk::WyrdError::from(&error).code()
                 == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" =>
         {
             Vec::new()
@@ -518,6 +536,28 @@ fn connect(server: &WyrdTestServer, credential: &str) -> WyrdClient {
     .expect("client builds")
 }
 
+/// Build a public client over the bound test server whose HTTP deadline
+/// outlasts the server's direct-execution deadline.
+///
+/// A judgment slower than [`EXECUTION_DEADLINE`] must end in the server's own
+/// `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`, not a client-side timeout, so
+/// the client waits the deadline plus a grace for the 504 itself to arrive.
+///
+/// # Panics
+/// Panics when the client cannot be assembled.
+fn connect_direct(server: &WyrdTestServer, credential: &str) -> WyrdClient {
+    let mut config = ClientConfig::from_global_with_overrides(
+        &GlobalConfig::default(),
+        Some(server.base_url().expect("bound server has a URL")),
+        server.grpc_url().as_deref(),
+    );
+    config.credential = Some(SecretString::from(credential.to_owned()));
+    config.http.timeout_ms =
+        u64::try_from((EXECUTION_DEADLINE + Duration::from_secs(10)).as_millis())
+            .expect("the execute deadline fits in u64 milliseconds");
+    WyrdClient::with_config(config).expect("client builds")
+}
+
 /// Prove PSI, SPC, and Custom Drift fit, score server-side, persist results,
 /// and dispatch only a failed scheduled binding result.
 ///
@@ -561,7 +601,7 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
 
     let credential = emit_window(&server, &admin, &service, &root.path().join("bundle")).await;
     emit_window(&server, &admin, &service_b, &root.path().join("bundle-b")).await;
-    let verification = Verification::with_client(connect(&server, &credential));
+    let verification = connect(&server, &credential);
     let query = Bifrost::query_only(&admin);
     let now = Utc::now();
     let window = (
@@ -604,7 +644,11 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
     .await;
 
     let unready = verification
-        .start_run(&direct(&unfit, &service, window.0, window.1), None)
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            &direct(&unfit, &service, window.0, window.1),
+        )
         .await
         .expect_err("an unready Verifier is refused");
     assert_eq!(unready.code(), "WYRD_VERIFICATION_409_VERIFIER_NOT_READY");
@@ -745,14 +789,14 @@ async fn subject(cards: &Cards, root: &Path, name: &str) -> RegistrationReceipt 
 ///
 /// # Panics
 /// Panics when the credential cannot be issued.
-async fn verifier_of(server: &WyrdTestServer, subject: &RegistrationReceipt) -> Verification {
+async fn verifier_of(server: &WyrdTestServer, subject: &RegistrationReceipt) -> WyrdClient {
     let credential = api_key(
         server
             .credential_registered_service(&subject.root, &["admin"])
             .await
             .expect("subject credential issues"),
     );
-    Verification::with_client(connect(server, &credential))
+    connect(server, &credential)
 }
 
 /// `(feature, method, verdict)` of every feature row, in feature order.
@@ -1049,8 +1093,13 @@ impl EdgeJourney<'_> {
         let verification = verifier_of(self.server, subject).await;
         let request = direct(psi, subject, self.start, self.end);
         let historical = verification
-            .start_run(&request, None)
+            .submit_idempotent::<_, StartVerificationRunResponse>(
+                Method::POST,
+                "/v1/verification/runs",
+                &request,
+            )
             .await
+            .map(|response| response.run_id)
             .expect("run starts");
         let before = wait_settled(&verification, &historical).await;
         let result_id = before.result_id.expect("a completed run names its result");
@@ -1068,8 +1117,13 @@ impl EdgeJourney<'_> {
         .expect("fitted profile retires");
 
         let legacy = verification
-            .start_run(&request, None)
+            .submit_idempotent::<_, StartVerificationRunResponse>(
+                Method::POST,
+                "/v1/verification/runs",
+                &request,
+            )
             .await
+            .map(|response| response.run_id)
             .expect("run starts");
         let refused = wait_settled(&verification, &legacy).await;
         assert_eq!(
@@ -1084,7 +1138,14 @@ impl EdgeJourney<'_> {
         );
         assert!(refused.result_id.is_none(), "a refused run is never scored");
 
-        let after = verification.get_run(&historical).await.expect("run reads");
+        let after = verification
+            .request_json::<(), VerificationRunStatus>(
+                Method::GET,
+                &format!("/v1/verification/runs/{historical}"),
+                None,
+            )
+            .await
+            .expect("run reads");
         assert_eq!(after.result_id, before.result_id);
         let (reread, _) = read_result(self.server, &self.query, &result_id.to_string()).await;
         assert_eq!(
@@ -1176,7 +1237,7 @@ impl EdgeJourney<'_> {
 /// Panics when a run or its persisted rows differ from the expected outcome.
 async fn assert_direct_scores(
     server: &WyrdTestServer,
-    verification: &Verification,
+    verification: &WyrdClient,
     query: &Bifrost,
     [psi, spc, custom, empty]: [StartVerificationRunRequest; 4],
     subject: &str,
@@ -1287,7 +1348,7 @@ struct SharedTrigger<'a> {
     /// Admin Card handle used to read each Service's binding status.
     cards: &'a Cards,
     /// Verification handle of the first Service's credential.
-    verification: &'a Verification,
+    verification: &'a WyrdClient,
     /// Admin query handle over the tenant's result tables.
     query: &'a Bifrost,
 }
@@ -1431,8 +1492,13 @@ impl SharedTrigger<'_> {
         .expect("run request matches the wire contract");
         let run = self
             .verification
-            .start_run(&request, None)
+            .submit_idempotent::<_, StartVerificationRunResponse>(
+                Method::POST,
+                "/v1/verification/runs",
+                &request,
+            )
             .await
+            .map(|response| response.run_id)
             .expect("manual binding run starts");
         let manual = self.settle_failed(&run).await;
         assert_eq!(manual.binding, scheduled.binding);
@@ -1545,7 +1611,7 @@ async fn assert_refusals(
         "the refusal names the retired field: {retired:?}"
     );
 
-    let reader = Verification::with_client(connect(
+    let reader = connect(
         server,
         &api_key(
             server
@@ -1553,10 +1619,15 @@ async fn assert_refusals(
                 .await
                 .expect("reader bootstraps"),
         ),
-    ));
+    );
     let denied = reader
-        .start_run(request, None)
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            request,
+        )
         .await
+        .map(|response| response.run_id)
         .expect_err("a caller without evals:run is refused");
     assert_eq!(denied.status(), 403);
 
@@ -1573,9 +1644,14 @@ async fn assert_refusals(
                 .expect("second tenant admin bootstraps"),
         ),
     );
-    let foreign = Verification::with_client(WyrdClient::clone(&other))
-        .start_run(request, None)
+    let foreign = other
+        .submit_idempotent::<_, StartVerificationRunResponse>(
+            Method::POST,
+            "/v1/verification/runs",
+            request,
+        )
         .await
+        .map(|response| response.run_id)
         .expect_err("another tenant cannot run this tenant's Verifier");
     assert_eq!(
         foreign.code(),
@@ -1587,11 +1663,12 @@ async fn assert_refusals(
             "SELECT execution_status, verdict, details, subject_card_uid, binding_id, \
                     owner_card_uid \
              FROM vala.verification.results",
+            &[],
         )
         .await
         .expect_err("a tenant that never verified has no results table to read");
     assert_eq!(
-        wyrd_sdk::verification::WyrdError::from(&leaked).code(),
+        wyrd_sdk::WyrdError::from(&leaked).code(),
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
         "no result crosses tenants: {leaked:?}"
     );
@@ -1881,10 +1958,9 @@ struct IntegratedJourney<'a> {
     server: &'a WyrdTestServer,
     /// The registered Service owning every binding.
     service: &'a RegistrationReceipt,
-    /// Public client authenticated as the exact registered Service principal.
+    /// Public client authenticated as the exact registered Service principal,
+    /// which also reads its runs.
     client: WyrdClient,
-    /// Run GET handle on the Service's own credential.
-    verification: Verification,
     /// SDK query handle over the tenant's verification tables.
     query: Bifrost,
     /// Complete hydrated bundle the invocation loads offline.
@@ -1937,7 +2013,7 @@ impl<'a> IntegratedJourney<'a> {
             state
                 .run_for_card(alias)
                 .expect("component alias resolves")
-                .card_ref()
+                .subject()
                 .uid
                 .as_ref()
                 .expect("hydrated Card carries its UID")
@@ -1947,7 +2023,6 @@ impl<'a> IntegratedJourney<'a> {
         Self {
             server,
             service,
-            verification: Verification::with_client(WyrdClient::clone(&client)),
             query: Bifrost::query_only(admin),
             client,
             bundle,
@@ -2060,11 +2135,14 @@ impl<'a> IntegratedJourney<'a> {
             .expect("flush server Scribe");
         let drift: Vec<SubjectCount> = self
             .query
-            .sql_as(&format!(
-                "SELECT card_uid, CAST(COUNT(*) AS BIGINT) AS row_count \
+            .sql_as(
+                &format!(
+                    "SELECT card_uid, CAST(COUNT(*) AS BIGINT) AS row_count \
                  FROM vala.drift.observations WHERE run_id = '{}' GROUP BY card_uid",
-                invocation.run_id
-            ))
+                    invocation.run_id
+                ),
+                &[],
+            )
             .await
             .expect("drift observations read");
         assert_eq!(drift.len(), 1, "one subject for every Drift row: {drift:?}");
@@ -2089,11 +2167,14 @@ impl<'a> IntegratedJourney<'a> {
     /// Panics when the query fails.
     async fn eval_observations(&self, invocation: &Invocation) -> Vec<EvalObservationRow> {
         self.query
-            .sql_as(&format!(
-                "SELECT record_id, context, card_uid FROM vala.eval.observations \
+            .sql_as(
+                &format!(
+                    "SELECT record_id, context, card_uid FROM vala.eval.observations \
                  WHERE run_id = '{}'",
-                invocation.run_id
-            ))
+                    invocation.run_id
+                ),
+                &[],
+            )
             .await
             .expect("eval observations read")
     }
@@ -2160,17 +2241,20 @@ impl<'a> IntegratedJourney<'a> {
                 .expect("flush server Scribe");
             let results: Vec<OwnedResult> = match self
                 .query
-                .sql_as(&format!(
-                    "SELECT result_id, run_id, card_uid, implementation, verdict, \
+                .sql_as(
+                    &format!(
+                        "SELECT result_id, run_id, card_uid, implementation, verdict, \
                             subject_card_uid, binding_id, source_record_id \
                      FROM vala.verification.results WHERE owner_card_uid = '{}'",
-                    self.owner()
-                ))
+                        self.owner()
+                    ),
+                    &[],
+                )
                 .await
             {
                 Ok(results) => results,
                 Err(error)
-                    if wyrd_sdk::verification::WyrdError::from(&error).code()
+                    if wyrd_sdk::WyrdError::from(&error).code()
                         == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" =>
                 {
                     Vec::new()
@@ -2197,7 +2281,7 @@ impl<'a> IntegratedJourney<'a> {
     /// reports another state or result.
     async fn completed_run(&self, result: &OwnedResult) -> VerificationRunStatus {
         let run: VerificationRunId = result.run_id.parse().expect("run id parses");
-        let status = wait_settled(&self.verification, &run).await;
+        let status = wait_settled(&self.client, &run).await;
         assert_eq!(
             status.status,
             VerificationExecutionStatus::Completed,
@@ -2297,13 +2381,16 @@ impl<'a> IntegratedJourney<'a> {
             );
             let items: Vec<ItemRow> = self
                 .query
-                .sql_as(&format!(
-                    "SELECT i.task_id, i.passed \
+                .sql_as(
+                    &format!(
+                        "SELECT i.task_id, i.passed \
                      FROM vala.eval.result_items i JOIN vala.verification.results r \
                        ON i.result_id = r.result_id \
                      WHERE r.result_id = '{}' ORDER BY i.task_id",
-                    result.result_id
-                ))
+                        result.result_id
+                    ),
+                    &[],
+                )
                 .await
                 .expect("task outcomes read");
             assert_eq!(
@@ -2335,7 +2422,15 @@ impl<'a> IntegratedJourney<'a> {
     async fn assert_delivered(&self, run: &VerificationRunId) {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
-            let status = self.verification.get_run(run).await.expect("run reads");
+            let status = self
+                .client
+                .request_json::<(), VerificationRunStatus>(
+                    Method::GET,
+                    &format!("/v1/verification/runs/{run}"),
+                    None,
+                )
+                .await
+                .expect("run reads");
             assert_eq!(
                 status.dispatches.len(),
                 1,
@@ -2437,7 +2532,7 @@ async fn start_direct_judge() -> wiremock::MockServer {
         .respond_with(
             graded
                 .clone()
-                .set_delay(wyrd_sdk::verification::EXECUTION_DEADLINE + Duration::from_secs(5)),
+                .set_delay(EXECUTION_DEADLINE + Duration::from_secs(5)),
         )
         .with_priority(1)
         .mount(&upstream)
@@ -2558,7 +2653,7 @@ async fn direct_execution_judges_supplied_input_through_the_sdk() {
     wait_baseline(&cards, &unfit, "failed").await;
     let journey = DirectJourney {
         server: &server,
-        verification: Verification::with_client(connect(
+        verification: connect_direct(
             &server,
             &api_key(
                 server
@@ -2566,7 +2661,7 @@ async fn direct_execution_judges_supplied_input_through_the_sdk() {
                     .await
                     .expect("the subject Service is credentialed"),
             ),
-        )),
+        ),
         subject: &subject,
         psi: &psi,
         spc: &spc,
@@ -2594,7 +2689,7 @@ struct DirectJourney<'a> {
     /// Bound test server, for second callers and the run ledger.
     server: &'a WyrdTestServer,
     /// The subject Service's own handle, scoped over the subject.
-    verification: Verification,
+    verification: WyrdClient,
     /// The Service every execution judges.
     subject: &'a RegistrationReceipt,
     /// PSI Verifier with a ready baseline over `latency` and `tier`.
@@ -2626,7 +2721,11 @@ impl DirectJourney<'_> {
     /// # Panics
     /// Panics when the execution succeeds or carries another code.
     async fn refuse(&self, request: &ExecuteVerificationRequest, code: &str) {
-        let error = self.verification.execute(request).await.expect_err(code);
+        let error = self
+            .verification
+            .request_json::<_, Judgment>(Method::POST, "/v1/verification/execute", Some(request))
+            .await
+            .expect_err(code);
         assert_eq!(error.code(), code, "{error:?}");
     }
 
@@ -2699,7 +2798,11 @@ impl DirectJourney<'_> {
         for (verifier, input, kind, verdict) in judged {
             let response = self
                 .verification
-                .execute(&self.request(verifier, &input))
+                .request_json::<_, Judgment>(
+                    Method::POST,
+                    "/v1/verification/execute",
+                    Some(&self.request(verifier, &input)),
+                )
                 .await
                 .unwrap_or_else(|error| panic!("{} executes: {error:?}", verifier.root.name));
             let response = serde_json::to_value(&response).expect("response serializes");
@@ -2790,7 +2893,7 @@ impl DirectJourney<'_> {
     /// # Panics
     /// Panics when either caller is not refused with its stable code.
     async fn assert_callers_refused(&self) {
-        let reader = Verification::with_client(connect(
+        let reader = connect(
             self.server,
             &api_key(
                 self.server
@@ -2798,11 +2901,15 @@ impl DirectJourney<'_> {
                     .await
                     .expect("reader bootstraps"),
             ),
-        ));
+        );
         let custom_request =
             self.request(self.custom, &samples(serde_json::json!({ "score": [1.0] })));
         let denied = reader
-            .execute(&custom_request)
+            .request_json::<_, Judgment>(
+                Method::POST,
+                "/v1/verification/execute",
+                Some(&custom_request),
+            )
             .await
             .expect_err("a caller without evals:run is refused");
         assert_eq!(
@@ -2815,7 +2922,7 @@ impl DirectJourney<'_> {
             .seed_tenant("direct-other")
             .await
             .expect("second tenant seeds");
-        let foreign = Verification::with_client(connect(
+        let foreign = connect(
             self.server,
             &api_key(
                 self.server
@@ -2823,8 +2930,12 @@ impl DirectJourney<'_> {
                     .await
                     .expect("second tenant admin bootstraps"),
             ),
-        ))
-        .execute(&custom_request)
+        )
+        .request_json::<_, Judgment>(
+            Method::POST,
+            "/v1/verification/execute",
+            Some(&custom_request),
+        )
         .await
         .expect_err("another tenant cannot execute this tenant's Verifier");
         assert_eq!(

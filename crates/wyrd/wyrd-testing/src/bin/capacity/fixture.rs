@@ -32,10 +32,14 @@ use wyrd_client::{Bifrost, GlobalConfig, QueueConfig, WyrdClient};
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::verification::{DirectVerificationInput, DriftSample};
+use wyrd_spec::verification::{DirectVerificationInput, DriftSample, EXECUTION_DEADLINE};
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::Result;
+
+/// HTTP deadline of the direct-execution client: the server's
+/// [`EXECUTION_DEADLINE`] plus time for the upload, audit, and 504 answer.
+const EXECUTE_TIMEOUT: Duration = EXECUTION_DEADLINE.saturating_add(Duration::from_secs(10));
 
 /// Rows in the fitted baseline (AC-040).
 const BASELINE_ROWS: u32 = 10_000;
@@ -270,7 +274,7 @@ impl Tenant {
         .map_err(|error| format!("hydrating the Service bundle: {error}"))?;
         let state = WyrdState::from_path(&bundle)?;
         let component = |alias: &str| -> Result<CardUid> {
-            uid(state.run_for_card(alias)?.card_ref().uid.as_ref())
+            uid(state.run_for_card(alias)?.subject().uid.as_ref())
         };
         let model_uid = component("model")?;
         let mut targets = Vec::new();
@@ -326,6 +330,22 @@ impl Tenant {
         connect(url, &self.admin_key)
     }
 
+    /// An administrator client of the replica at `url` for direct execution.
+    ///
+    /// Its HTTP deadline is [`EXECUTE_TIMEOUT`] rather than the default, so a
+    /// judgment slower than the server's [`EXECUTION_DEADLINE`] ends in the
+    /// server's own `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` instead of a
+    /// client-side timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client configuration failure.
+    pub fn executor(&self, url: &str) -> Result<WyrdClient> {
+        let mut config = client_config(url, &self.admin_key);
+        config.http.timeout_ms = u64::try_from(EXECUTE_TIMEOUT.as_millis())?;
+        Ok(WyrdClient::with_config(config)?)
+    }
+
     /// A Service-authenticated client of the replica at `url`.
     ///
     /// # Errors
@@ -347,7 +367,7 @@ impl Tenant {
     /// Read-only, apart from the audited read decision the server records.
     pub async fn count(&self, sql: &str) -> Result<u64> {
         let rows: Vec<Count> = Bifrost::query_only(&self.admin(SERVER_URL)?)
-            .sql_as(sql)
+            .sql_as(sql, &[])
             .await?;
         match rows.as_slice() {
             [row] => Ok(u64::try_from(row.n)?),
@@ -463,10 +483,15 @@ fn uid(uid: Option<&CardUid>) -> Result<CardUid> {
 ///
 /// Returns the client configuration failure.
 fn connect(url: &str, credential: &SecretString) -> Result<WyrdClient> {
-    Ok(WyrdClient::with_config(ClientConfig {
+    Ok(WyrdClient::with_config(client_config(url, credential))?)
+}
+
+/// The default public client configuration at `url` presenting `credential`.
+fn client_config(url: &str, credential: &SecretString) -> ClientConfig {
+    ClientConfig {
         credential: Some(SecretString::from(credential.expose_secret().to_owned())),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(url), None)
-    })?)
+    }
 }
 
 /// Writes the baseline Parquet artifact under `directory` and returns its

@@ -8,9 +8,9 @@
 //! the offered rate. Requests rotate across the deployment's replicas,
 //! standing in for its gateway.
 //!
-//! - A direct arrival is one `verification.execute` call whose verdict is
-//!   checked against the input it sent.
-//! - A queued Drift arrival is one manual `start_run` over the tenant's
+//! - A direct arrival is one `POST /v1/verification/execute` call whose
+//!   verdict is checked against the input it sent.
+//! - A queued Drift arrival is one manual `POST /v1/verification/runs` over the tenant's
 //!   seeded window; a queued Eval arrival is one observation whose binding
 //!   activates the run.
 //! - An ingest arrival is one Drift observation of [`INGEST_FEATURES`]
@@ -22,15 +22,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Method;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use wyrd_client::observe::EvalObservationOptions;
 use wyrd_client::state::WyrdState;
-use wyrd_client::{Bifrost, QueueConfig, Verification};
+use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_spec::verification::{
-    ExecuteVerificationRequest, StartVerificationRunRequest, VerificationRunInput,
-    VerificationRunTarget, VerificationVerdict,
+    ExecuteVerificationRequest, Judgment, StartVerificationRunRequest,
+    StartVerificationRunResponse, VerificationRunInput, VerificationRunTarget, VerificationVerdict,
 };
 
 use crate::Result;
@@ -145,8 +146,9 @@ pub struct Tally {
 
 /// The public clients one tenant's lanes use, one of each per replica.
 pub struct TenantClients {
-    /// Administrator Verification handles.
-    verification: Vec<Verification>,
+    /// Administrator clients calling the Verification routes, with the
+    /// direct-execution deadline.
+    verification: Vec<WyrdClient>,
     /// Service lifetimes emitting observations, with the default queue.
     states: Vec<WyrdState>,
     /// Administrator Oracle query handles.
@@ -179,7 +181,13 @@ impl TenantClients {
                 .await
                 .map_err(|error| format!("exchanging the administrator token: {error}"))?;
             oracle.push(Bifrost::query_only(&admin));
-            verification.push(Verification::with_client(admin));
+            let executor = tenant.executor(url)?;
+            executor
+                .auth()
+                .bearer()
+                .await
+                .map_err(|error| format!("exchanging the executor token: {error}"))?;
+            verification.push(executor);
             let state = WyrdState::from_path(&tenant.bundle)?;
             state
                 .start_bifrost_with_config(&tenant.service(url)?, None, QueueConfig::default())
@@ -383,7 +391,11 @@ impl Request {
         match self {
             Self::Execute(inputs) => {
                 match clients.verification[replica]
-                    .execute(&inputs[usize::from(failing)])
+                    .request_json::<_, Judgment>(
+                        Method::POST,
+                        "/v1/verification/execute",
+                        Some(&inputs[usize::from(failing)]),
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -400,7 +412,14 @@ impl Request {
                 }
             }
             Self::Start(request) => {
-                match clients.verification[replica].start_run(request, None).await {
+                match clients.verification[replica]
+                    .submit_idempotent::<_, StartVerificationRunResponse>(
+                        Method::POST,
+                        "/v1/verification/runs",
+                        &**request,
+                    )
+                    .await
+                {
                     Ok(_) => accepted,
                     Err(error) => Outcome::Rejected(error.code().to_owned()),
                 }
@@ -444,7 +463,7 @@ impl Request {
             }
             Self::Query(shape) => {
                 match clients.oracle[replica]
-                    .sql(&query(*shape, sequence, chrono::Utc::now()))
+                    .sql(&query(*shape, sequence, chrono::Utc::now()), &[])
                     .await
                 {
                     Ok(_) => accepted,

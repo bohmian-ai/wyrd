@@ -821,6 +821,20 @@ fn retype(
         .build()
 }
 
+/// Report whether an actual field holds the expected field's layout after a
+/// storage round trip, whatever its name.
+///
+/// Canonical Variant identity must agree first, so a Variant never matches an
+/// ordinary Struct with the same `metadata` and `value` storage children; then
+/// nullability and [`arrow_type_shape_matches`] decide. Callers compare names
+/// where the name is part of the layout.
+#[must_use]
+pub fn field_layout_matches(expected: &Field, actual: &Field) -> bool {
+    is_variant(expected) == is_variant(actual)
+        && expected.is_nullable() == actual.is_nullable()
+        && arrow_type_shape_matches(expected.data_type(), actual.data_type())
+}
+
 /// Report whether an actual Arrow type is the expected one after a storage
 /// round trip.
 ///
@@ -828,16 +842,15 @@ fn retype(
 /// back — a binary or string column widens to its large variant, a list may
 /// return as a large list, and a zoned timestamp may return as `+00:00` — so a
 /// physical table's schema is compared by shape rather than by exact equality.
-/// Nested children are compared by name, never by position.
+/// Every nested field goes through [`field_layout_matches`], so Variant
+/// identity is compared at any depth. Struct children are compared by name;
+/// a list element and a map's key and value by position.
 #[must_use]
 pub fn arrow_type_shape_matches(
     expected: &arrow::datatypes::DataType,
     actual: &arrow::datatypes::DataType,
 ) -> bool {
     use arrow::datatypes::DataType as Arrow;
-    if expected.equals_datatype(actual) {
-        return true;
-    }
     match (expected, actual) {
         (Arrow::Binary, Arrow::LargeBinary)
         | (Arrow::LargeBinary, Arrow::Binary)
@@ -846,35 +859,43 @@ pub fn arrow_type_shape_matches(
         (
             Arrow::List(expected) | Arrow::LargeList(expected),
             Arrow::List(actual) | Arrow::LargeList(actual),
-        ) => {
-            expected.is_nullable() == actual.is_nullable()
-                && arrow_type_shape_matches(expected.data_type(), actual.data_type())
-        }
+        ) => field_layout_matches(expected, actual),
         (Arrow::Struct(expected), Arrow::Struct(actual)) => {
             expected.len() == actual.len()
                 && expected.iter().all(|field| {
                     actual
                         .iter()
                         .find(|candidate| candidate.name() == field.name())
-                        .is_some_and(|candidate| {
-                            field.is_nullable() == candidate.is_nullable()
-                                && arrow_type_shape_matches(
-                                    field.data_type(),
-                                    candidate.data_type(),
-                                )
-                        })
+                        .is_some_and(|candidate| field_layout_matches(field, candidate))
                 })
         }
+        (Arrow::Map(expected, expected_sorted), Arrow::Map(actual, actual_sorted)) => {
+            expected_sorted == actual_sorted
+                && expected.is_nullable() == actual.is_nullable()
+                && match (expected.data_type(), actual.data_type()) {
+                    (Arrow::Struct(expected), Arrow::Struct(actual)) => {
+                        expected.len() == actual.len()
+                            && expected
+                                .iter()
+                                .zip(actual.iter())
+                                .all(|(expected, actual)| field_layout_matches(expected, actual))
+                    }
+                    _ => false,
+                }
+        }
         (
-            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
-            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
+            Arrow::Timestamp(expected_unit, Some(expected_timezone)),
+            Arrow::Timestamp(actual_unit, Some(actual_timezone)),
         ) => {
             expected_unit == actual_unit
-                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
+                && (expected_timezone == actual_timezone
+                    || (expected_timezone.as_ref() == "UTC"
+                        && actual_timezone.as_ref() == "+00:00")
                     || (expected_timezone.as_ref() == "+00:00"
                         && actual_timezone.as_ref() == "UTC"))
         }
-        _ => false,
+        // Iceberg converts to no other nested Arrow type.
+        _ => expected.equals_datatype(actual),
     }
 }
 

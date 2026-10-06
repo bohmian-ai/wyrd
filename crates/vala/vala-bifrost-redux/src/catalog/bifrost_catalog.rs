@@ -1520,11 +1520,10 @@ pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
             .all(|(expected, actual)| field_shape_matches(expected, actual))
 }
 
-/// Whether two fields describe the same column name, nullability, and layout.
+/// Whether two fields describe the same column name, Variant identity,
+/// nullability, and layout.
 fn field_shape_matches(expected: &Field, actual: &Field) -> bool {
-    expected.name() == actual.name()
-        && expected.is_nullable() == actual.is_nullable()
-        && crate::tables::arrow_type_shape_matches(expected.data_type(), actual.data_type())
+    expected.name() == actual.name() && crate::tables::field_layout_matches(expected, actual)
 }
 
 /// Resolves the physical schema and canonical layout one registration writes.
@@ -1785,7 +1784,10 @@ fn provider_error(error: IcebergError) -> BifrostCatalogError {
 
 #[cfg(test)]
 mod schema_shape_tests {
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+    use wyrd_queue::variant::{variant_field, variant_storage_type};
 
     use super::schema_shape_matches;
 
@@ -1822,6 +1824,36 @@ mod schema_shape_tests {
         )]);
 
         assert!(!schema_shape_matches(&utc, &other));
+    }
+
+    /// A Variant and an ordinary Struct with its storage children are
+    /// different physical shapes in both directions, at the top level and
+    /// nested under a Struct or a List.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any placement compares a Variant equal to its storage
+    /// Struct, or a Variant stops matching itself.
+    #[test]
+    fn schema_shape_keeps_variant_identity_at_any_depth() {
+        let variant = || variant_field("payload", true);
+        let storage = || Field::new("payload", variant_storage_type(), true);
+        let placements: [(&str, fn(Field) -> Field); 3] = [
+            ("top level", |field| field),
+            ("struct child", |field| {
+                Field::new("outer", DataType::Struct(Fields::from(vec![field])), true)
+            }),
+            ("list element", |field| {
+                Field::new("outer", DataType::List(Arc::new(field)), true)
+            }),
+        ];
+        for (placement, place) in placements {
+            let variant = Schema::new(vec![place(variant())]);
+            let storage = Schema::new(vec![place(storage())]);
+            assert!(schema_shape_matches(&variant, &variant), "{placement}");
+            assert!(!schema_shape_matches(&variant, &storage), "{placement}");
+            assert!(!schema_shape_matches(&storage, &variant), "{placement}");
+        }
     }
 
     /// The same columns in a different order are a different physical shape.

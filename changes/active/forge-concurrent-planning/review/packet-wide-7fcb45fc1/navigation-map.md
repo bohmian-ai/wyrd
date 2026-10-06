@@ -85,4 +85,3 @@
 - Review the deleted Python test and the replacement parity coverage; review
   `capacity_refused` classification for the first refused cleanup preparation;
   neither is automatically a defect without a violated approved obligation.
-

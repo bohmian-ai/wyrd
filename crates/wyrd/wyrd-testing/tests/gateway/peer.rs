@@ -7,18 +7,30 @@
 //! a leaf that is not the `wyrd-peer` identity is proven once for every peer
 //! service by the `bifrost_oracle` peer-network listener journeys.
 
+use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
+use arrow::datatypes::Schema;
+use arrow::ipc::writer::StreamWriter;
+use arrow::json::ReaderBuilder;
 use serde_json::{Value, json};
 use url::Url;
+use vala_bifrost_redux::tables::{CallsTable, DomainTable};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_runtime::Permission;
 use wyrd_server::config::BifrostTarget;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, GatewayAccess};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::server::WyrdTestServer;
+use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
+use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 
 use crate::harness::{PROVIDER_KEY, api_key, exchange};
 
@@ -96,6 +108,76 @@ async fn strings(
     Ok(values)
 }
 
+/// Submits one `vala.gateway.calls` row whose present `resolved_model` lacks
+/// its `model` child to `scribe`'s capture peer RPC, as a cluster member.
+///
+/// The row is otherwise a valid capture, so the refusal can come only from
+/// the partial Struct. Returns the row's call id and the stable error the
+/// peer plane answered with.
+///
+/// # Errors
+///
+/// Returns an encoding, TLS, or connection error, or a description when the
+/// Scribe acknowledges the row.
+async fn submit_partial_resolved_model(
+    cluster: &WyrdTestCluster,
+    scribe: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> Result<(uuid::Uuid, WyrdError), Box<dyn std::error::Error>> {
+    let call_id = uuid::Uuid::now_v7();
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = json!({
+        "schema_version": 1,
+        "call_id": call_id.to_string(),
+        "caller_principal_id": uuid::Uuid::now_v7().to_string(),
+        "operation": "chat_completions",
+        "ingress_dialect": "openai",
+        "requested_model": {"provider": "openai", "model": "gpt-4o"},
+        "resolved_model": {"provider": "openai", "model": null},
+        "streaming": false,
+        "started_at": now,
+        "terminal_at": now,
+        "outcome": "succeeded",
+        "attempt_count": 1,
+        "pricing_versions": [],
+        "capture_policy_version": 1,
+        "payload_object_refs": [],
+    });
+    let schema = Arc::new(Schema::new(CallsTable::arrow_fields()));
+    let batch = ReaderBuilder::new(Arc::clone(&schema))
+        .build(Cursor::new(row.to_string()))?
+        .next()
+        .ok_or("the partial row decodes to no batch")??;
+    let mut writer = StreamWriter::try_new(Vec::new(), &schema)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    let authority = cluster.peer_ca();
+    let member = authority.issue_leaf("gateway-peer-journey")?;
+    let channel = wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
+        scribe
+            .peer_url()
+            .ok_or("the scribe pod has no peer listener")?,
+        authority.ca_certificate_pem().as_bytes(),
+        authority.server_name().to_owned(),
+        member.certificate_pem().as_bytes(),
+        member.private_key_pem().as_bytes(),
+    )?
+    .connect()
+    .await?;
+    let refused = ScribeCapturePeerServiceClient::new(channel)
+        .ingest_capture(IngestCaptureRequest {
+            tenant_id: tenant.to_string(),
+            table: "vala.gateway.calls".to_owned(),
+            batch_id: uuid::Uuid::now_v7().to_string(),
+            request_id: RequestId::now_v7().as_str().to_owned(),
+            arrow_ipc: writer.into_inner()?.into(),
+        })
+        .await
+        .err()
+        .ok_or("the scribe pod acknowledged a partial resolved_model")?;
+    Ok((call_id, wyrd_client::error::from_grpc_status(&refused)))
+}
+
 /// Proves AC-043's peer-mode path: a gateway call served by an `oracle`-target
 /// pod, which runs no Scribe, still lands its capture.
 ///
@@ -105,6 +187,11 @@ async fn strings(
 /// span `vala.traces.spans` on the scribe pod through the capture-only peer
 /// RPC, both stamped with the reserved capture principal and the admitting
 /// request, and read back through the oracle pod's public query path.
+///
+/// Before that call, a calls row whose present `resolved_model` lacks a child
+/// is sent straight to the scribe pod's capture peer RPC; it is refused before
+/// any ACK with the exact partial-Struct problem, no row for it is ever
+/// readable, and the following real capture still lands.
 ///
 /// # Panics
 ///
@@ -146,6 +233,22 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         &api_key(gateway, "peer_caller", &["gateway_invoker"]).await,
     )
     .await;
+    let (partial_call, refusal) =
+        submit_partial_resolved_model(&cluster, scribe, cluster.data_tenant_id())
+            .await
+            .expect("the partial capture is refused");
+    let WyrdError::Vala { error: refusal } = refusal else {
+        panic!("the partial capture was refused as {refusal:?}");
+    };
+    assert_eq!(
+        refusal,
+        BifrostError::SchemaParse {
+            detail: "row 0: resolved_model.model must be null exactly when resolved_model is null"
+                .to_owned(),
+        },
+        "the peer plane carries the exact partial-Struct problem"
+    );
+
     let http = reqwest::Client::new();
     let base = gateway.base_url().expect("bound url").to_owned();
     put(
@@ -228,5 +331,17 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
             "{table} holds exactly the call's capture, stamped with the capture principal"
         );
     }
+    assert_eq!(
+        strings(
+            gateway,
+            &admin_key,
+            &format!("SELECT call_id FROM vala.gateway.calls WHERE call_id = '{partial_call}'"),
+            "call_id",
+        )
+        .await
+        .expect("the refused call id queries"),
+        Vec::<String>::new(),
+        "the refused partial capture retained no row"
+    );
     cluster.shutdown().await.expect("cluster shuts down");
 }

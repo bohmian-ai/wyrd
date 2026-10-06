@@ -392,7 +392,7 @@ fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(StructArray::try_new(
         fields,
         children,
-        Some(NullBuffer::from_iter(present)),
+        Some(present.collect::<NullBuffer>()),
     )?))
 }
 
@@ -626,7 +626,7 @@ mod tests {
         for value in values {
             match value {
                 Some(_) => {
-                    features.append(&EncodedVariant::from_json_text(r#"{"k":1}"#).expect("json"))
+                    features.append(&EncodedVariant::from_json_text(r#"{"k":1}"#).expect("json"));
                 }
                 None => features.append_null(),
             }
@@ -665,7 +665,7 @@ mod tests {
                         .map(|value| value.map(|_| r#"{"a":"x"}"#))
                         .collect::<Vec<_>>(),
                 )),
-                Arc::new(Int64Array::from_iter_values(0..values.len() as i64)),
+                Arc::new(Int64Array::from_iter_values((0..).take(values.len()))),
             ],
         )
         .expect("batch");

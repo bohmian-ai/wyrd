@@ -2282,6 +2282,18 @@ mod tests {
     /// Panics when any locked value, layout, code, or detail field drifts.
     #[test]
     fn variant_contract_and_builtin_schemas_are_stable() {
+        assert_variant_identity_and_errors();
+        assert_result_struct_layouts();
+        assert_builtin_variant_columns();
+    }
+
+    /// Pins the Variant tag, limits, fingerprint bytes, and each catalogued
+    /// Variant error's code and detail fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those locked values drifts.
+    fn assert_variant_identity_and_errors() {
         use wyrd_queue::variant::VariantViolation;
         use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
 
@@ -2348,7 +2360,15 @@ mod tests {
             keys.sort_unstable();
             assert_eq!(keys, detail_keys, "{code} detail fields");
         }
+    }
 
+    /// Pins the exact `drift_report` and `eval_summary` Struct layouts of
+    /// `vala.verification.results` and the absence of a `details` column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either layout drifts or `details` reappears.
+    fn assert_result_struct_layouts() {
         let results = (builtin_table("verification", "results")
             .expect("verification results")
             .schema)();
@@ -2390,7 +2410,15 @@ mod tests {
             ])
         );
         assert!(results.field_with_name("details").is_err());
+    }
 
+    /// Pins every built-in column stored as Variant and the locked
+    /// `resource_entity_refs` Struct list of each signal table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a column is not Variant or an entity-reference shape drifts.
+    fn assert_builtin_variant_columns() {
         let entity_ref = DataType::List(Arc::new(Field::new(
             "entity_ref",
             DataType::Struct(Fields::from(vec![

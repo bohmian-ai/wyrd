@@ -317,9 +317,12 @@ impl PyQueryResult {
     /// valid Variant, which only a faulty server result can produce.
     #[staticmethod]
     fn variant_to_python(py: Python<'_>, metadata: &[u8], value: &[u8]) -> WyrdPyResult<Py<PyAny>> {
-        let json = wyrd_queue::variant::variant_bytes_to_json(metadata, value).map_err(|violation| {
-            boundary_internal(format!("query result Variant does not decode: {violation:?}"))
-        })?;
+        let json =
+            wyrd_queue::variant::variant_bytes_to_json(metadata, value).map_err(|violation| {
+                boundary_internal(format!(
+                    "query result Variant does not decode: {violation:?}"
+                ))
+            })?;
         Ok(json_to_pyobject(py, &json)?)
     }
 }

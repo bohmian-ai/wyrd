@@ -438,7 +438,9 @@ pub fn table_config_from_json_schema(
 #[napi]
 pub fn variant_to_value(metadata: Uint8Array, value: Uint8Array) -> Result<Value> {
     wyrd_queue::variant::variant_bytes_to_json(&metadata, &value).map_err(|violation| {
-        napi_error(format!("query result Variant does not decode: {violation:?}"))
+        napi_error(format!(
+            "query result Variant does not decode: {violation:?}"
+        ))
     })
 }
 

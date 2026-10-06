@@ -17,13 +17,16 @@ pub mod eval;
 pub mod lifecycle;
 #[cfg(test)]
 mod tests;
+mod verify;
 
 use arrow_schema::DataType;
 use serde::Serialize;
 use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::ids::{RunId, SessionId};
+use wyrd_spec::verification::{ExecuteVerificationRequest, Judgment};
 
 use crate::bifrost::{Correlation, WriterTable};
 use crate::state::WyrdState;
@@ -53,22 +56,25 @@ pub struct Run {
     state: WyrdState,
     /// The invocation identity every observation of every view correlates to.
     run_id: RunId,
-    /// The exact Card this view observes: the root Service for
-    /// `WyrdState::run`, the initially selected Card for
-    /// `WyrdState::run_for_card`, or the selected sibling for `for_card`.
+    /// The alias this view was opened with: `root` for `WyrdState::run`, the
+    /// alias given to `WyrdState::run_for_card` or `for_card` otherwise.
+    alias: String,
+    /// The exact Card `alias` resolves to in the hydrated graph.
     subject: CardRef,
 }
 
 impl Run {
-    /// Open a run over `state` whose first view observes `subject`.
+    /// Open a run over `state` whose first view observes `subject`, opened
+    /// as `alias`.
     ///
     /// Mints the invocation's UUIDv7 `run_id`; every later [`Run::for_card`]
     /// view shares it. The caller has already resolved `subject` from the
     /// state's hydrated graph, so opening never fails and performs no IO.
-    pub(crate) fn new(state: WyrdState, subject: CardRef) -> Self {
+    pub(crate) fn new(state: WyrdState, alias: String, subject: CardRef) -> Self {
         Self {
             state,
             run_id: RunId::new(),
+            alias,
             subject,
         }
     }
@@ -79,9 +85,18 @@ impl Run {
         &self.run_id
     }
 
-    /// The exact Card this view observes.
+    /// The alias this view was opened with; `root` for the Service view.
+    ///
+    /// The exact Card reference for an alias is `WyrdState::card_ref`.
     #[must_use]
-    pub fn card_ref(&self) -> &CardRef {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// The exact Card this view observes, which every observation carries as
+    /// its correlation and a foreign runtime attaches to its trace spans.
+    #[must_use]
+    pub fn subject(&self) -> &CardRef {
         &self.subject
     }
 
@@ -99,6 +114,7 @@ impl Run {
         Ok(Self {
             state: self.state.clone(),
             run_id: self.run_id.clone(),
+            alias: alias.to_owned(),
             subject: self.state.card_ref(alias)?.clone(),
         })
     }
@@ -271,6 +287,98 @@ impl Observe<'_> {
             .bifrost
             .insert_into(&destination, row_bytes(row)?, self.run.correlation())?;
         Ok(())
+    }
+}
+
+impl Observe<'_> {
+    /// Judge `input` with the Verifier named `verifier` and return its judgment.
+    ///
+    /// `verifier` is the `metadata.name` of a Verifier bound in `verified_by`
+    /// to this view's subject in the hydrated graph; the subject is always
+    /// this view's. An Eval Verifier takes one context object, in the forms
+    /// [`Observe::eval`] accepts; a Drift Verifier takes a non-empty sequence
+    /// of feature rows, in the forms [`Observe::drift`] accepts. It judges
+    /// only: no observation, run, Operator dispatch, or Bifrost write, and
+    /// Bifrost need not be started. A `failed` verdict is a normal return.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` when no Verifier of that name
+    /// is bound to the subject and `WYRD_SDK_400_INVALID_OBSERVATION` when the
+    /// input's shape does not match the Verifier's kind, both before any
+    /// network call; the client resolution error when no server or credential
+    /// is configured; and the server's refusal, including
+    /// `WYRD_VERIFICATION_409_BASELINE_NOT_READY` for an unfitted baseline.
+    ///
+    /// # Cancellation
+    /// Dropping the future abandons the request; the call is never retried.
+    pub async fn verify<T: Serialize>(
+        &self,
+        verifier: &str,
+        input: &T,
+    ) -> Result<Judgment, WyrdError> {
+        self.verify_value(verifier, to_value(input, "verify input")?, Vec::new())
+            .await
+    }
+
+    /// Judge one Eval context carrying media a judge Prompt binds by `id`.
+    ///
+    /// # Errors
+    /// As [`Observe::verify`], plus `WYRD_SDK_400_INVALID_OBSERVATION` when
+    /// `verifier` is a Drift Verifier, which takes no media.
+    ///
+    /// # Cancellation
+    /// As [`Observe::verify`].
+    pub async fn verify_with_media<T: Serialize>(
+        &self,
+        verifier: &str,
+        context: &T,
+        media: Vec<MediaRef>,
+    ) -> Result<Judgment, WyrdError> {
+        self.verify_value(verifier, to_value(context, "verify input")?, media)
+            .await
+    }
+
+    /// Judge input from a foreign runtime's JSON text.
+    ///
+    /// # Errors
+    /// As [`Observe::verify_with_media`], plus an invalid-observation error
+    /// when `json` is not valid JSON or a Drift row carries an integer literal
+    /// beyond exact `Float64` range.
+    ///
+    /// # Cancellation
+    /// As [`Observe::verify`].
+    pub async fn verify_json(
+        &self,
+        verifier: &str,
+        json: &str,
+        media: Vec<MediaRef>,
+    ) -> Result<Judgment, WyrdError> {
+        verify::check_drift_integer_literals(json)?;
+        self.verify_value(verifier, parse_json(json, "verify input")?, media)
+            .await
+    }
+
+    /// Resolve the bound Verifier, build its request, and execute it.
+    ///
+    /// Resolution and input conversion are local and complete before the
+    /// client is resolved, so a refusal of either sends nothing.
+    ///
+    /// # Errors
+    /// As [`Observe::verify_with_media`].
+    async fn verify_value(
+        &self,
+        verifier: &str,
+        input: Value,
+        media: Vec<MediaRef>,
+    ) -> Result<Judgment, WyrdError> {
+        let state = &self.run.state;
+        let bound = state.bound_verifier(&self.run.subject, verifier)?;
+        let request = ExecuteVerificationRequest {
+            verifier_uid: bound.verifier_uid,
+            subject_card_uid: bound.subject_uid,
+            input: verify::direct_input(bound.implementation, input, media)?,
+        };
+        verify::execute(state.client()?, &request).await
     }
 }
 

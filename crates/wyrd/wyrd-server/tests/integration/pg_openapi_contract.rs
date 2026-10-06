@@ -1291,7 +1291,7 @@ async fn verification_contract_publishes_exactly_four_typed_operations() {
     );
     assert_eq!(
         schema_ref(execute, "200").as_deref(),
-        Some("#/components/schemas/ExecuteVerificationResponse")
+        Some("#/components/schemas/Judgment")
     );
     let documented: BTreeSet<&str> = execute["responses"]
         .as_object()

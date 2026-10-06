@@ -26,7 +26,10 @@ use wyrd_spec::ids::{CardUid, VerificationExecutionId};
 use wyrd_spec::vala::eval::EvalTask;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::ids::{RecordId, RunId};
-use wyrd_spec::verification::{DirectVerificationInput, DriftSample, VerificationExecutionDetail};
+use wyrd_spec::verification::{
+    DirectVerificationInput, DriftSample, EvalReport as WireEvalReport,
+    SkipReason as WireSkipReason, SkippedTask, VerificationExecutionDetail,
+};
 
 use super::drift::{BASELINE_LEGACY, BASELINE_NOT_READY, FittedBaselines};
 use super::engines::{EngineOutcome, VerifierReport};
@@ -371,53 +374,54 @@ fn samples_batch(
 
 /// The wire detail of a direct execution's `report`.
 ///
-/// Drift is the Vala report as serialized. Eval lists the ran assertion
+/// Drift is the Vala report in its serialized spelling, read back into the
+/// typed wire report; a non-finite score or threshold of an inconclusive
+/// feature serializes as an absent value. Eval lists the ran assertion
 /// results and the skipped tasks with their reasons.
 ///
 /// # Errors
-/// Returns [`WyrdError::Internal`] when the report cannot be encoded.
+/// Returns [`WyrdError::Internal`] when the Drift report does not encode into
+/// the wire report.
 pub fn detail(report: &VerifierReport) -> Result<VerificationExecutionDetail, WyrdError> {
-    let internal = |error: serde_json::Error| WyrdError::Internal {
-        message: format!("the verification report cannot be encoded: {error}"),
-        details: json!({}),
-    };
     Ok(match report {
-        VerifierReport::Drift(report) => {
-            VerificationExecutionDetail::Drift(serde_json::to_value(report).map_err(internal)?)
-        }
+        VerifierReport::Drift(report) => VerificationExecutionDetail::Drift(
+            serde_json::to_value(report)
+                .and_then(serde_json::from_value)
+                .map_err(|error| WyrdError::Internal {
+                    message: format!("the verification report cannot be encoded: {error}"),
+                    details: json!({}),
+                })?,
+        ),
         VerifierReport::Eval { report, .. } => {
-            VerificationExecutionDetail::Eval(eval_detail(report).map_err(internal)?)
+            VerificationExecutionDetail::Eval(eval_detail(report))
         }
     })
 }
 
-/// Encode an Eval report as `{ results, skipped }`.
-///
-/// # Errors
-/// Returns the encoding error of an assertion result.
-fn eval_detail(report: &EvalReport) -> Result<Value, serde_json::Error> {
-    let results = report
-        .ran()
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()?;
-    let skipped = report
-        .outcomes
-        .iter()
-        .filter_map(|outcome| match outcome {
-            TaskRunOutcome::Skipped { task_id, reason } => Some(match reason {
-                SkipReason::ConditionFalse => {
-                    json!({ "task_id": task_id, "reason": "condition_false" })
-                }
-                SkipReason::DependencySkipped { upstream } => json!({
-                    "task_id": task_id,
-                    "reason": "dependency_skipped",
-                    "upstream_task_id": upstream,
+/// Project an Eval report into its ran results and skipped tasks.
+fn eval_detail(report: &EvalReport) -> WireEvalReport {
+    WireEvalReport {
+        results: report.ran().cloned().collect(),
+        skipped: report
+            .outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                TaskRunOutcome::Skipped { task_id, reason } => Some(match reason {
+                    SkipReason::ConditionFalse => SkippedTask {
+                        task_id: task_id.clone(),
+                        reason: WireSkipReason::ConditionFalse,
+                        upstream_task_id: None,
+                    },
+                    SkipReason::DependencySkipped { upstream } => SkippedTask {
+                        task_id: task_id.clone(),
+                        reason: WireSkipReason::DependencySkipped,
+                        upstream_task_id: Some(upstream.clone()),
+                    },
                 }),
-            }),
-            TaskRunOutcome::Ran(_) => None,
-        })
-        .collect::<Vec<_>>();
-    Ok(json!({ "results": results, "skipped": skipped }))
+                TaskRunOutcome::Ran(_) => None,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]

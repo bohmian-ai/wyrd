@@ -18,9 +18,9 @@ use wyrd_spec::ids::{
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::verification::{
-    ExecuteVerificationRequest, ExecuteVerificationResponse, StartVerificationRunRequest,
-    VerificationBindingStatus, VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
-    VerifierKind, VerifierReadiness,
+    ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
+    VerificationRunInput, VerificationRunStatus, VerificationRunTarget, VerifierKind,
+    VerifierReadiness,
 };
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
@@ -370,7 +370,7 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         request: &ExecuteVerificationRequest,
         edge_timer: Option<&EdgeTimer>,
-    ) -> Result<ExecuteVerificationResponse, WyrdError> {
+    ) -> Result<Judgment, WyrdError> {
         request.validate()?;
         let execution_id = VerificationExecutionId::new_v7();
         let span = tracing::Span::current();
@@ -433,7 +433,7 @@ impl<'a> VerificationControl<'a> {
         span.record("outcome", outcome);
         telemetry.finish(outcome, outcome != "completed");
         let report = result?;
-        Ok(ExecuteVerificationResponse {
+        Ok(Judgment {
             execution_id,
             verifier: target.verifier,
             subject: target.subject,

@@ -146,7 +146,7 @@ pub(crate) fn rows(record: &DriftRecordObservation) -> Result<Vec<Vec<u8>>, Wyrd
 ///
 /// # Errors
 /// As [`rows`].
-fn projected_value(
+pub(crate) fn projected_value(
     series: &FeatureName,
     value: &FeatureValue,
 ) -> Result<(Value, Value), WyrdError> {

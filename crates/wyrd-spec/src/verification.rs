@@ -16,17 +16,19 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::PrincipalId;
-use crate::card::drift::DriftProfile;
+use crate::card::drift::{DriftMethod, DriftProfile};
 use crate::card::operator::VerifierCounts;
 use crate::card::verifier::VerifierImplementation;
 use crate::error::WyrdError;
 use crate::ids::{
-    BindingId, CardUid, OperatorDispatchId, VerificationExecutionId, VerificationResultId,
-    VerificationRunId,
+    BindingId, CardUid, FeatureName, OperatorDispatchId, VerificationExecutionId,
+    VerificationResultId, VerificationRunId,
 };
 use crate::reference::CardRef;
 use crate::vala::eval::EvalTask;
+use crate::vala::eval::ids::TaskId;
 use crate::vala::eval::media::MediaRef;
+use crate::vala::eval::result::AssertionResult;
 
 /// Longest manual Drift window a caller may request: 31 days.
 ///
@@ -576,25 +578,111 @@ impl ExecuteVerificationRequest {
 
 /// The engine report of a direct execution, by implementation.
 ///
-/// The Drift body is the Vala Drift report and the Eval body lists its ran
-/// and skipped tasks. Both are owned by the Vala engines, so the wire carries
-/// them as documented JSON objects rather than a duplicated schema.
+/// Serialized as `{ "drift": DriftReport }` or `{ "eval": EvalReport }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerificationExecutionDetail {
-    /// `{ method, features: { <feature>: { feature, score, threshold, verdict, evidence? } }, verdict }`.
-    Drift(serde_json::Value),
-    /// `{ results: [AssertionResult], skipped: [{ task_id, reason, upstream_task_id? }] }`.
-    Eval(serde_json::Value),
+    /// The Drift report of a Drift Verifier.
+    Drift(DriftReport),
+    /// The ran and skipped tasks of an Eval Verifier.
+    Eval(EvalReport),
 }
 
-/// `200 OK` response to `POST /v1/verification/execute`.
+/// The verdict of one Drift feature or of a whole Drift report.
+///
+/// Serialized in the Drift engine's own spelling (`NoDrift`, `Drift`,
+/// `Inconclusive`), so a report reads the same wherever it is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum DriftVerdict {
+    /// The score did not exceed its threshold.
+    NoDrift,
+    /// The score exceeded its threshold.
+    Drift,
+    /// The target data could not be scored.
+    Inconclusive,
+}
+
+/// The Drift engine's report of one direct execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DriftReport {
+    /// The Drift method the Verifier's profile selected.
+    pub method: DriftMethod,
+    /// One report per scored feature, keyed by feature name.
+    pub features: BTreeMap<FeatureName, FeatureDriftReport>,
+    /// The aggregated verdict: `Drift` when any feature drifted.
+    pub verdict: DriftVerdict,
+}
+
+/// The Drift report of one feature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FeatureDriftReport {
+    /// The feature this report describes.
+    pub feature: FeatureName,
+    /// PSI score, total SPC chart signals, or absolute Custom delta; absent
+    /// when the feature is inconclusive.
+    pub score: Option<f64>,
+    /// The threshold `score` was compared against; absent when the feature is
+    /// inconclusive.
+    pub threshold: Option<f64>,
+    /// The feature's verdict.
+    pub verdict: DriftVerdict,
+    /// The method's evidence behind a scored PSI or SPC feature: frozen bins
+    /// with baseline and target counts, or chart limits and signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// The Eval engine's report of one direct execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvalReport {
+    /// The result of every task that ran, in stage order.
+    #[cfg_attr(feature = "server", schema(value_type = Vec<Object>))]
+    pub results: Vec<AssertionResult>,
+    /// Every task that did not run, with its reason.
+    pub skipped: Vec<SkippedTask>,
+}
+
+/// One Eval task that did not run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SkippedTask {
+    /// The skipped task.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub task_id: TaskId,
+    /// Why it did not run.
+    pub reason: SkipReason,
+    /// The skipped upstream task that caused a `dependency_skipped` skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub upstream_task_id: Option<TaskId>,
+}
+
+/// Why an Eval task did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The task's own condition evaluated to false.
+    ConditionFalse,
+    /// A declared upstream dependency was skipped first.
+    DependencySkipped,
+}
+
+/// The judgment of one direct execution: `200 OK` to
+/// `POST /v1/verification/execute`, and what `observe.verify` returns.
 ///
 /// A `failed` verdict is a successful response. Nothing here is persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ExecuteVerificationResponse {
+pub struct Judgment {
     /// Transient identity of this execution, shared with its audit and trace.
     pub execution_id: VerificationExecutionId,
     /// The exact Verifier executed.
@@ -611,6 +699,14 @@ pub struct ExecuteVerificationResponse {
     pub counts: VerifierCounts,
     /// The engine report.
     pub detail: VerificationExecutionDetail,
+}
+
+impl Judgment {
+    /// Whether the expectations held: true only for a `passed` verdict.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == VerificationVerdict::Passed
+    }
 }
 
 #[cfg(test)]

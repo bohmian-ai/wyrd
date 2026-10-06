@@ -29,7 +29,6 @@ pub mod saved_login;
 pub mod state;
 pub mod storage;
 pub mod transport;
-pub mod verification;
 pub mod workflow;
 
 pub use bifrost::{Bifrost, QueueConfig};
@@ -39,5 +38,4 @@ pub use global_config::GlobalConfig;
 pub use operator_connections::OperatorConnections;
 pub use platform::Platform;
 pub use principals::Principals;
-pub use verification::Verification;
 pub use workflow::{PublicWyrdGatewayCaller, Workflow, WorkflowCards, Workflows};

@@ -19,8 +19,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, IdempotencyKey, VerificationRunId};
 use wyrd_spec::registry::GetCardResponse;
 use wyrd_spec::verification::{
-    ExecuteVerificationRequest, ExecuteVerificationResponse, StartVerificationRunResponse,
-    VerificationBindingStatus, VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
+    ExecuteVerificationRequest, Judgment, StartVerificationRunResponse, VerificationBindingStatus,
+    VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
 };
 
 use super::principals::{parse_args, tool};
@@ -133,7 +133,7 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
              caller, Card scope over the subject.",
             false,
         ),
-        tool::<ExecuteVerificationRequest, ExecuteVerificationResponse>(
+        tool::<ExecuteVerificationRequest, Judgment>(
             EXECUTE,
             "Execute a Verifier on supplied input",
             "Judge supplied drift_samples or one eval_record with one exact Verifier about one \

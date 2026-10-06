@@ -604,7 +604,7 @@ async fn ambiguous_shutdown_retries_the_same_batch_on_the_same_state() {
 fn scoped_views_share_one_invocation_and_keep_their_subjects() {
     let (_bundle, state) = state_fixture();
     let run = state.run();
-    assert_eq!(run.card_ref(), state.root_ref());
+    assert_eq!(run.subject(), state.root_ref());
 
     let model = run.for_card("model").expect("registered alias resolves");
     let backup = run.for_card("backup").expect("registered alias resolves");
@@ -612,16 +612,18 @@ fn scoped_views_share_one_invocation_and_keep_their_subjects() {
     assert_eq!(model.run_id(), run.run_id());
     assert_eq!(backup.run_id(), run.run_id());
     assert_eq!(
-        model.card_ref(),
-        state.card_ref("model").expect("model ref")
+        (run.alias(), model.alias(), backup.alias()),
+        ("root", "model", "backup"),
+        "each view is named by the alias it was opened with"
     );
+    assert_eq!(model.subject(), state.card_ref("model").expect("model ref"));
     assert_eq!(
-        backup.card_ref(),
+        backup.subject(),
         state.card_ref("backup").expect("backup ref")
     );
-    assert_ne!(model.card_ref(), backup.card_ref());
+    assert_ne!(model.subject(), backup.subject());
     assert_eq!(
-        run.card_ref(),
+        run.subject(),
         state.root_ref(),
         "scoping a view never mutates its parent"
     );
@@ -657,15 +659,12 @@ fn run_for_card_selects_the_initial_view_and_shares_its_invocation() {
     let model = state
         .run_for_card("model")
         .expect("registered alias resolves");
-    assert_eq!(
-        model.card_ref(),
-        state.card_ref("model").expect("model ref")
-    );
+    assert_eq!(model.subject(), state.card_ref("model").expect("model ref"));
 
     let backup = model.for_card("backup").expect("registered alias resolves");
     assert_eq!(backup.run_id(), model.run_id());
     assert_eq!(
-        model.card_ref(),
+        model.subject(),
         state.card_ref("model").expect("model ref"),
         "a sibling view never mutates the initial view"
     );
@@ -688,6 +687,187 @@ fn run_for_card_refuses_an_unknown_alias_without_network_io() {
         .run_for_card("not_in_this_graph")
         .expect_err("an unregistered alias must refuse");
     assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_ALIAS");
+}
+
+// ── Scenario 2b: judging a view's subject with a bound Verifier ───────────
+
+/// A stub execute endpoint that records each request body and answers with
+/// one fixed passing Eval judgment.
+///
+/// # Panics
+/// Panics when the listener cannot bind or adopt the test runtime.
+fn execute_server() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("listener converts to tokio");
+    let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let (head, body) = loop {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|n| n.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length || read == 0 {
+                            break (head.to_owned(), body.to_owned());
+                        }
+                    }
+                };
+                let response = if head.starts_with("POST /auth/token") {
+                    ok_json(
+                        r#"{"access_token":"test-token","token_type":"Bearer","expires_in":3600}"#,
+                    )
+                } else {
+                    seen.lock()
+                        .expect("body lock")
+                        .push(serde_json::from_str(&body).expect("execute body is JSON"));
+                    ok_json(&judgment_body().to_string())
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{address}"), bodies)
+}
+
+/// The passing Eval judgment the stub execute endpoint answers with.
+fn judgment_body() -> Value {
+    let card =
+        json!({ "kind": "Verifier", "name": "quality", "version": "1.0.0", "space": "default" });
+    json!({
+        "execution_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff",
+        "verifier": card,
+        "subject": card,
+        "kind": "eval_assertion",
+        "verdict": "passed",
+        "summary": "1 of 1 assertions passed",
+        "counts": { "implementation": "eval", "passed_tasks": 1, "failed_tasks": 0, "total_tasks": 1, "pass_rate_percent": 100 },
+        "detail": { "eval": { "results": [], "skipped": [] } },
+    })
+}
+
+/// `observe.verify` resolves a bound Verifier locally, sends one request in
+/// the shape its kind takes, and returns the typed judgment; an unbound name
+/// and a wrong input shape are refused before any request is sent.
+///
+/// # Panics
+/// Panics when a refusal carries the wrong code, a refusal reaches the
+/// server, or the sent request or returned judgment differs from expected.
+#[tokio::test]
+async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
+    let bundle = TestBundle::with_typed_cards();
+    let state = WyrdState::from_path(bundle.path()).expect("fixture bundle loads");
+    let (url, bodies) = execute_server();
+    state.use_client_for_test(client_for(&url));
+    let service = state.run();
+    let observe = service.observe();
+
+    let refusals = [
+        (
+            "not-bound",
+            json!({ "answer": "yes" }),
+            "WYRD_SDK_404_UNKNOWN_VERIFIER",
+        ),
+        (
+            "quality",
+            json!([{ "answer": "yes" }]),
+            "WYRD_SDK_400_INVALID_OBSERVATION",
+        ),
+        (
+            "model-drift",
+            json!({ "score": 0.4 }),
+            "WYRD_SDK_400_INVALID_OBSERVATION",
+        ),
+        ("model-drift", json!([]), "WYRD_SDK_400_INVALID_OBSERVATION"),
+        (
+            "model-drift",
+            json!([{ "score": [1] }]),
+            "WYRD_SDK_400_INVALID_OBSERVATION",
+        ),
+    ];
+    for (verifier, input, code) in refusals {
+        let error = observe
+            .verify(verifier, &input)
+            .await
+            .expect_err("a local refusal");
+        assert_eq!(error.code(), code, "{verifier} over {input}");
+    }
+    let unbound_view = state.run_for_card("training_data").expect("data alias");
+    let error = unbound_view
+        .observe()
+        .verify("quality", &json!({ "answer": "yes" }))
+        .await
+        .expect_err("a Verifier bound to the Service is not bound to its Data");
+    assert_eq!(error.code(), "WYRD_SDK_404_UNKNOWN_VERIFIER");
+    assert!(
+        bodies.lock().expect("body lock").is_empty(),
+        "refusals send nothing"
+    );
+
+    let judgment = observe
+        .verify("quality", &json!({ "answer": "yes" }))
+        .await
+        .expect("a bound Eval Verifier judges");
+    assert!(judgment.passed());
+    observe
+        .verify(
+            "model-drift",
+            &json!([{ "score": 0.4 }, { "score": 0.6, "tier": "gold" }]),
+        )
+        .await
+        .expect("a bound Drift Verifier judges");
+
+    let root = state.root_ref().uid.clone().expect("root uid").to_string();
+    let quality = state
+        .card_ref("quality_eval")
+        .expect("eval ref")
+        .uid
+        .clone()
+        .expect("eval uid")
+        .to_string();
+    let drift = state
+        .card_ref("model_drift")
+        .expect("drift ref")
+        .uid
+        .clone()
+        .expect("drift uid")
+        .to_string();
+    assert_eq!(
+        *bodies.lock().expect("body lock"),
+        vec![
+            json!({
+                "verifier_uid": quality,
+                "subject_card_uid": root,
+                "input": { "kind": "eval_record", "context": { "answer": "yes" } },
+            }),
+            json!({
+                "verifier_uid": drift,
+                "subject_card_uid": root,
+                "input": { "kind": "drift_samples", "columns": {
+                    "score": [0.4, 0.6],
+                    "tier": [null, "gold"],
+                } },
+            }),
+        ]
+    );
 }
 
 // ── Scenario 3: the Drift projection ───────────────────────────────────────

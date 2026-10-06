@@ -15,9 +15,8 @@ use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, VerificationRunId};
 use wyrd_spec::verification::{
-    ExecuteVerificationRequest, ExecuteVerificationResponse, MAX_EXECUTE_BODY_BYTES,
-    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
-    VerificationRunStatus,
+    ExecuteVerificationRequest, Judgment, MAX_EXECUTE_BODY_BYTES, StartVerificationRunRequest,
+    StartVerificationRunResponse, VerificationBindingStatus, VerificationRunStatus,
 };
 
 use super::service::{VerificationControl, decode_start_request};
@@ -198,7 +197,7 @@ async fn get_run(
     request_body = ExecuteVerificationRequest,
     responses(
         (status = 200, description = "The judgment; a failed verdict is a success",
-         body = ExecuteVerificationResponse),
+         body = Judgment),
         (status = 400, description = "The body or input is malformed \
           (WYRD_VERIFICATION_400_INPUT_INVALID)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
@@ -232,7 +231,7 @@ async fn execute(
     edge_timer: Option<Extension<EdgeTimer>>,
     caller: Caller,
     body: Body,
-) -> Result<Json<ExecuteVerificationResponse>, WyrdErrorResponse> {
+) -> Result<Json<Judgment>, WyrdErrorResponse> {
     let body = axum::body::to_bytes(body, MAX_EXECUTE_BODY_BYTES)
         .await
         .map_err(|_| WyrdError::VerificationInputTooLarge {

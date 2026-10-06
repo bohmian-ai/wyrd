@@ -1220,6 +1220,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// `observe.verify` named a Verifier that is not bound in `verified_by`
+    /// to the Run view's subject in the hydrated graph.
+    ///
+    /// Refused locally before any network call.
+    #[error("[WYRD_SDK_404_UNKNOWN_VERIFIER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_404_UNKNOWN_VERIFIER",
+        status = 404,
+        title = "Verifier is not bound to this subject",
+        remediation = "Name a Verifier bound in `verified_by` to the view's subject Card, or open the view on the Card that binds it."
+    )]
+    SdkUnknownVerifier {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -4096,6 +4113,7 @@ impl WyrdError {
             | Self::SdkRuntimeHydrationFailed { message, details }
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
+            | Self::SdkUnknownVerifier { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }

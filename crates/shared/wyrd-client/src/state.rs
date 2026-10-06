@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::WyrdClient;
 use crate::bifrost::{Bifrost, QueueConfig, TableConfig};
@@ -21,10 +21,11 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
 };
@@ -317,14 +318,42 @@ impl HydratedStateIndex {
             .map(|artifact| {
                 Ok(ArtifactManifestEntry {
                     relative_path: RelativeArtifactPath::new(artifact.relative_path())?,
-                    sha256: artifact.sha256().to_owned(),
-                    size_bytes: artifact.size_bytes(),
+                    sha256: Some(artifact.sha256().to_owned()),
+                    size_bytes: Some(artifact.size_bytes()),
                     content_type: artifact.content_type().map(str::to_owned),
                 })
             })
             .collect::<Result<Vec<_>, WyrdError>>()?;
         canonical_artifact_manifest_hash(&manifest)
     }
+}
+
+/// The alias of the root Service view `WyrdState::run` opens.
+const ROOT_ALIAS: &str = "root";
+
+/// A Verifier bound to a subject, resolved for one direct execution.
+#[derive(Debug)]
+pub(crate) struct BoundVerifier<'a> {
+    /// The exact Verifier Card version.
+    pub(crate) verifier_uid: CardUid,
+    /// The exact subject Card version it judges.
+    pub(crate) subject_uid: CardUid,
+    /// The Verifier's Drift or Eval implementation, which fixes its input shape.
+    pub(crate) implementation: &'a VerifierImplementation,
+}
+
+/// The server-resolved UID a hydrated reference carries.
+///
+/// # Errors
+/// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when the reference has none,
+/// which a server-produced bundle always supplies.
+fn required_uid(card_ref: &CardRef) -> Result<CardUid, WyrdError> {
+    card_ref.uid.clone().ok_or_else(|| {
+        state_bundle_error(
+            "a hydrated Card reference carries no UID",
+            json!({ "card_ref": card_ref }),
+        )
+    })
 }
 
 /// A complete, local, non-executing Card graph, and its one Bifrost lifetime.
@@ -338,6 +367,10 @@ pub struct WyrdState {
     index: Arc<HydratedStateIndex>,
     /// The one Bifrost lifetime every observation of every run emits through.
     bifrost: Arc<BifrostLifecycle>,
+    /// The client `observe.verify` calls the server with, shared by every
+    /// clone: the client Bifrost was started over, else one resolved from the
+    /// ambient configuration on first use.
+    client: Arc<OnceLock<WyrdClient>>,
 }
 
 /// Private filesystem reader for one confined hydrated-bundle root.
@@ -414,6 +447,7 @@ impl WyrdState {
         Ok(Self {
             index: Arc::new(index),
             bifrost: Arc::new(BifrostLifecycle::default()),
+            client: Arc::new(OnceLock::new()),
         })
     }
 
@@ -481,9 +515,90 @@ impl WyrdState {
         queue: QueueConfig,
     ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
+        let _ = self.client.set(WyrdClient::clone(client));
         claim
             .complete(Bifrost::connect_with_config(client, table, queue).await?)
             .await
+    }
+
+    /// Pin the client this state's server calls go through, for server-free
+    /// tests that point it at a stub instead of the ambient configuration.
+    #[cfg(test)]
+    pub(crate) fn use_client_for_test(&self, client: WyrdClient) {
+        let _ = self.client.set(client);
+    }
+
+    /// The client this state's server calls go through.
+    ///
+    /// The client Bifrost was started over when there is one; otherwise one is
+    /// resolved from the ambient configuration on first use and kept for every
+    /// clone. Resolution performs no network IO.
+    ///
+    /// # Errors
+    /// Returns the client configuration or credential resolution error.
+    pub(crate) fn client(&self) -> Result<&WyrdClient, WyrdError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+        let client = WyrdClient::from_env().map_err(WyrdError::from)?;
+        Ok(self.client.get_or_init(|| client))
+    }
+
+    /// Resolve the Verifier named `name` bound in `verified_by` to `subject`.
+    ///
+    /// A subject's bindings are the root Service's own when it is the root,
+    /// those of every Service component occurrence that references it, and a
+    /// standalone Agent's own. Each bound Verifier is in the hydrated graph,
+    /// so resolution is a local lookup with no network IO.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` when no bound Verifier has that
+    /// name, and `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a bound Verifier or
+    /// the subject is absent from the graph or carries no UID.
+    pub(crate) fn bound_verifier(
+        &self,
+        subject: &CardRef,
+        name: &str,
+    ) -> Result<BoundVerifier<'_>, WyrdError> {
+        let subject_key = subject.to_string();
+        let mut bindings: Vec<&VerificationBinding> = Vec::new();
+        if let Spec::Service(service) = &self.service().spec {
+            if subject_key == self.index.root_key {
+                bindings.extend(&service.verified_by);
+            }
+            for component in &service.components {
+                if component.card_ref.as_card_ref() == Some(subject) {
+                    bindings.extend(&component.verified_by);
+                }
+            }
+        }
+        if let Spec::Agent(agent) = &self.index.card_by_key(&subject_key)?.spec {
+            bindings.extend(&agent.verified_by);
+        }
+        for binding in bindings {
+            let Some(verifier_ref) = binding.verifier.as_card_ref() else {
+                continue;
+            };
+            let card = self.index.card_by_key(&verifier_ref.to_string())?;
+            if card.metadata.name.as_str() != name {
+                continue;
+            }
+            let Spec::Verifier(spec) = &card.spec else {
+                return Err(state_bundle_error(
+                    "a verified_by binding names a Card that is not a Verifier",
+                    json!({ "verifier": verifier_ref }),
+                ));
+            };
+            return Ok(BoundVerifier {
+                verifier_uid: required_uid(verifier_ref)?,
+                subject_uid: required_uid(subject)?,
+                implementation: &spec.implementation,
+            });
+        }
+        Err(WyrdError::SdkUnknownVerifier {
+            message: format!("no Verifier named {name:?} is bound to {subject}"),
+            details: json!({ "verifier": name, "subject": subject }),
+        })
     }
 
     /// Open one invocation over this state, targeting the root Service Card.
@@ -492,7 +607,7 @@ impl WyrdState {
     /// execution. The run mints a UUIDv7 `run_id` that every view of it shares.
     #[must_use]
     pub fn run(&self) -> Run {
-        Run::new(self.clone(), self.root_ref().clone())
+        Run::new(self.clone(), ROOT_ALIAS.to_owned(), self.root_ref().clone())
     }
 
     /// Open one invocation over this state whose first view observes `alias`.
@@ -507,7 +622,7 @@ impl WyrdState {
     /// this bundle; nothing is opened.
     pub fn run_for_card(&self, alias: &str) -> Result<Run, WyrdError> {
         let subject = self.card_ref(alias)?.clone();
-        Ok(Run::new(self.clone(), subject))
+        Ok(Run::new(self.clone(), alias.to_owned(), subject))
     }
 
     /// Drain every producer of this state's writer without closing it.
@@ -2029,7 +2144,7 @@ pub(crate) mod tests {
         ///
         /// # Panics
         /// Panics if fixture construction or serialization fails.
-        fn with_typed_cards() -> Self {
+        pub(crate) fn with_typed_cards() -> Self {
             let mut bundle = Self::complete_service();
             let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
             let inline_prompt_ref = test_ref(CardKind::Agent, "inline", 5);

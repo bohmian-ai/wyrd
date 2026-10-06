@@ -242,3 +242,51 @@ persisted, security, or sequencing decision remains.
 - `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
 - `architecture/operations/{deployment-and-release,reliability-and-recovery}.md`
+
+## Implementation Evidence — 2026-10-05
+
+All commands ran with
+`CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd-bifrost-variant/target`
+on the final candidate and exited 0.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Variant limits, errors, fingerprint, persisted Structs, and every built-in producer/consumer match revision 10 with no legacy stored form | `wyrd-spec/src/vala/error.rs`, `wyrd-queue/src/variant.rs`, `vala-bifrost-redux/src/tables/`, producers in `wyrd-client/src/observe/eval.rs`, `wyrd-server/src/verification/results.rs`, gateway/audit/OTLP owners; regenerated `wyrd-spec/schemas`, `tests/schemas`, `error-codes.ts` | V1 `tables::tests::variant_contract_and_builtin_schemas_are_stable`; V2 `verification_runtime::typed_builtin_payloads_are_queryable`; V3 lists the three OTLP names; V4 runs all three; V5 Rust, V6 Python, V7 TypeScript, V8 MCP `builtin_variant_and_struct_payloads_are_queryable`; V16 `codegen:check` | PASS |
+| Every Oracle production session and codec supports the same SQL contract and enforces sensitivity before IO; Struct stays `get_field`; Variant stays semantic `variant_get` with correct full-root and residual evaluation | `oracle/variant_sql.rs` (one `OracleVariantSql` registration, `mask_placeholders` for Variants under null Structs), `oracle/mod.rs` (`remote_variant_error` keeps catalog identity across distributed hops), `wyrd-client/src/error.rs` (exact `BifrostError` reconstruction) | V9 `published::variant_sql_registry_covers_every_session` (interactive + analytical matrices, invalid JSON code on both paths, workload role refused before follower leases advance); plan shape (`get_field` vs `variant_as_text(variant_get(...))`) and null-parent Struct/Variant rows proven by `oracle::variant_sql::tests::variant_operators_and_functions_follow_the_contract` | PASS |
+| All tables are v3 only after repeated-rewrite lineage and v3 GC pass; hidden columns stay out of the logical schema and handoff | Forge managed rewrite + `parquet/promoted_object.rs` Variant group arm; pinned forks `iceberg-rust` e999331f280b698bcd026550812b5047e8789df6, `iceberg-compaction` 94db7b94f72c48c75c937d36a59e80c237e8ca72 (tested revisions equal the pins) | V10 `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`; V12 `arrow::schema::tests::variant_round_trips_unshredded`; V13 `compaction::tests::rewrite_preserves_v3_row_lineage` | PASS |
+| Both writers use row-group Bloom capacity and retain folding/FPP behavior | `parquet/writer_properties.rs` | V11 `parquet::writer_properties::tests::bloom_capacity_uses_row_group_limit_for_scribe_and_forge` | PASS |
+| Canonical signal round-trip in Python and TypeScript | `sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/oracle-query.test.ts` | V14 `test_canonical_signal_arrow_write_and_sql_read_round_trip`; V15 `canonical signal Arrow write and SQL read round-trip` | PASS |
+
+Deferral (lead decision, option C): the Python and TypeScript canonical-signal
+journeys (V14, V15) now produce their rows through the stock OTLP exporters
+(traces, logs, metrics) and read the Variant columns back natively through
+SQL. Neither SDK can author a Variant Arrow column until TASK-002, so
+canonical-Arrow write equivalence stays proven in Rust through the shared
+fixture. Direct Python/TypeScript Arrow writes return with TASK-002
+scenario 5. No per-fixture Variant encoder was added, and `write_batch`
+JSON-text normalization was not pulled forward.
+
+Consumer journeys re-run because stored values are now native Variant: Rust
+`sdks/wyrd-sdk-rust/tests/drift_verification.rs`, Python
+`test_drift_journey.py` and `state/test_observe_journey.py`, the OTEL export
+journeys in `bifrost/test_bifrost_e2e.py`, TypeScript
+`drift-verification.test.ts` and `otel-export.test.ts`, and the MCP canonical
+query journey: all pass.
+
+Diagnosis — Python `test_drift_method_edges_score_through_oracle` 500:
+- **Symptom:** an internal server error on
+  `to_json(drift_report['features'])`.
+- **Evidence:** the handler panicked at
+  `parquet-variant-59.3.0/src/variant.rs:379` ("Received empty bytes") from
+  `ToJson::invoke_with_args`.
+- **Cause:** a null Struct leaves empty-bytes placeholders in its Variant
+  child, and neither the Parquet reader nor DataFusion `get_field` pushes the
+  parent null down.
+- **Fix site:** every Variant argument now passes through `mask_placeholders`
+  in `oracle/variant_sql.rs` before it is decoded. It uses the shared
+  `wyrd_queue::variant::is_placeholder`, which the JSON writer also uses.
+
+Format and lint: `mise run fmt`, `mise run lints`, `mise run py:format`,
+`mise run py:lints`, `mise run ts:typecheck`, and V17 `git diff --check` all
+pass. Non-goals stayed excluded: no shredding, no DataFusion repin, no
+compatibility alias, and no second Variant model.

@@ -208,13 +208,13 @@ impl LogColumns {
             .transpose()
             .map_err(|failure| failure.reason(row))?;
         if body.as_ref().is_some_and(|encoded| {
-            encoded.len() > wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES
+            encoded.encoded_bytes() > wyrd_spec::vala::logs::record::MAX_LOG_BODY_BYTES
         }) {
             return Err("log body exceeds the accepted payload size".into());
         }
         let attributes = attributes_variant("attributes", &record.attributes)
             .map_err(|failure| failure.reason(row))?;
-        if attributes.len() > wyrd_spec::vala::logs::record::MAX_LOG_ATTRIBUTES_BYTES {
+        if attributes.encoded_bytes() > wyrd_spec::vala::logs::record::MAX_LOG_ATTRIBUTES_BYTES {
             return Err("log attributes exceed the accepted payload size".into());
         }
         let correlation = RecordCorrelation::extract(&record.attributes, card_scope)?;
@@ -225,8 +225,8 @@ impl LogColumns {
         };
         let payload_bytes = record.severity_text.len()
             + record.event_name.len()
-            + body.as_ref().map_or(0, EncodedVariant::len)
-            + attributes.len()
+            + body.as_ref().map_or(0, EncodedVariant::encoded_bytes)
+            + attributes.encoded_bytes()
             + exception.bytes()
             + body_text.as_ref().map_or(0, String::len)
             + correlation.card_ref.as_ref().map_or(0, String::len)

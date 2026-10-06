@@ -913,16 +913,16 @@ fn point_payload_bytes(descriptor: &MetricDescriptor, row: &PointRow) -> usize {
     descriptor.name.len()
         + descriptor.description.len()
         + descriptor.unit.len()
-        + descriptor.metadata.len()
+        + descriptor.metadata.encoded_bytes()
         + descriptor.kind.len()
-        + row.attributes.len()
+        + row.attributes.encoded_bytes()
         + row.correlation.card_ref.as_ref().map_or(0, String::len)
         + row.correlation.run_id.as_ref().map_or(0, String::len)
         + numeric_elements * size_of::<i64>()
         + row
             .exemplars
             .iter()
-            .map(|exemplar| exemplar.filtered_attributes.len())
+            .map(|exemplar| exemplar.filtered_attributes.encoded_bytes())
             .sum::<usize>()
 }
 

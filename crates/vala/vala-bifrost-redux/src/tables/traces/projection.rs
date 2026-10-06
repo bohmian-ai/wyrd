@@ -367,7 +367,7 @@ impl SpanColumns {
                 .status
                 .as_ref()
                 .map_or(0, |status| status.message.len())
-            + attributes.len()
+            + attributes.encoded_bytes()
             + http.bytes()
             + exception.bytes()
             + promotions
@@ -544,7 +544,7 @@ impl SpanColumns {
                 checked_i64(event.time_unix_nano)
                     .expect("a validated event time never exceeds its span's checked end"),
             );
-            payload_bytes += event.name.len() + attributes.len();
+            payload_bytes += event.name.len() + attributes.encoded_bytes();
             self.event_name.push(event.name.clone());
             self.event_attributes.push(attributes);
             self.event_dropped.push(event.dropped_attributes_count);
@@ -562,7 +562,7 @@ impl SpanColumns {
         for (link, attributes) in span.links.iter().zip(attributes) {
             self.link_trace_id.push(link.trace_id.clone());
             self.link_span_id.push(link.span_id.clone());
-            payload_bytes += link.trace_state.len() + attributes.len();
+            payload_bytes += link.trace_state.len() + attributes.encoded_bytes();
             self.link_trace_state.push(link.trace_state.clone());
             self.link_flags.push(link.flags);
             self.link_attributes.push(attributes);

@@ -401,7 +401,7 @@ impl ResourceEnvelope {
     /// row that repeats it, including one 4-byte offset per entity reference.
     #[must_use]
     pub fn repeated_bytes(&self) -> usize {
-        self.attributes.len()
+        self.attributes.encoded_bytes()
             + self.schema_url.len()
             + [
                 &self.service_name,
@@ -469,7 +469,7 @@ impl ScopeEnvelope {
     /// row that repeats it.
     #[must_use]
     pub fn repeated_bytes(&self) -> usize {
-        self.name.len() + self.version.len() + self.attributes.len() + self.schema_url.len()
+        self.name.len() + self.version.len() + self.attributes.encoded_bytes() + self.schema_url.len()
     }
 }
 

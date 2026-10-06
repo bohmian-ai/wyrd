@@ -168,10 +168,13 @@ impl EncodedVariant {
 
     /// Wrap finished bytes after the size check.
     ///
+    /// Private because size is only the first check: the public constructors
+    /// call it and then add the encoding and depth guarantees the type promises.
+    ///
     /// # Errors
     ///
     /// Returns [`VariantViolation::TooLarge`] past [`VARIANT_MAX_ENCODED_BYTES`].
-    pub fn sized(metadata: Vec<u8>, value: Vec<u8>) -> Result<Self, VariantViolation> {
+    fn sized(metadata: Vec<u8>, value: Vec<u8>) -> Result<Self, VariantViolation> {
         let bytes = u64::try_from(metadata.len() + value.len()).unwrap_or(u64::MAX);
         if bytes > VARIANT_MAX_ENCODED_BYTES {
             return Err(VariantViolation::TooLarge { bytes });
@@ -192,15 +195,12 @@ impl EncodedVariant {
     }
 
     /// Return the encoded size, metadata plus value.
+    ///
+    /// Producers compare it against per-field byte budgets; it is never zero
+    /// because every valid Variant has metadata and value bytes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn encoded_bytes(&self) -> usize {
         self.metadata.len() + self.value.len()
-    }
-
-    /// Report whether both byte strings are empty, which no valid value is.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Render the value as JSON.

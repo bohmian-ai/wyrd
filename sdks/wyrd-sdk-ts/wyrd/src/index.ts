@@ -635,13 +635,6 @@ export interface RowSchema<T> {
   parse(value: unknown): T;
 }
 
-/**
- * Arrow batches from one query, converted on demand.
- *
- * Collected by draining {@link Bifrost.stream}, so a collected result and a
- * streamed one are the same rows read the same way — only the batches are
- * retained rather than yielded.
- */
 /** The Arrow extension name every Variant column carries. */
 const VARIANT_EXTENSION = "arrow.parquet.variant";
 
@@ -683,6 +676,13 @@ function nativeValue(field: Field, value: unknown): unknown {
   );
 }
 
+/**
+ * Arrow batches from one query, converted on demand.
+ *
+ * Collected by draining {@link Bifrost.stream}, so a collected result and a
+ * streamed one are the same rows read the same way — only the batches are
+ * retained rather than yielded.
+ */
 export class QueryResult {
   readonly #batches: readonly RecordBatch[];
   readonly #terminal: QueryTerminal;

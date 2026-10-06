@@ -270,3 +270,58 @@ fork, codegen, and diff-check commands. Also run:
 
 Do not run `mise run verify:bifrost` or `mise run gate`; the original task and
 these remediation-specific lanes are the complete scoped proof.
+
+## Implementation evidence
+
+Command prefix for every cargo/mise command: `CARGO_TARGET_DIR=/home/thorrester/Documents/GitHub/wyrd-bifrost-variant/target`. PG journeys use `scripts/postgres/with-test-postgres.sh` with the migrate step from the original V-commands.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-1` | 45b61e80c: `wyrd-queue/src/variant.rs` `EncodedVariant::from_json_text` validates once as `RawValue` and classifies number tokens lexically (`raw_number_variant` parses integral tokens as `i128`); `integer_variant` is the one integer rule for both JSON paths (i64 narrowed, else Decimal16 scale 0, else `NumericOutOfRange{numeric_kind:"integer"}`); a fraction or exponent token is a finite `f64`; objects split into a `BTreeMap`, so the last duplicate key wins. Declared the already-unified `raw_value` feature on wyrd-queue's serde_json, following the wyrd-client precedent | `mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=variant::tests::json_text_classifies_integers_from_their_tokens) \| test(=variant::tests::json_converts_under_the_variant_contract)'`; `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support -E 'test(=oracle::variant_sql::tests::parse_json_keeps_exact_integers_and_refuses_the_rest)'` | PASS |
+| `FIND-TASK-001-2` | 347747ee3: `DomainDefinition::validate_variants` runs in Scribe `decode_rows` before ACK and WAL for every built-in, top-level and nested; `ScribeError`/`IngestError::ContractViolation` carry the typed `BifrostError`. 87b736e2e: `IngestError::into_status` attaches the `wyrd-error-bin` problem document so gRPC clients rebuild the exact error | `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=verification_runtime::builtin_variant_columns_are_refused_before_ack)"'`; `gate::error::tests::*` | PASS |
+| `FIND-TASK-001-3` | fb2415572 removes the publication optional-metrics prerequisite. Fork `iceberg-compaction` fb3a594 (pinned in eccf249ad) removes the rewrite-wide `_row_id` collect/sort/duplicate scan and keeps per-batch missing/type/null validation plus the unchanged copy. Per the human direction relayed by the lead, 83954156c removes the journey's duplicate-copy refusal step because it asserted the deleted mechanism, and the design doc no longer claims duplicate detection | V10 `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite`; V13 `compaction::tests::rewrite_preserves_v3_row_lineage` and `executor::datafusion::tests::row_lineage_is_complete` (fork) | PASS |
+| `FIND-TASK-001-4` | 9e39241ac, 83954156c: `architecture/bifrost-design.md` gains "Storage format and Variant", "Variant SQL", and Forge lineage text, and drops the "losslessly" duplicate-key wording. `docs/.../bifrost/schema.svx` gains Storage format and Variant sections, and its spans, metrics, logs, agent_traces, eval, and verification tables are regenerated from the ledgers (`details` removed) | `mise run docs:check`; `mise run check:docs` | PASS |
+| `FIND-TASK-001-5` | 0181ff52a: `VariantQueryError` carries the tagged serde `BifrostError`; the coordinator decodes only that form | `oracle::tests::variant_errors_keep_their_catalog_identity_locally_and_remotely`; `error::tests::bifrost_problem_details_reconstruct_exact_variant` (wyrd-client) | PASS |
+| `FIND-TASK-001-6` | 963782b7d: `sized` private, `encoded_bytes()` replaces `len`/`is_empty` | `wyrd-queue` `variant::tests::*`; workspace `mise run lints` | PASS |
+| `FIND-TASK-001-7` | 963782b7d: TS `QueryResult` JSDoc on the exported class | `mise run ts:typecheck` | PASS |
+| `FIND-TASK-001-8` | 86f570328: Wyrd NDV constant removed; parquet-rs derives NDV from row-group geometry | V11 `parquet::writer_properties::tests::bloom_capacity_uses_row_group_limit_for_scribe_and_forge` | PASS |
+| `FIND-TASK-001-9` | 0d562a891, 111e7bdce: rustdoc, `# Errors` and `# Panics` on every added or changed item, by item-by-item audit of the base..HEAD diff | audit of the cumulative diff; `mise run lints` | PASS |
+| `FIND-TASK-001-10` | 1612506e2: imports hoisted to module or test-module tops; bare signature names | `cargo check --all-targets` on touched crates; `mise run lints` | PASS |
+
+Deviation record (FIND-1): the remediation text says to use serde_json's
+"installed arbitrary-precision token preservation". That feature is not
+installed; only `raw_value` is. Enabling `arbitrary_precision` would unify
+across the workspace and break `f64` and `i128` deserialization through
+`#[serde(flatten)]`, untagged, and internally tagged enums: 141 such
+attributes, plus iceberg serde. This is a known serde_json limitation. The lead
+chose the local `RawValue` plus `i128` lexical classification instead.
+
+Broader verification on the remediated candidate: V1
+`tables::tests::variant_contract_and_builtin_schemas_are_stable`; V2
+`typed_builtin_payloads_are_queryable` plus
+`result_layout_partitions_blooms_and_prunes_by_result`; V4 all three OTLP
+`pg_tests` Variant journeys; V5 wyrd-client, V6/V14 Python, V7/V15
+TypeScript, and V8 MCP journeys; V9
+`published::variant_sql_registry_covers_every_session`; V10; V11; V12
+`arrow::schema::tests::variant_round_trips_unshredded` (iceberg-rust e999331f2);
+V13; V16 `mise run codegen:check`; V17 `git diff --check`. All PASS. Also PASS:
+`mise run fmt`, `lints`, `py:format`, `py:lints`, `ts:typecheck`,
+`docs:check`, `check:docs`, `check:client-tier`, `check:pyo3-scope`, and
+`check:unwrap-audit`. Not run, as instructed: `verify:bifrost` and `gate`.
+
+Unexpected failure diagnosis (V10):
+
+- **Symptom:** `refuse_unencodable_lineage` asserted that the poisoned
+  partition was unchanged, but the rewrite committed.
+- **Evidence:** `managed_rewrite.rs:1526`. The live set changed from
+  {output, output.duplicate} to one new output.
+- **Cause:** the step injected a byte-copy duplicate of `_row_id` and relied on
+  the rewrite-wide duplicate scan, which FIND-3 deletes by direction.
+- **Fix site:** that journey step and its two helpers, removed in 83954156c.
+- **Other callers checked:** none outside `managed_rewrite.rs`.
+
+The lead forbade sub-agents, so no diagnostician was spawned.
+
+Non-goals stayed excluded: no new dependency (the `raw_value` feature was
+already unified through workspace-hack), no new option or check, no shredding
+or dynamic-table work.

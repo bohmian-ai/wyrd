@@ -97,6 +97,20 @@ def test_arrow_json_text_is_stored_as_variant(
     assert rows == [Event(id=1, payload={"n": 9007199254740993}, mixed="seven")]
 
 
+def test_arrow_struct_and_list_columns_are_stored(
+    bifrost: Bifrost, wyrd_server: WyrdTestServer
+) -> None:
+    # pyarrow's own shapes: nullable children in any order, nullable list items.
+    point = pyarrow.array([{"label": "a", "x": 7}])
+    arrow = pyarrow.table({"tags": [["a", "b"]], "point": point, "id": [1]})
+    bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])
+    wyrd_server.flush_bifrost()
+
+    rows = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {bifrost.table.fqn}", Event)
+
+    assert rows == [Event(id=1, point=Point(x=7, label="a"), tags=["a", "b"])]
+
+
 def test_query_results_copy_into_another_table(
     bifrost: Bifrost, wyrd_server: WyrdTestServer
 ) -> None:

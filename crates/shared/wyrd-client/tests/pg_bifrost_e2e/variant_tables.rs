@@ -261,6 +261,55 @@ mod pg_tests {
         events.stop().await;
     }
 
+    /// Struct and List columns built the way an Arrow writer builds them —
+    /// every child nullable, children in the writer's order, a list item
+    /// named by the writer — are stored with the table's declared types.
+    #[tokio::test]
+    async fn arrow_struct_and_list_columns_are_stored() {
+        let events = Events::start().await;
+        let point = StructArray::from(vec![
+            (
+                Arc::new(Field::new("label", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("a")])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("x", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+            ),
+        ]);
+        let tags = arrow::array::ListArray::new(
+            Arc::new(Field::new("element", DataType::Utf8, true)),
+            arrow::buffer::OffsetBuffer::from_lengths([2]),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            None,
+        );
+        let batch = RecordBatch::try_from_iter([
+            ("tags", Arc::new(tags) as ArrayRef),
+            ("point", Arc::new(point)),
+            ("id", Arc::new(Int64Array::from(vec![1]))),
+        ])
+        .expect("batch builds");
+
+        events
+            .bifrost
+            .write_batch(&events.table, &batch)
+            .await
+            .expect("batch is accepted");
+        events.server.flush_bifrost().await.expect("rows publish");
+
+        let expected = Event {
+            id: 1,
+            point: Some(Point {
+                x: 7,
+                label: Some("a".to_owned()),
+            }),
+            tags: Some(vec!["a".to_owned(), "b".to_owned()]),
+            ..Event::default()
+        };
+        assert_eq!(events.read(&events.table).await, vec![expected]);
+        events.stop().await;
+    }
+
     /// Query results keep the Variant extension and copy into another table.
     #[tokio::test]
     async fn query_results_copy_into_another_table() {

@@ -4737,6 +4737,90 @@ mod tests {
         );
     }
 
+    /// A field of a null struct is null on the hot read path: the required
+    /// child's placeholder under a null parent is never stored in Parquet, so
+    /// neither statistics pruning nor the decoder row filter may observe it.
+    /// `point.x IS NULL` keeps exactly the parentless row and `point.x = 0`
+    /// keeps none, whether the file's row groups are pruned first or every
+    /// group is decoded through the row filter alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be written or read, or when either
+    /// predicate keeps a row other than the expected ones.
+    #[test]
+    fn struct_fields_of_null_parents_are_null_with_and_without_pruning() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let point = Field::new(
+            "point",
+            DataType::Struct(vec![Field::new("x", DataType::Int64, false)].into()),
+            true,
+        );
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            point,
+        ]));
+        let points = arrow::array::StructArray::new(
+            vec![Field::new("x", DataType::Int64, false)].into(),
+            vec![Arc::new(Int64Array::from(vec![5, 0])) as ArrayRef],
+            Some(arrow::buffer::NullBuffer::from(vec![true, false])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(points)],
+        )
+        .expect("fixture batch");
+        let mut sink = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(&schema), None)
+            .expect("fixture writer");
+        writer.write(&batch).expect("fixture write");
+        writer.close().expect("fixture close");
+        let published = Bytes::from(sink);
+
+        let leaf = || ScanLeaf::StructField {
+            column: "point".to_owned(),
+            fields: vec!["x".to_owned()],
+        };
+        for (predicate, expected) in [
+            (ScanPredicate::IsNull(leaf()), vec![2_i64]),
+            (ScanPredicate::Eq(leaf(), ScanLiteral::I64(0)), vec![]),
+        ] {
+            for prune in [true, false] {
+                let plan = hot_file_plan(&published, &schema, std::slice::from_ref(&predicate));
+                let groups = if prune {
+                    plan.select_row_groups(vec![0]).retained
+                } else {
+                    vec![0]
+                };
+                let HotFileReadPlan { plan, .. } = plan;
+                let mut builder = ParquetRecordBatchReaderBuilder::try_new(published.clone())
+                    .expect("reader builder")
+                    .with_row_groups(groups)
+                    .with_projection(plan.projection_mask);
+                if let Some(row_filter) = plan.row_filter {
+                    builder = builder.with_row_filter(row_filter);
+                }
+                let ids = builder
+                    .build()
+                    .expect("reader")
+                    .flat_map(|batch| {
+                        let batch = batch.expect("decoded batch");
+                        batch
+                            .column_by_name("id")
+                            .expect("id column")
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("id is Int64")
+                            .values()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, expected, "{predicate:?} prune={prune}");
+            }
+        }
+    }
+
     /// Page selection measured on one production-recipe row group: an
     /// equality leaf on a sorted column skips every page whose index proves it
     /// cannot match, keeps strictly fewer rows than the group, and still

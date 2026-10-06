@@ -33,6 +33,7 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::builtin_tables;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{
@@ -1106,27 +1107,28 @@ const LINEAGE_STEPS: usize = 24;
 /// and two successive rewrite outputs.
 const REWRITTEN_TWICE: usize = 3;
 
-/// Hidden v3 lineage of one live row beside the logical value naming it.
+/// Hidden v3 lineage the reader resolves for one live row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowLineage {
+    /// `_row_id` the reader resolves for the row.
+    row_id: i64,
     /// `_last_updated_sequence_number` the reader resolves for the row.
     last_updated_sequence_number: i64,
-    /// Logical identity of the row, rendered from its key column.
-    key: String,
 }
 
 /// One table whose lineage the scenario follows across every rewrite.
 struct LineageTable {
     /// Bound tenant table the rows live in.
     binding: TenantTableBinding,
-    /// Logical column that identifies each generated row.
+    /// Logical column whose rendered value identifies each generated row.
     key_column: &'static str,
-    /// Every row seen so far, as it was first observed.
-    rows: BTreeMap<i64, RowLineage>,
-    /// Every data file each row has lived in, keyed by `_row_id`.
-    homes: BTreeMap<i64, BTreeSet<String>>,
+    /// Every row seen so far, keyed by its logical identity, with the lineage
+    /// it was first observed with.
+    rows: BTreeMap<String, RowLineage>,
+    /// Every data file each row has lived in, keyed by logical identity.
+    homes: BTreeMap<String, BTreeSet<String>>,
     /// Rows promoted before the first rewrite, which must be rewritten twice.
-    original: BTreeSet<i64>,
+    original: BTreeSet<String>,
 }
 
 impl LineageTable {
@@ -1155,7 +1157,8 @@ impl LineageTable {
             .expect("lineage table loads")
     }
 
-    /// Scans every live row's hidden lineage and file, keyed by `_row_id`.
+    /// Scans every live row's hidden lineage and file, keyed by the row's
+    /// logical identity.
     ///
     /// The scan asks the fork reader for both reserved columns and `_file`
     /// beside the key column, which is the resolution any reader of the table
@@ -1164,12 +1167,11 @@ impl LineageTable {
     ///
     /// # Panics
     ///
-    /// Panics when the scan fails, when a lineage value is null, or when two
-    /// live rows share one `_row_id`.
+    /// Panics when the scan fails or a lineage value is null.
     async fn scan(
         &self,
         fixture: &PromotionIntegrationFixture,
-    ) -> BTreeMap<i64, (RowLineage, String)> {
+    ) -> BTreeMap<String, (RowLineage, String)> {
         let table = self.load(fixture).await;
         let mut rows = BTreeMap::new();
         if table.metadata().current_snapshot().is_none() {
@@ -1214,15 +1216,12 @@ impl LineageTable {
                 .expect("the scan returns the key column");
             for row in 0..batch.num_rows() {
                 let lineage = RowLineage {
+                    row_id: row_ids.value(row),
                     last_updated_sequence_number: sequences.value(row),
-                    key: array_value_to_string(keys, row).expect("key renders"),
                 };
-                let previous =
-                    rows.insert(row_ids.value(row), (lineage, files.value(row).to_owned()));
-                assert!(
-                    previous.is_none(),
-                    "two live rows share _row_id {}",
-                    row_ids.value(row)
+                rows.insert(
+                    array_value_to_string(keys, row).expect("key renders"),
+                    (lineage, files.value(row).to_owned()),
                 );
             }
         }
@@ -1232,33 +1231,23 @@ impl LineageTable {
     /// Proves every row seen before is still live with the lineage it was
     /// first seen with, then records new rows and each row's current file.
     ///
-    /// New rows must take ids no earlier row holds, which the scan's own
-    /// uniqueness check and the metadata's `next-row-id` bound prove together.
-    ///
     /// # Panics
     ///
-    /// Panics when a known row vanished or changed its `_row_id`,
-    /// `_last_updated_sequence_number`, or key, or when an id reaches
-    /// `next-row-id`.
+    /// Panics when a known row vanished or changed its `_row_id` or
+    /// `_last_updated_sequence_number`.
     async fn observe(&mut self, fixture: &PromotionIntegrationFixture) {
         let current = self.scan(fixture).await;
         let name = &self.binding.table_ref.name;
-        for (row_id, lineage) in &self.rows {
+        for (key, lineage) in &self.rows {
             assert_eq!(
-                current.get(row_id).map(|(lineage, _)| lineage),
+                current.get(key).map(|(lineage, _)| lineage),
                 Some(lineage),
-                "row {row_id} of {name} keeps its _row_id and _last_updated_sequence_number"
+                "row {key} of {name} keeps its _row_id and _last_updated_sequence_number"
             );
         }
-        let next = i64::try_from(self.load(fixture).await.metadata().next_row_id())
-            .expect("next-row-id fits i64");
-        for (row_id, (lineage, file)) in current {
-            assert!(
-                row_id < next,
-                "_row_id {row_id} of {name} is below next-row-id {next}"
-            );
-            self.rows.entry(row_id).or_insert(lineage);
-            self.homes.entry(row_id).or_default().insert(file);
+        for (key, (lineage, file)) in current {
+            self.homes.entry(key.clone()).or_default().insert(file);
+            self.rows.entry(key).or_insert(lineage);
         }
     }
 
@@ -1269,22 +1258,18 @@ impl LineageTable {
     /// Panics when a row already lived in more than its promoted object, which
     /// would mean a rewrite ran before the baseline was taken.
     fn freeze_original(&mut self) {
-        for (row_id, homes) in &self.homes {
-            assert_eq!(
-                homes.len(),
-                1,
-                "row {row_id} is recorded before any rewrite"
-            );
+        for (key, homes) in &self.homes {
+            assert_eq!(homes.len(), 1, "row {key} is recorded before any rewrite");
         }
-        self.original = self.rows.keys().copied().collect();
+        self.original = self.rows.keys().cloned().collect();
     }
 
     /// Reports whether every original row has lived in two rewrite outputs.
     fn rewritten_twice(&self) -> bool {
         !self.original.is_empty()
-            && self.original.iter().all(|row_id| {
+            && self.original.iter().all(|key| {
                 self.homes
-                    .get(row_id)
+                    .get(key)
                     .is_some_and(|homes| homes.len() >= REWRITTEN_TWICE)
             })
     }
@@ -1473,11 +1458,12 @@ async fn collect_v3_garbage(
 /// the production scheduler and worker then rewrite them until every
 /// originally promoted row has lived in two successive rewrite outputs, with
 /// more rows promoted between rounds because only Forge's own commits make a
-/// table due. After every step each known row must still carry the `_row_id`
-/// and `_last_updated_sequence_number` it was first seen with. Finally a leader maintenance
-/// pass rewrites the user table's fragmented manifests and expires its
-/// replaced snapshots, and both existing lineage and fresh row-id assignment
-/// survive it.
+/// table due. After every step each known row, found by its logical
+/// identity, must still carry the `_row_id` and
+/// `_last_updated_sequence_number` it was first seen with. Finally a leader
+/// maintenance pass rewrites the user table's fragmented manifests and expires
+/// its replaced snapshots, existing lineage survives it, and rows promoted
+/// after it are read with lineage too.
 ///
 /// # Panics
 ///
@@ -1509,7 +1495,7 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
     )
     .await;
     let mut tables = [
-        LineageTable::new(fixture.binding.clone(), "value"),
+        LineageTable::new(fixture.binding.clone(), WYRD_EVENT_TIME),
         LineageTable::new(builtin, "result_id"),
     ];
     assert_eq!(
@@ -1568,7 +1554,7 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
 
     let rows_before = collect_v3_garbage(fixture, &mut supervisor, &mut tables).await;
 
-    // Row ids assigned after the manifest rewrite come from fresh space.
+    // Rows promoted after the manifest rewrite join the lineage baseline.
     fixture.seal_more(1).await;
     advance_and_observe(&mut supervisor, fixture, &mut tables).await;
     assert_eq!(

@@ -1,5 +1,6 @@
 //! Validated conversions between protobuf and pure Bifrost query contracts.
 
+use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
 
@@ -41,6 +42,9 @@ pub enum QueryConversionError {
     /// A lifecycle timestamp was outside Chrono's supported range.
     #[error("running query timestamp `{0}` is invalid")]
     Timestamp(&'static str),
+    /// A terminal's error bytes were not a Wyrd problem document.
+    #[error("query terminal error is not a Wyrd problem document")]
+    ErrorProblem,
 }
 
 impl TryFrom<proto::RunningQuerySummary> for domain::RunningQuerySummary {
@@ -283,7 +287,12 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
                         .into_iter()
                         .map(proto_source_completion)
                         .collect(),
-                    error: value.error.map(proto_terminal_error),
+                    // A problem is plain strings, a status, and JSON details,
+                    // so serializing it cannot fail.
+                    error_problem_json: value
+                        .error
+                        .and_then(|problem| serde_json::to_vec(&problem).ok())
+                        .unwrap_or_default(),
                     arrow_ipc_eos: value.arrow_ipc_eos,
                     query_class: match value.query_class {
                         domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
@@ -475,7 +484,7 @@ fn terminal(
             .into_iter()
             .map(source_completion)
             .collect::<Result<_, _>>()?,
-        error: value.error.map(terminal_error).transpose()?,
+        error: terminal_error(&value.error_problem_json)?,
         arrow_ipc_eos: value.arrow_ipc_eos,
         query_class: match proto::QueryClass::try_from(value.query_class)
             .map_err(|_| QueryConversionError::RequiredEnum("query_class"))?
@@ -518,27 +527,6 @@ fn proto_source_completion(value: domain::SourceCompletion) -> proto::SourceComp
                 proto::SourceCompletionOutcome::Unavailable as i32
             }
         },
-    }
-}
-
-/// Maps one bounded domain terminal error to protobuf.
-fn proto_terminal_error(value: domain::QueryTerminalError) -> proto::QueryTerminalError {
-    use domain::QueryTerminalErrorCode as D;
-    use proto::QueryTerminalErrorCode as P;
-    proto::QueryTerminalError {
-        code: match value.code {
-            D::QueryTimeout => P::QueryTimeout as i32,
-            D::QueryVisibilityUnavailable => P::QueryVisibilityUnavailable as i32,
-            D::QueryTenantInvariant => P::QueryTenantInvariant as i32,
-            D::QueryReconciliationInvariant => P::QueryReconciliationInvariant as i32,
-            D::QueryPeerSecurity => P::QueryPeerSecurity as i32,
-            D::QueryAuditUnavailable => P::QueryAuditUnavailable as i32,
-            D::CatalogUnreachable => P::CatalogUnreachable as i32,
-            D::StorageUnreachable => P::StorageUnreachable as i32,
-            D::QueryExecutionFailed => P::QueryExecutionFailed as i32,
-            D::QueryResourcesExhausted => P::QueryResourcesExhausted as i32,
-        },
-        detail: value.detail.map(|detail| detail.as_str().to_owned()),
     }
 }
 
@@ -585,37 +573,18 @@ fn source_completion(
     Ok(domain::SourceCompletion { source, outcome })
 }
 
-/// Decodes one bounded terminal error and its optional scrubbed detail.
+/// Decodes a terminal's problem+json error bytes; empty bytes mean no error.
 ///
 /// # Errors
-/// Returns [`QueryConversionError`] for an unknown code or invalid detail.
-fn terminal_error(
-    value: proto::QueryTerminalError,
-) -> Result<domain::QueryTerminalError, QueryConversionError> {
-    use domain::QueryTerminalErrorCode as D;
-    use proto::QueryTerminalErrorCode as P;
-    let code = match P::try_from(value.code)
-        .map_err(|_| QueryConversionError::RequiredEnum("error_code"))?
-    {
-        P::QueryTimeout => D::QueryTimeout,
-        P::QueryVisibilityUnavailable => D::QueryVisibilityUnavailable,
-        P::QueryTenantInvariant => D::QueryTenantInvariant,
-        P::QueryReconciliationInvariant => D::QueryReconciliationInvariant,
-        P::QueryPeerSecurity => D::QueryPeerSecurity,
-        P::QueryAuditUnavailable => D::QueryAuditUnavailable,
-        P::CatalogUnreachable => D::CatalogUnreachable,
-        P::StorageUnreachable => D::StorageUnreachable,
-        P::QueryExecutionFailed => D::QueryExecutionFailed,
-        P::QueryResourcesExhausted => D::QueryResourcesExhausted,
-        P::Unspecified => return Err(QueryConversionError::RequiredEnum("error_code")),
-    };
-    Ok(domain::QueryTerminalError {
-        code,
-        detail: value
-            .detail
-            .map(domain::QueryErrorDetail::new)
-            .transpose()?,
-    })
+/// Returns [`QueryConversionError::ErrorProblem`] when non-empty bytes are not
+/// a Wyrd problem document.
+fn terminal_error(bytes: &[u8]) -> Result<Option<WyrdProblem>, QueryConversionError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(bytes)
+        .map(Some)
+        .map_err(|_| QueryConversionError::ErrorProblem)
 }
 
 #[cfg(test)]
@@ -672,16 +641,64 @@ mod tests {
             failed_with_eos.frame.as_mut()
         {
             terminal.outcome = proto::QueryTerminalOutcome::Failed as i32;
-            terminal.error = Some(proto::QueryTerminalError {
-                code: proto::QueryTerminalErrorCode::QueryExecutionFailed as i32,
-                detail: None,
-            });
+            terminal.error_problem_json = execution_failed_problem();
         }
         let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         assert!(matches!(
             converter.convert(failed_with_eos, None),
             Err(QueryConversionError::Contract(_))
+        ));
+    }
+
+    /// A failed terminal carries its catalog error's problem unchanged, and
+    /// error bytes that are not a problem document are refused.
+    #[test]
+    fn failed_terminal_problem_round_trips() {
+        let problem = wyrd_spec::error::WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 3,
+                path: "/a".to_owned(),
+            },
+        )
+        .problem();
+        let mut failed = valid_terminal(0);
+        if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = failed.frame.as_mut() {
+            terminal.outcome = proto::QueryTerminalOutcome::Failed as i32;
+            terminal.arrow_ipc_eos.clear();
+            terminal.error_problem_json = serde_json::to_vec(&problem).expect("problem encodes");
+        }
+        let mut converter = QueryStreamConverter::new();
+        prime_schema(&mut converter);
+        let domain::QueryStreamFrame::Terminal(decoded) =
+            converter.convert(failed.clone(), None).expect("converts")
+        else {
+            panic!("terminal frame must decode as a terminal");
+        };
+        assert_eq!(decoded.error, Some(problem));
+        let mut roundtrip = QueryStreamConverter::new();
+        prime_schema(&mut roundtrip);
+        assert_eq!(
+            roundtrip
+                .convert(
+                    proto::QueryStreamFrame::from(domain::QueryStreamFrame::Terminal(
+                        decoded.clone()
+                    )),
+                    None
+                )
+                .expect("round trip"),
+            domain::QueryStreamFrame::Terminal(decoded)
+        );
+
+        if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = failed.frame.as_mut() {
+            terminal.error_problem_json = b"not a problem".to_vec();
+        }
+        let mut converter = QueryStreamConverter::new();
+        prime_schema(&mut converter);
+        assert!(matches!(
+            converter.convert(failed, None),
+            Err(QueryConversionError::ErrorProblem)
         ));
     }
 
@@ -706,7 +723,7 @@ mod tests {
                     row_count: 0,
                     warnings: vec![],
                     source_completion: vec![],
-                    error: None,
+                    error_problem_json: Vec::new(),
                     arrow_ipc_eos: EOS.to_vec(),
                 },
             )),
@@ -772,7 +789,7 @@ mod tests {
                 row_count: 0,
                 warnings: vec![],
                 source_completion: sealed.clone(),
-                error: None,
+                error_problem_json: Vec::new(),
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
@@ -781,7 +798,7 @@ mod tests {
                 row_count: 0,
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
                 source_completion: unavailable_live,
-                error: None,
+                error_problem_json: Vec::new(),
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
@@ -790,7 +807,7 @@ mod tests {
                 row_count: 0,
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
                 source_completion: sealed.clone(),
-                error: None,
+                error_problem_json: Vec::new(),
                 arrow_ipc_eos: Vec::new(),
             },
         ] {
@@ -865,11 +882,22 @@ mod tests {
                     row_count,
                     warnings: vec![],
                     source_completion,
-                    error: None,
+                    error_problem_json: Vec::new(),
                     arrow_ipc_eos: EOS.to_vec(),
                 },
             )),
         }
+    }
+
+    /// Encodes the generic execution failure a failed fixture terminal carries.
+    fn execution_failed_problem() -> Vec<u8> {
+        serde_json::to_vec(
+            &wyrd_spec::error::WyrdError::from(
+                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+            )
+            .problem(),
+        )
+        .expect("problem encodes")
     }
 
     /// Advances one converter through its required initial schema frame.

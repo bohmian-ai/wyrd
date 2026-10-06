@@ -20,19 +20,6 @@ enum RunningQueryLifecycleState { RUNNING_QUERY_LIFECYCLE_STATE_UNSPECIFIED = 0;
 enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
 enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
 enum QueryWarning { QUERY_WARNING_UNSPECIFIED = 0; QUERY_WARNING_LIVE_TAIL_UNAVAILABLE = 1; QUERY_WARNING_STALE_CUT_REPLANNED = 2; }
-enum QueryTerminalErrorCode {
-  QUERY_TERMINAL_ERROR_CODE_UNSPECIFIED = 0;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_TIMEOUT = 1;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_VISIBILITY_UNAVAILABLE = 2;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_TENANT_INVARIANT = 3;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_RECONCILIATION_INVARIANT = 4;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_PEER_SECURITY = 5;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_AUDIT_UNAVAILABLE = 6;
-  QUERY_TERMINAL_ERROR_CODE_CATALOG_UNREACHABLE = 7;
-  QUERY_TERMINAL_ERROR_CODE_STORAGE_UNREACHABLE = 8;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_EXECUTION_FAILED = 9;
-  QUERY_TERMINAL_ERROR_CODE_QUERY_RESOURCES_EXHAUSTED = 10;
-}
 message BifrostQueryRequest {
   string sql = 1; optional uint64 deadline_ms = 4;
   reserved 2, 3;
@@ -41,19 +28,22 @@ message BifrostQueryRequest {
 message QuerySchemaFrame { string schema_fingerprint = 1; bytes arrow_ipc_schema = 2; }
 message QueryBatchFrame { bytes arrow_ipc_batch = 1; }
 message SourceCompletion { QuerySource source = 1; SourceCompletionOutcome outcome = 2; }
-message QueryTerminalError { QueryTerminalErrorCode code = 1; optional string detail = 2; }
 message QueryTerminalFrame {
   QueryTerminalOutcome outcome = 1;
-  reserved 2;
-  reserved "freshness";
+  reserved 2, 6;
+  reserved "freshness", "error";
   uint64 row_count = 3; repeated QueryWarning warnings = 4;
-  repeated SourceCompletion source_completion = 5; optional QueryTerminalError error = 6;
+  repeated SourceCompletion source_completion = 5;
   // Arrow IPC end-of-stream delta closing the query's single IPC stream.
   // Required on success/degraded, and empty on failure.
   bytes arrow_ipc_eos = 7;
   // Server-derived query class, which is also the path that ran. Never a
   // request field.
   QueryClass query_class = 8;
+  // The catalog error that failed the query, as the RFC 9457 problem+json
+  // bytes an HTTP error response and the gRPC `wyrd-error-bin` status
+  // metadata carry. Required on failure, and empty on success/degraded.
+  bytes error_problem_json = 9;
 }
 message QueryStreamFrame {
   oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }

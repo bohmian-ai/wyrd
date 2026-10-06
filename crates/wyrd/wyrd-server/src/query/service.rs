@@ -364,33 +364,16 @@ pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
         details: serde_json::json!({ "detail": error.to_string() }),
     }
 }
-/// Preserves the stable terminal error catalog across typed query adapters.
-pub(crate) fn terminal_error_to_bifrost(
-    code: wyrd_spec::vala::api::QueryTerminalErrorCode,
-) -> wyrd_spec::vala::error::BifrostError {
-    use wyrd_spec::vala::api::QueryTerminalErrorCode;
-    use wyrd_spec::vala::error::BifrostError;
-
-    match code {
-        QueryTerminalErrorCode::QueryTimeout => BifrostError::QueryTimeout,
-        QueryTerminalErrorCode::QueryVisibilityUnavailable => {
-            BifrostError::QueryVisibilityUnavailable
-        }
-        QueryTerminalErrorCode::QueryTenantInvariant => BifrostError::QueryTenantInvariant,
-        QueryTerminalErrorCode::QueryReconciliationInvariant => {
-            BifrostError::QueryReconciliationInvariant
-        }
-        QueryTerminalErrorCode::QueryPeerSecurity => BifrostError::QueryPeerSecurity,
-        QueryTerminalErrorCode::QueryAuditUnavailable => BifrostError::QueryAuditUnavailable,
-        QueryTerminalErrorCode::CatalogUnreachable => BifrostError::CatalogUnreachable {
-            detail: "Oracle typed query catalog unavailable".to_owned(),
-        },
-        QueryTerminalErrorCode::StorageUnreachable => BifrostError::StorageUnreachable {
-            detail: "Oracle typed query storage unavailable".to_owned(),
-        },
-        QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
-        QueryTerminalErrorCode::QueryResourcesExhausted => BifrostError::QueryResourcesExhausted,
-    }
+/// Rebuilds the catalog error a failed query terminal carries.
+///
+/// The terminal holds the same problem the server returns before a stream
+/// starts, so typed adapters rebuild it through the client's reconstruction;
+/// a terminal with no problem is a generic execution failure.
+pub(crate) fn terminal_error(problem: Option<&wyrd_spec::error::WyrdProblem>) -> WyrdError {
+    problem.map_or_else(
+        || wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
+        wyrd_client::error::from_problem,
+    )
 }
 #[cfg(test)]
 mod tests {

@@ -145,7 +145,7 @@ pub(super) async fn audit_rows(
 async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJourneyError> {
     use vala_bifrost_redux::oracle::{OracleQueryStream, failed_terminal};
     use wyrd_spec::vala::BifrostError;
-    use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalErrorCode};
+    use wyrd_spec::vala::api::QueryStreamFrame;
 
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
@@ -180,7 +180,7 @@ async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJou
             OracleQueryStream::test_new("settlement-fixture".to_owned(), frames, token.clone());
         stream.deadline_ms =
             chrono::Utc::now().timestamp_millis() + if case == "deadline" { 200 } else { 5_000 };
-        let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 0);
+        let terminal = failed_terminal(BifrostError::QueryExecutionFailed, 0);
         let observed = (case == "consumed failed").then(|| terminal.clone());
         let controls = controls.clone();
         let settlement = tokio::spawn(async move {

@@ -1787,8 +1787,8 @@ fn settled_analytical_evidence(
 #[test]
 fn sql_terminal_rejects_failed_output_after_rows() {
     use wyrd_spec::vala::api::{
-        QuerySource, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
-        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        QuerySource, QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion,
+        SourceCompletionOutcome,
     };
 
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
@@ -1829,10 +1829,12 @@ fn sql_terminal_rejects_failed_output_after_rows() {
             complete(QuerySource::HotSealed),
             complete(QuerySource::LiveTail),
         ],
-        error: Some(QueryTerminalError {
-            code: QueryTerminalErrorCode::QueryExecutionFailed,
-            detail: None,
-        }),
+        error: Some(
+            wyrd_spec::error::WyrdError::from(
+                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+            )
+            .problem(),
+        ),
         arrow_ipc_eos: Vec::new(),
     };
     failed

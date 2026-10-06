@@ -3,7 +3,7 @@
 //! server-response mappers.
 
 use thiserror::Error;
-use wyrd_spec::error::{WyrdError, WyrdStorageError};
+use wyrd_spec::error::{WyrdError, WyrdProblem, WyrdStorageError};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::error::WYRD_ERROR_HEADER;
 
@@ -138,6 +138,19 @@ pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
         .cloned()
         .unwrap_or(serde_json::json!({}));
     code_to_wyrd_error(code, message, details)
+}
+
+/// Rebuild the [`WyrdError`] a typed [`WyrdProblem`] carries.
+///
+/// A failed query terminal carries the same problem the server returns before
+/// a stream starts, so both reach callers through this one reconstruction:
+/// a `WYRD_VALA_*` problem rebuilds its exact typed error from `details`.
+pub fn from_problem(problem: &WyrdProblem) -> WyrdError {
+    code_to_wyrd_error(
+        &problem.code,
+        problem.detail.clone(),
+        problem.details.clone(),
+    )
 }
 
 /// Maps a gRPC [`wyrd_tonic::tonic::Status`] into a [`WyrdError`].

@@ -51,9 +51,7 @@ use wyrd_spec::vala::api::{
     AuthMethod, NodeId, NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire,
     TimeGranularityWire,
 };
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass, QueryTerminalOutcome, QueryWarning};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch};
@@ -386,7 +384,7 @@ async fn prove_selective_predicate_pruning(
         return Err(format!("foreign file reached a SQL operator under predicate pushdown: rows={refused_rows} outcome={refused_outcome:?} error={refused_error:?}").into());
     }
     if refused_outcome != QueryTerminalOutcome::Failed
-        || refused_error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+        || refused_error.as_deref() != Some(BifrostError::QueryTenantInvariant.code())
     {
         return Err(format!(
             "footer tenant proof did not fail closed: {refused_outcome:?} {refused_error:?}"
@@ -423,7 +421,7 @@ async fn prove_selective_predicate_pruning(
 /// is a property of the fixture's physical layout rather than of the invariant
 /// under test. A journey that asserted only one surface would therefore pin a
 /// fixture detail; this normalizes both into the same
-/// `(rows, outcome, error code)` triple so the assertion stays on the
+/// `(rows, outcome, catalog error code)` triple so the assertion stays on the
 /// invariant.
 ///
 /// # Errors
@@ -433,7 +431,7 @@ async fn prove_selective_predicate_pruning(
 async fn query_terminal_either_surface(
     client: &WyrdClient,
     sql: String,
-) -> Result<(u64, QueryTerminalOutcome, Option<QueryTerminalErrorCode>), JourneyError> {
+) -> Result<(u64, QueryTerminalOutcome, Option<String>), JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
@@ -443,9 +441,11 @@ async fn query_terminal_either_surface(
     let mut stream = match opened {
         Ok(stream) => stream,
         Err(BifrostClientError::Transport(WyrdError::Vala { error })) => {
-            let code = bifrost_terminal_code(&error)
-                .ok_or_else(|| format!("refusal is not a terminal query outcome: {error:?}"))?;
-            return Ok((0, QueryTerminalOutcome::Failed, Some(code)));
+            return Ok((
+                0,
+                QueryTerminalOutcome::Failed,
+                Some(error.code().to_owned()),
+            ));
         }
         Err(other) => return Err(other.into()),
     };
@@ -467,30 +467,8 @@ async fn query_terminal_either_surface(
     Ok((
         rows,
         terminal.outcome,
-        terminal.error.as_ref().map(|error| error.code),
+        terminal.error.as_ref().map(|error| error.code.clone()),
     ))
-}
-
-/// Maps the closed terminal Bifrost query errors back to their terminal code.
-///
-/// Returns `None` for a Bifrost error that is not a terminal query outcome
-/// (an admission rejection or invalid SQL, for example), so a caller cannot
-/// silently reinterpret an unrelated refusal as a terminal result.
-fn bifrost_terminal_code(error: &BifrostError) -> Option<QueryTerminalErrorCode> {
-    Some(match error {
-        BifrostError::QueryTimeout => QueryTerminalErrorCode::QueryTimeout,
-        BifrostError::QueryVisibilityUnavailable => {
-            QueryTerminalErrorCode::QueryVisibilityUnavailable
-        }
-        BifrostError::QueryTenantInvariant => QueryTerminalErrorCode::QueryTenantInvariant,
-        BifrostError::QueryReconciliationInvariant => {
-            QueryTerminalErrorCode::QueryReconciliationInvariant
-        }
-        BifrostError::QueryPeerSecurity => QueryTerminalErrorCode::QueryPeerSecurity,
-        BifrostError::QueryAuditUnavailable => QueryTerminalErrorCode::QueryAuditUnavailable,
-        BifrostError::QueryExecutionFailed => QueryTerminalErrorCode::QueryExecutionFailed,
-        _ => return None,
-    })
 }
 
 /// Number of rows written before compaction. Every one of them is sealed as
@@ -2002,7 +1980,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
         .map_err(|error| error.to_string())?;
     if rows != 0
         || outcome != QueryTerminalOutcome::Failed
-        || error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+        || error.as_deref() != Some(BifrostError::QueryTenantInvariant.code())
     {
         return Err(format!(
             "staged foreign footer did not fail closed: rows={rows} {outcome:?} {error:?}"

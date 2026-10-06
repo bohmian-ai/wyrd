@@ -592,14 +592,7 @@ impl ResultCollector {
                     }
                     if frame.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(frame.clone());
-                        return Err(frame.error.as_ref().map_or(
-                            WyrdError::from(ValaError::QueryExecutionFailed),
-                            |error| {
-                                WyrdError::from(crate::query::service::terminal_error_to_bifrost(
-                                    error.code,
-                                ))
-                            },
-                        ));
+                        return Err(crate::query::service::terminal_error(frame.error.as_ref()));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
                         stream.request_cancel();
@@ -774,8 +767,7 @@ mod tests {
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
         QueryBatchFrame, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
 
     /// One synthetic batch carrying every shape the projection must survive.
@@ -915,10 +907,8 @@ mod tests {
                     "EOS" => terminal.arrow_ipc_eos = vec![1],
                     "failed" => {
                         terminal.outcome = QueryTerminalOutcome::Failed;
-                        terminal.error = Some(QueryTerminalError {
-                            code: QueryTerminalErrorCode::QueryTimeout,
-                            detail: None,
-                        });
+                        terminal.error =
+                            Some(WyrdError::from(BifrostError::QueryTimeout).problem());
                         terminal.arrow_ipc_eos.clear();
                     }
                     "duplicate" => frames.push(frames[2].clone()),

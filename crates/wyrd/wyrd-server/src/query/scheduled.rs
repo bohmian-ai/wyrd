@@ -304,13 +304,7 @@ impl ScheduledQueryCaller {
                         .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(terminal.clone());
-                        return Err(terminal
-                            .error
-                            .as_ref()
-                            .map_or(BifrostError::QueryExecutionFailed, |error| {
-                                super::service::terminal_error_to_bifrost(error.code)
-                            })
-                            .into());
+                        return Err(super::service::terminal_error(terminal.error.as_ref()));
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
@@ -346,8 +340,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, SourceCompletion, SourceCompletionOutcome,
     };
 
     use super::*;
@@ -439,10 +432,7 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryTimeout,
-                detail: None,
-            }),
+            error: Some(WyrdError::from(BifrostError::QueryTimeout).problem()),
             ..success_terminal(3, Vec::new())
         };
 

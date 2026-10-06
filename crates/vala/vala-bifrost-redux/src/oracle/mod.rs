@@ -31,14 +31,15 @@ use vala_sql::ValaPostgres;
 use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
     QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QuerySchemaFrame, QuerySource,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-    SourceCompletion, SourceCompletionOutcome,
+    QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion,
+    SourceCompletionOutcome,
 };
 
 use crate::catalog::{
@@ -3660,8 +3661,8 @@ pub type OracleFrameStream = dyn Stream<Item = Result<QueryStreamFrame, BifrostE
 /// terminal names [`QueryClass::Interactive`]: REQ-002 makes selection
 /// irreversible, and a caller must never read a path the server did not run.
 #[must_use]
-pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTerminalFrame {
-    failed_terminal_on_path(code, row_count, QueryClass::Interactive)
+pub fn failed_terminal(error: BifrostError, row_count: u64) -> QueryTerminalFrame {
+    failed_terminal_on_path(error, row_count, QueryClass::Interactive)
 }
 
 /// Returns a contract-valid failed terminal naming every source tier.
@@ -3671,7 +3672,7 @@ pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTer
 /// presenting itself as an Interactive failure. A failed terminal carries no
 /// live-loss warning: the failure, not a degraded source, is the result.
 fn failed_terminal_on_path(
-    code: QueryTerminalErrorCode,
+    error: BifrostError,
     row_count: u64,
     query_class: QueryClass,
 ) -> QueryTerminalFrame {
@@ -3691,7 +3692,7 @@ fn failed_terminal_on_path(
         row_count,
         warnings: Vec::new(),
         source_completion,
-        error: Some(wyrd_spec::vala::api::QueryTerminalError { code, detail: None }),
+        error: Some(WyrdError::from(error).problem()),
         // A failed stream never finished its Arrow IPC stream, so there is no
         // end-of-stream delta to report.
         arrow_ipc_eos: Vec::new(),
@@ -4015,22 +4016,6 @@ pub(super) fn resolved_table_scopes(cuts: &[PinnedSealedTable]) -> Vec<Permissio
         .collect()
 }
 
-/// Returns the closed metric label for one stable late terminal code.
-const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
-    match code {
-        QueryTerminalErrorCode::QueryTimeout => "query_timeout",
-        QueryTerminalErrorCode::QueryVisibilityUnavailable => "query_visibility_unavailable",
-        QueryTerminalErrorCode::QueryTenantInvariant => "query_tenant_invariant",
-        QueryTerminalErrorCode::QueryReconciliationInvariant => "query_reconciliation_invariant",
-        QueryTerminalErrorCode::QueryPeerSecurity => "query_peer_security",
-        QueryTerminalErrorCode::QueryAuditUnavailable => "query_audit_unavailable",
-        QueryTerminalErrorCode::CatalogUnreachable => "catalog_unreachable",
-        QueryTerminalErrorCode::StorageUnreachable => "storage_unreachable",
-        QueryTerminalErrorCode::QueryExecutionFailed => "query_execution_failed",
-        QueryTerminalErrorCode::QueryResourcesExhausted => "query_resources_exhausted",
-    }
-}
-
 /// Everything one executed attempt produced, before its first batch is settled.
 ///
 /// These six values are produced together by a successful attempt and consumed
@@ -4244,17 +4229,21 @@ fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
     }
 }
 
-/// Maps a pre-stream `DataFusion` failure into the stable public catalog.
+/// Maps a `DataFusion` failure into the stable public catalog.
 ///
-/// The query was already admitted, so a typed resource refusal anywhere in the
-/// chain is execution-memory exhaustion, never admission or queue overload.
+/// Both the pre-stream path and a failure after framing began use this one
+/// mapping, so a query reports the same catalog error whichever row fails.
+/// A typed resource refusal anywhere in the chain is execution-memory
+/// exhaustion, never admission or queue overload; otherwise the catalog error
+/// the failure carries is returned unchanged, and only a failure with no
+/// catalog identity is classified from its message.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
     if datafusion_resources_exhausted(error) {
         return BifrostError::QueryResourcesExhausted;
     }
-    if let Some(variant) = variant_query_error(error) {
-        return variant;
+    if let Some(catalog) = catalog_query_error(error) {
+        return catalog;
     }
     let message = error.to_string().to_ascii_lowercase();
     if is_tenant_refusal(error) {
@@ -4268,23 +4257,18 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     }
 }
 
-/// Returns the catalogued Variant failure a query function raised, if any.
+/// Returns the catalog error a query failure carries, if any.
 ///
-/// `parse_json` raises a [`variant_sql::VariantQueryError`]. Locally the typed
-/// error is in the source chain; from an Analytical worker only its forwarded
-/// text arrives, which is the error's tagged serde form. Either way the
-/// caller sees the stable Variant code and details rather than a generic
-/// execution failure.
-fn variant_query_error(error: &DataFusionError) -> Option<BifrostError> {
+/// Locally the typed [`BifrostError`] is in the source chain: a query
+/// deadline, a tenant refusal, or the Variant failure `parse_json` raises.
+/// From an Analytical worker only the forwarded text of a
+/// [`variant_sql::VariantQueryError`] arrives, which is the error's tagged
+/// serde form. Either way the caller sees the stable code and details rather
+/// than a generic execution failure.
+fn catalog_query_error(error: &DataFusionError) -> Option<BifrostError> {
     let mut source: Option<&(dyn Error + 'static)> = Some(error);
     while let Some(current) = source {
-        if let Some(
-            found @ (BifrostError::VariantInvalidJson { .. }
-            | BifrostError::VariantNumericOutOfRange { .. }
-            | BifrostError::VariantTooDeep { .. }
-            | BifrostError::VariantTooLarge { .. }),
-        ) = current.downcast_ref::<BifrostError>()
-        {
+        if let Some(found) = current.downcast_ref::<BifrostError>() {
             return Some(found.clone());
         }
         if let Some(found) = variant_sql::VariantQueryError::decode(&current.to_string()) {
@@ -5169,21 +5153,21 @@ mod tests {
         );
     }
 
-    /// Late execution failure produces one closed failed terminal shape.
+    /// Late execution failure produces one closed failed terminal carrying
+    /// the catalog error's exact problem.
     #[test]
     fn late_failure_terminal_is_closed_and_non_success() {
-        let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 17);
+        let error = BifrostError::VariantNumericOutOfRange {
+            field: "parse_json".to_owned(),
+            row: 2,
+            path: "/n".to_owned(),
+            numeric_kind: "integer".to_owned(),
+        };
+        let terminal = failed_terminal(error.clone(), 17);
         assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
         assert_eq!(terminal.row_count, 17);
         assert!(terminal.validate().is_ok());
-        assert_eq!(
-            terminal
-                .error
-                .as_ref()
-                .expect("failed terminal has an error")
-                .code,
-            QueryTerminalErrorCode::QueryExecutionFailed
-        );
+        assert_eq!(terminal.error, Some(WyrdError::from(error).problem()));
     }
 
     /// The standard recorder observes the canonical failed stream labels.

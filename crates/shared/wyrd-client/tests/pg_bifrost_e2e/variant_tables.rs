@@ -7,8 +7,10 @@
 mod pg_tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use std::collections::BTreeMap;
+
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
@@ -16,6 +18,8 @@ mod pg_tests {
     use wyrd_client::bifrost::{Bifrost, BifrostClientError, Correlation, TableConfig};
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{GrpcConfig, HttpConfig};
+    use wyrd_queue::variant::{EncodedVariant, is_variant};
+    use wyrd_queue::{QueueConfig, RowPreflight};
     use wyrd_spec::vala::api::{
         DataTypeSpec, FieldSpec, RegisterTableRequest, RegisterTableResponse,
     };
@@ -88,6 +92,9 @@ mod pg_tests {
             let client = WyrdClient::with_config(ClientConfig {
                 grpc: GrpcConfig {
                     endpoint: server.grpc_url().expect("gRPC URL"),
+                    // The server's frame ceiling, so a direct writer can send
+                    // a Variant cell past the 8 MiB value limit.
+                    max_message_bytes: 16 * 1024 * 1024,
                     ..GrpcConfig::default()
                 },
                 http: HttpConfig {
@@ -168,11 +175,6 @@ mod pg_tests {
         .expect("batch builds")
     }
 
-    /// Whether a field carries the Arrow Variant extension.
-    fn is_variant(field: &Field) -> bool {
-        field.extension_type_name() == Some("arrow.parquet.variant")
-    }
-
     /// The stable code an SDK error carries.
     fn code(error: &BifrostClientError) -> &'static str {
         wyrd_spec::error::WyrdError::from(error).code()
@@ -196,10 +198,10 @@ mod pg_tests {
             schema.field_with_name("point").expect("point").data_type(),
             DataType::Struct(_)
         ));
-        assert!(matches!(
-            schema.field_with_name("tags").expect("tags").data_type(),
-            DataType::List(_)
-        ));
+        let DataType::List(item) = schema.field_with_name("tags").expect("tags").data_type() else {
+            panic!("tags is a List");
+        };
+        assert!(!item.is_nullable(), "Vec<String> items are never null");
         events.stop().await;
     }
 
@@ -424,6 +426,173 @@ mod pg_tests {
             .await
             .expect_err("no table");
         assert_eq!(code(&missing), "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
+        events.stop().await;
+    }
+
+    /// A model that allows extra keys beside its declared fields.
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Loose {
+        /// A declared field.
+        id: i64,
+        /// Every other key, which no column could hold.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    }
+
+    /// A model allowing extra keys is refused with the remediation to
+    /// declare a Variant field instead.
+    #[tokio::test]
+    async fn model_allowing_extra_keys_is_refused() {
+        let refused = TableConfig::from_model::<Loose>("vala.datasets.loose")
+            .expect_err("extra keys could be lost");
+
+        assert_eq!(code(&refused), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert!(
+            refused
+                .to_string()
+                .contains("declare a Variant field for open data"),
+            "{refused}"
+        );
+    }
+
+    /// Every type Iceberg cannot store is refused when the table is
+    /// declared, naming the field and its type.
+    #[tokio::test]
+    async fn each_unsupported_type_is_refused_when_declared() {
+        let new_york = Some("America/New_York".into());
+        for data_type in [
+            DataType::UInt64,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, new_york),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "moment",
+                data_type.clone(),
+                true,
+            )]));
+
+            let refused =
+                TableConfig::from_arrow("vala.datasets.unsupported", schema).expect_err("refused");
+
+            assert_eq!(code(&refused), "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE");
+            let message = refused.to_string();
+            assert!(
+                message.contains("moment") && message.contains(&data_type.to_string()),
+                "{message}"
+            );
+        }
+    }
+
+    /// One Variant cell whose bytes are written directly, bypassing JSON
+    /// encoding.
+    ///
+    /// # Panics
+    ///
+    /// Panics when Arrow refuses the storage arrays.
+    fn variant_cell(metadata: &[u8], value: &[u8]) -> ArrayRef {
+        let DataType::Struct(storage) = wyrd_queue::variant::variant_storage_type() else {
+            panic!("Variant storage is a struct");
+        };
+        Arc::new(StructArray::new(
+            storage,
+            vec![
+                Arc::new(BinaryArray::from(vec![metadata])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![value])),
+            ],
+            None,
+        ))
+    }
+
+    /// Wrap one encoded Variant value in a one-element array, adding a level
+    /// of nesting without the encoder's depth check.
+    fn wrap_in_array(child: &[u8]) -> Vec<u8> {
+        // Array header: basic type 3, four-byte offsets, one-byte count.
+        let mut value = vec![0x0F, 1];
+        value.extend_from_slice(&0_u32.to_le_bytes());
+        value.extend_from_slice(&u32::try_from(child.len()).expect("fits").to_le_bytes());
+        value.extend_from_slice(child);
+        value
+    }
+
+    /// Variant bytes sent straight to the server, skipping the SDK's checks,
+    /// are refused before anything is stored: malformed, too deep, and too
+    /// large. A valid batch on the same path is stored.
+    #[tokio::test]
+    async fn server_refuses_unstorable_variant_bytes_sent_directly() {
+        let events = Events::start().await;
+        // `enqueue_batch` sends a batch unchanged; messages may carry a cell
+        // past the 8 MiB Variant limit.
+        let direct = Bifrost::connect_with_config(
+            &events.client,
+            None,
+            QueueConfig {
+                max_message_bytes: 12 * 1024 * 1024,
+                ..QueueConfig::default()
+            },
+        )
+        .await
+        .expect("direct writer connects");
+        let described = events
+            .bifrost
+            .describe(&events.table)
+            .await
+            .expect("table describes");
+        let valid = RowPreflight::from_description(&described)
+            .expect("preflight")
+            .prepare(&[br#"{"id": 1, "payload": {"ok": true}}"#], None, None)
+            .expect("row prepares")
+            .batch()
+            .clone();
+        let payload = valid.schema().index_of("payload").expect("payload column");
+
+        let mut deep = json!(1);
+        for _ in 0..64 {
+            deep = json!([deep]);
+        }
+        let deep = EncodedVariant::from_json(&deep).expect("64 levels encode");
+        let small = EncodedVariant::from_json(&json!(1)).expect("encodes");
+        for (cell, expected) in [
+            (
+                variant_cell(small.metadata(), &[0xFF]),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+            ),
+            (
+                variant_cell(deep.metadata(), &wrap_in_array(deep.value())),
+                "WYRD_VALA_400_VARIANT_TOO_DEEP",
+            ),
+            (
+                variant_cell(small.metadata(), &vec![0; 8 * 1024 * 1024 + 1]),
+                "WYRD_VALA_413_VARIANT_TOO_LARGE",
+            ),
+        ] {
+            let mut columns = valid.columns().to_vec();
+            columns[payload] = cell;
+            let batch = RecordBatch::try_new(valid.schema(), columns).expect("batch builds");
+
+            direct
+                .enqueue_batch(&events.table, batch, None)
+                .expect("the SDK sends the batch unchanged");
+            let refused = direct.flush().await.expect_err("the server refuses");
+            events.server.flush_bifrost().await.expect("publish");
+
+            assert_eq!(code(&refused), expected, "{refused}");
+            assert_eq!(events.read(&events.table).await, Vec::new());
+        }
+
+        direct
+            .enqueue_batch(&events.table, valid, None)
+            .expect("valid batch sends");
+        direct.flush().await.expect("valid batch is stored");
+        events.server.flush_bifrost().await.expect("publish");
+        let stored = Event {
+            id: 1,
+            payload: Some(json!({"ok": true})),
+            ..Event::default()
+        };
+        assert_eq!(events.read(&events.table).await, vec![stored]);
         events.stop().await;
     }
 }

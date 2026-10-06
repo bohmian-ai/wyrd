@@ -528,8 +528,8 @@ pub(crate) struct DecodeContext<'a> {
 /// time, or managed column construction failure, a fingerprint mismatch
 /// when a stamped field has no registered counterpart, and
 /// [`ScribeError::ContractViolation`] carrying the catalogued error when a
-/// built-in's declared Variant arrives without its extension or holds a value
-/// that cannot be stored.
+/// built-in's declared Variant arrives without its extension, or when any
+/// table's Variant holds a value that cannot be stored.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -566,6 +566,9 @@ fn decode_rows(
             table: "resolved ingress table".to_owned(),
         });
     }
+    if context.definition.is_none() {
+        enforce_dynamic_variants(rows)?;
+    }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
     match context.registered_schema {
@@ -575,6 +578,34 @@ fn decode_rows(
             }),
         None => Ok(stamped),
     }
+}
+
+/// Validates a dynamic table's Variant values at the trust boundary.
+///
+/// A dynamic table has no built-in validator, and the fingerprint compares
+/// storage types only, so this is where its Variant cells are read before
+/// admission. Every supplied field marked as a Variant, top level or nested
+/// in a Struct or List, goes through
+/// [`crate::tables::validate_declared_variants`], the same walk built-in
+/// validators run, so each present value must decode within the encoding,
+/// depth, and size limits. A registered Variant supplied without its
+/// extension is left to field-id stamping, which refuses it against the
+/// registered schema. It runs after the fingerprint check and before card
+/// scope, stamping, dispatch, or any WAL mutation, and reads the batch only.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::ContractViolation`] carrying the catalogued Variant
+/// refusal for the first failing value in row, then field, order.
+fn enforce_dynamic_variants(rows: &RecordBatch) -> Result<(), ScribeError> {
+    let supplied: Vec<Field> = rows
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    crate::tables::validate_declared_variants(&supplied, rows)
+        .map_err(ScribeError::ContractViolation)
 }
 
 /// Enforces one built-in's user contract before the fingerprint check.

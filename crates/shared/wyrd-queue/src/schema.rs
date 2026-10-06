@@ -102,7 +102,7 @@ pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError
 /// managed candidates the writer chooses to supply itself. Everything else on
 /// the physical table is server-stamped and must not appear on the wire.
 ///
-/// Use this for a direct Arrow writer; [`crate::BatchBuilder::from_description`]
+/// Use this for a direct Arrow writer; [`crate::RowPreflight::from_description`]
 /// is the JSON-row path and appends correlation itself.
 ///
 /// # Errors

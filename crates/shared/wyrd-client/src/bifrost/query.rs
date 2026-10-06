@@ -1814,8 +1814,8 @@ mod tests {
             "a writer that supplies no event time declares no event-time column"
         );
 
-        let builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&described)
-            .expect("the description builds a JSON row builder");
+        let builder = wyrd_queue::RowPreflight::from_description(&described)
+            .expect("the description builds a JSON row preflight");
         assert_eq!(
             builder
                 .output_schema()

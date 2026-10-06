@@ -15,6 +15,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
+use crate::batch_builder::{PreparedRows, RowPreflight};
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
 use crate::queue::{Entry, FlushOutcome, InFlight, OwnedBatch, RecordQueue, Row, Settled};
@@ -369,6 +370,7 @@ enum Ctrl {
 /// Admission never waits: a whole record is charged to the shared byte
 /// budget and handed to the background owner as one message, or refused.
 pub struct Producer {
+    preflight: RowPreflight,
     tx: mpsc::UnboundedSender<Entry>,
     ctrl_tx: mpsc::Sender<Ctrl>,
     control_pending: Arc<AtomicBool>,
@@ -418,6 +420,7 @@ impl Producer {
         budget: ClientByteBudget,
     ) -> Result<Self, WyrdQueueError> {
         config.validate()?;
+        let preflight = RowPreflight::new(&schema);
         let (tx, rx) = mpsc::unbounded_channel();
         let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let channel_depth = Arc::new(AtomicUsize::new(0));
@@ -427,7 +430,7 @@ impl Producer {
         let task = Task {
             queue: RecordQueue::new(
                 table.to_owned(),
-                schema,
+                Arc::clone(preflight.output_schema()),
                 sink,
                 config,
                 budget.clone(),
@@ -450,6 +453,7 @@ impl Producer {
             }
         });
         Ok(Self {
+            preflight,
             tx,
             ctrl_tx,
             control_pending,
@@ -478,46 +482,60 @@ impl Producer {
         self.enqueue_rows(vec![json], card_ref, run_id)
     }
 
-    /// Admits every row of one logical record, or none of them, without waiting.
+    /// Prepares and admits every row of one logical record, or none of them,
+    /// without waiting.
     ///
-    /// Each row is charged its JSON allocation plus its row owner. Every
-    /// charge is reserved before the record is handed over as one message; a
-    /// refusal releases whatever was reserved, so a caller may resubmit the
-    /// whole record without duplicating an accepted prefix. Every row carries
+    /// The complete record goes through this producer's [`RowPreflight`]
+    /// first, so a refused row leaves queue, budget, and counters untouched;
+    /// admission then follows [`Self::enqueue_prepared`]. Every row carries
     /// the same correlation.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::PayloadTooLarge`] when the record charges
-    /// more than the whole admission budget, [`WyrdQueueError::QueueFull`]
-    /// when the producer is draining, and [`WyrdQueueError::Backpressure`]
-    /// when the handle budget cannot cover every row now. Each refusal counts
-    /// every row as dropped.
+    /// Returns any [`RowPreflight::prepare`] refusal without counting a row,
+    /// then any [`Self::enqueue_prepared`] refusal.
     pub fn enqueue_rows(
         &self,
         rows: Vec<Vec<u8>>,
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        let count = rows.len();
-        let charges = rows
-            .iter()
-            .map(|json| json.capacity().saturating_add(std::mem::size_of::<Row>()))
-            .collect::<Vec<_>>();
-        let total = charges
-            .iter()
-            .fold(0_usize, |total, charge| total.saturating_add(*charge));
-        let admitted = self.admission_check(total).and_then(|()| {
-            let mut entry = Vec::with_capacity(count);
-            for (json, charge) in rows.into_iter().zip(charges) {
-                entry.push(Row {
-                    _guard: self.budget.reserve(charge)?,
-                    json,
-                    card_ref: card_ref.clone(),
-                    run_id: run_id.clone(),
-                });
-            }
-            Ok(Entry::Rows(entry))
+        let prepared = self
+            .preflight
+            .prepare(&rows, card_ref.as_ref(), run_id.as_ref())?;
+        drop(rows);
+        self.enqueue_prepared(prepared)
+    }
+
+    /// Admits one prepared record, all or none, without waiting.
+    ///
+    /// The record's exact charge is reserved once and the record is handed
+    /// over as one message of one-row slices sharing that reservation; nothing
+    /// after the reservation can fail, and a refusal releases it, so a caller
+    /// may resubmit the whole record without duplicating an accepted prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::PayloadTooLarge`] when the record charges
+    /// more than the whole admission budget, [`WyrdQueueError::QueueFull`]
+    /// when the producer is draining, and [`WyrdQueueError::Backpressure`]
+    /// when the handle budget cannot cover the record now. Each refusal counts
+    /// every row as dropped.
+    pub fn enqueue_prepared(&self, prepared: PreparedRows) -> Result<(), WyrdQueueError> {
+        let (batch, charge) = prepared.into_parts();
+        let count = batch.num_rows();
+        let admitted = self.admission_check(charge).and_then(|()| {
+            let guard = Arc::new(self.budget.reserve(charge)?);
+            let bytes = charge / count.max(1);
+            Ok(Entry::Rows(
+                (0..count)
+                    .map(|row| Row {
+                        batch: batch.slice(row, 1),
+                        bytes,
+                        _guard: Arc::clone(&guard),
+                    })
+                    .collect(),
+            ))
         });
         self.hand_over(count as u64, admitted)
     }
@@ -977,11 +995,12 @@ mod tests {
     use tokio::sync::Notify;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::BifrostError;
 
-    use super::ClientByteBudget;
+    use super::{ClientByteBudget, ProducerMetrics};
     use crate::{
         BatchSink, ClientByteGuard, DurableBatchAck, MockSink, Producer, QueueConfig, Row,
-        SealedBatch, SinkError, WyrdQueueError,
+        RowPreflight, SealedBatch, SinkError, WyrdQueueError,
     };
 
     /// Builds a one-column user schema for sealed-batch tests.
@@ -1001,12 +1020,17 @@ mod tests {
             .collect()
     }
 
-    /// Returns the bytes admission charges for `rows`: each JSON allocation
-    /// plus its row owner.
+    /// Returns the bytes admission charges for `rows` as one card-correlated
+    /// record: its prepared arrays plus one row owner per row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rows do not prepare against [`schema`].
     fn charge(rows: &[Vec<u8>]) -> usize {
-        rows.iter()
-            .map(|json| json.capacity() + std::mem::size_of::<Row>())
-            .sum()
+        RowPreflight::new(&schema())
+            .prepare(rows, Some(&card()), None)
+            .expect("rows prepare")
+            .charge()
     }
 
     /// Cancellable sink that acknowledges only after the test releases it.
@@ -1684,6 +1708,113 @@ mod tests {
             "never above max_in_flight"
         );
         assert_eq!(budget.used_bytes(), 0, "shutdown settles every reservation");
+    }
+
+    /// A complete record is prepared before admission: when only its final
+    /// row is unstorable, the exact first refusal names that row, and queue
+    /// depth, budget, counters, and the sink stay untouched. Dropping a
+    /// prepared record before hand-over (cancellation) changes nothing; once
+    /// handed over, the record settles whole through the ordinary flush.
+    #[test]
+    fn prepared_rows_reject_atomically_before_reservation() {
+        let config = QueueConfig {
+            linger_ms: 60_000,
+            ..QueueConfig::default()
+        };
+        let budget = ClientByteBudget::for_config(&config);
+        let sink = Arc::new(MockSink::new());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            crate::variant::variant_field("payload", true),
+        ]));
+        let producer = Producer::with_budget(
+            "vala.bifrost.prepared",
+            Arc::clone(&schema),
+            sink.clone(),
+            config,
+            budget.clone(),
+        )
+        .expect("producer starts");
+        let untouched = |case: &str| {
+            assert_eq!(
+                producer.metrics(),
+                ProducerMetrics {
+                    accepted: 0,
+                    dropped: 0,
+                    queue_depth: 0
+                },
+                "{case}"
+            );
+            assert_eq!(budget.used_bytes(), 0, "{case}");
+        };
+        let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
+        let large = format!(r#""{}""#, "x".repeat(8 * 1024 * 1024));
+        let cases = [
+            (r#"{"id":2,"extra":1}"#.to_owned(), "undeclared"),
+            (format!(r#"{{"id":2,"payload":{deep}}}"#), "deep"),
+            (format!(r#"{{"id":2,"payload":{large}}}"#), "large"),
+            (
+                r#"{"id":2,"payload":99999999999999999999999}"#.to_owned(),
+                "range",
+            ),
+            (
+                format!(r#"{{"id":2,"extra":1,"payload":{deep}}}"#),
+                "undeclared",
+            ),
+        ];
+        for (last, expected) in cases {
+            let rows = vec![
+                br#"{"id":0,"payload":{"ok":true}}"#.to_vec(),
+                br#"{"id":1,"payload":"text"}"#.to_vec(),
+                last.into_bytes(),
+            ];
+            let error = producer
+                .enqueue_rows(rows, Some(card()), None)
+                .expect_err("the final row refuses the whole record");
+            let matched = match (&error, expected) {
+                (
+                    WyrdQueueError::Contract(BifrostError::UndeclaredField { field, row: 2 }),
+                    "undeclared",
+                ) => field == "extra",
+                (
+                    WyrdQueueError::Contract(BifrostError::VariantTooDeep {
+                        field, row: 2, ..
+                    }),
+                    "deep",
+                )
+                | (
+                    WyrdQueueError::Contract(BifrostError::VariantTooLarge {
+                        field, row: 2, ..
+                    }),
+                    "large",
+                )
+                | (
+                    WyrdQueueError::Contract(BifrostError::VariantNumericOutOfRange {
+                        field,
+                        row: 2,
+                        ..
+                    }),
+                    "range",
+                ) => field == "payload",
+                _ => false,
+            };
+            assert!(matched, "{expected}: {error:?}");
+            untouched(expected);
+        }
+
+        let preflight = RowPreflight::new(&schema);
+        let rows = [br#"{"id":0}"#, br#"{"id":1}"#];
+        drop(preflight.prepare(&rows, None, None).expect("rows prepare"));
+        untouched("cancelled before hand-over");
+        producer
+            .enqueue_prepared(preflight.prepare(&rows, None, None).expect("rows prepare"))
+            .expect("the record is admitted whole");
+        assert_eq!(producer.metrics().accepted, 2);
+        producer.flush().expect("the admitted record settles");
+        assert_eq!(received_rows(&sink), 2);
+        assert_eq!(sink.received().len(), 1, "one record, one batch");
+        producer.shutdown().expect("nothing remains");
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     /// A multi-row record is admitted whole or not at all: a record larger

@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-variant
-spec_revision: 10
+spec_revision: 11
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-017, REQ-019, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-005, AC-008, AC-009]
 depends_on: []
 parent_task:

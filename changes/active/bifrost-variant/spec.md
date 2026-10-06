@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -635,9 +635,13 @@ remain in the lossless attribute payload" clause of
 `SPEC-bifrost-canonical-otel-signals` and `architecture/bifrost-design.md`.
 
 JSON input converts as follows: an integer within the 64-bit signed range is
-an integer; another integer that fits a Variant decimal is a decimal; a
-non-integer number is a double; an integer that fits no Variant numeric type is
-refused (REQ-019).
+an integer; an integer above that range but within the 64-bit unsigned range is
+a scale-zero Variant decimal; a non-integer number is a double; any other
+integer is refused with `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`
+(REQ-019). Every accepted integer therefore reads back exactly in every
+terminal, including Rust `serde_json::Value`, without serde_json
+`arbitrary_precision`. This matches BigQuery `PARSE_JSON`'s default exact mode;
+callers needing wider integers send them as strings.
 
 #### REQ-005 — Bloom filters sized to the data
 
@@ -830,6 +834,14 @@ Variant nested beyond depth 64, and a Variant exceeding 8,388,608 encoded bytes
 fail with stable catalog codes before acknowledgement
 (writes) or as a query error (queries). They are never truncated or stored
 partially.
+
+A query failure keeps the same catalog code and details whether it occurs
+before or after the first result batch is sent. The late query terminal
+carries the existing catalog error (code and details) for every failure, not a
+fixed code list plus free text, in interactive and distributed execution over
+HTTP and gRPC. Every SDK raises that catalog error unchanged and discards the
+partial result. This applies to all catalog errors, not only Variant ones; a
+failure with no catalog identity remains `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
 
 ### Shredding
 
@@ -1155,6 +1167,13 @@ None.
 
 ## Revision history
 
+- **Revision 11 (2026-10-06, approved):** From TASK-001 review r2. JSON
+  integers outside the signed/unsigned 64-bit ranges are refused with
+  `NUMERIC_OUT_OF_RANGE` instead of stored as wide decimals, so every accepted
+  value reads back exactly in every terminal (FIND-TASK-001-11). The late query
+  terminal carries the full catalog error so failures after the first batch
+  keep their code and details (FIND-TASK-001-12). serde_json
+  `arbitrary_precision` stays rejected.
 - **Revision 10 (2026-10-05, approved):** Assigns the one pure Variant analyzer
   and schema wrapper to the iceberg-rust fork and adds its concrete deferred
   `VariantParquetWriterBuilder`, so each existing Forge rollover owns an

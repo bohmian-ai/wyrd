@@ -1245,6 +1245,7 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
         }
     }
     prove_late_failures(&cluster, &client, &suffix, &invalid_json).await?;
+    prove_worker_tenant_refusal(&cluster, &client, &suffix).await?;
 
     // A caller without gateway payload authority is refused at the logical
     // plan, before any peer or provider work.
@@ -1369,6 +1370,83 @@ async fn prove_late_failures(
         if &problem != expected {
             return Err(format!("{case} failed as {problem:?}").into());
         }
+    }
+    Ok(())
+}
+
+/// Proves a worker's tenant refusal reaches the caller with its full problem.
+///
+/// Two published objects plus one hot file whose footer names a foreign
+/// tenant are read through a bounded sort, so the statement runs as an
+/// Analytical graph whose remote leaf stage scans the foreign file on a
+/// follower. The refusal is raised on that worker and must cross the peer
+/// boundary as the complete `QueryTenantInvariant` problem, with no rows
+/// returned and every Oracle back at its pre-query ownership.
+///
+/// The refusal is accepted on either surface: the footer check fails on the
+/// first poll of the partition holding the foreign file, so whether a clean
+/// batch is delivered first depends on scheduling, and ordering it
+/// deterministically would need a new execution hook. When a terminal frame
+/// is present it must report Analytical execution.
+///
+/// # Errors
+///
+/// Returns the first claim that broke: a settled query, a different problem,
+/// a non-Analytical terminal, no remote work, or an Oracle that did not
+/// settle.
+async fn prove_worker_tenant_refusal(
+    cluster: &PeerCluster,
+    client: &WyrdClient,
+    suffix: &impl Display,
+) -> Result<(), JourneyError> {
+    let table = format!("variant_late_tenant_{suffix}");
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    for _ in 0..2 {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &table, 0, 4_096, 3)
+            .await?;
+    }
+    cluster
+        .seed_foreign_hot_row(
+            PEER_SCRIBE,
+            &table,
+            &format!("variant-late-foreign-{suffix}"),
+        )
+        .await?;
+    cluster.refresh_snapshots().await?;
+    let baseline = cluster
+        .indices_of(BifrostTarget::Oracle)
+        .into_iter()
+        .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    let remote_before = RemoteWork::observe(cluster)?;
+    let case = "worker tenant refusal";
+    let sql = format!(
+        "SELECT id FROM (SELECT id FROM vala.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
+    );
+    let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+        Err(error) => error,
+        Ok(result) => return Err(format!("{case} returned {} rows", result.num_rows()).into()),
+    };
+    if let Some(terminal) = error.terminal() {
+        expect_path(case, terminal.query_class, QueryClass::Analytical)?;
+    }
+    let problem = wyrd_spec::error::WyrdError::from(&error).problem();
+    let expected = wyrd_spec::error::WyrdError::from(BifrostError::QueryTenantInvariant).problem();
+    if problem != expected {
+        return Err(format!("{case} failed as {problem:?}").into());
+    }
+    // Every task of the scanning stage routes to one follower, so remote work
+    // is proven by any follower leasing the graph.
+    let mut leased = false;
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        leased |= cluster.graph_leases(index)?.0 > remote_before.leases[offset];
+    }
+    if !leased {
+        return Err(format!("{case} leased no graph on any follower").into());
+    }
+    for (index, before) in baseline {
+        await_baseline(cluster, index, before).await?;
     }
     Ok(())
 }

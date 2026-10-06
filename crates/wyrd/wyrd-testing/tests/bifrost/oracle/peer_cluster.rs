@@ -30,7 +30,7 @@ use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-use crate::support::JourneyError;
+use crate::support::{JourneyError, seed_foreign_hot_row};
 
 /// How long one pod may take to report every readiness probe passing.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -1048,6 +1048,35 @@ impl PeerCluster {
             Bootstrap::Machine { api_key, .. } => Ok(api_key),
             Bootstrap::User { .. } => Err("machine bootstrap returned a user".into()),
         }
+    }
+
+    /// Seeds one hot file under `table` whose footer names a new foreign tenant.
+    ///
+    /// Delegates to [`seed_foreign_hot_row`] with this topology's private
+    /// cluster and fixture tenant, attributing the file-list row to pod
+    /// `index`. Every read of `table` that scans the file must then refuse
+    /// with the tenant invariant. `slug` names the foreign tenant and the
+    /// object, so it must be unique within one topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tenant provisioning failure or any seeding error.
+    pub(crate) async fn seed_foreign_hot_row(
+        &self,
+        index: usize,
+        table: &str,
+        slug: &str,
+    ) -> Result<(), JourneyError> {
+        let foreign = self.cluster.add_tenant(slug).await?;
+        seed_foreign_hot_row(
+            &self.cluster,
+            self.tenant(),
+            table,
+            foreign,
+            slug,
+            self.node_id(index).as_uuid(),
+        )
+        .await
     }
 
     /// Deletes one object from the shared local object store.

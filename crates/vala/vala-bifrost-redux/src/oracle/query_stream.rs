@@ -1639,8 +1639,8 @@ mod tests {
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::failed_terminal_on_path;
     use crate::oracle::{
-        BifrostError, OracleTelemetry, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalFrame, QueryTerminalOutcome,
+        BifrostError, OracleTelemetry, QueryCatalogError, QueryClass, QuerySchemaFrame,
+        QuerySource, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -1667,38 +1667,51 @@ mod tests {
     }
 
     /// A late catalog failure keeps its exact code and details, whether its
-    /// typed error is in the local chain or only a worker's forwarded text
-    /// arrived, and the failed terminal carries that error's problem.
+    /// envelope is in the local chain or crossed from a worker, and the failed
+    /// terminal carries that error's complete problem.
+    ///
+    /// The remote form is the pinned distributed wire shape: the worker's
+    /// `External` envelope is reduced to its display text and rebuilt as a
+    /// generic `External` under the structurally preserved `Context` frames.
     ///
     /// # Panics
     ///
     /// Panics when the late mapping or terminal loses the catalog identity.
     #[test]
     fn late_catalog_error_keeps_its_identity() {
-        let error = BifrostError::VariantInvalidJson {
-            field: "parse_json".to_owned(),
-            row: 1,
-            path: String::new(),
-        };
-        let local = DataFusionError::Context(
-            "late batch".to_owned(),
-            Box::new(DataFusionError::External(Box::new(error.clone()))),
-        );
-        let forwarded = DataFusionError::External(
-            serde_json::to_string(&error)
-                .expect("the error serializes")
-                .into(),
-        );
-        for late in [local, forwarded] {
-            let mapped = crate::oracle::map_datafusion_error(&late);
-            assert_eq!(mapped, error);
-            let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);
-            assert_eq!(
-                terminal.error,
-                Some(Box::new(
-                    wyrd_spec::error::WyrdError::from(error.clone()).problem()
-                ))
+        for error in [
+            BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 1,
+                path: String::new(),
+            },
+            BifrostError::QueryTenantInvariant,
+        ] {
+            let envelope = QueryCatalogError::external(error.clone());
+            let DataFusionError::External(inner) = &envelope else {
+                panic!("the envelope is an external error");
+            };
+            let text = inner.to_string();
+            let local = DataFusionError::Context("late batch".to_owned(), Box::new(envelope));
+            let forwarded = DataFusionError::Context(
+                "remote stage".to_owned(),
+                Box::new(DataFusionError::Context(
+                    "late batch".to_owned(),
+                    Box::new(DataFusionError::External(text.into())),
+                )),
             );
+            for late in [local, forwarded] {
+                let mapped = crate::oracle::map_datafusion_error(&late);
+                assert_eq!(mapped, error);
+                let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);
+                assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
+                assert_eq!(
+                    terminal.error,
+                    Some(Box::new(
+                        wyrd_spec::error::WyrdError::from(error.clone()).problem()
+                    ))
+                );
+            }
         }
     }
 

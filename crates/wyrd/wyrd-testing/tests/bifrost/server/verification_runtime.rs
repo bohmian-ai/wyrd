@@ -24,10 +24,9 @@ use arrow::array::{
     StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{
-    DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef, TimeUnit,
-};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
+use arrow::json::writer::{JsonArray, WriterBuilder};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike as _, Utc};
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -44,7 +43,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, variant_cell_to_json, variant_field, variant_storage_type,
+    EncodedVariant, VariantColumnBuilder, VariantJsonEncoderFactory, variant_field,
+    variant_storage_type,
 };
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
@@ -1709,40 +1709,6 @@ fn expect_eq<T: PartialEq + Debug>(
     Err(format!("{what} differs:\n  stored   {actual:?}\n  expected {expected:?}").into())
 }
 
-/// Render one query cell as the JSON value it carries.
-///
-/// A Variant cell decodes to its JSON value, a Struct becomes an object of
-/// its children, text becomes a string, and integers and floats become
-/// numbers. A null cell is JSON `null`.
-///
-/// # Errors
-/// Returns an error for a Variant cell that does not decode or a column type
-/// this journey does not read.
-fn cell_json(column: &dyn Array, row: usize) -> Result<Value, ServerJourneyError> {
-    if column.is_null(row) {
-        return Ok(Value::Null);
-    }
-    if column.data_type() == &variant_storage_type() {
-        return variant_cell_to_json(column, row)
-            .map_err(|violation| format!("a Variant cell does not decode: {violation:?}").into());
-    }
-    Ok(match column.data_type() {
-        DataType::Utf8 => json!(column.as_string::<i32>().value(row)),
-        DataType::Int32 => json!(column.as_primitive::<Int32Type>().value(row)),
-        DataType::Int64 => json!(column.as_primitive::<Int64Type>().value(row)),
-        DataType::Float64 => json!(column.as_primitive::<Float64Type>().value(row)),
-        DataType::Struct(fields) => {
-            let children = column.as_struct();
-            let mut object = serde_json::Map::new();
-            for (field, child) in fields.iter().zip(children.columns()) {
-                object.insert(field.name().clone(), cell_json(child.as_ref(), row)?);
-            }
-            Value::Object(object)
-        }
-        other => return Err(format!("the journey reads no {other} column").into()),
-    })
-}
-
 /// Results the journey published and the native values they must read back as.
 struct PublishedResults {
     /// A Drift result whose report scored two features.
@@ -2240,18 +2206,29 @@ impl TypedPayloadJourney {
             },
         )
         .await?;
-        let mut rows = Vec::new();
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            return Ok(Vec::new());
+        };
+        let mut bytes = Vec::new();
+        let mut writer = WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .build::<_, JsonArray>(&mut bytes);
         for batch in &batches {
-            for row in 0..batch.num_rows() {
-                rows.push(
-                    batch
-                        .columns()
-                        .iter()
-                        .map(|column| cell_json(column.as_ref(), row))
-                        .collect::<Result<_, _>>()?,
-                );
-            }
+            writer.write(batch)?;
         }
-        Ok(rows)
+        writer.finish()?;
+        drop(writer);
+        let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&bytes)?;
+        Ok(objects
+            .into_iter()
+            .map(|mut object| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| object.remove(field.name()).unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect())
     }
 }

@@ -36,7 +36,6 @@ use wyrd_client::cards::{
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
 use wyrd_client::{QueueConfig, WyrdClient};
-use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
@@ -395,33 +394,6 @@ fn texts(batches: &[RecordBatch]) -> Result<Vec<Option<String>>, ServerJourneyEr
     Ok(values)
 }
 
-/// Every Variant cell of column `index` of `batches`, rendered as JSON text.
-///
-/// A null cell is `None`; a stored JSON null renders as the text `null`.
-///
-/// # Errors
-/// Returns an error when the column is absent or a cell is not a valid
-/// Variant.
-fn variant_texts(
-    batches: &[RecordBatch],
-    index: usize,
-) -> Result<Vec<Option<String>>, ServerJourneyError> {
-    let mut values = Vec::new();
-    for batch in batches {
-        let column = batch.column(index);
-        for row in 0..column.len() {
-            if column.is_null(row) {
-                values.push(None);
-                continue;
-            }
-            let value = variant_cell_to_json(column.as_ref(), row)
-                .map_err(|violation| format!("a Variant cell does not decode: {violation:?}"))?;
-            values.push(Some(serde_json::to_string(&value)?));
-        }
-    }
-    Ok(values)
-}
-
 /// The one run of `verifier` over `record`.
 ///
 /// # Errors
@@ -609,7 +581,8 @@ async fn record_id(
             server,
             tenant,
             format!(
-                "SELECT record_id FROM vala.eval.observations WHERE context LIKE '%\"{marker}\"%'"
+                "SELECT record_id FROM vala.eval.observations \
+                 WHERE (context ->> 'marker') = '{marker}'"
             ),
         )
         .await?,
@@ -932,17 +905,16 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
 
     // Redacted capture stores no `actual`.
     let ungated = run_of(&runs, "eval-ungated", &pass)?;
-    let actual = variant_texts(
+    let actual = texts(
         &query(
             &server,
             tenant,
             format!(
-                "SELECT actual FROM vala.eval.result_items WHERE result_id = '{}'",
+                "SELECT to_json(actual) FROM vala.eval.result_items WHERE result_id = '{}'",
                 ungated.state.result_id.ok_or("no result")?
             ),
         )
         .await?,
-        0,
     )?;
     if actual != [None] {
         return Err(format!("redacted capture stored {actual:?}").into());
@@ -1573,7 +1545,8 @@ impl TraceJourney {
         runs
     }
 
-    /// Every canonical result item of `result` as `task_id=actual`, sorted.
+    /// Every canonical result item of `result` as `task_id=actual`, sorted, with
+    /// `actual` rendered by the Oracle's `to_json`.
     ///
     /// # Errors
     /// Returns the query error.
@@ -1583,20 +1556,14 @@ impl TraceJourney {
             &self.server,
             self.tenant,
             format!(
-                "SELECT task_id, actual FROM vala.eval.result_items WHERE result_id = '{result}'"
+                "SELECT concat(task_id, '=', to_json(actual)) FROM vala.eval.result_items \
+                 WHERE result_id = '{result}'"
             ),
         )
         .await?;
         let mut items: Vec<String> = texts(&batches)?
             .into_iter()
-            .zip(variant_texts(&batches, 1)?)
-            .map(|(task, actual)| {
-                format!(
-                    "{}={}",
-                    task.unwrap_or_default(),
-                    actual.unwrap_or_default()
-                )
-            })
+            .map(Option::unwrap_or_default)
             .collect();
         items.sort();
         Ok(items)

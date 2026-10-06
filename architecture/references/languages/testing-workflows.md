@@ -180,7 +180,7 @@ a specific change will trip:
 |---|---|
 | `check:client-tier` | Foundation invariants (wyrd-spec server-tier-free; shared shells pyo3+sqlx-free; Skald locked Wyrd edges) |
 | `check:pyo3-scope` | PyO3 stays out of pure contracts and Python-free shared crates |
-| `check:mocks-scope` | Mock helpers stay out of production source |
+| `check:mocks-scope` | Mock crates are dev-dependencies outside `wyrd-testing` |
 | `check:unwrap-audit` | Audits `unwrap()`/`expect()` outside tests |
 | `check:tenant-isolation` | SQL foundation tenant isolation + server-tier boundaries |
 | `check:registry-no-server-routes` | `wyrd-sql` does not import `axum`/`hyper`/`tower` |

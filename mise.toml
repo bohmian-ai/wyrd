@@ -978,7 +978,7 @@ run = "bash scripts/checks/pyo3-scope.sh"
 
 [tasks."check:mocks-scope"]
 hide = true
-description = "Assert mock helpers stay out of production source"
+description = "Assert mock crates are dev-dependencies outside wyrd-testing"
 run = "bash scripts/checks/mocks-scope.sh"
 
 [tasks."check:object-store-pin"]

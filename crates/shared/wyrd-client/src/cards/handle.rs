@@ -541,13 +541,15 @@ mod tests {
     use base64::Engine;
     use secrecy::SecretString;
     use sha2::{Digest, Sha256};
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{CardSelector, Cards};
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::card::verifier::DriftBaselineState;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::reference::CardRef;
 
     /// Preserve an existing publication and remove private staging when a later
     /// artifact fails integrity verification.
@@ -672,6 +674,191 @@ mod tests {
                     .starts_with(".wyrd-artifacts-")
             });
         assert!(!staging_remains);
+    }
+
+    /// One registered envelope for each Card kind `cards.get` types, paired
+    /// with its kind so the stub server can answer the matching exact read.
+    ///
+    /// The Verifier carries a building Drift baseline so the status projection
+    /// is exercised alongside the spec projection.
+    fn supported_kind_envelopes() -> Vec<(CardKind, serde_json::Value)> {
+        let baseline_ref = serde_json::json!({
+            "kind": "Data",
+            "name": "churn-training",
+            "space": "retention",
+            "version": "1.0.0",
+            "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+        });
+        let specs = [
+            (
+                CardKind::Data,
+                serde_json::json!({
+                    "interface": {"kind": "Parquet", "meta": {"compression": "Snappy"}},
+                    "schema": {"columns": [{"name": "feature", "dtype": "float64"}]},
+                    "stats": {"row_count": 1, "col_count": 1, "byte_count": 8, "sha256": "00"}
+                }),
+            ),
+            (
+                CardKind::Model,
+                serde_json::json!({
+                    "interface": {"kind": "Sklearn", "meta": {"framework_version": "1.4.0"}},
+                    "task_type": "BinaryClassification",
+                    "signature": {
+                        "inputs": [{"name": "feature", "dtype": "float64"}],
+                        "outputs": [{"name": "prediction", "dtype": "float64"}]
+                    }
+                }),
+            ),
+            (
+                CardKind::Prompt,
+                serde_json::json!({
+                    "model": "gpt-4o",
+                    "request": {
+                        "provider": "open_ai_chat_completion",
+                        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+                    }
+                }),
+            ),
+            (
+                CardKind::Agent,
+                serde_json::json!({
+                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"}
+                }),
+            ),
+            (
+                CardKind::Verifier,
+                serde_json::json!({
+                    "implementation": {
+                        "kind": "drift",
+                        "spec": {
+                            "method": "Psi",
+                            "signal": {
+                                "kind": "Distribution",
+                                "baseline_ref": baseline_ref.clone(),
+                                "features": ["feature"]
+                            },
+                            "condition": {"kind": "Statistical"},
+                            "profile": {
+                                "kind": "Psi",
+                                "binning_strategy": {"kind": "Quantile", "n_bins": 10},
+                                "threshold": {"kind": "Fixed", "value": 0.25}
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                CardKind::Service,
+                serde_json::json!({"description": "churn remediation"}),
+            ),
+            (
+                CardKind::Trigger,
+                serde_json::json!({"kind": "schedule", "cron": "*/5 * * * *", "tz": "UTC"}),
+            ),
+            (
+                CardKind::Operator,
+                serde_json::json!({
+                    "kind": "notify",
+                    "channel": {
+                        "kind": "slack",
+                        "connection": "ops-slack",
+                        "channel_id": "C0123456789",
+                        "text": "drift"
+                    }
+                }),
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(kind, spec)| {
+                let status = if kind == CardKind::Verifier {
+                    serde_json::json!({
+                        "phase": "active",
+                        "verification": {"baseline": {"state": "building", "data": baseline_ref.clone()}}
+                    })
+                } else {
+                    serde_json::json!({"phase": "active"})
+                };
+                let card = serde_json::json!({
+                    "apiVersion": "wyrd/v1",
+                    "kind": kind.wire_name(),
+                    "metadata": {"space": "retention", "name": "subject", "version": "1.0.0"},
+                    "spec": spec,
+                    "status": status
+                });
+                (kind, card)
+            })
+            .collect()
+    }
+
+    /// Every kind `cards.get` supports deserializes into its own typed `Spec`
+    /// variant, and a Drift Verifier's baseline state arrives typed on
+    /// `status.verification`.
+    #[tokio::test]
+    async fn supported_kinds_project_typed_specs_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let envelopes = supported_kind_envelopes();
+        for (kind, card) in &envelopes {
+            Mock::given(method("GET"))
+                .and(path("/v1/cards/by-ref"))
+                .and(query_param("kind", kind.wire_name()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "card": card,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                })))
+                .mount(&server)
+                .await;
+        }
+        let cards = Cards::new(
+            Some(&server.uri()),
+            Some(SecretString::from("test-api-key")),
+            None,
+        )
+        .expect("test cards handle is configured");
+
+        for (kind, _) in envelopes {
+            let card_ref: CardRef = format!("retention/{}/subject@1.0.0", kind.wire_name())
+                .parse()
+                .expect("test card ref is valid");
+            let card = cards
+                .get(CardSelector::exact(card_ref))
+                .await
+                .unwrap_or_else(|error| panic!("{kind:?} card is readable: {error}"));
+            let typed = matches!(
+                (&kind, &card.spec),
+                (CardKind::Data, Spec::Data(_))
+                    | (CardKind::Model, Spec::Model(_))
+                    | (CardKind::Prompt, Spec::Prompt(_))
+                    | (CardKind::Agent, Spec::Agent(_))
+                    | (CardKind::Verifier, Spec::Verifier(_))
+                    | (CardKind::Service, Spec::Service(_))
+                    | (CardKind::Trigger, Spec::Trigger(_))
+                    | (CardKind::Operator, Spec::Operator(_))
+            );
+            assert!(typed, "{kind:?} projects its own typed spec");
+            let baseline = card
+                .status
+                .as_ref()
+                .and_then(|status| status.verification.as_ref())
+                .and_then(|verification| verification.baseline.as_ref());
+            if kind == CardKind::Verifier {
+                let baseline = baseline.expect("drift verifier carries a typed baseline");
+                assert_eq!(baseline.state, DriftBaselineState::Building);
+            } else {
+                assert!(baseline.is_none(), "{kind:?} carries no baseline");
+            }
+        }
     }
 
     /// Keep latest and exact selector construction semantically distinct.

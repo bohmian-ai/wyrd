@@ -34,7 +34,7 @@ describe("BifrostQueryStream", () => {
       schemaIpc: null,
       terminalJson: null,
     };
-    const stream = new BifrostQueryStream(native);
+    const stream = BifrostQueryStream.fromNative(native);
     expect(stream.requestId).toBe(REQUEST_ID);
     const batches = [];
     for await (const batch of stream) {
@@ -58,7 +58,7 @@ describe("BifrostQueryStream", () => {
       schemaIpc: null,
       terminalJson: null,
     };
-    const stream = new BifrostQueryStream(native);
+    const stream = BifrostQueryStream.fromNative(native);
     await stream.return();
     expect(closed).toBe(true);
   });
@@ -82,7 +82,7 @@ describe("BifrostQueryStream", () => {
       schemaIpc: null,
       terminalJson: null,
     };
-    const stream = new BifrostQueryStream(native);
+    const stream = BifrostQueryStream.fromNative(native);
     await expect(stream.next()).rejects.toBeInstanceOf(
       IncompleteQueryStreamError,
     );
@@ -116,7 +116,7 @@ describe("BifrostQueryStream", () => {
       schemaIpc: null,
       terminalJson: JSON.stringify(terminal),
     };
-    const stream = new BifrostQueryStream(native);
+    const stream = BifrostQueryStream.fromNative(native);
     await expect(stream.next()).rejects.toMatchObject({
       code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
       status: 500,
@@ -139,7 +139,7 @@ describe("BifrostQueryStream", () => {
       schemaIpc: null,
       terminalJson: null,
     };
-    const stream = new BifrostQueryStream(native);
+    const stream = BifrostQueryStream.fromNative(native);
     await expect(stream.next()).rejects.toThrow();
     expect(closed).toBe(true);
     await expect(stream.next()).resolves.toEqual({
@@ -209,12 +209,16 @@ describe("TableConfig compaction target", () => {
     expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA).compactionTargetFileSizeBytes).toBeUndefined();
     const target = 256 * 1024 * 1024;
     expect(
-      TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, target).compactionTargetFileSizeBytes,
+      TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionTargetFileSizeBytes: target })
+        .compactionTargetFileSizeBytes,
     ).toBe(target);
   });
 
   it("refuses a target that is not a non-negative integer", () => {
-    expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, 1.5)).toThrow(/compaction target/);
-    expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, -1)).toThrow(/compaction target/);
+    for (const bytes of [1.5, -1]) {
+      expect(() =>
+        TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionTargetFileSizeBytes: bytes }),
+      ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
+    }
   });
 });

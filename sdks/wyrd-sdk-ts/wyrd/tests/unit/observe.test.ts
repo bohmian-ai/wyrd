@@ -5,7 +5,7 @@ import { type EvalMediaRef, Observe, WyrdError } from "@wyrd/sdk";
 
 import { StorageContextManager } from "../support/otel-context.js";
 
-type NativeRun = ConstructorParameters<typeof Observe>[0];
+type NativeRun = Parameters<typeof Observe.fromNative>[0];
 
 /** One emit the fake native run recorded, as the arguments it received. */
 type Emit = readonly (string | undefined)[];
@@ -54,7 +54,7 @@ function withActiveSpan(emit: () => void): void {
 describe("Observe", () => {
   it("passes the feature map as JSON text with its session", () => {
     const { native, emits } = fakeRun();
-    new Observe(native).drift(
+    Observe.fromNative(native).drift(
       { latency_ms: 12.5, tier: "gold" },
       { sessionId: "00000000-0000-0000-0000-00000000000a" },
     );
@@ -68,7 +68,7 @@ describe("Observe", () => {
 
   it("encodes media descriptors with their canonical field names", () => {
     const { native, emits } = fakeRun();
-    new Observe(native).eval(
+    Observe.fromNative(native).eval(
       { answer: "yes" },
       {
         media: [
@@ -100,7 +100,7 @@ describe("Observe", () => {
 
   it("omits media entirely when the caller names none", () => {
     const { native, emits } = fakeRun();
-    new Observe(native).eval({ answer: "yes" });
+    Observe.fromNative(native).eval({ answer: "yes" });
     expect(emits).toEqual([
       [JSON.stringify({ answer: "yes" }), undefined, undefined, undefined, undefined],
     ]);
@@ -108,7 +108,7 @@ describe("Observe", () => {
 
   it("awaits one generic-table row as JSON text", async () => {
     const { native, emits } = fakeRun();
-    await new Observe(native).record("vala.datasets.events", { value: 1 });
+    await Observe.fromNative(native).record("vala.datasets.events", { value: 1 });
     expect(emits).toEqual([["vala.datasets.events", JSON.stringify({ value: 1 })]]);
   });
 
@@ -119,7 +119,7 @@ describe("Observe", () => {
       errorTitle: "Bifrost is not started",
       errorDetail: "call start_bifrost before observing",
     });
-    const observe = new Observe(native);
+    const observe = Observe.fromNative(native);
     try {
       observe.drift({ score: 1 });
     } catch (error) {
@@ -162,7 +162,7 @@ describe("Observe", () => {
       ["cycle", cycle],
     ];
     const { native, emits } = fakeRun();
-    const observe = new Observe(native);
+    const observe = Observe.fromNative(native);
     for (const [label, value] of refused) {
       const calls = [
         () => observe.drift(value as Record<string, number>),
@@ -204,7 +204,7 @@ describe("Observe", () => {
     ];
     for (const [label, input, expected] of inputs) {
       const { native, emits } = fakeRun();
-      const observe = new Observe(native);
+      const observe = Observe.fromNative(native);
       const calls = [
         () => observe.drift(input() as Record<string, number>),
         () => observe.eval(input()),
@@ -238,7 +238,7 @@ describe("Observe", () => {
       ["non-enumerable key", Object.defineProperty({ ...base }, "mediaType", { value: "a/b" })],
     ];
     const { native, emits } = fakeRun();
-    const observe = new Observe(native);
+    const observe = Observe.fromNative(native);
     for (const [label, item] of refused) {
       expect(() => observe.eval({ n: 1 }, { media: [item as EvalMediaRef] }), label).toThrow(
         expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }),
@@ -261,7 +261,7 @@ describe("Observe", () => {
   it("calls native exactly once for valid nested JSON", () => {
     const { native, emits } = fakeRun();
     const context = { a: [1, "x", true, null], b: { c: -2.5 }, d: Number.MAX_SAFE_INTEGER };
-    new Observe(native).eval(context);
+    Observe.fromNative(native).eval(context);
     expect(emits).toEqual([[JSON.stringify(context), undefined, undefined, undefined, undefined]]);
   });
 
@@ -270,7 +270,7 @@ describe("Observe", () => {
     context.setGlobalContextManager(manager);
     try {
       const { native, emits } = fakeRun();
-      const observe = new Observe(native);
+      const observe = Observe.fromNative(native);
       observe.eval({ n: 0 });
       withActiveSpan(() => {
         observe.eval({ n: 1 });

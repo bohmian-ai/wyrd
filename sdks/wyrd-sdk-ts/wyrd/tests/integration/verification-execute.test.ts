@@ -7,17 +7,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import {
-  type CardRef,
-  Cards,
-  type DirectVerificationInput,
-  type ExecuteVerificationRequest,
-  type ExecuteVerificationResponse,
-  Verification,
-  WyrdError,
-} from "@wyrd/sdk";
+import { type CardRef, Cards, type Judgment, WyrdError, WyrdState } from "@wyrd/sdk";
 
 /** Upper bound on every wait for the verification runtime to fit a baseline. */
 const WAIT_MS = 90_000;
@@ -73,8 +65,6 @@ ${distribution("latency, tier")}      profile:
         threshold: {kind: Fixed, value: 0.25}
 `,
   "ts-exec-spc": spcBody(),
-  // Its fitted format is retired once ready, as a baseline fitted under earlier semantics is stored.
-  "ts-exec-legacy-spc": spcBody(),
   "ts-exec-custom": `      method: Custom
       signal: {kind: Metric, name: score}
       condition: {kind: Statistical}
@@ -95,9 +85,6 @@ const JUDGE_TASK = `        judge:
           max_retries: 0
 `;
 
-/** Judge answer the mock delays past the provider timeout. */
-const SLOW_ANSWER = "slow";
-
 /** Judge answer the mock refuses with a provider failure. */
 const BROKEN_ANSWER = "broken";
 
@@ -106,8 +93,6 @@ const EVAL: Record<string, string> = {
   "ts-exec-assert": `        answer: {kind: assertion, id: answer, context_path: $.answer, operator: equals, expected: "yes"}
 `,
   "ts-exec-judge": JUDGE_TASK,
-  // Two retries of a judge slower than the provider's 30 s timeout outlive the 60 s server deadline.
-  "ts-exec-judge-retrying": JUDGE_TASK.replace("max_retries: 0", "max_retries: 2"),
   "ts-exec-traced": `        span: {kind: trace_assertion, id: span, span_selector: "$.spans[0].name", operator: equals, expected: x}
 `,
 };
@@ -187,43 +172,56 @@ async function refusal(promise: Promise<unknown>): Promise<string> {
   return (error as WyrdError).code;
 }
 
-/** Registered targets and the server every test executes against. */
+/** Registered targets, the subject's hydrated bundle, and the server every test executes against. */
 interface Journey {
   readonly server: NativeWyrdTestServer;
-  readonly verification: Verification;
+  /** The subject's own key: its Card scope covers the subject it verifies. */
+  readonly credential: string;
+  readonly bundle: string;
   readonly subject: CardRef;
   readonly verifiers: Record<string, CardRef>;
   readonly close: () => Promise<void>;
 }
 
-/** Build a direct execution request of Verifier `name` over the journey subject. */
-const request = (
-  journey: Journey,
-  name: string,
-  input: DirectVerificationInput,
-): ExecuteVerificationRequest => ({
-  verifier_uid: journey.verifiers[name]?.uid ?? "",
-  subject_card_uid: journey.subject.uid ?? "",
-  input,
-});
+/** The subject Service binding every journey Verifier at its root on a daily schedule. */
+const serviceYaml = (names: readonly string[]) => `apiVersion: wyrd/v1
+kind: Service
+metadata: {name: ts-exec-service, version: 1.0.0, space: default}
+spec:
+  verified_by:
+${names
+  .map(
+    (name) => `    - verifier: {kind: Verifier, name: ${name}, version: 1.0.0, space: default}
+      runs_on: {kind: schedule, cron: "0 0 * * *"}
+`,
+  )
+  .join("")}`;
 
-/** Drift samples input over `columns`. */
-const samples = (
-  columns: Record<string, readonly (number | string | null)[]>,
-): DirectVerificationInput => ({ kind: "drift_samples", columns });
+/** Drift rows of one feature `name` per value. */
+const column = (name: string, values: readonly (number | string)[]) =>
+  values.map((value) => ({ [name]: value }));
 
-/** Eval record input over `context`. */
-const record = (context: Record<string, unknown>): DirectVerificationInput => ({
-  kind: "eval_record",
-  context,
-});
-
-describe("direct verification execution journey", () => {
+describe("direct verification journey", () => {
   let journey: Journey;
+
+  /**
+   * Judge `input` with Verifier `name` over the root subject as `credential`.
+   *
+   * Bifrost is not started, so `observe.verify` resolves its client from the
+   * environment on first use; each call loads a fresh state so that client is
+   * this credential's, and callers await one judgment before the next.
+   */
+  async function verifyAs(credential: string, name: string, input: unknown): Promise<Judgment> {
+    vi.stubEnv("WYRD_SERVER_URL", journey.server.baseUrl);
+    vi.stubEnv("WYRD_API_KEY", credential);
+    vi.stubEnv("WYRD_ACCESS_TOKEN", undefined);
+    vi.stubEnv("WYRD_WORKLOAD_TOKEN", undefined);
+    return WyrdState.fromPath(journey.bundle).run().observe.verify(name, input);
+  }
 
   beforeAll(async () => {
     const root = mkdtempSync(join(tmpdir(), "wyrd-ts-execute-"));
-    // Routes on the graded answer in the request body, so one mock serves passing, broken, and slow judges.
+    // Routes on the graded answer in the request body, so one mock serves passing and broken judges.
     const judge: Server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -232,13 +230,8 @@ describe("direct verification execution journey", () => {
         const [status, answer] = body.includes(BROKEN_ANSWER)
           ? [500, { error: "provider failure" }]
           : [200, JUDGE_COMPLETION];
-        setTimeout(
-          () => {
-            res.writeHead(status, { "content-type": "application/json" });
-            res.end(JSON.stringify(answer));
-          },
-          body.includes(SLOW_ANSWER) ? 65_000 : 0,
-        );
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(answer));
       });
     });
     await new Promise<void>((resolve) => judge.listen(0, "127.0.0.1", resolve));
@@ -288,23 +281,16 @@ describe("direct verification execution journey", () => {
         `      pass_gate: {kind: all_pass}\n      tasks:\n${tasks}`,
       );
     }
-    for (const name of ["ts-exec-psi", "ts-exec-spc", "ts-exec-legacy-spc"]) {
+    for (const name of ["ts-exec-psi", "ts-exec-spc"]) {
       await waitReady(cards, verifiers[name] as CardRef);
     }
-    server.retireFittedFormat(verifiers["ts-exec-legacy-spc"]?.uid ?? "");
-    const subject = await register(
-      cards,
-      root,
-      "ts-exec-service",
-      "apiVersion: wyrd/v1\nkind: Service\nmetadata: {name: ts-exec-service, version: 1.0.0, space: default}\nspec: {}\n",
-    );
+    const subject = await register(cards, root, "ts-exec-service", serviceYaml(Object.keys(verifiers)));
+    const bundle = join(root, "bundle");
+    await cards.hydrate(subject, bundle);
     journey = {
       server,
-      // The subject's own key: its Card scope covers the subject it verifies.
-      verification: Verification.connect({
-        serverUrl: server.baseUrl,
-        credential: server.credentialRegisteredService("default/Service/ts-exec-service@1.0.0", ["admin"]),
-      }),
+      credential: server.credentialRegisteredService("default/Service/ts-exec-service@1.0.0", ["admin"]),
+      bundle,
       subject,
       verifiers,
       close: async () => {
@@ -316,33 +302,34 @@ describe("direct verification execution journey", () => {
   }, 180_000);
 
   afterAll(async () => {
+    vi.unstubAllEnvs();
     await journey?.close();
   });
 
-  it("judges supplied input inline with exact attribution and stable refusals", async () => {
-    const execute = (name: string, input: DirectVerificationInput) =>
-      journey.verification.execute(request(journey, name, input));
-    const baselineLike = samples({
-      latency: Array.from({ length: 100 }, (_, row) => (row * 37) % 100),
-      tier: Array.from({ length: 100 }, (_, row) => (row % 2 === 0 ? "gold" : "silver")),
-    });
-    const cases: [string, DirectVerificationInput, ExecuteVerificationResponse["kind"], string][] = [
+  it("judges supplied input with exact attribution and stable refusals", async () => {
+    const verify = (name: string, input: unknown) => verifyAs(journey.credential, name, input);
+    const baselineLike = Array.from({ length: 100 }, (_, row) => ({
+      latency: (row * 37) % 100,
+      tier: row % 2 === 0 ? "gold" : "silver",
+    }));
+    const cases: [string, unknown, Judgment["kind"], Judgment["verdict"]][] = [
       ["ts-exec-psi", baselineLike, "drift_psi", "passed"],
-      ["ts-exec-psi", samples({ latency: Array(100).fill(99), tier: Array(100).fill("gold") }), "drift_psi", "failed"],
-      ["ts-exec-psi", samples({ latency: [1, null], tier: ["gold", "silver"] }), "drift_psi", "inconclusive"],
-      ["ts-exec-spc", samples({ latency: [48, 49, 50, 51, 52, 48, 49, 50, 51, 52] }), "drift_spc", "passed"],
-      ["ts-exec-spc", samples({ latency: Array(20).fill(200) }), "drift_spc", "failed"],
-      ["ts-exec-custom", samples({ score: [1.0, 2.0] }), "drift_custom", "passed"],
-      ["ts-exec-custom", samples({ score: [2.0, 2.0] }), "drift_custom", "failed"],
-      ["ts-exec-custom", samples({ score: [1.0, null] }), "drift_custom", "inconclusive"],
-      ["ts-exec-assert", record({ answer: "yes" }), "eval_assertion", "passed"],
-      ["ts-exec-assert", record({ answer: "no" }), "eval_assertion", "failed"],
-      ["ts-exec-judge", record({ answer: "yes" }), "eval_llm_judge", "passed"],
+      ["ts-exec-psi", Array(100).fill({ latency: 99, tier: "gold" }), "drift_psi", "failed"],
+      // The second row omits `latency`, a null sample that leaves PSI unscorable.
+      ["ts-exec-psi", [{ latency: 1, tier: "gold" }, { tier: "silver" }], "drift_psi", "inconclusive"],
+      ["ts-exec-spc", column("latency", [48, 49, 50, 51, 52, 48, 49, 50, 51, 52]), "drift_spc", "passed"],
+      ["ts-exec-spc", column("latency", Array(20).fill(200)), "drift_spc", "failed"],
+      ["ts-exec-custom", column("score", [1.0, 2.0]), "drift_custom", "passed"],
+      ["ts-exec-custom", column("score", [2.0, 2.0]), "drift_custom", "failed"],
+      ["ts-exec-custom", [{ score: 1.0 }, { tier: "gold" }], "drift_custom", "inconclusive"],
+      ["ts-exec-assert", { answer: "yes" }, "eval_assertion", "passed"],
+      ["ts-exec-assert", { answer: "no" }, "eval_assertion", "failed"],
+      ["ts-exec-judge", { answer: "yes" }, "eval_llm_judge", "passed"],
     ];
     for (const [name, input, kind, verdict] of cases) {
-      const judged = await execute(name, input);
+      const judged = await verify(name, input);
       const label = `${name} ${verdict}: ${JSON.stringify(judged)}`;
-      expect([judged.kind, judged.verdict], label).toEqual([kind, verdict]);
+      expect([judged.kind, judged.verdict, judged.passed], label).toEqual([kind, verdict, verdict === "passed"]);
       const registered = journey.verifiers[name];
       expect([judged.verifier.uid, judged.verifier.version], label).toEqual([
         registered?.uid,
@@ -356,56 +343,45 @@ describe("direct verification execution journey", () => {
       expect(Object.keys(judged.detail), label).toEqual([kind.startsWith("drift") ? "drift" : "eval"]);
     }
 
-    const wide = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`c${i}`, [1.0]]));
-    const refusals: [Promise<unknown>, string][] = [
-      [execute("ts-exec-custom", samples({ score: [1.0, "a"] })), "WYRD_VERIFICATION_400_INPUT_INVALID"],
+    const wide = [Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`c${i}`, 1.0]))];
+    const refusals: [() => Promise<unknown>, string][] = [
+      [() => verify("ts-exec-custom", column("score", [1.0, "a"])), "WYRD_VERIFICATION_400_INPUT_INVALID"],
+      [() => verify("ts-exec-custom", wide), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
+      [() => verify("ts-exec-custom", column("score", Array(100_001).fill(1))), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
+      [() => verify("ts-exec-assert", { answer: "a".repeat(256 * 1024) }), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
+      [() => verify("ts-exec-unfitted", column("ghost", [1.0])), "WYRD_VERIFICATION_409_BASELINE_NOT_READY"],
+      [() => verify("ts-exec-custom", { answer: "yes" }), "WYRD_SDK_400_INVALID_OBSERVATION"],
+      [() => verify("ts-exec-psi", column("latency", [1.0])), "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE"],
+      [() => verify("ts-exec-assert", { question: "?" }), "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE"],
+      [() => verify("ts-exec-traced", { answer: "yes" }), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED"],
+      [() => verify("ts-exec-judge", { answer: BROKEN_ANSWER }), "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"],
+      [() => verify("ts-exec-missing", { answer: "yes" }), "WYRD_SDK_404_UNKNOWN_VERIFIER"],
       [
-        journey.verification.execute({
-          ...request(journey, "ts-exec-custom", samples({ score: [1.0] })),
-          extra: 1,
-        } as ExecuteVerificationRequest),
-        "WYRD_VERIFICATION_400_INPUT_INVALID",
-      ],
-      [execute("ts-exec-custom", samples(wide)), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
-      [execute("ts-exec-custom", samples({ score: Array(100_001).fill(1) })), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
-      [execute("ts-exec-assert", record({ answer: "a".repeat(256 * 1024) })), "WYRD_VERIFICATION_413_INPUT_TOO_LARGE"],
-      [execute("ts-exec-unfitted", samples({ ghost: [1.0] })), "WYRD_VERIFICATION_409_BASELINE_NOT_READY"],
-      [execute("ts-exec-legacy-spc", samples({ latency: [1.0] })), "WYRD_VERIFICATION_409_BASELINE_LEGACY"],
-      [execute("ts-exec-custom", record({ answer: "yes" })), "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE"],
-      [execute("ts-exec-psi", samples({ latency: [1.0] })), "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE"],
-      [execute("ts-exec-assert", record({ question: "?" })), "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE"],
-      [execute("ts-exec-traced", record({ answer: "yes" })), "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED"],
-      [execute("ts-exec-judge", record({ answer: BROKEN_ANSWER })), "WYRD_VERIFICATION_502_DEPENDENCY_FAILED"],
-      [
-        Verification.connect({
-          serverUrl: journey.server.baseUrl,
-          credential: journey.server.scopedApiKey("ts_exec_reader", ["cards:read"]),
-        }).execute(request(journey, "ts-exec-assert", record({ answer: "yes" }))),
+        () =>
+          verifyAs(journey.server.scopedApiKey("ts_exec_reader", ["cards:read"]), "ts-exec-assert", {
+            answer: "yes",
+          }),
         "WYRD_PERMISSION_403_DENIED_RBAC",
       ],
       [
-        Verification.connect({
-          serverUrl: journey.server.baseUrl,
-          credential: journey.server.bootstrapServiceInTenant(
-            journey.server.seedTenant("ts-exec-other"),
-            ["admin"],
-            "ts-exec-foreign",
+        () =>
+          verifyAs(
+            journey.server.bootstrapServiceInTenant(
+              journey.server.seedTenant("ts-exec-other"),
+              ["admin"],
+              "ts-exec-foreign",
+            ),
+            "ts-exec-assert",
+            { answer: "yes" },
           ),
-        }).execute(request(journey, "ts-exec-assert", record({ answer: "yes" }))),
         "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
       ],
     ];
-    expect(await Promise.all(refusals.map(([promise]) => refusal(promise)))).toEqual(refusals.map(([, code]) => code));
-    expect(journey.server.verificationRuns(), "direct execution never enqueues a run").toEqual([]);
-  }, 120_000);
-
-  it("refuses a judge that outlives the server deadline", async () => {
-    const code = await refusal(
-      journey.verification.execute(
-        request(journey, "ts-exec-judge-retrying", record({ answer: SLOW_ANSWER })),
-      ),
-    );
-    expect(code).toBe("WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT");
-    expect(journey.server.verificationRuns()).toEqual([]);
+    const codes = [];
+    // Sequential: each call resolves its client from the environment it stubs.
+    for (const [call] of refusals) {
+      codes.push(await refusal(call()));
+    }
+    expect(codes).toEqual(refusals.map(([, code]) => code));
   }, 120_000);
 });

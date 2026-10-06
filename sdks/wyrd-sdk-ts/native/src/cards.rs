@@ -463,10 +463,10 @@ impl NativeRun {
         self.run.run_id().as_str().to_owned()
     }
 
-    /// The exact Card reference this view observes.
+    /// The alias this view was opened with.
     #[napi(getter)]
-    pub fn card_ref(&self) -> String {
-        self.run.card_ref().to_string()
+    pub fn alias(&self) -> String {
+        self.run.alias().to_owned()
     }
 
     /// An immutable sibling view scoped to a registered alias.
@@ -526,6 +526,44 @@ impl NativeRun {
             Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
         };
         NativeLifecycleResult::outcome(self.run.observe().eval_json(&context_json, options))
+    }
+
+    /// Judges this view's subject with a bound Verifier from JSON input.
+    ///
+    /// `input_json` is one Eval context object or one array of Drift feature
+    /// rows; `media_json` is one JSON array of media descriptors. One server
+    /// call, never replayed; nothing is observed, recorded, or dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; an
+    /// unbound Verifier, input of the wrong shape, malformed media, and the
+    /// server's verification refusals are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn verify(
+        &self,
+        verifier: String,
+        input_json: String,
+        media_json: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
+            Ok(media) => media.unwrap_or_default(),
+            Err(error) => {
+                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                    message: format!("media is invalid: {error}"),
+                    details: serde_json::json!({ "field": "media", "reason": error.to_string() }),
+                }));
+            }
+        };
+        NativeLifecycleResult::outcome(
+            Box::pin(
+                self.run
+                    .observe()
+                    .verify_json(&verifier, &input_json, media),
+            )
+            .await,
+        )
     }
 
     /// Emits one row into a registered `vala.datasets` table.

@@ -267,7 +267,7 @@ impl NativeGateway {
 ///
 /// Returns the stable validation error naming `field` when the body does not
 /// match the contract, including any contract-level grammar violation.
-fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> {
+pub(crate) fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> {
     serde_json::from_str(json).map_err(|error| invalid(&error, field))
 }
 
@@ -276,7 +276,7 @@ fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> 
 /// # Errors
 ///
 /// Returns the stable validation error for a name outside the grammar.
-fn decode_name<T: DeserializeOwned>(name: String) -> Result<T, WyrdError> {
+pub(crate) fn decode_name<T: DeserializeOwned>(name: String) -> Result<T, WyrdError> {
     serde_json::from_value(serde_json::Value::String(name)).map_err(|error| invalid(&error, "name"))
 }
 

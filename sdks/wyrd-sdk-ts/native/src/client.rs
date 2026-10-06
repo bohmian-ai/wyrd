@@ -45,14 +45,6 @@ impl NativeWyrdClientResult {
     }
 }
 
-/// Builds one client without performing IO.
-///
-/// Omitted arguments resolve through `client_from_options`: the environment,
-/// then the saved `wyrd auth login` for this server (the one for `tenant`, a
-/// tenant route key, when given, otherwise the newest), then
-/// `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
-/// metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
-/// has saved logins but none for `tenant`.
 /// Closed result of reading one client's current bearer: a token or a catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeAccessTokenResult {
@@ -62,6 +54,14 @@ pub struct NativeAccessTokenResult {
     pub error: Option<NativeWyrdError>,
 }
 
+/// Builds one client without performing IO.
+///
+/// Omitted arguments resolve through `client_from_options`: the environment,
+/// then the saved `wyrd auth login` for this server (the one for `tenant`, a
+/// tenant route key, when given, otherwise the newest), then
+/// `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+/// metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
+/// has saved logins but none for `tenant`.
 #[napi]
 pub fn connect_wyrd_client(
     server_url: Option<String>,

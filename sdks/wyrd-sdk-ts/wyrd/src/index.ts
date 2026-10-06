@@ -8,6 +8,11 @@ import {
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
+import type {
+  CardRef,
+  RegisteredCard,
+  VerificationError,
+} from "./card-types.js";
 
 import type {
   NativeBifrostQueryStream,
@@ -19,10 +24,17 @@ import type {
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
+  cliApply,
+  cliDeleteProviderCredential,
+  cliGet,
+  cliIssueKey,
+  cliLoad,
+  cliPlan,
+  cliPutProviderCredential,
+  cliRevokeProviderCredential,
   connectBifrost,
   connectCards,
   connectOperatorConnections,
-  connectVerification,
   connectGateway,
   connectWyrdClient,
   describeTableConfig,
@@ -33,7 +45,6 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
-type NativeVerification = import("../index.cjs").NativeVerification;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
@@ -42,8 +53,17 @@ type NativeRun = import("../index.cjs").NativeRun;
 type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
+/**
+ * One positional SQL bind value: `params[i]` binds placeholder `$(i + 1)`.
+ *
+ * Values travel as typed data beside the SQL text and are never interpolated
+ * into it. A safe integer binds as an integer and any other number as a float.
+ */
+export type QueryParam = null | boolean | number | string;
+
 export interface BifrostQueryRequest {
   sql: string;
+  params?: readonly QueryParam[];
   deadlineMs?: number;
 }
 
@@ -174,6 +194,38 @@ export interface QueryTerminal {
 }
 
 export type { WyrdErrorCode } from "./error-codes.js";
+export type {
+  AgentSpec,
+  CardKind,
+  CardRef,
+  DataSpec,
+  DriftBaselineState,
+  DriftBaselineStatus,
+  Metadata as CardMetadata,
+  ModelSpec,
+  OperatorSpec,
+  PromptSpec,
+  RegisteredAgentCard,
+  RegisteredCard,
+  RegisteredDataCard,
+  RegisteredModelCard,
+  RegisteredOperatorCard,
+  RegisteredPromptCard,
+  RegisteredServiceCard,
+  RegisteredTriggerCard,
+  RegisteredUntypedCard,
+  RegisteredVerifierCard,
+  Relationships as CardRelationships,
+  ServiceSpec,
+  Status as CardStatus,
+  TriggerSpec,
+  TypedCardKind,
+  VerificationError,
+  VerificationStatus,
+  VerifierSpec,
+} from "./card-types.js";
+/** Every type generated from the `wyrd-spec` Card schema, including nested spec types. */
+export type * as CardTypes from "./card-types.js";
 
 export class WyrdError extends Error {
   readonly code: WyrdErrorCode;
@@ -329,8 +381,13 @@ export class BifrostQueryStream
   #terminal: QueryTerminal | undefined;
   #done = false;
 
-  constructor(native: NativeBifrostQueryStream) {
+  private constructor(native: NativeBifrostQueryStream) {
     this.#native = native;
+  }
+
+  /** @internal Wrap one native stream the Bifrost client started. */
+  static fromNative(native: NativeBifrostQueryStream): BifrostQueryStream {
+    return new BifrostQueryStream(native);
   }
 
   get terminal(): QueryTerminal | undefined {
@@ -459,6 +516,14 @@ function layoutJson(layout?: TableLayout): string | undefined {
   });
 }
 
+/** Optional physical declarations for {@link TableConfig.fromJsonSchema}. */
+export interface TableConfigOptions {
+  /** Physical layout to request; omitted, the server default layout applies. */
+  readonly layout?: TableLayout;
+  /** Explicit Forge compaction file target in bytes. */
+  readonly compactionTargetFileSizeBytes?: number;
+}
+
 /**
  * Anything that can describe itself as JSON Schema.
  *
@@ -505,33 +570,33 @@ export class TableConfig {
    * dependency of this SDK and any peer offering the same method works
    * unchanged.
    *
-   * `compactionTargetFileSizeBytes` pins the table's Forge compaction file
-   * target; omitted, the table follows the server's deployment default.
+   * `options.layout` requests the table's physical layout.
+   * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
+   * file target; omitted, the table follows the server's deployment default.
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *
-   * @throws when the resulting document does not map to an Arrow schema,
-   * declares a column the write path already owns, or the compaction target is
-   * not a non-negative integer.
+   * @throws {@link WyrdError} when the resulting document does not map to an
+   * Arrow schema, declares a column the write path already owns, or the
+   * compaction target is not a non-negative integer
+   * (`WYRD_SPEC_400_VALIDATION`).
    */
   static fromJsonSchema(
     table: string,
     schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
-    layout?: TableLayout,
-    compactionTargetFileSizeBytes?: number,
+    options: TableConfigOptions = {},
   ): TableConfig {
     const document =
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
         ? (schema as JsonSchemaSource).toJSONSchema()
         : schema;
-    return new TableConfig(
-      tableConfigFromJsonSchema(
-        table,
-        JSON.stringify(document),
-        layoutJson(layout),
-        compactionTargetFileSizeBytes,
-      ),
+    const declared = tableConfigFromJsonSchema(
+      table,
+      JSON.stringify(document),
+      layoutJson(options.layout),
+      options.compactionTargetFileSizeBytes,
     );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
   }
 
   /**
@@ -832,9 +897,10 @@ export class Bifrost {
    * Run one SQL SELECT over any authorized table and collect every batch.
    *
    * Drains {@link Bifrost.stream}, so the two cannot disagree about the rows a
-   * query returns or about the terminal frame each requires.
+   * query returns or about the terminal frame each requires. `params` bind
+   * the `$1..$n` placeholders in order and are never interpolated into SQL.
    */
-  async sql(query: string): Promise<QueryResult>;
+  async sql(query: string, params?: readonly QueryParam[]): Promise<QueryResult>;
   /**
    * Run one SQL SELECT and return each row parsed by `rows`.
    *
@@ -846,12 +912,17 @@ export class Bifrost {
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
    * partially valid result is never returned as success.
    */
-  async sql<T>(query: string, rows: RowSchema<T>): Promise<T[]>;
   async sql<T>(
     query: string,
+    params: readonly QueryParam[],
+    rows: RowSchema<T>,
+  ): Promise<T[]>;
+  async sql<T>(
+    query: string,
+    params?: readonly QueryParam[],
     rows?: RowSchema<T>,
   ): Promise<QueryResult | T[]> {
-    const stream = await this.stream({ sql: query });
+    const stream = await this.stream({ sql: query, params });
     const batches: RecordBatch[] = [];
     for await (const batch of stream) {
       batches.push(batch);
@@ -885,6 +956,18 @@ export class Bifrost {
     const nativeRequest: NativeQueryRequest = {
       sql: query.sql,
       deadlineMs: query.deadlineMs,
+      params: query.params?.map((value) => {
+        switch (typeof value) {
+          case "boolean":
+            return { kind: "boolean", bool: value };
+          case "number":
+            return { kind: "number", number: value };
+          case "string":
+            return { kind: "string", string: value };
+          default:
+            return { kind: value === null ? "null" : typeof value };
+        }
+      }),
     };
     const start = await this.#native.query(nativeRequest);
     const error = projectedError(start);
@@ -899,7 +982,7 @@ export class Bifrost {
         "native query startup returned neither a stream nor structured error",
       );
     }
-    return new BifrostQueryStream(native);
+    return BifrostQueryStream.fromNative(native);
   }
 
   /** Number of distinct table producers currently pooled. */
@@ -941,51 +1024,6 @@ export class Bifrost {
       await this.#native.describeTable(namespace, name),
     );
   }
-}
-
-/** Exact Card identity as returned by the registry. */
-export interface CardRef {
-  readonly kind: string;
-  readonly name: string;
-  readonly version: string;
-  readonly space?: string | null;
-  readonly uid?: string | null;
-}
-
-/** One Card envelope: `apiVersion`, `kind`, `metadata`, `spec`, and server-derived fields. */
-export interface Card {
-  readonly apiVersion: "wyrd/v1";
-  readonly kind: string;
-  readonly metadata: {
-    readonly name: string;
-    readonly version: string;
-    readonly space?: string;
-    readonly uid?: string;
-    readonly [key: string]: unknown;
-  };
-  readonly spec: Readonly<Record<string, unknown>>;
-  readonly status?: CardStatus | null;
-  readonly [key: string]: unknown;
-}
-
-/** Server-derived Card status; a registration request's own status is ignored. */
-export interface CardStatus {
-  readonly phase: string;
-  readonly message?: string | null;
-  readonly updated_at?: string | null;
-  readonly verification?: VerificationStatus | null;
-}
-
-/** Server-derived verification state of one Card version. */
-export interface VerificationStatus {
-  /** Stable UUIDv7 binding identities, ordered by identity; omitted when empty. */
-  readonly binding_ids?: readonly string[];
-  /** Fitted Drift baseline lifecycle of a Drift Verifier; omitted otherwise. */
-  readonly baseline?: {
-    readonly state: "pending" | "building" | "ready" | "failed";
-    readonly data: CardRef;
-    readonly error?: VerificationError;
-  };
 }
 
 /** Server outcome for one Card in a composite registration. */
@@ -1124,6 +1162,18 @@ export class WyrdClient {
   }
 
   /**
+   * Return a current bearer for this client's credential.
+   *
+   * Hand it to a third-party client, such as an OpenAI SDK pointed at the
+   * Gateway. The token is renewed in Rust when it nears expiry, so call this
+   * again rather than holding the value.
+   */
+  async accessToken(): Promise<string> {
+    const result = await this.#native.accessToken();
+    return nativeHandle(result.token, result.error);
+  }
+
+  /**
    * Return a client that acts for the holder of `subjectToken` (RFC 8693).
    *
    * This client's credential is the actor. The issued token's subject is the
@@ -1183,9 +1233,18 @@ export class Cards {
     );
   }
 
-  /** Fetch one Card envelope by exact reference. */
-  async get(ref: CardRef | string): Promise<Card> {
-    return lifecycleValue<Card>(await this.#native.get(cardRefText(ref)));
+  /**
+   * Fetch one registered Card envelope by exact reference.
+   *
+   * The envelope is discriminated by `kind`: `spec` and `status` are typed for
+   * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
+   * including a Drift Verifier's `status.verification.baseline` state. Other
+   * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
+   */
+  async get(ref: CardRef | string): Promise<RegisteredCard> {
+    return lifecycleValue<RegisteredCard>(
+      await this.#native.get(cardRefText(ref)),
+    );
   }
 
   /** List metadata-only Card summaries. */
@@ -1217,7 +1276,7 @@ export class Cards {
 
   /** Load registered Workflows through this registry client. */
   get workflow(): WorkflowCards {
-    return new WorkflowCards(this.#native);
+    return WorkflowCards.fromNative(this.#native);
   }
 }
 
@@ -1243,9 +1302,13 @@ export type WorkflowSelector =
 export class WorkflowCards {
   readonly #native: NativeCards;
 
-  /** @internal Built by {@link Cards.workflow}. */
-  constructor(native: NativeCards) {
+  private constructor(native: NativeCards) {
     this.#native = native;
+  }
+
+  /** @internal Built by {@link Cards.workflow}. */
+  static fromNative(native: NativeCards): WorkflowCards {
+    return new WorkflowCards(native);
   }
 
   /**
@@ -1268,7 +1331,7 @@ export class WorkflowCards {
    */
   async load(selector: WorkflowSelector): Promise<Workflow> {
     const loaded = await this.#native.loadWorkflow(JSON.stringify(selector));
-    return new Workflow(nativeHandle(loaded.workflow, loaded.error));
+    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
   }
 }
 
@@ -1359,9 +1422,13 @@ export interface WorkflowRun {
 export class Workflow {
   readonly #native: NativeWorkflow;
 
-  /** @internal Built by {@link Workflow.fromPath} or {@link WorkflowCards.load}. */
-  constructor(native: NativeWorkflow) {
+  private constructor(native: NativeWorkflow) {
     this.#native = native;
+  }
+
+  /** @internal Built by {@link Workflow.fromPath} or {@link WorkflowCards.load}. */
+  static fromNative(native: NativeWorkflow): Workflow {
+    return new Workflow(native);
   }
 
   /**
@@ -1382,7 +1449,7 @@ export class Workflow {
    */
   static async fromPath(path: string): Promise<Workflow> {
     const loaded = await loadWorkflowFromPath(path);
-    return new Workflow(nativeHandle(loaded.workflow, loaded.error));
+    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
   }
 
   /** Step IDs in declaration order. */
@@ -1403,96 +1470,10 @@ export class Workflow {
   }
 }
 
-/** What a manual run verifies: one projected binding, or one exact Verifier over one subject. */
-export type VerificationRunTarget =
-  | { readonly kind: "binding"; readonly binding_id: string }
-  | {
-      readonly kind: "verifier";
-      readonly verifier_uid: string;
-      readonly subject_card_uid: string;
-    };
-
-/** A manual Drift run request: its target and an RFC 3339 `[start, end)` window. */
-export interface StartVerificationRunRequest {
-  readonly target: VerificationRunTarget;
-  readonly input: {
-    readonly kind: "drift_window";
-    readonly start: string;
-    readonly end: string;
-  };
-}
-
-/** A structured run or dispatch failure. */
-export interface VerificationError {
-  readonly code: string;
-  readonly message: string;
-}
-
-/** One binding's exact identities, activity gate, readiness, and cursor. */
-export interface VerificationBindingStatus {
-  readonly binding_id: string;
-  readonly owner_card_uid: string;
-  readonly subject_card_uid: string;
-  readonly verifier_uid: string;
-  readonly active: boolean;
-  readonly readiness: "ready" | "baseline_not_ready" | "verifier_unavailable";
-  readonly next_run_at: string | null;
-  readonly last_activated_at: string | null;
-  readonly last_run_id: string | null;
-}
-
-/** One Operator dispatch a failed binding run produced. */
-export interface OperatorDispatchState {
-  readonly dispatch_id: string;
-  readonly operator: { readonly uid: string } | { readonly digest: string };
-  readonly status: "pending" | "running" | "retrying" | "delivered" | "failed";
-  readonly error: VerificationError | null;
-}
-
-/** One run's execution status, requester, result pointer, and dispatches. */
-export interface VerificationRunStatus {
-  readonly run_id: string;
-  readonly status:
-    | "pending"
-    | "running"
-    | "retrying"
-    | "completed"
-    | "cancelled"
-    | "timed_out"
-    | "errored";
-  readonly requested_by_principal_id: string | null;
-  readonly result_id: string | null;
-  readonly error: VerificationError | null;
-  readonly dispatches: readonly OperatorDispatchState[];
-}
-
-/** Supplied input one direct execution judges, in its wire shape. */
-export type DirectVerificationInput =
-  | {
-      readonly kind: "drift_samples";
-      /** Named columns; `null` marks a missing sample, which leaves Drift unscored. */
-      readonly columns: Readonly<Record<string, readonly (number | string | null)[]>>;
-    }
-  | {
-      readonly kind: "eval_record";
-      readonly context: Readonly<Record<string, unknown>>;
-      readonly media?: readonly {
-        readonly id: string;
-        readonly kind: "image" | "document";
-        readonly uri: string;
-        readonly media_type?: string;
-      }[];
-    };
-
-/** A direct execution: one exact Verifier judging supplied input about one subject. */
-export interface ExecuteVerificationRequest {
-  readonly verifier_uid: string;
-  readonly subject_card_uid: string;
-  readonly input: DirectVerificationInput;
-}
-
-/** The judgment of one direct execution, returned in the same response. */
-export interface ExecuteVerificationResponse {
+/** The judgment of one direct verification, returned by {@link Observe.verify}. */
+export interface Judgment {
+  /** Whether the expectations held: true only for a `passed` verdict. */
+  readonly passed: boolean;
   /** Transient identity found only in this response, the audit row, and the trace. */
   readonly execution_id: string;
   readonly verifier: CardRef;
@@ -1518,92 +1499,6 @@ export interface ExecuteVerificationResponse {
       };
   /** `{ drift: DriftReport }` or `{ eval: { results, skipped } }`. */
   readonly detail: { readonly drift: unknown } | { readonly eval: unknown };
-}
-
-/**
- * Tenant-scoped Verification control-plane client over the shared Rust handle.
- *
- * The server decides readiness, authorizes and audits each request, and
- * enqueues runs or judges supplied input inline; failures throw a structured
- * {@link WyrdError}. Binding IDs
- * come from a Card's `status.verification.binding_ids`; verdicts are read from
- * Bifrost by the run's `result_id`.
- */
-export class Verification {
-  readonly #native: NativeVerification;
-
-  private constructor(native: NativeVerification) {
-    this.#native = native;
-  }
-
-  /**
-   * Build a Verification client without performing IO.
-   *
-   * Omitted options resolve through the same chain as {@link Cards.connect}.
-   */
-  static connect(
-    options: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-      readonly tenant?: string;
-    } = {},
-  ): Verification {
-    const connection = connectVerification(
-      options.serverUrl,
-      options.credential,
-      options.tenant,
-    );
-    return new Verification(
-      nativeHandle(connection.verification, connection.error),
-    );
-  }
-
-  /** Read one binding's identities, activity, readiness, and cursor. */
-  async getBinding(bindingId: string): Promise<VerificationBindingStatus> {
-    return lifecycleValue<VerificationBindingStatus>(
-      await this.#native.getBinding(bindingId),
-    );
-  }
-
-  /**
-   * Durably enqueue one manual Drift run and return its run ID.
-   *
-   * Resolves once the run is enqueued, not finished; poll {@link getRun}. A
-   * retry with the same `idempotencyKey` and request returns the same run ID.
-   */
-  async startRun(
-    request: StartVerificationRunRequest,
-    options: { readonly idempotencyKey?: string } = {},
-  ): Promise<string> {
-    return lifecycleValue<{ readonly run_id: string }>(
-      await this.#native.startRun(
-        JSON.stringify(request),
-        options.idempotencyKey,
-      ),
-    ).run_id;
-  }
-
-  /**
-   * Judge supplied input with one exact Verifier and return its judgment.
-   *
-   * Nothing is enqueued, published, or dispatched, and a `failed` verdict
-   * resolves normally. The request is never replayed after an ambiguous
-   * transport failure, so a judge call is never silently repeated.
-   */
-  async execute(
-    request: ExecuteVerificationRequest,
-  ): Promise<ExecuteVerificationResponse> {
-    return lifecycleValue<ExecuteVerificationResponse>(
-      await this.#native.execute(JSON.stringify(request)),
-    );
-  }
-
-  /** Read one run's execution status, requester, result pointer, and dispatches. */
-  async getRun(runId: string): Promise<VerificationRunStatus> {
-    return lifecycleValue<VerificationRunStatus>(
-      await this.#native.getRun(runId),
-    );
-  }
 }
 
 /** The provider an Operator connection authenticates to. */
@@ -1956,7 +1851,8 @@ function mediaJson(media?: readonly EvalMediaRef[]): string | undefined {
 }
 
 /**
- * The three observation emits available on one scoped {@link Run}.
+ * The observation emits and the direct judgment available on one scoped
+ * {@link Run}.
  *
  * `drift` and `eval` are synchronous: their fixed tables were described at
  * {@link WyrdState.startBifrost}, so an emit only projects and enqueues.
@@ -1966,9 +1862,13 @@ function mediaJson(media?: readonly EvalMediaRef[]): string | undefined {
 export class Observe {
   readonly #native: NativeRun;
 
-  /** @internal Wrap the native run this surface emits through. */
-  constructor(native: NativeRun) {
+  private constructor(native: NativeRun) {
     this.#native = native;
+  }
+
+  /** @internal Wrap the native run this surface emits through. */
+  static fromNative(native: NativeRun): Observe {
+    return new Observe(native);
   }
 
   /**
@@ -2026,6 +1926,35 @@ export class Observe {
   async record(table: string, row: unknown): Promise<void> {
     lifecycleValue<null>(await this.#native.record(table, strictJson("row", row)));
   }
+
+  /**
+   * Judge this view's subject with a bound Verifier and return its judgment.
+   *
+   * `verifier` names a Verifier bound in `verified_by` to this view's subject.
+   * An Eval Verifier takes one context object plus optional media; a Drift
+   * Verifier takes an array of flat feature rows. A `failed` verdict resolves
+   * normally. Nothing is observed, recorded, enqueued, or dispatched, Bifrost
+   * need not be started, and the request is never replayed.
+   *
+   * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER` for an
+   * unbound Verifier and `WYRD_SDK_400_INVALID_OBSERVATION` for input of the
+   * wrong shape, both before any network IO, and otherwise the server's
+   * verification refusal.
+   */
+  async verify(
+    verifier: string,
+    input: unknown,
+    options: { readonly media?: readonly EvalMediaRef[] } = {},
+  ): Promise<Judgment> {
+    const judgment = lifecycleValue<Omit<Judgment, "passed">>(
+      await this.#native.verify(
+        verifier,
+        strictJson("input", input),
+        mediaJson(options.media),
+      ),
+    );
+    return { ...judgment, passed: judgment.verdict === "passed" };
+  }
 }
 
 /**
@@ -2053,14 +1982,17 @@ export class Run {
     return this.#native.runId;
   }
 
-  /** The exact `space/Kind/name@version` this view observes. */
-  get cardRef(): string {
-    return this.#native.cardRef;
+  /**
+   * The alias this view was opened with; {@link WyrdState.cardRef} returns
+   * its exact typed reference.
+   */
+  get alias(): string {
+    return this.#native.alias;
   }
 
   /** The emit surface for this view. */
   get observe(): Observe {
-    return new Observe(this.#native);
+    return Observe.fromNative(this.#native);
   }
 
   /**
@@ -2105,8 +2037,8 @@ export class WyrdState {
   }
 
   /** The stored Card envelope for an alias. */
-  card(alias: string): Card {
-    return lifecycleValue<Card>(this.#native.card(alias));
+  card(alias: string): RegisteredCard {
+    return lifecycleValue<RegisteredCard>(this.#native.card(alias));
   }
 
   /** The exact Card reference for an alias. */
@@ -2484,3 +2416,159 @@ export class Gateway {
     return lifecycleValue(await this.#native.capturePolicy());
   }
 }
+
+/** One loader diagnostic reported by {@link cli.plan}. */
+export interface PlanDiagnostic {
+  readonly code: string;
+  readonly status: number;
+  readonly severity: string;
+  readonly path: string;
+  readonly span?: unknown;
+  readonly message: string;
+  readonly remediation: string;
+  readonly details?: unknown;
+}
+
+/** Deterministic local registration plan printed by `wyrd plan --format json`. */
+export interface PlanReport {
+  readonly ok: boolean;
+  readonly cards: readonly {
+    readonly kind: string;
+    readonly space: string | null;
+    readonly name: string;
+    readonly version: string | null;
+  }[];
+  readonly diagnostics: readonly PlanDiagnostic[];
+}
+
+/** Result of `wyrd load --format json`. */
+export interface LoadOutput {
+  readonly card_ref: CardRef;
+  readonly materialized: boolean;
+}
+
+/** Card selector: a `uid` with `kind`, or `kind`, `space`, and `name`; `version` narrows either. */
+export interface CliCardSelector {
+  readonly kind?: string;
+  readonly space?: string;
+  readonly name?: string;
+  readonly version?: string;
+  readonly uid?: string;
+}
+
+/** Response of `wyrd auth issue-key`; `key` is the plaintext API key, returned exactly once. */
+export interface IssueKeyResponse {
+  readonly key_id: string;
+  readonly key: string;
+  readonly prefix: string;
+  readonly card_ref: CardRef;
+  readonly created_at: string;
+  readonly expires_at: string;
+}
+
+/** Provider credential submission for {@link cli.putProviderCredential}. */
+export interface ProviderCredentialWrite {
+  readonly name: string;
+  readonly provider: string;
+  readonly source:
+    | { readonly environment: { readonly binding: string } }
+    | {
+        readonly external_secret: {
+          readonly backend: string;
+          readonly reference: string;
+        };
+      }
+    | { readonly managed_secret: { readonly secret: string } };
+}
+
+/** Endpoint override shared by the networked {@link cli} commands. */
+export interface CliServerOptions {
+  /** Wyrd server base URL; the credential always comes from the ambient chain. */
+  readonly server?: string;
+}
+
+/**
+ * The `wyrd` CLI in process: the same Rust command implementation the
+ * installed `wyrd` executable runs.
+ *
+ * Each command takes its options as typed arguments, returns the value the
+ * command prints with `--format json`, and throws a {@link WyrdError} instead
+ * of exiting. Networked commands read their credential from the ambient chain
+ * (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+ * `credentials.toml`), never from an argument; `server` re-points only the
+ * endpoint.
+ */
+export const cli = {
+  /** Validate a local Card tree without contacting a server (`wyrd plan`). */
+  plan(path: string): PlanReport {
+    return lifecycleValue(cliPlan(path));
+  },
+
+  /** Register a local Card tree and return its receipt (`wyrd apply`). */
+  async apply(path: string, options: CliServerOptions = {}): Promise<RegistrationReceipt> {
+    return lifecycleValue(await cliApply(path, options.server));
+  },
+
+  /** Hydrate a Card's reachable graph into `outputDir` (`wyrd get`). */
+  async get(
+    selector: CliCardSelector,
+    outputDir: string,
+    options: CliServerOptions & { readonly metadataOnly?: boolean } = {},
+  ): Promise<HydrationSummary> {
+    return lifecycleValue(
+      await cliGet(selector, outputDir, options.metadataOnly, options.server),
+    );
+  },
+
+  /** Load one Card and materialize its artifacts (`wyrd load`). */
+  async load(
+    selector: CliCardSelector,
+    options: CliServerOptions & { readonly path?: string } = {},
+  ): Promise<LoadOutput> {
+    return lifecycleValue(await cliLoad(selector, options.path, options.server));
+  },
+
+  /** Issue an API key bound to one exact Card (`wyrd auth issue-key`). */
+  async issueKey(
+    card: {
+      readonly kind: string;
+      readonly name: string;
+      readonly version: string;
+      readonly space: string;
+      readonly label?: string;
+      readonly expiresInSeconds?: number;
+    },
+    options: CliServerOptions = {},
+  ): Promise<IssueKeyResponse> {
+    return lifecycleValue(await cliIssueKey(card, options.server));
+  },
+
+  /**
+   * Create or rotate a provider credential (`wyrd gateway credential put`).
+   * A rejected body is reported without quoting it; the view is redacted.
+   */
+  async putProviderCredential(
+    write: ProviderCredentialWrite,
+    options: CliServerOptions = {},
+  ): Promise<ProviderCredentialView> {
+    return lifecycleValue(
+      await cliPutProviderCredential(JSON.stringify(write), options.server),
+    );
+  },
+
+  /** Terminally revoke a provider credential (`wyrd gateway credential revoke`). */
+  async revokeProviderCredential(
+    name: string,
+    options: CliServerOptions = {},
+  ): Promise<ProviderCredentialView> {
+    return lifecycleValue(await cliRevokeProviderCredential(name, options.server));
+  },
+
+  /** Delete an unreferenced provider credential; an absent name succeeds. */
+  async deleteProviderCredential(
+    name: string,
+    options: CliServerOptions = {},
+  ): Promise<void> {
+    lifecycleValue<null>(await cliDeleteProviderCredential(name, options.server));
+  },
+};

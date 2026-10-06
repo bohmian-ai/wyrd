@@ -52,12 +52,12 @@ function journeyResource() {
   return resourceFromAttributes({ "service.name": SERVICE_NAME });
 }
 
-/** Publishes the acknowledged rows, then reads one canonical query back. */
+/** Commits the acknowledged rows, then reads one canonical query back. */
 async function readCanonical(
   server: NativeWyrdTestServer,
   sql: string,
 ): Promise<Table> {
-  server.waitForBifrostPublication();
+  server.flushBifrost();
   const client = await Bifrost.connect({
     serverUrl: server.baseUrl,
     credential: server.token,

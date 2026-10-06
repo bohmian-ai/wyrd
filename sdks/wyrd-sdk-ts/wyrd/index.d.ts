@@ -57,8 +57,9 @@ export declare class NativeBifrost {
    *
    * # Errors
    *
-   * Returns a napi error for an invalid card reference; no-active-table and
-   * queue-full refusals are returned in [`NativeLifecycleResult`].
+   * Returns a napi error only when the outcome cannot be encoded; an invalid
+   * card reference, no-active-table, and queue-full refusals are returned in
+   * [`NativeLifecycleResult`].
    */
   insert(row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
@@ -482,8 +483,8 @@ export declare class NativeQueryStart {
 export declare class NativeRun {
   /** The `UUIDv7` invocation identity this run and every view of it shares. */
   get runId(): string
-  /** The exact Card reference this view observes. */
-  get cardRef(): string
+  /** The alias this view was opened with. */
+  get alias(): string
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**
@@ -511,6 +512,21 @@ export declare class NativeRun {
    */
   eval(contextJson: string, sessionId?: string | undefined | null, mediaJson?: string | undefined | null, traceId?: string | undefined | null, spanId?: string | undefined | null): NativeLifecycleResult
   /**
+   * Judges this view's subject with a bound Verifier from JSON input.
+   *
+   * `input_json` is one Eval context object or one array of Drift feature
+   * rows; `media_json` is one JSON array of media descriptors. One server
+   * call, never replayed; nothing is observed, recorded, or dispatched.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; an
+   * unbound Verifier, input of the wrong shape, malformed media, and the
+   * server's verification refusals are returned in
+   * [`NativeLifecycleResult`].
+   */
+  verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null): Promise<NativeLifecycleResult>
+  /**
    * Emits one row into a registered `vala.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls
@@ -523,53 +539,6 @@ export declare class NativeRun {
    * returned in [`NativeLifecycleResult`].
    */
   record(table: string, rowJson: string): Promise<NativeLifecycleResult>
-}
-
-/** Tenant-scoped Verification handle over the shared `wyrd_client` handle. */
-export declare class NativeVerification {
-  /**
-   * Reads one binding's identities, activity, readiness, and cursor.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the status cannot be serialized; a
-   * malformed ID or server refusal is returned in the result.
-   */
-  getBinding(bindingId: string): Promise<NativeLifecycleResult>
-  /**
-   * Durably enqueues one manual Drift run and returns `{ run_id }`.
-   *
-   * `request_json` is one serialized `StartVerificationRunRequest`; a retry
-   * with the same `idempotency_key` and request returns the same run.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the response cannot be serialized; a
-   * malformed request or server refusal is returned in the result.
-   */
-  startRun(requestJson: string, idempotencyKey?: string | undefined | null): Promise<NativeLifecycleResult>
-  /**
-   * Judges supplied input with one exact Verifier and returns the judgment.
-   *
-   * `request_json` is one serialized `ExecuteVerificationRequest`, decoded
-   * by the shared wire owner so a malformed request carries the server's
-   * code. Nothing is enqueued; a `failed` verdict is a successful result.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the response cannot be serialized; a
-   * malformed request or server refusal is returned in the result.
-   */
-  execute(requestJson: string): Promise<NativeLifecycleResult>
-  /**
-   * Reads one run's status, requester, result pointer, and dispatches.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the status cannot be serialized; a
-   * malformed ID or server refusal is returned in the result.
-   */
-  getRun(runId: string): Promise<NativeLifecycleResult>
 }
 
 /** Runnable Workflow loaded from a file or from the registry. */
@@ -599,6 +568,14 @@ export declare class NativeWyrdClient {
    * was given, else the server URL's scheme and host on port `50051`.
    */
   get grpcUrl(): string
+  /**
+   * Returns a current bearer for this client's credential.
+   *
+   * Reads through the Rust client's shared auth middleware, so an expired
+   * token is renewed there; nothing is cached in Node. A refusal or
+   * transport failure is returned as catalog metadata.
+   */
+  accessToken(): Promise<NativeAccessTokenResult>
   /**
    * Returns a client that acts for the holder of `subject_token`.
    *
@@ -723,6 +700,94 @@ export declare class NativeWyrdState {
 }
 
 /**
+ * Registers a local Card tree and returns its receipt (`wyrd apply`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the receipt cannot be serialized; local,
+ * client, and server failures are returned in the result.
+ */
+export declare function cliApply(path: string, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Deletes one unreferenced provider credential; an absent name succeeds
+ * (`wyrd gateway credential delete`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the result cannot be serialized; an invalid
+ * name, client, or server failure is returned in the result.
+ */
+export declare function cliDeleteProviderCredential(name: string, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Hydrates a Card's reachable graph into `output_dir` (`wyrd get`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the summary cannot be serialized; selector,
+ * client, and server failures are returned in the result.
+ */
+export declare function cliGet(selector: NativeCardSelector, outputDir: string, metadataOnly?: boolean | undefined | null, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Issues an API key bound to one exact Card (`wyrd auth issue-key`).
+ *
+ * The result holds the plaintext key exactly once.
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the response cannot be serialized;
+ * coordinate, client, and server failures are returned in the result.
+ */
+export declare function cliIssueKey(options: NativeIssueKey, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Loads one Card and materializes its artifacts (`wyrd load`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the output cannot be serialized; selector,
+ * client, and server failures are returned in the result.
+ */
+export declare function cliLoad(selector: NativeCardSelector, path?: string | undefined | null, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Validates a local Card tree without contacting a server (`wyrd plan`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the plan cannot be serialized; a load
+ * failure is returned in the result.
+ */
+export declare function cliPlan(path: string): NativeLifecycleResult
+
+/**
+ * Creates or rotates one provider credential from its serialized body
+ * (`wyrd gateway credential put`).
+ *
+ * A decode failure quotes no part of the body, which may carry a provider
+ * key; the returned view is redacted.
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the view cannot be serialized; a malformed
+ * body, client, or server failure is returned in the result.
+ */
+export declare function cliPutProviderCredential(writeJson: string, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
+ * Terminally revokes one provider credential
+ * (`wyrd gateway credential revoke`).
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the view cannot be serialized; an invalid
+ * name, client, or server failure is returned in the result.
+ */
+export declare function cliRevokeProviderCredential(name: string, server?: string | undefined | null): Promise<NativeLifecycleResult>
+
+/**
  * Connects one Bifrost client, optionally already bound to a write target.
  *
  * A free function rather than a constructor because connecting is asynchronous
@@ -768,14 +833,6 @@ export declare function connectGateway(serverUrl?: string | undefined | null, cr
 export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeOperatorConnectionsConnection
 
 /**
- * Builds one Verification handle without performing IO.
- *
- * Omitted arguments resolve through the same shared client configuration
- * chain as `connectCards`, so every capability authenticates identically.
- */
-export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeVerificationConnection
-
-/**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
@@ -816,6 +873,14 @@ export declare function describeTableConfig(table: string, serverUrl?: string | 
  */
 export declare function loadWorkflowFromPath(path: string): Promise<NativeWorkflowLoad>
 
+/** Closed result of reading one client's current bearer: a token or a catalog error. */
+export interface NativeAccessTokenResult {
+  /** Current bearer when the auth path produced one. */
+  token?: string
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
 /** Closed result of connecting one Bifrost client: a handle or a catalog error. */
 export interface NativeBifrostConnection {
   /** Connected client when construction succeeded. */
@@ -830,6 +895,39 @@ export interface NativeCardsConnection {
   cards?: NativeCards
   /** Catalog failure when no credential resolves or the client cannot be built. */
   error?: NativeWyrdError
+}
+
+/**
+ * Card selector for `get` and `load`: a `uid` with `kind`, or `kind`,
+ * `space`, and `name`; `version` narrows either.
+ */
+export interface NativeCardSelector {
+  /** Card kind, such as `Model` or `Prompt`. */
+  kind?: string
+  /** Card space. */
+  space?: string
+  /** Card name. */
+  name?: string
+  /** Exact Card version. */
+  version?: string
+  /** Exact Card UID. */
+  uid?: string
+}
+
+/** Options for `issueKey`: the bound Card and the key's label and lifetime. */
+export interface NativeIssueKey {
+  /** Card kind, such as `Service` or `Agent`. */
+  kind: string
+  /** Card name. */
+  name: string
+  /** Exact Card version. */
+  version: string
+  /** Card space. */
+  space: string
+  /** Optional label stored with the key row. */
+  label?: string
+  /** Optional lifetime override in seconds. */
+  expiresInSeconds?: number
 }
 
 /** Structured native result for one live-query lifecycle control. */
@@ -858,6 +956,24 @@ export interface NativeOperatorConnectionsConnection {
   error?: NativeWyrdError
 }
 
+/**
+ * One JavaScript bind value, tagged by its JavaScript runtime type.
+ *
+ * The TypeScript facade sets `kind` to `"null"`, `"boolean"`, `"number"`, or
+ * `"string"` and fills the matching field; any other kind is refused by
+ * [`NativeQueryParam::into_param`] so the catalog error comes from Rust.
+ */
+export interface NativeQueryParam {
+  /** JavaScript runtime type of the value. */
+  kind: string
+  /** Value when `kind` is `"boolean"`. */
+  bool?: boolean
+  /** Value when `kind` is `"number"`. */
+  number?: number
+  /** Value when `kind` is `"string"`. */
+  string?: string
+}
+
 /** JavaScript query request projected onto the pure Wyrd contract. */
 export interface NativeQueryRequest {
   /** SELECT-only SQL text. */
@@ -870,6 +986,8 @@ export interface NativeQueryRequest {
    * napi binding error.
    */
   deadlineMs?: number
+  /** Ordered bind values for the `$1..$n` placeholders in `sql`. */
+  params?: Array<NativeQueryParam>
 }
 
 /** One raw native iterator step consumed by the TypeScript Arrow facade. */
@@ -935,14 +1053,6 @@ export interface NativeTableConfigResult {
   error?: NativeWyrdError
 }
 
-/** Closed result of building one Verification handle: a handle or a catalog error. */
-export interface NativeVerificationConnection {
-  /** Verification handle when construction succeeded. */
-  verification?: NativeVerification
-  /** Catalog failure when no credential resolves or the client cannot be built. */
-  error?: NativeWyrdError
-}
-
 /** Closed result of loading one Workflow: a handle or a catalog error. */
 export interface NativeWorkflowLoad {
   /** Workflow when loading succeeded. */
@@ -984,6 +1094,12 @@ export interface NativeWyrdError {
 export declare function openWyrdState(path: string): NativeWyrdState
 
 /**
+ * Runs the `wyrd` executable over `args` (argv including the program name)
+ * and resolves its process exit code.
+ */
+export declare function runWyrdCli(args: Array<string>): Promise<number>
+
+/**
  * Builds one table config from a JSON Schema document.
  *
  * This is the Zod (`z.toJSONSchema()`) door; the mapping is the same
@@ -992,9 +1108,10 @@ export declare function openWyrdState(path: string): NativeWyrdState
  *
  * # Errors
  *
- * Returns a napi error when the table is not `namespace.name`, the document is
- * not one mappable JSON Schema, a declared column is server-owned, the
- * layout is not one physical-layout declaration, or the compaction target is
- * not a non-negative integer.
+ * Returns a napi error only when the declared config cannot be encoded. A
+ * table that is not `namespace.name`, a document that is not one mappable
+ * JSON Schema, a server-owned column, a layout that is not one
+ * physical-layout declaration, or a compaction target that is not a
+ * non-negative integer is returned as catalog metadata.
  */
-export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null): NativeTableConfig
+export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null): NativeTableConfigResult

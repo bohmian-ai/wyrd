@@ -75,7 +75,14 @@ describe("Bifrost write journey", () => {
   it("reads as A but cannot write with B's authority through a delegated client", async () => {
     const server = startTestServer();
     try {
-      server.seedBifrostRows(server.tableFqn, [11, 12]);
+      const seeder = await connect(server);
+      await seeder.useTableByName(server.tableFqn);
+      for (const value of [11, 12]) {
+        seeder.insert({ value }, { cardRef: server.cardRef });
+      }
+      await seeder.flush();
+      await seeder.shutdown();
+      server.flushBifrost();
       const aKey = server.scopedApiKey("ts_delegation_a", ["bifrost_query:read"]);
       const bKey = server.scopedApiKey("ts_delegation_b", [
         "bifrost_query:read",
@@ -216,7 +223,7 @@ describe("Bifrost write journey", () => {
       bifrost.useTable(TableConfig.fromJsonSchema(server.tableFqn, SCHEMA));
       expect(() =>
         bifrost.insert({ value: 82 }, { cardRef: "not-a-ref" }),
-      ).toThrow(/invalid cardRef/);
+      ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
       await bifrost.shutdown();
     } finally {
       server.shutdown();
@@ -231,7 +238,7 @@ describe("Bifrost write journey", () => {
       const register = async (bytes?: number) => {
         const bifrost = await connect(
           server,
-          TableConfig.fromJsonSchema(fqn, SCHEMA, undefined, bytes),
+          TableConfig.fromJsonSchema(fqn, SCHEMA, { compactionTargetFileSizeBytes: bytes }),
         );
         try {
           return await bifrost.register();
@@ -480,14 +487,14 @@ describe("Bifrost analytical read journey", () => {
       const select = `SELECT model, latency_ms FROM ${facts} ORDER BY call_id`;
       const raw = await reader.sql(select);
       expect(raw.numRows).toBe(INFERENCES.length);
-      const rows = await reader.sql(select, Row);
+      const rows = await reader.sql(select, [], Row);
       expect(rows).toEqual(
         INFERENCES.map(({ model, latency_ms }) => ({ model, latency_ms })),
       );
 
       // A row that does not fit fails the whole read.
       await expect(
-        reader.sql(select, z.object({ model: z.number() })),
+        reader.sql(select, [], z.object({ model: z.number() })),
       ).rejects.toThrow();
     } finally {
       server.shutdown();

@@ -8,8 +8,8 @@ import { startTestServer } from "@wyrd/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
-  type Card,
   type CardRef,
+  type RegisteredCard,
   Cards,
   Gateway,
   type RegistrationReceipt,
@@ -147,9 +147,8 @@ function ref(registered: Record<string, CardRef>, name: string): CardRef {
 }
 
 /** Server-derived outbound relationship targets of a Card envelope, by name. */
-function outbound(card: Card): CardRef[] {
-  const relationships = card.relationships as { outbound_refs: { ref: CardRef }[] };
-  return relationships.outbound_refs
+function outbound(card: RegisteredCard): CardRef[] {
+  return (card.relationships?.outbound_refs ?? [])
     .map((relationship) => relationship.ref)
     .sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -258,6 +257,7 @@ describe("Workflow loading", () => {
         ref(applied, name),
       );
       const stored = await reader.get(ref(applied, "code-review"));
+      if (stored.kind !== "Workflow") throw new Error(`expected a Workflow, got ${stored.kind}`);
       const steps = stored.spec["steps"] as { action: { target: unknown } }[];
       expect(steps.map((step) => step.action.target)).toEqual(agents);
       expect(outbound(stored)).toEqual(byName(agents));
@@ -267,7 +267,8 @@ describe("Workflow loading", () => {
         ["final-reviewer", "final-review-prompt"],
       ] as const) {
         const storedAgent = await reader.get(ref(applied, agent));
-        expect(storedAgent.spec["prompt"], agent).toEqual(ref(applied, prompt));
+        if (storedAgent.kind !== "Agent") throw new Error(`expected an Agent, got ${storedAgent.kind}`);
+        expect(storedAgent.spec.prompt, agent).toEqual(ref(applied, prompt));
         expect(outbound(storedAgent), agent).toEqual([ref(applied, prompt)]);
       }
 

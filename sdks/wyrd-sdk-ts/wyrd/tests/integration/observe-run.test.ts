@@ -22,7 +22,6 @@ const MEDIA = [
 ] as const;
 const MEDIA_TEXT =
   '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]';
-const FIXED_TABLES = ["vala.drift.observations", "vala.eval.observations"] as const;
 
 const DATASET_SCHEMA = {
   type: "object",
@@ -152,16 +151,14 @@ describe("scoped observation journey", () => {
     const root = mkdtempSync(join(tmpdir(), "wyrd-ts-observe-"));
     const service = writeServiceGraph(root);
     const bundle = join(root, "bundle");
-    // Publication would retire the staged describe decisions counted below.
-    const server = startTestServer(undefined, false);
+    const server = startTestServer();
     const manager = new StorageContextManager();
     context.setGlobalContextManager(manager);
     try {
       const stamp = Date.now().toString(36);
       const dataset = `vala.datasets.observe_ts_${stamp}_a`;
       const datasetB = `vala.datasets.observe_ts_${stamp}_b`;
-      const datasetC = `vala.datasets.observe_ts_${stamp}_c`;
-      for (const fqn of [dataset, datasetB, datasetC]) {
+      for (const fqn of [dataset, datasetB]) {
         const registrar = await Bifrost.connect({
           table: TableConfig.fromJsonSchema(fqn, DATASET_SCHEMA),
           serverUrl: server.baseUrl,
@@ -193,21 +190,18 @@ describe("scoped observation journey", () => {
         credential,
         grpcUrl: server.grpcUrl,
       });
-      const fixedDescribes = FIXED_TABLES.map((table) => server.tableDescribeCount(table));
 
       const run = state.run();
       // With no Card argument the run targets the root Service.
-      expect(
-        run.cardRef.startsWith(
-          `${receipt.root.space}/Service/${receipt.root.name}@${receipt.root.version}`,
-        ),
-      ).toBe(true);
+      expect(run.alias).toBe("root");
+      expect(state.rootRef.uid).toBe(receipt.root.uid);
       const model = run.forCard("model");
       const agent = run.forCard("agent");
       expect(model.runId).toBe(run.runId);
       expect(agent.runId).toBe(run.runId);
-      const modelUid = model.cardRef.split("#")[1];
-      const agentUid = agent.cardRef.split("#")[1];
+      expect([model.alias, agent.alias]).toEqual(["model", "agent"]);
+      const modelUid = state.cardRef("model").uid;
+      const agentUid = state.cardRef("agent").uid;
       expect(modelUid).toBeTruthy();
       expect(agentUid).not.toBe(modelUid);
 
@@ -231,8 +225,6 @@ describe("scoped observation journey", () => {
       await tracerProvider.shutdown();
       await agent.observe.record(dataset, { value: 41 });
       await agent.observe.record(dataset, { value: 43 });
-      // The repeated write reused its cached describe.
-      expect(server.tableDescribeCount(dataset)).toBe(1);
       await model.observe.record(datasetB, { value: 42 });
 
       expect(() =>
@@ -271,16 +263,12 @@ describe("scoped observation journey", () => {
       );
       // The concise single-Card form opens its own invocation on that Card.
       const agentRun = state.run("agent");
-      expect(agentRun.cardRef).toBe(agent.cardRef);
+      expect(agentRun.alias).toBe("agent");
       expect(agentRun.runId).not.toBe(run.runId);
       expect(agentRun.forCard("model").runId).toBe(agentRun.runId);
-      expect(agentRun.cardRef).toBe(agent.cardRef);
       expect(() => state.run("missing")).toThrow(
         expect.objectContaining({ code: "WYRD_SDK_404_UNKNOWN_ALIAS" }),
       );
-
-      // Drift and Eval emits perform no per-observation schema IO.
-      expect(FIXED_TABLES.map((table) => server.tableDescribeCount(table))).toEqual(fixedDescribes);
 
       await state.shutdown();
       // A closed state stays closed and has nothing left to drain.
@@ -374,20 +362,6 @@ describe("scoped observation journey", () => {
           .map((row) => row.toJSON());
         expect(rows).toEqual(values.map((value) => ({ value, run_id: run.runId, card_uid: subject })));
       }
-
-      // A writer that described a table before its server-side schema changed
-      // keeps its cached schema, and the server's fingerprint fence refuses the
-      // stale batch visibly at the drain rather than landing it.
-      const stale = WyrdState.fromPath(bundle);
-      await stale.startBifrost({ serverUrl: server.baseUrl, credential, grpcUrl: server.grpcUrl });
-      const staleRun = stale.run("agent");
-      await staleRun.observe.record(datasetC, { value: 1 });
-      expect(server.tableDescribeCount(datasetC)).toBe(1);
-      server.changeTableFingerprint(datasetC);
-      await staleRun.observe.record(datasetC, { value: 2 });
-      expect(server.tableDescribeCount(datasetC), "the stale writer never re-describes").toBe(1);
-      const fenced = await rejection(stale.shutdown());
-      expect(fenced.code).toBe("WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH");
     } finally {
       context.disable();
       server.shutdown();

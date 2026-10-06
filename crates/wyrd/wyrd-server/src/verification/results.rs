@@ -22,7 +22,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Error as JsonError;
+use serde_json::{Error as JsonError, Value};
 use vala_bifrost_redux::tables::verification::{DRIFT_REPORT, EVAL_SUMMARY, ResultsTable};
 use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable};
 use vala_drift::{DriftReport, DriftVerdict};
@@ -590,9 +590,9 @@ struct EvalItem<'a> {
     /// Whether an executed task passed.
     passed: Option<bool>,
     /// The captured actual value; a captured null is `Some(Value::Null)`.
-    actual: Option<serde_json::Value>,
+    actual: Option<Value>,
     /// The expected value.
-    expected: Option<serde_json::Value>,
+    expected: Option<Value>,
     /// Canonical JSON of the comparison operator.
     operator: Option<String>,
     /// Executed task's message.
@@ -671,7 +671,7 @@ impl<'a> EvalItem<'a> {
 
 /// Encode `value` as canonical (RFC 8785) JSON.
 ///
-/// Routes through [`serde_json::Value`] first so a non-finite float, which
+/// Routes through [`Value`] first so a non-finite float, which
 /// canonical JSON cannot represent, becomes `null` instead of failing.
 ///
 /// # Errors
@@ -704,7 +704,7 @@ fn drift_report(report: Option<&DriftReport>) -> Result<ArrayRef, ResultPayloadE
         // The children are non-nullable, so a null report holds placeholder
         // values under its null parent rather than child nulls.
         None => {
-            let placeholder = EncodedVariant::from_json(&serde_json::Value::Null)
+            let placeholder = EncodedVariant::from_json(&Value::Null)
                 .map_err(|violation| violation.into_error(DRIFT_REPORT, 0))?;
             features.append(&placeholder);
             (Some(String::new()), Some(String::new()))
@@ -757,7 +757,7 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError>
 /// value exceeds a Variant limit.
 fn variants<'v>(
     column: &str,
-    values: impl ExactSizeIterator<Item = Option<&'v serde_json::Value>>,
+    values: impl ExactSizeIterator<Item = Option<&'v Value>>,
 ) -> Result<ArrayRef, ResultPayloadError> {
     let mut builder = VariantColumnBuilder::with_capacity(values.len());
     for (row, value) in values.enumerate() {
@@ -944,7 +944,7 @@ mod tests {
     ///
     /// # Panics
     /// Panics when the column is absent or the cell is not a valid Variant.
-    fn variant_cell(batch: &RecordBatch, column: &str, row: usize) -> serde_json::Value {
+    fn variant_cell(batch: &RecordBatch, column: &str, row: usize) -> Value {
         let array = batch
             .column_by_name(column)
             .unwrap_or_else(|| panic!("{column} column exists"));
@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!(cell(&report, "method", 0).as_deref(), Some("Psi"));
         assert_eq!(cell(&report, "verdict", 0).as_deref(), Some("Drift"));
         let features = variant_cell(&report, "features", 0);
-        assert_eq!(features["tokens"]["score"], serde_json::Value::Null);
+        assert_eq!(features["tokens"]["score"], Value::Null);
         assert_eq!(features["latency"]["verdict"], "Drift");
     }
 
@@ -1095,7 +1095,7 @@ mod tests {
                 TaskRunOutcome::Ran(Box::new(AssertionResult {
                     task_id: task("exact"),
                     passed: true,
-                    actual: Some(serde_json::Value::Null),
+                    actual: Some(Value::Null),
                     expected: serde_json::json!({"b": 2, "a": 1}),
                     operator: ComparisonOperator::Equals,
                     message: None,
@@ -1126,7 +1126,7 @@ mod tests {
         let items = &payload.batches()[0].batch;
         assert_eq!(cell(items, "outcome_kind", 0).as_deref(), Some("ran"));
         assert!(items.column_by_name("actual").expect("actual").is_valid(0));
-        assert_eq!(variant_cell(items, "actual", 0), serde_json::Value::Null);
+        assert_eq!(variant_cell(items, "actual", 0), Value::Null);
         assert_eq!(
             variant_cell(items, "expected", 0),
             serde_json::json!({"a": 1, "b": 2})

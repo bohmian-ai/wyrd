@@ -20,6 +20,7 @@ mod pg_tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
+    use serde_json::Value;
     use tokio::sync::Notify;
     use tokio::task::JoinHandle;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
@@ -2698,9 +2699,9 @@ mod pg_tests {
         /// `resource_attributes ->> 'service.name'`: a second Variant column.
         service: String,
         /// `attributes -> 'absent'`: an absent key is SQL null.
-        absent: Option<serde_json::Value>,
+        absent: Option<Value>,
         /// The whole `attributes` Variant column as its JSON object.
-        attributes: serde_json::Value,
+        attributes: Value,
         /// `events[1]['name']`: a Struct child read by exact field access.
         event_name: String,
         /// `events[1]['attributes'] ->> 'gen_ai.finish_reason'`: a Variant
@@ -2708,9 +2709,9 @@ mod pg_tests {
         finish_reason: String,
         /// A parsed JSON literal holding an integer beyond 2^53 and
         /// `u64::MAX`, which must both read back exactly.
-        parsed: serde_json::Value,
+        parsed: Value,
         /// `try_parse_json` over invalid JSON: null rather than an error.
-        lenient: Option<serde_json::Value>,
+        lenient: Option<Value>,
     }
 
     /// Built-in Variant and Struct payloads are queryable through the SDK.

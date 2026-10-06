@@ -21,7 +21,7 @@ use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
 
 use super::live::LiveDispatch;
-use super::{DegradedSourceAccumulator, OracleMemoryResources, OracleTelemetry};
+use super::{DegradedSourceAccumulator, OracleMemoryResources, OracleTelemetry, QueryCatalogError};
 
 /// Complete planned authority of one physical remote-scan occurrence.
 ///
@@ -138,9 +138,7 @@ impl OracleExecutionGrant {
         if self.deadline <= Utc::now() {
             return Err(DataFusionError::Context(
                 "Oracle query deadline elapsed before row IO".to_owned(),
-                Box::new(DataFusionError::External(Box::new(
-                    BifrostError::QueryTimeout,
-                ))),
+                Box::new(QueryCatalogError::external(BifrostError::QueryTimeout)),
             ));
         }
         Ok(())

@@ -6,6 +6,7 @@
 use arrow_schema::DataType;
 use chrono::Utc;
 use opentelemetry::trace::TraceContextExt;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wyrd_queue::variant::variant_storage_type;
@@ -185,7 +186,7 @@ pub(crate) fn row(record: &EvalRecordObservation) -> Result<Vec<u8>, WyrdError> 
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` when the value is not
 /// serializable as JSON.
-fn json_value<T: serde::Serialize>(value: &T, field: &str) -> Result<Value, WyrdError> {
+fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, WyrdError> {
     serde_json::to_value(value).map_err(|error| {
         invalid_observation(
             "eval observation field is not serializable as JSON",

@@ -1628,6 +1628,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
+    use datafusion::error::DataFusionError;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
@@ -1651,7 +1652,6 @@ mod tests {
     /// Panics when the typed chain is not selected before message text.
     #[test]
     fn late_resource_exhaustion_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "tenant invariant".to_owned(),
             Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),
@@ -1675,7 +1675,6 @@ mod tests {
     /// Panics when the late mapping or terminal loses the catalog identity.
     #[test]
     fn late_catalog_error_keeps_its_identity() {
-        use datafusion::error::DataFusionError;
         let error = BifrostError::VariantInvalidJson {
             field: "parse_json".to_owned(),
             row: 1,
@@ -1711,7 +1710,6 @@ mod tests {
     /// Panics when the typed deadline is not selected.
     #[test]
     fn late_query_deadline_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "Oracle query deadline elapsed during a live Scribe read".to_owned(),
             Box::new(DataFusionError::External(Box::new(

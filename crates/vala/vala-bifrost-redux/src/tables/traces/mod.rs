@@ -21,6 +21,7 @@ mod tests {
         AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
     };
     use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::span::Event;
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
 
     use super::spans::SPAN_FIELDS;
@@ -81,8 +82,8 @@ mod tests {
     /// The span event whose `exception.*` attributes the span promotes.
     ///
     /// Its stack trace is deliberately not a string, so the promotion is null.
-    fn exception_event() -> span::Event {
-        span::Event {
+    fn exception_event() -> Event {
+        Event {
             time_unix_nano: 1_700_000_000_000_000_300,
             name: "exception".to_owned(),
             attributes: vec![

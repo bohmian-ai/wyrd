@@ -1124,7 +1124,7 @@ pub(crate) fn fixed_row_bytes(fields: &Fields) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value as JsonValue, json};
     use wyrd_queue::variant::variant_bytes_to_json;
     use wyrd_spec::vala::api::VARIANT_MAX_DEPTH;
     use wyrd_tonic::otlp::common::v1::{ArrayValue, KeyValueList};
@@ -1142,7 +1142,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the bytes are not a valid Variant.
-    fn json_of(encoded: &EncodedVariant) -> serde_json::Value {
+    fn json_of(encoded: &EncodedVariant) -> JsonValue {
         variant_bytes_to_json(encoded.metadata(), encoded.value()).expect("valid Variant")
     }
 

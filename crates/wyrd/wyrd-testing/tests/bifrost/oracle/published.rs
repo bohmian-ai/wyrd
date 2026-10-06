@@ -11,6 +11,7 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ use wyrd_client::WyrdClient;
 use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -1302,8 +1304,8 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
 async fn prove_late_failures(
     cluster: &PeerCluster,
     client: &WyrdClient,
-    suffix: &impl std::fmt::Display,
-    invalid_json: &wyrd_spec::error::WyrdProblem,
+    suffix: &impl Display,
+    invalid_json: &WyrdProblem,
 ) -> Result<(), JourneyError> {
     let interactive = format!("variant_late_one_{suffix}");
     cluster.register_table(PEER_SCRIBE, &interactive).await?;

@@ -2,7 +2,7 @@
 
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError};
 use wyrd_runtime::{Action, Permission, PermissionDenyReason, PermissionVerdict, Resource};
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditOutcome, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse, RunningQuerySummary,
@@ -369,7 +369,7 @@ pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
 /// The terminal holds the same problem the server returns before a stream
 /// starts, so typed adapters rebuild it through the client's reconstruction;
 /// a terminal with no problem is a generic execution failure.
-pub(crate) fn terminal_error(problem: Option<&wyrd_spec::error::WyrdProblem>) -> WyrdError {
+pub(crate) fn terminal_error(problem: Option<&WyrdProblem>) -> WyrdError {
     problem.map_or_else(
         || wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
         wyrd_client::error::from_problem,

@@ -7,6 +7,7 @@
 use bindings::OracleExecutionLock;
 use datafusion::prelude::SessionConfig;
 use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2532,7 +2533,7 @@ impl Oracle {
             let Err(error) = item else {
                 return;
             };
-            if !is_tenant_refusal(error) {
+            if QueryCatalogError::find(error) != Some(BifrostError::QueryTenantInvariant) {
                 return;
             }
             let Some(query) = context.take() else {
@@ -4235,62 +4236,75 @@ fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
 /// mapping, so a query reports the same catalog error whichever row fails.
 /// A typed resource refusal anywhere in the chain is execution-memory
 /// exhaustion, never admission or queue overload; otherwise the catalog error
-/// the failure carries is returned unchanged, and only a failure with no
-/// catalog identity is classified from its message.
+/// [`QueryCatalogError::find`] reconstructs is returned unchanged, and a
+/// failure with no catalog identity is a generic execution failure.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
     if datafusion_resources_exhausted(error) {
         return BifrostError::QueryResourcesExhausted;
     }
-    if let Some(catalog) = catalog_query_error(error) {
-        return catalog;
+    QueryCatalogError::find(error).unwrap_or(BifrostError::QueryExecutionFailed)
+}
+
+/// A catalogued [`BifrostError`] raised inside query execution.
+///
+/// Distributed execution forwards an external error between peers as its
+/// `Display` text only, so this envelope renders the error's tagged serde
+/// form. Every execution site that fails with a catalogued error raises it
+/// through [`Self::external`], and [`Self::find`] reads it back on the
+/// coordinator, so a worker failure keeps the same code and details as a
+/// local one. Locally the typed error also stays reachable as `source`.
+#[derive(Debug)]
+pub(crate) struct QueryCatalogError(BifrostError);
+
+impl QueryCatalogError {
+    /// Wraps `error` as the external `DataFusion` error execution raises.
+    pub(crate) fn external(error: BifrostError) -> DataFusionError {
+        DataFusionError::External(Box::new(Self(error)))
     }
-    let message = error.to_string().to_ascii_lowercase();
-    if is_tenant_refusal(error) {
-        BifrostError::QueryTenantInvariant
-    } else if message.contains("reconciliation invariant") {
-        BifrostError::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        BifrostError::QueryAuditUnavailable
-    } else {
-        BifrostError::QueryExecutionFailed
+
+    /// Returns the catalogued error `error` carries, if any.
+    ///
+    /// Walks the source chain: a local chain holds the typed error, while a
+    /// worker's failure arrives as an external error whose text is this
+    /// envelope's tagged serde form. Any other external text, malformed or
+    /// not, carries no catalog identity.
+    pub(crate) fn find(error: &(dyn Error + 'static)) -> Option<BifrostError> {
+        let mut source = Some(error);
+        while let Some(current) = source {
+            if let Some(found) = current.downcast_ref::<BifrostError>() {
+                return Some(found.clone());
+            }
+            if let Some(DataFusionError::External(external)) =
+                current.downcast_ref::<DataFusionError>()
+                && let Ok(found) = serde_json::from_str::<BifrostError>(&external.to_string())
+            {
+                return Some(found);
+            }
+            source = current.source();
+        }
+        None
     }
 }
 
-/// Returns the catalog error a query failure carries, if any.
-///
-/// Locally the typed [`BifrostError`] is in the source chain: a query
-/// deadline, a tenant refusal, or the Variant failure `parse_json` raises.
-/// From an Analytical worker only the forwarded text of a
-/// [`variant_sql::VariantQueryError`] arrives, which is the error's tagged
-/// serde form. Either way the caller sees the stable code and details rather
-/// than a generic execution failure.
-fn catalog_query_error(error: &DataFusionError) -> Option<BifrostError> {
-    let mut source: Option<&(dyn Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if let Some(found) = current.downcast_ref::<BifrostError>() {
-            return Some(found.clone());
-        }
-        if let Some(found) = variant_sql::VariantQueryError::decode(&current.to_string()) {
-            return Some(found);
-        }
-        source = current.source();
+impl Display for QueryCatalogError {
+    /// Writes the error's tagged serde form, the text peers forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`fmt::Error`] when the formatter fails or the error does not
+    /// serialize, which its plain string and integer fields never cause.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let tagged = serde_json::to_string(&self.0).map_err(|_| fmt::Error)?;
+        formatter.write_str(&tagged)
     }
-    None
 }
 
-/// Reports whether an execution error is a footer-tenant refusal.
-///
-/// A local refusal carries the typed [`BifrostError::QueryTenantInvariant`] in
-/// its chain. A follower's refusal arrives as a transport error whose message
-/// is all that survives the wire, so the stable message fragment is accepted
-/// as well.
-pub(super) fn is_tenant_refusal(error: &DataFusionError) -> bool {
-    exec::is_tenant_invariant_error(error)
-        || error
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("tenant invariant")
+impl Error for QueryCatalogError {
+    /// Exposes the typed error so a local caller can downcast it directly.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 /// Reports whether any typed `DataFusion` source in an execution error chain is
@@ -4497,78 +4511,63 @@ mod tests {
         .expect("the fixture principal forms a query context")
     }
 
-    /// A Variant error keeps its code and fields locally and across peers.
+    /// A catalogued error keeps its code and fields locally and across peers.
     ///
     /// Locally the typed error is in the source chain. A peer forwards only
-    /// the carrier's text, its tagged serde form, wrapped the way the leader
-    /// receives it; both must map back to the sent error without reading its
-    /// human `Display`. Unrelated, malformed, and non-Variant catalogued text
+    /// the envelope's text, its tagged serde form, re-wrapped as a generic
+    /// external error under the worker's context the way the coordinator
+    /// receives it; a Variant and a non-Variant error must both map back to
+    /// the sent error. Human wording, malformed, and unknown tagged text
     /// stays a generic failure.
     ///
     /// # Panics
     ///
-    /// Panics when a Variant error does not survive either path or other text
-    /// is mistaken for one.
+    /// Panics when a catalogued error does not survive either path or other
+    /// text is mistaken for one.
     #[test]
-    fn variant_errors_keep_their_catalog_identity_locally_and_remotely() {
-        let field = "parse_json".to_owned();
+    fn catalog_errors_keep_their_identity_locally_and_remotely() {
+        let variant = BifrostError::VariantTooDeep {
+            field: "parse_json".to_owned(),
+            row: 2,
+            path: "/x/0".to_owned(),
+            depth: 65,
+            limit: 64,
+        };
         for sent in [
-            BifrostError::VariantInvalidJson {
-                field: field.clone(),
-                row: 3,
-                path: "/a at b".to_owned(),
-            },
-            BifrostError::VariantInvalidJson {
-                field: field.clone(),
-                row: 0,
-                path: String::new(),
-            },
-            BifrostError::VariantNumericOutOfRange {
-                field: field.clone(),
-                row: 1,
-                path: "/n".to_owned(),
-                numeric_kind: "integer".to_owned(),
-            },
-            BifrostError::VariantTooDeep {
-                field: field.clone(),
-                row: 2,
-                path: "/x/0".to_owned(),
-                depth: 65,
-                limit: 64,
-            },
-            BifrostError::VariantTooLarge {
-                field: field.clone(),
-                row: 4,
-                bytes: 9_000_000,
-                limit: 8_388_608,
-            },
+            variant.clone(),
+            BifrostError::QueryTenantInvariant,
+            BifrostError::QueryForbidden,
         ] {
-            let local = DataFusionError::External(Box::new(sent.clone()));
+            let raised = QueryCatalogError::external(sent.clone());
+            let local = DataFusionError::Context("late batch".to_owned(), Box::new(raised));
             assert_eq!(map_datafusion_error(&local), sent);
-            let forwarded = serde_json::to_string(&sent).expect("a Variant error serializes");
+            let DataFusionError::Context(_, raised) = local else {
+                unreachable!("the fixture is a context wrapper");
+            };
+            let DataFusionError::External(envelope) = *raised else {
+                unreachable!("the envelope is an external error");
+            };
             let received = DataFusionError::Context(
                 "remote stage".to_owned(),
-                Box::new(DataFusionError::External(forwarded.into())),
+                Box::new(DataFusionError::Context(
+                    "late batch".to_owned(),
+                    Box::new(DataFusionError::External(envelope.to_string().into())),
+                )),
             );
             assert_eq!(map_datafusion_error(&received), sent);
         }
-        let other_catalogued =
-            serde_json::to_string(&BifrostError::QueryForbidden).expect("serializes");
         for unrelated in [
-            BifrostError::VariantTooDeep {
-                field,
-                row: 2,
-                path: "/x/0".to_owned(),
-                depth: 65,
-                limit: 64,
-            }
-            .to_string(),
-            "Variant value in field x".to_owned(),
+            variant.to_string(),
+            BifrostError::QueryTenantInvariant.to_string(),
+            "tenant invariant".to_owned(),
             r#"{"variant":"variant_too_deep","data":{"field":"x"}}"#.to_owned(),
-            other_catalogued,
+            r#"{"variant":"not_a_catalog_error"}"#.to_owned(),
         ] {
             assert_eq!(
-                map_datafusion_error(&DataFusionError::External(unrelated.into())),
+                map_datafusion_error(&DataFusionError::Context(
+                    "remote stage".to_owned(),
+                    Box::new(DataFusionError::External(unrelated.into())),
+                )),
                 BifrostError::QueryExecutionFailed
             );
         }
@@ -4926,20 +4925,6 @@ mod tests {
             map_datafusion_error(&DataFusionError::Plan("private".to_owned())),
             BifrostError::QueryExecutionFailed
         );
-        for (context, expected) in [
-            ("tenant invariant", BifrostError::QueryTenantInvariant),
-            (
-                "reconciliation invariant",
-                BifrostError::QueryReconciliationInvariant,
-            ),
-            ("audit unavailable", BifrostError::QueryAuditUnavailable),
-        ] {
-            let error = DataFusionError::Context(
-                context.to_owned(),
-                Box::new(DataFusionError::Internal("private".to_owned())),
-            );
-            assert_eq!(map_query_planning_error(&error), expected);
-        }
         let exhausted = DataFusionError::Context(
             "private".to_owned(),
             Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),

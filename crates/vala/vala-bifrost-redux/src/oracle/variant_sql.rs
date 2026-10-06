@@ -23,8 +23,6 @@
 //! owner and why [`ORACLE_VARIANT_SQL_VERSION`] is bound into the plan and
 //! stage digests peers verify before decoding.
 
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, StructArray};
@@ -50,8 +48,8 @@ use wyrd_queue::variant::{
     EncodedVariant, VariantColumnBuilder, VariantViolation, is_placeholder, variant_field,
     variant_storage_type,
 };
-use wyrd_spec::vala::BifrostError;
 
+use super::QueryCatalogError;
 use crate::tables::fields::is_variant;
 
 /// Version of the Oracle Variant SQL contract every peer must share.
@@ -637,60 +635,13 @@ impl ScalarUDFImpl for ParseJson {
                 Err(VariantViolation::InvalidJson { .. }) if self.lenient => column.append_null(),
                 Err(violation) => {
                     let row = u64::try_from(row).unwrap_or(u64::MAX);
-                    return Err(DataFusionError::External(Box::new(VariantQueryError(
+                    return Err(QueryCatalogError::external(
                         violation.into_error(self.name(), row),
-                    ))));
+                    ));
                 }
             }
         }
         Ok(ColumnarValue::Array(column.finish()))
-    }
-}
-
-/// A catalogued Variant failure raised inside query execution.
-///
-/// Distributed execution forwards an external error between peers as its
-/// `Display` text only, so this carrier renders the error's tagged serde
-/// form: the coordinator reads the same code and details back through
-/// [`Self::decode`] whether the failure was raised locally or on a worker.
-/// Locally the typed error also stays reachable as this error's `source`.
-#[derive(Debug)]
-pub(crate) struct VariantQueryError(BifrostError);
-
-impl VariantQueryError {
-    /// Read a Variant failure back from the text a peer forwarded.
-    ///
-    /// Only the tagged serde form of one of the four Variant errors is
-    /// recognised; any other text, including another catalogued error or a
-    /// malformed payload, yields `None` and stays a generic failure.
-    pub(crate) fn decode(message: &str) -> Option<BifrostError> {
-        match serde_json::from_str::<BifrostError>(message).ok()? {
-            found @ (BifrostError::VariantInvalidJson { .. }
-            | BifrostError::VariantNumericOutOfRange { .. }
-            | BifrostError::VariantTooDeep { .. }
-            | BifrostError::VariantTooLarge { .. }) => Some(found),
-            _ => None,
-        }
-    }
-}
-
-impl Display for VariantQueryError {
-    /// Write the error's tagged serde form, the text peers forward.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`fmt::Error`] when the formatter fails or the error does not
-    /// serialize, which its plain string and integer fields never cause.
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        let tagged = serde_json::to_string(&self.0).map_err(|_| fmt::Error)?;
-        formatter.write_str(&tagged)
-    }
-}
-
-impl Error for VariantQueryError {
-    /// Expose the typed error so a local caller can downcast it directly.
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.0)
     }
 }
 
@@ -703,6 +654,8 @@ mod tests {
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
+    use std::error::Error;
+    use wyrd_spec::vala::BifrostError;
 
     /// Builds a session with the Variant surface over one table `t` holding
     /// a Variant `v`, a Struct `s` with a Variant child, and a JSON text `j`.

@@ -5,6 +5,7 @@
 //! join, aggregate, or limit.
 
 use datafusion::common::tree_node::TreeNodeRecursion;
+use std::error::Error;
 use std::fmt;
 #[cfg(test)]
 use std::fs::File;
@@ -76,7 +77,7 @@ use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
-use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry};
+use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry, QueryCatalogError};
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -1201,12 +1202,19 @@ struct OracleIcebergStaleObject {
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-/// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
+/// Maps an Iceberg scan failure into the `DataFusion` error the scan raises.
+///
+/// A catalogued [`BifrostError`] in the chain, such as the footer tenant
+/// refusal, is raised through [`QueryCatalogError`] so it keeps its identity
+/// across peers. Otherwise a typed Iceberg-only stale marker is preserved
+/// without classifying adjacent IO.
 pub(super) fn iceberg_datafusion_error<E>(error: E) -> DataFusionError
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
 {
-    if error_chain_contains_not_found(&error) {
+    if let Some(catalog) = QueryCatalogError::find(&error) {
+        QueryCatalogError::external(catalog)
+    } else if error_chain_contains_not_found(&error) {
         DataFusionError::External(Box::new(OracleIcebergStaleObject {
             source: Box::new(error),
         }))
@@ -1523,9 +1531,9 @@ impl OracleIcebergScanExec {
         // Bifrost writes no encrypted data file. One that claims key metadata
         // would bypass the tenant-proving loader, so it is refused outright.
         if planned.iter().any(|task| task.key_metadata.is_some()) {
-            return Err(DataFusionError::External(Box::new(
+            return Err(QueryCatalogError::external(
                 BifrostError::QueryTenantInvariant,
-            )));
+            ));
         }
         let sizes = planned.iter().map(|task| task.length).collect::<Vec<_>>();
         let partitions = self.properties.partitioning.partition_count();
@@ -1671,7 +1679,7 @@ impl ExecutionPlan for OracleIcebergScanExec {
         let footers = self
             .footers
             .as_ref()
-            .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?
+            .ok_or_else(|| QueryCatalogError::external(BifrostError::QueryTenantInvariant))?
             .loader(self.table.file_io().clone(), context.as_ref())?;
         let source = self.clone();
         let future = async move { source.start_stream(partition, footers).await };
@@ -3130,8 +3138,7 @@ fn hot_piece_metadata(
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     metrics: &OracleScanMetricsHandle,
 ) -> DataFusionResult<Option<(ArrowReaderMetadata, Vec<usize>)>> {
-    verify_scanned_footer_tenant(metadata, tenant)
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    verify_scanned_footer_tenant(metadata, tenant).map_err(QueryCatalogError::external)?;
     let owned = row_groups_in_byte_range(metadata, range);
     if owned.is_empty() {
         return Ok(None);

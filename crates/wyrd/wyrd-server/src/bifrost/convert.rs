@@ -1,21 +1,15 @@
-//! `DataTypeSpec ↔ arrow::DataType` conversion and schema fingerprinting for the
-//! Bifrost register path.
+//! Namespace resolution and schema fingerprinting for the Bifrost register
+//! path.
 //!
-//! The Arrow-free wire types live in `wyrd-spec`; the Arrow bridge lives here (in
-//! the server), never in `wyrd-spec`. The register handler turns a wire
-//! [`FieldSpec`] list into Arrow [`Field`]s for Redux catalog registration
-//! and derives the server-authoritative schema fingerprint the same way the
-//! catalog does (user-fields-only, over the Arrow schema).
+//! Wire-to-Arrow field conversion is owned by `wyrd_queue::spec_to_field`; the
+//! register handler uses it to build Redux catalog fields and derives the
+//! server-authoritative schema fingerprint here the same way the catalog does
+//! (user-fields-only, over the Arrow schema).
 
-use std::sync::Arc;
-
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
+use arrow::datatypes::{Field, Schema};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
-use vala_bifrost_redux::tables::fields::{is_extension_key, mark_variant};
-use wyrd_queue::variant::{is_variant, variant_storage_type};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
 /// Resolve a wire namespace string (e.g. `"vala.bifrost"`) to its engine enum.
 ///
@@ -24,159 +18,6 @@ pub fn namespace_from_wire(namespace: &str) -> Result<BifrostNamespace, WyrdErro
     BifrostNamespace::from_wire(namespace).ok_or_else(|| WyrdError::Validation {
         message: format!("unknown Bifrost namespace: {namespace}"),
         details: serde_json::json!({ "namespace": namespace }),
-    })
-}
-
-/// Map a wire time precision to its Arrow form.
-fn time_unit_to_arrow(unit: TimeUnit) -> ArrowTimeUnit {
-    match unit {
-        TimeUnit::Second => ArrowTimeUnit::Second,
-        TimeUnit::Millisecond => ArrowTimeUnit::Millisecond,
-        TimeUnit::Microsecond => ArrowTimeUnit::Microsecond,
-        TimeUnit::Nanosecond => ArrowTimeUnit::Nanosecond,
-    }
-}
-
-/// Map an Arrow time precision to its wire form.
-fn time_unit_from_arrow(unit: ArrowTimeUnit) -> TimeUnit {
-    match unit {
-        ArrowTimeUnit::Second => TimeUnit::Second,
-        ArrowTimeUnit::Millisecond => TimeUnit::Millisecond,
-        ArrowTimeUnit::Microsecond => TimeUnit::Microsecond,
-        ArrowTimeUnit::Nanosecond => TimeUnit::Nanosecond,
-    }
-}
-
-/// Convert a wire [`DataTypeSpec`] into an Arrow [`DataType`].
-pub fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
-    match spec {
-        DataTypeSpec::Bool => DataType::Boolean,
-        DataTypeSpec::Int8 => DataType::Int8,
-        DataTypeSpec::Int16 => DataType::Int16,
-        DataTypeSpec::Int32 => DataType::Int32,
-        DataTypeSpec::Int64 => DataType::Int64,
-        DataTypeSpec::UInt8 => DataType::UInt8,
-        DataTypeSpec::UInt16 => DataType::UInt16,
-        DataTypeSpec::UInt32 => DataType::UInt32,
-        DataTypeSpec::UInt64 => DataType::UInt64,
-        DataTypeSpec::Float32 => DataType::Float32,
-        DataTypeSpec::Float64 => DataType::Float64,
-        DataTypeSpec::Utf8 => DataType::Utf8,
-        DataTypeSpec::LargeUtf8 => DataType::LargeUtf8,
-        DataTypeSpec::Binary => DataType::Binary,
-        DataTypeSpec::LargeBinary => DataType::LargeBinary,
-        DataTypeSpec::FixedSizeBinary { len } => DataType::FixedSizeBinary(*len),
-        DataTypeSpec::Date32 => DataType::Date32,
-        DataTypeSpec::Date64 => DataType::Date64,
-        DataTypeSpec::Timestamp { unit, tz } => {
-            DataType::Timestamp(time_unit_to_arrow(*unit), tz.clone().map(Into::into))
-        }
-        DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
-        DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
-        DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
-        DataTypeSpec::List(element) => DataType::List(Arc::new(field_to_arrow(element))),
-        DataTypeSpec::Struct(fields) => {
-            DataType::Struct(fields.iter().map(field_to_arrow).collect())
-        }
-        DataTypeSpec::Variant => variant_storage_type(),
-    }
-}
-
-/// Convert an Arrow [`DataType`] back into a wire [`DataTypeSpec`].
-///
-/// A stored type outside the register-accepted set is a `500` (the catalog
-/// should never hold one), never a silent coercion.
-pub fn data_type_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdError> {
-    let spec = match dt {
-        DataType::Boolean => DataTypeSpec::Bool,
-        DataType::Int8 => DataTypeSpec::Int8,
-        DataType::Int16 => DataTypeSpec::Int16,
-        DataType::Int32 => DataTypeSpec::Int32,
-        DataType::Int64 => DataTypeSpec::Int64,
-        DataType::UInt8 => DataTypeSpec::UInt8,
-        DataType::UInt16 => DataTypeSpec::UInt16,
-        DataType::UInt32 => DataTypeSpec::UInt32,
-        DataType::UInt64 => DataTypeSpec::UInt64,
-        DataType::Float32 => DataTypeSpec::Float32,
-        DataType::Float64 => DataTypeSpec::Float64,
-        DataType::Utf8 => DataTypeSpec::Utf8,
-        DataType::LargeUtf8 => DataTypeSpec::LargeUtf8,
-        DataType::Binary => DataTypeSpec::Binary,
-        DataType::LargeBinary => DataTypeSpec::LargeBinary,
-        DataType::FixedSizeBinary(len) => DataTypeSpec::FixedSizeBinary { len: *len },
-        DataType::Date32 => DataTypeSpec::Date32,
-        DataType::Date64 => DataTypeSpec::Date64,
-        DataType::Timestamp(unit, tz) => DataTypeSpec::Timestamp {
-            unit: time_unit_from_arrow(*unit),
-            tz: tz.as_ref().map(ToString::to_string),
-        },
-        DataType::Time32(unit) => DataTypeSpec::Time32 {
-            unit: time_unit_from_arrow(*unit),
-        },
-        DataType::Time64(unit) => DataTypeSpec::Time64 {
-            unit: time_unit_from_arrow(*unit),
-        },
-        DataType::Decimal128(precision, scale) => DataTypeSpec::Decimal128 {
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::List(element) => DataTypeSpec::List(Box::new(field_from_arrow(element)?)),
-        DataType::Struct(fields) => {
-            let mut specs = Vec::with_capacity(fields.len());
-            for field in fields {
-                specs.push(field_from_arrow(field)?);
-            }
-            DataTypeSpec::Struct(specs)
-        }
-        other => {
-            return Err(WyrdError::Internal {
-                message: "stored Bifrost column type is not representable on the wire".to_owned(),
-                details: serde_json::json!({ "data_type": format!("{other:?}") }),
-            });
-        }
-    };
-    Ok(spec)
-}
-
-/// Convert a wire [`FieldSpec`] into an Arrow [`Field`].
-///
-/// Metadata travels with the field, so a stable `PARQUET:field_id` supplied by
-/// a description survives the round trip into Arrow at every nesting depth.
-pub fn field_to_arrow(field: &FieldSpec) -> Field {
-    let arrow = Field::new(
-        field.name.clone(),
-        data_type_to_arrow(&field.data_type),
-        field.nullable,
-    )
-    .with_metadata(field.metadata.clone().into_iter().collect());
-    match field.data_type {
-        DataTypeSpec::Variant => mark_variant(arrow),
-        _ => arrow,
-    }
-}
-
-/// Convert an Arrow [`Field`] back into a wire [`FieldSpec`].
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the stored type is outside the
-/// register-accepted set, propagated from [`data_type_from_arrow`].
-pub fn field_from_arrow(field: &Field) -> Result<FieldSpec, WyrdError> {
-    let variant = is_variant(field);
-    Ok(FieldSpec {
-        name: field.name().clone(),
-        data_type: if variant {
-            DataTypeSpec::Variant
-        } else {
-            data_type_from_arrow(field.data_type())?
-        },
-        nullable: field.is_nullable(),
-        metadata: field
-            .metadata()
-            .iter()
-            .filter(|(key, _)| !variant || !is_extension_key(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
     })
 }
 
@@ -205,7 +46,9 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY;
+    use arrow::datatypes::DataType;
+    use wyrd_queue::{field_to_spec, spec_to_field};
+    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, PARQUET_FIELD_ID_KEY, TimeUnit};
 
     fn sample_field_specs() -> Vec<FieldSpec> {
         let plain = |name: &str, data_type: DataTypeSpec| FieldSpec {
@@ -255,14 +98,14 @@ mod tests {
     #[test]
     fn bifrost_tables_datatype_arrow_fingerprint_round_trips() {
         let specs = sample_field_specs();
-        let arrow_fields: Vec<Field> = specs.iter().map(field_to_arrow).collect();
+        let arrow_fields: Vec<Field> = specs.iter().map(|spec| spec_to_field(spec, true)).collect();
         let forward_fp = fingerprint_hex(&arrow_fields);
 
         // arrow → spec → arrow must reproduce the exact same fingerprint.
         let round_tripped: Vec<Field> = arrow_fields
             .iter()
-            .map(|f| field_from_arrow(f).expect("arrow field maps back to spec"))
-            .map(|s| field_to_arrow(&s))
+            .map(|f| field_to_spec(f).expect("arrow field maps back to spec"))
+            .map(|s| spec_to_field(&s, true))
             .collect();
         let round_fp = fingerprint_hex(&round_tripped);
 
@@ -312,7 +155,7 @@ mod tests {
             metadata: id(16),
         };
 
-        let arrow = field_to_arrow(&spec);
+        let arrow = spec_to_field(&spec, true);
         assert_eq!(
             arrow.metadata().get(PARQUET_FIELD_ID_KEY),
             Some(&"16".to_owned())
@@ -335,7 +178,7 @@ mod tests {
         );
 
         assert_eq!(
-            field_from_arrow(&arrow).expect("the Arrow field maps back to its declaration"),
+            field_to_spec(&arrow).expect("the Arrow field maps back to its declaration"),
             spec,
             "every nested name, nullability, and field id survives both directions"
         );

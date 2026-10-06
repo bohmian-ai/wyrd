@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use parquet_variant_compute::VariantType;
 use wyrd_queue::variant::variant_storage_type;
 
@@ -64,25 +63,6 @@ pub fn float64(name: &str, nullable: bool) -> Field {
 
 pub fn fixed_binary(name: &str, size: i32, nullable: bool) -> Field {
     Field::new(name, DataType::FixedSizeBinary(size), nullable)
-}
-
-/// Stamp the `arrow.parquet.variant` extension marker onto a storage field.
-///
-/// The field keeps its name, nullability, storage type, and every other
-/// metadata entry; callers that rebuild a declared Variant from a wire
-/// description use this instead of restating the extension keys.
-#[must_use]
-pub fn mark_variant(field: Field) -> Field {
-    field.with_extension_type(VariantType)
-}
-
-/// Report whether a metadata key is one of Arrow's extension-type keys.
-///
-/// Schema identities and wire descriptions express a Variant through its type,
-/// so they drop these keys rather than committing the extension spelling.
-#[must_use]
-pub fn is_extension_key(key: &str) -> bool {
-    key == EXTENSION_TYPE_NAME_KEY || key == EXTENSION_TYPE_METADATA_KEY
 }
 
 /// Projection and permission class of one canonical signal field.

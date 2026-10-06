@@ -7,6 +7,7 @@
 
 use arrow::datatypes::Field;
 use vala_bifrost_redux::catalog::{BifrostCatalogError, CompactionRegistration, TableRef};
+use wyrd_queue::spec_to_field;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -120,7 +121,11 @@ pub async fn register_table(
             details: serde_json::json!({ "table": fqn_for_audit }),
         });
     }
-    let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
+    let user_fields: Vec<Field> = body
+        .fields
+        .iter()
+        .map(|spec| spec_to_field(spec, true))
+        .collect();
     let fingerprint = convert::fingerprint_hex(&user_fields);
 
     let fqn = format!("{}.{}", ns.as_str(), body.name);

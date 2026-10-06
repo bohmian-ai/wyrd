@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use wyrd_queue::is_extension_key;
 use wyrd_queue::variant::{EncodedVariant, is_variant};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
@@ -841,9 +842,7 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
     let mut entries: Vec<(&String, &String)> = field
         .metadata()
         .iter()
-        .filter(|(key, _)| {
-            key.as_str() != fields::PARQUET_FIELD_ID && !fields::is_extension_key(key)
-        })
+        .filter(|(key, _)| key.as_str() != fields::PARQUET_FIELD_ID && !is_extension_key(key))
         .collect();
     out.extend_from_slice(&count_u32(entries.len())?.to_be_bytes());
     entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));

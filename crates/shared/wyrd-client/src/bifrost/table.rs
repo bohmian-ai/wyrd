@@ -79,10 +79,12 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_ref`, or `run_id` name.
+    /// `wyrd_*`, `card_ref`, or `run_id` name, and `WYRD_VALA_400_SCHEMA_PARSE`
+    /// when a column's Arrow type is not representable on the wire.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
+        wyrd_queue::arrow_schema_to_fieldspec(&schema)?;
         Ok(Self {
             namespace,
             name,
@@ -280,11 +282,17 @@ impl TableConfig {
     }
 
     /// The register-call body this config asks the server to create.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the schema is not wire-representable, which every
+    /// constructor refuses.
     pub(crate) fn register_request(&self) -> RegisterTableRequest {
         RegisterTableRequest {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema),
+            fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema)
+                .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: self.physical_layout.clone(),
             compaction_target_file_size_bytes: self.compaction_target_file_size_bytes,
             compaction_type: self.compaction_type,
@@ -330,11 +338,17 @@ struct TableConfigWire {
 
 impl From<TableConfig> for TableConfigWire {
     /// Project one config onto its wire form for a language boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the schema is not wire-representable, which every
+    /// constructor refuses.
     fn from(config: TableConfig) -> Self {
         Self {
             namespace: config.namespace,
             name: config.name,
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema),
+            fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema)
+                .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: config.physical_layout,
             compaction_target_file_size_bytes: config.compaction_target_file_size_bytes,
             compaction_type: config.compaction_type,

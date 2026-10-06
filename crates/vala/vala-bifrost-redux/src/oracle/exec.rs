@@ -26,6 +26,10 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::physical_plan::parquet::{
+    ParquetAccessPlan, ParquetFileMetrics, PerFileParquetReadInput, PerFileParquetReadPlan,
+    PerFileParquetReadPlanner, RowGroupAccessPlanFilter,
+};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -33,7 +37,9 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
@@ -60,7 +66,7 @@ use iceberg::io::{FileIO, FileRead};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::bloom_filter::Sbbf;
@@ -2943,12 +2949,7 @@ impl ExecutionPlan for HotParquetExec {
         // The hot leaf decodes at the admitted session's batch size, so this
         // path is shaped by the same grant as every other operator in the plan
         // rather than by a fixed constant of its own.
-        let stream = hot_stream(
-            self,
-            partition,
-            task.session_config().batch_size(),
-            governance,
-        );
+        let stream = hot_stream(self, partition, task.session_config(), governance);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
@@ -2999,18 +3000,21 @@ impl HotReaderFactory {
 /// The partition's byte ranges are read sequentially. The piece holding a
 /// file's first byte publishes its file observation before the footer is
 /// touched; every piece proves the footer's tenant before decoding anything,
-/// then keeps only the row groups whose midpoint lies in its
-/// range, prunes those and then pages against the closed predicates, decodes
-/// at the session `batch_size`, projects to the
+/// then keeps only the row groups whose midpoint lies in its range and applies
+/// the file's [`HotFileReadPlan`]: statistics, Bloom, then page pruning, the
+/// shared projection mask and decoder row filter. It decodes at the session
+/// `batch_size`, projects to the
 /// authenticated physical schema, and holds one governed reservation for
 /// exactly the lifetime of the yielded batch. Dropping the stream releases every retained reservation,
 /// which is what makes cancellation return the query's memory.
 fn hot_stream(
     exec: &HotParquetExec,
     partition: usize,
-    batch_size: usize,
+    config: &datafusion::execution::config::SessionConfig,
     governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
+    let batch_size = config.batch_size();
+    let max_in_list_size = config.options().execution.parquet.max_in_list_size;
     let pieces = exec.partition_pieces(partition);
     let readers = HotReaderFactory {
         file_io: exec.file_io.clone(),
@@ -3023,6 +3027,7 @@ fn hot_stream(
     let schema = Arc::clone(&exec.schema);
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
+    let filter = scan_predicate_conjunction(&predicates, &schema);
     let staged_lease = exec.staged_lease.clone();
     // Cancelling the query drops this stream, which drops the guard and
     // cancels any metadata decode this stream still has outstanding. Owner
@@ -3032,6 +3037,7 @@ fn hot_stream(
     async_stream::try_stream! {
         let _cancel_on_drop = cancel_on_drop;
         let _staged_lease = staged_lease;
+        let filter = filter?;
         for (file, range) in pieces {
             let size = u64::try_from(file.size_bytes).map_err(|_| {
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
@@ -3065,51 +3071,55 @@ fn hot_stream(
                 .map_err(|error| {
                     DataFusionError::External(Box::new((*error).clone()))
                 })?;
-            let Some((metadata, retained_groups)) = hot_piece_metadata(
+            let Some((metadata, owned_groups)) = hot_piece_metadata(
                 retained.metadata(),
                 file.metadata_key.tenant_id(),
                 &range,
-                &predicates,
-                &metrics,
             )?
             else {
                 continue;
             };
+            let read_plan =
+                HotFileReadPlan::new(&metadata, &schema, filter.clone(), max_in_list_size)?;
+            let selection = read_plan.select_row_groups(owned_groups);
+            metrics.record_row_groups(&selection);
+            if selection.excludes_file() {
+                continue;
+            }
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
             // Bloom filters are probed only for the groups statistics kept, so
             // each excluded group is attributed to exactly one mechanism.
             let bloom = HotBloomProbes::new(builder.metadata(), &predicates)
-                .retain(&mut builder, retained_groups)
+                .retain(&mut builder, selection.retained)
                 .await;
             metrics.record_bloom_pruned(bloom.pruned);
             if bloom.excludes_file() {
                 continue;
             }
-            let retained_groups = bloom.retained;
-            // Selective decode: only the closure's leaves leave storage. The
-            // post-decode `project_batch` below then normalizes exact order and
-            // types; it is a normalizer, not the thing that avoids the IO.
-            let mask = hot_projection_mask(builder.parquet_schema(), schema.as_ref());
-            let pages =
-                select_pages_for_predicates(builder.metadata(), &retained_groups, &predicates);
-            let builder = match pages {
-                Some(pages) => {
-                    metrics.record_page_pruned_rows(pages.skipped_row_count());
-                    builder.with_row_selection(pages)
-                }
-                None => builder,
-            };
-            let mut batches = builder
-                .with_row_groups(retained_groups)
+            let (row_groups, pages) = read_plan.select_pages(bloom.retained, &metrics)?;
+            let HotFileReadPlan { plan, .. } = read_plan;
+            // The shared plan's projection turns decoded leaves back into the
+            // closure's logical columns; `project_batch` below only pins the
+            // exact output schema.
+            let projector = plan.projection.make_projector(&plan.projected_schema)?;
+            let mut builder = builder
+                .with_row_groups(row_groups)
                 .with_batch_size(batch_size)
-                .with_projection(mask)
+                .with_projection(plan.projection_mask);
+            if let Some(pages) = pages {
+                builder = builder.with_row_selection(pages);
+            }
+            if let Some(row_filter) = plan.row_filter {
+                builder = builder.with_row_filter(row_filter);
+            }
+            let mut batches = builder
                 .build()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
             while let Some(decoded) = batches.next().await {
                 let batch = decoded
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let batch = project_batch(&batch, Arc::clone(&schema))?;
+                let batch = project_batch(&projector.project_batch(&batch)?, Arc::clone(&schema))?;
                 let decoded_reservation =
                     readers.governance.reserve_decoded(batch.get_array_memory_size())?;
                 yield batch;
@@ -3119,13 +3129,11 @@ fn hot_stream(
     }
 }
 
-/// Decides what one hot piece reads from its object's cached footer.
+/// Decides which row groups one hot piece owns in its object's cached footer.
 ///
 /// The tenant proof runs first, so a missing or foreign footer yields no row
-/// group, page, or row. Range ownership and predicate pruning then read only
-/// the cached footer, so a piece that owns or keeps no row group never pays the
-/// Arrow schema conversion; only a piece with surviving row groups builds its
-/// reader metadata. Pruning is recorded in `metrics` for every owning piece.
+/// group, page, or row. Range ownership then reads only the cached footer, so a
+/// piece that owns no row group never pays the Arrow schema conversion.
 ///
 /// # Errors
 ///
@@ -3136,23 +3144,148 @@ fn hot_piece_metadata(
     metadata: &Arc<ParquetMetaData>,
     tenant: DataTenantId,
     range: &Range<u64>,
-    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    metrics: &OracleScanMetricsHandle,
 ) -> DataFusionResult<Option<(ArrowReaderMetadata, Vec<usize>)>> {
     verify_scanned_footer_tenant(metadata, tenant).map_err(QueryCatalogError::external)?;
     let owned = row_groups_in_byte_range(metadata, range);
     if owned.is_empty() {
         return Ok(None);
     }
-    let selection = select_row_groups_for_predicates(metadata, owned, predicates);
-    metrics.record_row_groups(&selection);
-    if selection.excludes_file() {
-        return Ok(None);
-    }
     let reader_metadata =
         ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    Ok(Some((reader_metadata, selection.retained)))
+    Ok(Some((reader_metadata, owned)))
+}
+
+/// One hot file's read plan from `DataFusion`'s shared per-file planner.
+///
+/// Built once the footer is proved, it holds exactly what `ParquetSource`
+/// derives for the same file — the projection mask over the closure's leaves,
+/// the decoder row filter, and the row-group and page pruning predicates — so
+/// a Struct field or Variant path prunes and projects through the same
+/// machinery on every reader. Wyrd keeps only its scan metrics and Bloom
+/// probes; it owns no statistics pruning of its own.
+struct HotFileReadPlan {
+    /// The facade's owned plan for this file.
+    plan: PerFileParquetReadPlan,
+    /// The file's own Arrow schema the predicates were adapted to.
+    physical_schema: SchemaRef,
+    /// The file's cached footer.
+    metadata: Arc<ParquetMetaData>,
+    /// `DataFusion` per-file counters the row filter and pruning record into.
+    file_metrics: ParquetFileMetrics,
+}
+
+impl HotFileReadPlan {
+    /// Plans reading every `logical_schema` column from the file `reader`
+    /// describes, filtered by `filter`. Performs no IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error raised when a projection or filter
+    /// expression cannot be adapted to or evaluated against the file schema.
+    fn new(
+        reader: &ArrowReaderMetadata,
+        logical_schema: &SchemaRef,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+        max_in_list_size: usize,
+    ) -> DataFusionResult<Self> {
+        let physical_schema = Arc::clone(reader.schema());
+        let metadata = Arc::clone(reader.metadata());
+        let file_metrics = ParquetFileMetrics::new(0, "hot", &ExecutionPlanMetricsSet::new());
+        let columns = (0..logical_schema.fields().len()).collect::<Vec<_>>();
+        let plan = PerFileParquetReadPlanner::plan(PerFileParquetReadInput {
+            projection: ProjectionExprs::from_indices(&columns, logical_schema),
+            filter,
+            logical_file_schema: Arc::clone(logical_schema),
+            physical_file_schema: Arc::clone(&physical_schema),
+            metadata: Arc::clone(&metadata),
+            expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
+            max_in_list_size,
+            file_metrics: file_metrics.clone(),
+        })?;
+        Ok(Self {
+            plan,
+            physical_schema,
+            metadata,
+            file_metrics,
+        })
+    }
+
+    /// Returns an access plan scanning exactly `row_groups` of this file.
+    fn access(&self, row_groups: &[usize]) -> ParquetAccessPlan {
+        let mut access = ParquetAccessPlan::new_none(self.metadata.num_row_groups());
+        for &row_group in row_groups {
+            access.scan(row_group);
+        }
+        access
+    }
+
+    /// Keeps the `candidates` whose footer statistics may satisfy the filter.
+    ///
+    /// Without a row-group predicate every candidate is retained; absent or
+    /// unusable statistics always keep a group.
+    fn select_row_groups(&self, candidates: Vec<usize>) -> RowGroupSelection {
+        let Some(predicate) = self.plan.row_group_predicate.as_deref() else {
+            return RowGroupSelection {
+                retained: candidates,
+                pruned: 0,
+            };
+        };
+        let mut filter = RowGroupAccessPlanFilter::new(self.access(&candidates));
+        filter.prune_by_statistics_with_metadata(
+            &self.physical_schema,
+            &self.metadata,
+            predicate,
+            &self.file_metrics,
+        );
+        let retained = filter.row_group_indexes().collect::<Vec<_>>();
+        RowGroupSelection {
+            pruned: (candidates.len() - retained.len()) as u64,
+            retained,
+        }
+    }
+
+    /// Narrows `row_groups` to the pages whose page index may satisfy the
+    /// filter, recording the rows skipped in `metrics`.
+    ///
+    /// Returns the row groups still read and, when any page inside them was
+    /// skipped, the row selection over exactly those groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error raised when the pruned access plan
+    /// cannot be turned into a row selection.
+    fn select_pages(
+        &self,
+        row_groups: Vec<usize>,
+        metrics: &OracleScanMetricsHandle,
+    ) -> DataFusionResult<(Vec<usize>, Option<RowSelection>)> {
+        let Some(pages) = self.plan.page_predicate.as_deref() else {
+            return Ok((row_groups, None));
+        };
+        let rows = |groups: &[usize]| {
+            groups
+                .iter()
+                .map(|&group| {
+                    usize::try_from(self.metadata.row_group(group).num_rows()).unwrap_or(0)
+                })
+                .sum::<usize>()
+        };
+        let access = pages.prune_plan_with_page_index(
+            self.access(&row_groups),
+            &self.physical_schema,
+            self.metadata.file_metadata().schema_descr(),
+            &self.metadata,
+            &self.file_metrics,
+        );
+        let kept_groups = access.row_group_indexes();
+        let selection = access.into_overall_row_selection(self.metadata.row_groups())?;
+        let kept_rows = selection
+            .as_ref()
+            .map_or_else(|| rows(&kept_groups), RowSelection::row_count);
+        metrics.record_page_pruned_rows(rows(&row_groups).saturating_sub(kept_rows));
+        Ok((kept_groups, selection))
+    }
 }
 
 /// The equality probes one hot file's Bloom filters can answer.
@@ -3300,29 +3433,6 @@ impl HotBloomProbes {
         }
         RowGroupSelection { retained, pruned }
     }
-}
-
-/// Derives the Parquet projection mask that decodes exactly `schema`'s columns.
-///
-/// Matching is by name against the file's own root fields, because the closure
-/// is a name-based contract and a sealed hot file may order or extend its
-/// columns independently of the pinned table schema. A closure name the file
-/// does not carry is deliberately left out of the mask rather than refused
-/// here: [`project_batch`] raises that as a named missing-field error once the
-/// batch arrives, which keeps one diagnostic for the condition.
-fn hot_projection_mask(
-    parquet_schema: &parquet::schema::types::SchemaDescriptor,
-    schema: &Schema,
-) -> parquet::arrow::ProjectionMask {
-    let indices = parquet_schema
-        .root_schema()
-        .get_fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| schema.column_with_name(field.name()).is_some())
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
 }
 
 /// Result of classifying one `DataFusion` filter expression against the
@@ -4059,73 +4169,6 @@ pub(super) fn scan_predicate_conjunction(
     Ok(conjoin_physical_predicates(compiled))
 }
 
-/// One statistic bound value in the closed subset this pruning path
-/// understands. Two bounds are only ever compared after both are derived
-/// from the same predicate literal's type, so the derived ordering is exact.
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
-enum StatBound {
-    /// Boolean bound, ordered `false < true`.
-    Bool(bool),
-    /// Signed 64-bit bound, shared by `I64` and `TimestampMicros` literals.
-    I64(i64),
-    /// UTF-8 bound compared by byte order.
-    Utf8(String),
-    /// Binary bound compared by unsigned lexicographic byte order, which is
-    /// Parquet's order for unannotated and fixed-length byte arrays.
-    Bytes(Vec<u8>),
-}
-
-/// Converts one closed predicate literal into its comparable statistic bound.
-/// Returns `None` for `U64`/`F64Bits`, whose Parquet physical encoding this
-/// pruning path does not decode; callers must treat that as "never exclude".
-fn literal_bound(
-    literal: &wyrd_spec::vala::assignment_authority::ScanLiteral,
-) -> Option<StatBound> {
-    use wyrd_spec::vala::assignment_authority::ScanLiteral;
-    match literal {
-        ScanLiteral::Bool(value) => Some(StatBound::Bool(*value)),
-        ScanLiteral::I64(value) | ScanLiteral::TimestampMicros(value) => {
-            Some(StatBound::I64(*value))
-        }
-        ScanLiteral::Utf8(value) => Some(StatBound::Utf8(value.clone())),
-        ScanLiteral::Bytes(value) => Some(StatBound::Bytes(value.clone())),
-        ScanLiteral::U64(_) | ScanLiteral::F64Bits(_) => None,
-    }
-}
-
-/// Reads one column chunk's typed min/max as comparable bounds, matched
-/// against `target`'s variant. Returns `None` when the physical statistics
-/// type does not correspond to `target`, or either bound is unset.
-fn statistics_bound(
-    stats: &parquet::file::statistics::Statistics,
-    target: &StatBound,
-) -> Option<(StatBound, StatBound)> {
-    use parquet::file::statistics::Statistics;
-    match (stats, target) {
-        (Statistics::Boolean(value), StatBound::Bool(_)) => Some((
-            StatBound::Bool(*value.min_opt()?),
-            StatBound::Bool(*value.max_opt()?),
-        )),
-        (Statistics::Int64(value), StatBound::I64(_)) => Some((
-            StatBound::I64(*value.min_opt()?),
-            StatBound::I64(*value.max_opt()?),
-        )),
-        (Statistics::ByteArray(value), StatBound::Utf8(_)) => Some((
-            StatBound::Utf8(String::from_utf8_lossy(value.min_opt()?.data()).into_owned()),
-            StatBound::Utf8(String::from_utf8_lossy(value.max_opt()?.data()).into_owned()),
-        )),
-        (Statistics::ByteArray(value), StatBound::Bytes(_)) => Some((
-            StatBound::Bytes(value.min_opt()?.data().to_vec()),
-            StatBound::Bytes(value.max_opt()?.data().to_vec()),
-        )),
-        (Statistics::FixedLenByteArray(value), StatBound::Bytes(_)) => Some((
-            StatBound::Bytes(value.min_opt()?.data().to_vec()),
-            StatBound::Bytes(value.max_opt()?.data().to_vec()),
-        )),
-        _ => None,
-    }
-}
-
 /// Returns the Parquet leaf column index whose full path is exactly `leaf`'s
 /// path, or `None` when the file carries no such primitive column.
 ///
@@ -4153,204 +4196,6 @@ fn parquet_column_index(
     })
 }
 
-/// Returns true only when Parquet footer statistics prove no row in
-/// `row_group_index` can satisfy `predicate`. An absent, type-mismatched, or
-/// undecoded statistic always keeps the row group; this function never
-/// produces a false exclusion.
-fn leaf_excludes_row_group(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-    row_group_index: usize,
-    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
-) -> bool {
-    let Some(column_index) = parquet_column_index(metadata, predicate.leaf()) else {
-        return false;
-    };
-    let row_group = metadata.row_group(row_group_index);
-    let Some(stats) = row_group.column(column_index).statistics() else {
-        return false;
-    };
-    leaf_excludes_span(
-        predicate,
-        |target| statistics_bound(stats, target),
-        stats.null_count_opt(),
-        u64::try_from(row_group.num_rows()).unwrap_or(0),
-    )
-}
-
-/// Returns true only when one span's evidence proves no row in it can satisfy
-/// `predicate`.
-///
-/// A span is a row group or one data page; both prune through this one
-/// decision so page selection can never disagree with row-group pruning.
-/// `bounds` yields the span's min/max matched to the literal's type, and
-/// `null_count` with `rows` decides the null checks. Absent evidence always
-/// keeps the span, so this never produces a false exclusion.
-fn leaf_excludes_span(
-    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
-    bounds: impl Fn(&StatBound) -> Option<(StatBound, StatBound)>,
-    null_count: Option<u64>,
-    rows: u64,
-) -> bool {
-    use std::cmp::Ordering;
-    use wyrd_spec::vala::assignment_authority::ScanPredicate;
-
-    match predicate {
-        ScanPredicate::IsNull(_) => return null_count == Some(0),
-        ScanPredicate::IsNotNull(_) => return null_count == Some(rows),
-        ScanPredicate::In(_, literals) => {
-            return literals.iter().all(|literal| {
-                literal_bound(literal).is_some_and(|target| {
-                    bounds(&target).is_some_and(|(min, max)| target < min || max < target)
-                })
-            });
-        }
-        _ => {}
-    }
-    let Some(target) = predicate.literal().and_then(literal_bound) else {
-        return false;
-    };
-    let Some((min, max)) = bounds(&target) else {
-        return false;
-    };
-    match predicate {
-        ScanPredicate::Eq(..) => target < min || max < target,
-        ScanPredicate::NotEq(..) => min == max && min == target,
-        ScanPredicate::Lt(..) => matches!(
-            min.partial_cmp(&target),
-            Some(Ordering::Equal | Ordering::Greater)
-        ),
-        ScanPredicate::LtEq(..) => target < min,
-        ScanPredicate::Gt(..) => matches!(
-            target.partial_cmp(&max),
-            Some(Ordering::Equal | Ordering::Greater)
-        ),
-        ScanPredicate::GtEq(..) => max < target,
-        ScanPredicate::In(..) | ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => false,
-    }
-}
-
-/// Reads one page's typed min/max from a column index as comparable bounds.
-///
-/// The page-index counterpart of [`statistics_bound`]: returns `None` for an
-/// all-null page, a missing index, or a physical type that does not match
-/// `target`'s variant, so the caller keeps the page.
-fn page_bound(
-    index: &parquet::file::page_index::column_index::ColumnIndexMetaData,
-    page: usize,
-    target: &StatBound,
-) -> Option<(StatBound, StatBound)> {
-    use parquet::file::page_index::column_index::ColumnIndexMetaData;
-    match (index, target) {
-        (ColumnIndexMetaData::BOOLEAN(pages), StatBound::Bool(_)) => Some((
-            StatBound::Bool(*pages.min_value(page)?),
-            StatBound::Bool(*pages.max_value(page)?),
-        )),
-        (ColumnIndexMetaData::INT64(pages), StatBound::I64(_)) => Some((
-            StatBound::I64(*pages.min_value(page)?),
-            StatBound::I64(*pages.max_value(page)?),
-        )),
-        (ColumnIndexMetaData::BYTE_ARRAY(pages), StatBound::Utf8(_)) => Some((
-            StatBound::Utf8(String::from_utf8_lossy(pages.min_value(page)?).into_owned()),
-            StatBound::Utf8(String::from_utf8_lossy(pages.max_value(page)?).into_owned()),
-        )),
-        (
-            ColumnIndexMetaData::BYTE_ARRAY(pages)
-            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(pages),
-            StatBound::Bytes(_),
-        ) => Some((
-            StatBound::Bytes(pages.min_value(page)?.to_vec()),
-            StatBound::Bytes(pages.max_value(page)?.to_vec()),
-        )),
-        _ => None,
-    }
-}
-
-/// Selects the pages of `row_groups` whose page index can still satisfy every
-/// predicate leaf, as one row selection over those groups in order.
-///
-/// Row-group pruning alone makes a point lookup decode its whole row group;
-/// this narrows the retained groups to the pages that may match, and the
-/// reader then fetches and decodes only those pages of every projected column.
-/// A page is skipped only when [`leaf_excludes_span`] proves it empty for some
-/// leaf, so the selection is always a superset of the matching rows and the
-/// plan's own filter still decides exact membership. Returns `None` when the
-/// file carries no page index or no page was excluded, leaving the reader
-/// unchanged.
-fn select_pages_for_predicates(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-    row_groups: &[usize],
-    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-) -> Option<parquet::arrow::arrow_reader::RowSelection> {
-    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-
-    let (Some(column_indexes), Some(offset_indexes)) =
-        (metadata.column_index(), metadata.offset_index())
-    else {
-        return None;
-    };
-    let mut selectors = Vec::new();
-    let mut excluded_any = false;
-    for &row_group in row_groups {
-        let rows = usize::try_from(metadata.row_group(row_group).num_rows()).unwrap_or(0);
-        let mut excluded: Vec<Range<usize>> = Vec::new();
-        for predicate in predicates {
-            let Some(column) = parquet_column_index(metadata, predicate.leaf()) else {
-                continue;
-            };
-            let (Some(index), Some(offsets)) = (
-                column_indexes
-                    .get(row_group)
-                    .and_then(|group| group.get(column)),
-                offset_indexes
-                    .get(row_group)
-                    .and_then(|group| group.get(column)),
-            ) else {
-                continue;
-            };
-            let pages = offsets.page_locations();
-            if usize::try_from(index.num_pages()).ok() != Some(pages.len()) {
-                continue;
-            }
-            let first_row = |page: usize| {
-                pages.get(page).map_or(rows, |location| {
-                    usize::try_from(location.first_row_index).map_or(rows, |row| row.min(rows))
-                })
-            };
-            for page in 0..pages.len() {
-                let start = first_row(page);
-                let end = first_row(page + 1).max(start);
-                let null_count = index
-                    .null_count(page)
-                    .and_then(|count| u64::try_from(count).ok());
-                if leaf_excludes_span(
-                    predicate,
-                    |target| page_bound(index, page, target),
-                    null_count,
-                    u64::try_from(end - start).unwrap_or(u64::MAX),
-                ) {
-                    excluded.push(start..end);
-                }
-            }
-        }
-        excluded_any |= !excluded.is_empty();
-        excluded.sort_by_key(|range| range.start);
-        let mut cursor = 0;
-        for range in excluded {
-            if range.start > cursor {
-                selectors.push(RowSelector::select(range.start - cursor));
-            }
-            if range.end > cursor {
-                selectors.push(RowSelector::skip(range.end - range.start.max(cursor)));
-                cursor = range.end;
-            }
-        }
-        if rows > cursor {
-            selectors.push(RowSelector::select(rows - cursor));
-        }
-    }
-    excluded_any.then(|| RowSelection::from(selectors))
-}
-
 /// Row groups retained after closed-predicate statistics pruning for one
 /// Parquet file, together with how many the pruning removed.
 ///
@@ -4371,31 +4216,6 @@ impl RowGroupSelection {
     pub(super) fn excludes_file(&self) -> bool {
         self.retained.is_empty() && self.pruned > 0
     }
-}
-
-/// Selects the `candidates` row groups of `metadata` whose statistics can
-/// still satisfy the closed predicate conjunction, pruning the rest.
-///
-/// A row group is pruned only when at least one leaf proves it cannot contain a
-/// matching row; absent, type-mismatched, or unusable statistics always retain
-/// it, so pruning is a pure IO optimization and never changes results. An empty
-/// predicate conjunction retains every candidate and prunes none.
-pub(super) fn select_row_groups_for_predicates(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-    candidates: Vec<usize>,
-    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-) -> RowGroupSelection {
-    let total = candidates.len();
-    let retained: Vec<usize> = candidates
-        .into_iter()
-        .filter(|row_group_index| {
-            !predicates
-                .iter()
-                .any(|predicate| leaf_excludes_row_group(metadata, *row_group_index, predicate))
-        })
-        .collect();
-    let pruned = (total - retained.len()) as u64;
-    RowGroupSelection { retained, pruned }
 }
 
 /// Projects one physical batch to the pinned schema by field name.
@@ -4934,17 +4754,17 @@ mod tests {
         ]));
         let published =
             write_grouped_fixture(&schema, &[service_block(&schema, "checkout", 0, ROWS)]);
-        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
-            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
-            .parse_and_finish(&published)
-            .expect("valid Parquet footer and page index");
         let predicates = vec![ScanPredicate::Eq(
             ScanLeaf::Column("value".to_owned()),
             ScanLiteral::I64(TARGET),
         )];
 
-        let selection = select_pages_for_predicates(&metadata, &[0], &predicates)
-            .expect("the sorted column's page index excludes pages");
+        let metrics = OracleScanMetricsHandle::default();
+        let (groups, selection) = hot_file_plan(&published, &schema, &predicates)
+            .select_pages(vec![0], &metrics)
+            .expect("page selection");
+        assert_eq!(groups, vec![0]);
+        let selection = selection.expect("the sorted column's page index excludes pages");
         let kept = selection.row_count();
         assert!(
             kept > 0 && kept < usize::try_from(ROWS).expect("fixture rows fit usize"),
@@ -4952,7 +4772,7 @@ mod tests {
         );
 
         let matching: usize = ParquetRecordBatchReaderBuilder::try_new_with_options(
-            published,
+            published.clone(),
             ArrowReaderOptions::new()
                 .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
         )
@@ -4973,10 +4793,17 @@ mod tests {
         })
         .sum();
         assert_eq!(matching, 1, "the selection must keep the matching row");
+        let (groups, unchanged) = hot_file_plan(&published, &schema, &[])
+            .select_pages(vec![0], &metrics)
+            .expect("page selection");
         assert!(
-            select_pages_for_predicates(&metadata, &[0], &[]).is_none(),
+            groups == vec![0] && unchanged.is_none(),
             "an empty conjunction leaves the reader unchanged"
         );
+        assert_eq!(metrics.rows_pruned_page_index.load(Ordering::Relaxed), {
+            u64::try_from(ROWS).expect("fixture rows fit u64")
+                - u64::try_from(kept).expect("kept fits u64")
+        });
     }
 
     /// Row-group min/max pruning measured on a real two-row-group file written
@@ -5024,11 +4851,8 @@ mod tests {
             ScanLeaf::Column("service_name".to_owned()),
             ScanLiteral::Utf8("checkout".to_owned()),
         )];
-        let selection = select_row_groups_for_predicates(
-            &metadata,
-            (0..metadata.num_row_groups()).collect(),
-            &predicates,
-        );
+        let selection = hot_file_plan(&published, &schema, &predicates)
+            .select_row_groups((0..metadata.num_row_groups()).collect());
         assert_eq!(selection.retained, vec![0]);
         assert_eq!(selection.pruned, 1);
         assert!(!selection.excludes_file());
@@ -5062,10 +4886,7 @@ mod tests {
     ///
     /// Panics when the fixture batch cannot be built or encoded.
     fn write_trace_id_fixture() -> (Bytes, Vec<Vec<[u8; 16]>>) {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
-            Field::new("score", DataType::Float64, false),
-        ]));
+        let schema = trace_id_schema();
         // Group `g` holds the ids whose big-endian tail is `4k + 2g`: both
         // groups span nearly the same range and every odd tail is unwritten,
         // so statistics alone retain both groups for any id between them.
@@ -5105,6 +4926,37 @@ mod tests {
         }
         writer.close().expect("trace id fixture close");
         (bytes::Bytes::from(sink), groups)
+    }
+
+    /// The `trace_id`/`score` schema [`write_trace_id_fixture`] writes.
+    fn trace_id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("score", DataType::Float64, false),
+        ]))
+    }
+
+    /// Plans reading every `schema` column of the in-memory file `published`
+    /// under `predicates`, through the same [`HotFileReadPlan`] the hot reader
+    /// builds after footer discovery, page index included.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the footer does not decode or the predicates do not compile
+    /// against `schema`.
+    fn hot_file_plan(
+        published: &Bytes,
+        schema: &SchemaRef,
+        predicates: &[ScanPredicate],
+    ) -> HotFileReadPlan {
+        let reader = ArrowReaderMetadata::load(
+            published,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .expect("valid Parquet footer");
+        let filter = scan_predicate_conjunction(predicates, schema).expect("compiled predicates");
+        HotFileReadPlan::new(&reader, schema, filter, 20).expect("per-file read plan")
     }
 
     /// Builds one 16-byte trace id with a constant prefix and `tail` as its
@@ -5178,8 +5030,8 @@ mod tests {
             )]
         };
         let absent_predicates = lookup(&absent);
-        let statistics =
-            select_row_groups_for_predicates(&metadata, vec![0, 1], &absent_predicates);
+        let statistics = hot_file_plan(&published, &trace_id_schema(), &absent_predicates)
+            .select_row_groups(vec![0, 1]);
         assert_eq!(
             statistics.retained,
             vec![0, 1],
@@ -5235,14 +5087,14 @@ mod tests {
     #[test]
     fn binary_min_max_prunes_fixed_len_row_groups() {
         let (published, _) = write_trace_id_fixture();
-        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
-            .parse_and_finish(&published)
-            .expect("valid Parquet footer");
         let above = vec![ScanPredicate::Eq(
             ScanLeaf::Column("trace_id".to_owned()),
             ScanLiteral::Bytes(vec![0xff; 16]),
         )];
-        let selection = select_row_groups_for_predicates(&metadata, vec![0, 1], &above);
+        let plan = |predicates: &[ScanPredicate]| {
+            hot_file_plan(&published, &trace_id_schema(), predicates).select_row_groups(vec![0, 1])
+        };
+        let selection = plan(&above);
         assert_eq!(selection.retained, Vec::<usize>::new());
         assert_eq!(selection.pruned, 2);
         // Strictly below the smallest written id, so neither group can match.
@@ -5250,7 +5102,7 @@ mod tests {
             ScanLeaf::Column("trace_id".to_owned()),
             ScanLiteral::Bytes(trace_id_with_tail(0).to_vec()),
         )];
-        assert!(select_row_groups_for_predicates(&metadata, vec![0, 1], &below).excludes_file());
+        assert!(plan(&below).excludes_file());
     }
 
     /// A SQL `X'..'` literal compared with a fixed-size binary column

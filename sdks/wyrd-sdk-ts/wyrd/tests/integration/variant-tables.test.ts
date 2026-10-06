@@ -6,7 +6,7 @@
  * and Arrow batches go in; native values come back out, with 64-bit integers
  * as `bigint`.
  */
-import { Int64, Table, Utf8, vectorFromArray, type Field } from "apache-arrow";
+import { Field, Int64, List, Struct, Table, Utf8, vectorFromArray } from "apache-arrow";
 import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { afterEach, beforeEach, expect, it } from "vitest";
@@ -109,6 +109,22 @@ it("stores Arrow JSON text as Variant", async () => {
   expect(rows).toEqual([{ id: 1n, payload: { n: 9007199254740993n }, mixed: "seven" }]);
 });
 
+it("stores Arrow Struct and List columns", async () => {
+  // Arrow JS's own shapes: nullable children in any order, nullable list items.
+  const point = new Struct([new Field("label", new Utf8(), true), new Field("x", new Int64(), true)]);
+  const arrow = new Table({
+    tags: vectorFromArray([["a", "b"]], new List(new Field("element", new Utf8(), true))),
+    point: vectorFromArray([{ label: "a", x: 7n }], point),
+    id: vectorFromArray([1n], new Int64()),
+  });
+  await bifrost.writeBatch(table, arrow.batches[0]!);
+  server.flushBifrost();
+
+  const rows = await bifrost.sql(`SELECT id, point, tags FROM ${table}`, asReturned);
+
+  expect(rows).toEqual([{ id: 1n, point: { x: 7n, label: "a" }, tags: ["a", "b"] }]);
+});
+
 it("copies query results into another table", async () => {
   const archive = `vala.datasets.archive_${crypto.randomUUID().replaceAll("-", "")}`;
   const archiver = await Bifrost.connect({
@@ -175,6 +191,15 @@ it("refuses a model allowing extra keys", () => {
   expect(error).toBeInstanceOf(WyrdError);
   expect(error).toMatchObject({ code: "WYRD_VALA_400_SCHEMA_PARSE", status: 400 });
   expect((error as WyrdError).message).toContain("declare a Variant field for open data");
+  expect((error as WyrdError).details).toMatchObject({
+    data: {
+      detail:
+        "an object allows undeclared keys beside its declared properties; declare a Variant field for open data",
+    },
+  });
+  expect((error as WyrdError).remediation).toBe(
+    "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data.",
+  );
 });
 
 it("refuses a Variant column sent as neither Variant nor JSON text", async () => {

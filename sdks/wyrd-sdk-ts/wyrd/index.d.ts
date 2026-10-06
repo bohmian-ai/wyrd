@@ -874,7 +874,10 @@ export interface NativeTableConfig {
   resolvedJson?: string
 }
 
-/** Closed result of describing one table: its config or a catalog error. */
+/**
+ * Closed result of declaring or describing one table: its config or a
+ * catalog error.
+ */
 export interface NativeTableConfigResult {
   /** The table config when it was declared or described. */
   config?: NativeTableConfig

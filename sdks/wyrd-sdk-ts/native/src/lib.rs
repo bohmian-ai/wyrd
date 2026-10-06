@@ -206,7 +206,8 @@ impl NativeBifrostConnection {
     }
 }
 
-/// Closed result of describing one table: its config or a catalog error.
+/// Closed result of declaring or describing one table: its config or a
+/// catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeTableConfigResult {
     /// The table config when it was declared or described.

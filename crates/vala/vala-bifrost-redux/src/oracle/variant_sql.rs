@@ -914,6 +914,97 @@ mod tests {
         }
     }
 
+    /// Strict and lenient parsing let Wyrd, not `serde_json`, decide nesting
+    /// at any depth, report built oversize first, and stay usable after.
+    ///
+    /// Valid JSON nested 129 and 1,000 levels deep is too deep for both
+    /// functions; deep malformed text is invalid, so only `try_parse_json`
+    /// maps it to null; an out-of-range number under a deep value stays
+    /// numeric; and an oversized string beside a refused number or an
+    /// over-depth sibling is too large. A following parse still succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a class, its details, or the lenient mapping drifts.
+    #[tokio::test]
+    async fn parse_json_classifies_deep_and_oversized_text() {
+        let context = session(&[None]);
+        let nested = |inner: &str, levels: usize| {
+            format!("{}{inner}{}", "[".repeat(levels), "]".repeat(levels))
+        };
+        for function in ["parse_json", "try_parse_json"] {
+            for levels in [129, 1_000] {
+                assert_eq!(
+                    refusal(
+                        &context,
+                        &format!("SELECT {function}('{}')", nested("1", levels))
+                    )
+                    .await,
+                    BifrostError::VariantTooDeep {
+                        field: function.to_owned(),
+                        row: 0,
+                        path: "/0".repeat(64),
+                        depth: 65,
+                        limit: 64,
+                    },
+                    "{function} at {levels} levels"
+                );
+            }
+            assert_eq!(
+                refusal(
+                    &context,
+                    &format!(
+                        "SELECT {function}('{}')",
+                        nested("18446744073709551616", 1_000)
+                    )
+                )
+                .await,
+                BifrostError::VariantNumericOutOfRange {
+                    field: function.to_owned(),
+                    row: 0,
+                    path: "/0".repeat(1_000),
+                    numeric_kind: "integer".to_owned(),
+                },
+                "{function} numeric under depth"
+            );
+            let big = "x".repeat(8_388_608);
+            for other in ["18446744073709551616".to_owned(), nested("1", 65)] {
+                assert_eq!(
+                    refusal(
+                        &context,
+                        &format!(r#"SELECT {function}('{{"big": "{big}", "other": {other}}}')"#)
+                    )
+                    .await
+                    .code(),
+                    "WYRD_VALA_413_VARIANT_TOO_LARGE",
+                    "{function} oversize beside {}",
+                    &other[..20]
+                );
+            }
+        }
+        let malformed = format!("SELECT parse_json('{}1')", "[".repeat(1_000));
+        assert_eq!(
+            refusal(&context, &malformed).await,
+            BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 0,
+                path: String::new(),
+            }
+        );
+        assert_eq!(
+            column(
+                &context,
+                &format!("SELECT try_parse_json('{}1') IS NULL", "[".repeat(1_000))
+            )
+            .await,
+            ["true"]
+        );
+        assert_eq!(
+            column(&context, "SELECT to_json(parse_json('[1, 2.5]'))").await,
+            ["[1,2.5]"]
+        );
+    }
+
     /// Malformed stored Variant bytes fail every Variant function, never panic.
     ///
     /// Upstream decoding validates shallowly and panics on such bytes, so this

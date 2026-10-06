@@ -14,7 +14,6 @@ export type SessionMetadata = {
   subject: { id: string; name: string };
   tenants: Tenant[];
   expiresAt: number;
-  csrf: string;
 };
 
 type HomeStatus = { status: string; tone: 'warn' | 'danger' | 'neutral' | 'ok' | 'running' };

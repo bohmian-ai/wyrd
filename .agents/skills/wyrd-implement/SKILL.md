@@ -37,6 +37,19 @@ already-approved dependencies, and test or fixture structure. Reuse the nearest
 repository behavior before adding code, abstractions, configuration, features,
 or dependencies.
 
+Revalidate the task's capability/reuse map against current source before adding
+graph stores, traversals, loaders, parsers, transports, validators, lifecycle
+owners, caches, or orchestration layers. Record the existing owner, the precise
+gap, and why the selected extension is sufficient in task evidence. Reusing
+calls inside a duplicate workflow is not reuse. A cohesive struct is not proof
+that another struct needs to exist.
+
+Do not obey invalid task mechanics literally. Resolve reversible choices
+inside the established owner yourself. If contradictory task instructions
+prevent that, return `BLOCKED` with the task conflict and route task correction
+to `$wyrd-plan` without manufacturing a product approval. A necessary change to
+approved behavior or a material boundary routes to `$wyrd-spec` instead.
+
 For non-trivial behavior, work one observable scenario at a time:
 
 1. add or select the smallest test that fails for the missing behavior;
@@ -76,12 +89,22 @@ failing command, the trace, and the diff, never your hypothesis. It returns the
 cause, fix site, and affected callers. Record its report beside the diagnosis,
 then apply the Ponytail ladder to the smallest fix at that root cause.
 
+## Never invent complexity
+
+If there is already a standard and conventional way to do something (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), do it that way. Do not invent a mechanism, state,
+check, file, setting, option, or error that the standard way does not have.
+If the task text, a review finding, or a remediation asks for one, report it
+to the caller instead of building it.
+
 ## Verify and record evidence
 
-Run the smallest complete verification set required by `AGENTS.md`: focused
-tests, applicable owner or capability lanes, required journey or boundary
-checks, format and lint checks, `git diff --check`, and a final tracked and
-untracked diff audit. Derive corrected commands when task text is stale, without
+Run the narrowest verification set that covers your write set: exact
+named tests (journey tests by exact selector), the owner lanes and boundary
+checks your diff touches, format and lint checks, `git diff --check`, and a
+final tracked and untracked diff audit. Do not run full user-journey suites or
+broad aggregates for a task or remediation; they run once at change review. Derive corrected commands when task text is stale, without
 substituting weaker proof.
 
 Append compact evidence to the task or remediation task:

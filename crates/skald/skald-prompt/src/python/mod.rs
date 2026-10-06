@@ -1,6 +1,6 @@
 //! Typed Python pyclass mirrors for every in-scope provider wire struct.
 //!
-//! One clone per boundary crossing: a callback or observer receives a
+//! One clone per boundary crossing: a callback receives a
 //! `PyProviderRequest` / `PyProviderResponse` holding the request or response
 //! behind an `Arc`. Every nested field access from there is zero-copy — each
 //! wrapper carries the same `Arc` plus an index (or other locator) into the
@@ -50,7 +50,7 @@ pub use google::{
     PyGoogleFunctionCallingConfig, PyGoogleFunctionDeclaration, PyGoogleFunctionResponse,
     PyGoogleGenerationConfig, PyGoogleInlineData, PyGooglePart, PyGoogleSafetyRating,
     PyGoogleSafetySetting, PyGoogleThinkingConfig, PyGoogleTool, PyGoogleToolConfig,
-    PyGoogleUsageMetadata, PyVertexRequest, PyVertexResponse,
+    PyGoogleUsageMetadata,
 };
 pub use openai_chat_messages::{
     PyOpenAiChatMessage, PyOpenAiContentPart, PyOpenAiFilePart, PyOpenAiImageUrl,

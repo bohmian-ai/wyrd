@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkflowRun",
+  "description": "Portable Workflow run snapshot shared by local and server execution.",
+  "type": "object",
+  "required": [
+    "created_at",
+    "run_id",
+    "status"
+  ],
+  "properties": {
+    "created_at": {
+      "description": "Creation time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "description": "Terminal time.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "error": {
+      "description": "Primary run error for `failed` and `timed_out` runs.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorkflowRunError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outputs": {
+      "description": "Declared outputs, populated only for a succeeded run.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": true
+    },
+    "run_id": {
+      "description": "Run identity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "started_at": {
+      "description": "Start time.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "status": {
+      "description": "Run lifecycle status.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorkflowRunStatus"
+        }
+      ]
+    },
+    "steps": {
+      "description": "Step results keyed by step ID.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/WorkflowStepResult"
+      }
+    },
+    "workflow": {
+      "description": "Pinned Workflow Card, absent only for an unregistered local run.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Verifier",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional server-resolved durable UID.\n\nAuthors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    },
+    "WorkflowRunError": {
+      "description": "Terminal-snapshot projection of one derive-backed Wyrd error.\n\nThis is not a second catalog: `code` and `remediation` come from the [`WyrdError`] catalog and `details` carries only safe fields.",
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "remediation"
+      ],
+      "properties": {
+        "code": {
+          "description": "Stable Wyrd error code.",
+          "type": "string"
+        },
+        "details": {
+          "description": "Safe structured details.",
+          "default": null
+        },
+        "message": {
+          "description": "Safe diagnostic message.",
+          "type": "string"
+        },
+        "remediation": {
+          "description": "Operator-facing remediation.",
+          "type": "string"
+        }
+      }
+    },
+    "WorkflowRunStatus": {
+      "description": "Lifecycle status of a Workflow run.",
+      "oneOf": [
+        {
+          "description": "Accepted but not started.",
+          "type": "string",
+          "enum": [
+            "queued"
+          ]
+        },
+        {
+          "description": "Executing steps.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "Every step succeeded and every output resolved.",
+          "type": "string",
+          "enum": [
+            "succeeded"
+          ]
+        },
+        {
+          "description": "A step or run-level failure ended the run.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "The caller cancelled the run.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "The total run deadline expired.",
+          "type": "string",
+          "enum": [
+            "timed_out"
+          ]
+        }
+      ]
+    },
+    "WorkflowStepResult": {
+      "description": "Portable result of one Workflow step.",
+      "type": "object",
+      "required": [
+        "attempts",
+        "status"
+      ],
+      "properties": {
+        "attempts": {
+          "description": "Number of attempts begun.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ended_at": {
+          "description": "Terminal time.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "error": {
+          "description": "Terminal error, present only for a failed step.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowRunError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at": {
+          "description": "First attempt start time.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "status": {
+          "description": "Step lifecycle status.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkflowStepStatus"
+            }
+          ]
+        },
+        "structured_output": {
+          "description": "Structured output, retained only for a succeeded step."
+        },
+        "text": {
+          "description": "Final text output, retained only for a succeeded step.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "WorkflowStepStatus": {
+      "description": "Lifecycle status of one Workflow step.",
+      "oneOf": [
+        {
+          "description": "Waiting for dependencies or a concurrency slot.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "An attempt is executing.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "The step produced its output.",
+          "type": "string",
+          "enum": [
+            "succeeded"
+          ]
+        },
+        {
+          "description": "The step failed terminally.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "An active step was interrupted by cancellation or the run deadline.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "The run ended before the step started.",
+          "type": "string",
+          "enum": [
+            "unstarted"
+          ]
+        }
+      ]
+    }
+  }
+}

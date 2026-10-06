@@ -41,7 +41,7 @@ use wyrd_spec::card::source::{
 };
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::card::workflow::WorkflowSpec;
+use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRun, WorkflowSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
@@ -128,6 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<ParameterName>(out, golden, "parameter_name")?;
     write::<AgentSpec>(out, golden, "agent_spec")?;
     write::<WorkflowSpec>(out, golden, "workflow_spec")?;
+    write::<WorkflowRun>(out, golden, "workflow_run")?;
+    write::<CreateWorkflowRunRequest>(out, golden, "create_workflow_run_request")?;
     write::<CardEvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
     write::<TriggerSpec>(out, golden, "trigger_spec")?;

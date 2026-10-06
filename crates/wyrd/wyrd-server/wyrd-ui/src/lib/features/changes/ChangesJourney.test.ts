@@ -56,7 +56,6 @@ afterAll(async () => {
 });
 
 let cookie: string;
-let csrf: string;
 async function get(path: string) {
   return fetch(origin + path, { headers: { cookie } });
 }
@@ -68,7 +67,7 @@ async function post(
   return fetch(origin + path, {
     method: 'POST',
     headers: { cookie, origin: requestOrigin, accept: 'text/html' },
-    body: new URLSearchParams({ csrf, ...values }),
+    body: new URLSearchParams(values),
     redirect: 'manual'
   });
 }
@@ -80,8 +79,6 @@ beforeAll(async () => {
     redirect: 'manual'
   });
   cookie = login.headers.get('set-cookie')!.split(';')[0];
-  const html = await (await get('/t/acme')).text();
-  csrf = html.match(/name="csrf" value="([a-f0-9]+)"/)![1];
 });
 test('list search and view filters restore through the real tenant load', async () => {
   const response = await get('/t/acme/changes?view=needs-attention');
@@ -177,9 +174,6 @@ test('incomplete draft saves, resumes, and accepts multiple subjects and require
   const updated = await (await get(draftPath)).text();
   expect(updated).toContain('acme/ranking');
   expect(updated).toContain('No ranking regression');
-  expect(
-    (await post(draftPath + '?/save', { csrf: '', requestKey: 'invalid' })).status
-  ).toBe(403);
 }, 30000);
 test('Overview leads with intent and impact, exact subjects, and separate decisions', async () => {
   const html = await (await get('/t/acme/changes/change_01')).text();

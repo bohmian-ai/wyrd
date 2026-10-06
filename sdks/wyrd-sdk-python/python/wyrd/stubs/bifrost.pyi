@@ -166,6 +166,7 @@ class TableConfig:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name."""
         ...
@@ -234,12 +235,14 @@ class _BifrostBase:
         credential: str | None = None,
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
+        tenant: str | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect one client; every argument resolves from the chain if omitted.
 
         ``client`` reuses an existing, possibly delegated, ``WyrdClient`` and
-        cannot be combined with ``server_url``, ``credential``, or ``grpc_url``.
+        cannot be combined with ``server_url``, ``credential``, ``grpc_url``,
+        or ``tenant``.
         ``client_byte_limit_bytes`` overrides the handle-wide ingestion byte
         budget (256 MiB by default); a budget too small to seal one message
         raises ``WYRD_CLIENT_400_CONFIG_INVALID``.

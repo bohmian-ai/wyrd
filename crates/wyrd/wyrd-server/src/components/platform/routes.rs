@@ -15,21 +15,24 @@ use axum::Extension;
 use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::auth::{
-    CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
-    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest, SetTenantStatusRequest,
-    TenantListResponse,
+    CreateTenantRequest, CreateTenantResponse, ExchangeTokenType, OAuthErrorCode,
+    OAuthErrorResponse, ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+    SetTenantStatusRequest, TenantListResponse,
 };
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse, TokenType};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::oauth::{OAuthError, OAuthForm, TOKEN_EXCHANGE, no_store};
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
@@ -59,69 +62,96 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(platform_token))
 }
 
-/// Exchange a platform credential for a short-lived session.
+/// Exchange a platform credential for a short-lived session through the
+/// RFC 8693 token exchange.
 ///
 /// The one route that reads credential material. Every other platform route
 /// takes the session this mints, so no served surface after this point handles
-/// a secret.
+/// a secret. The form carries the credential as an API-key `subject_token`
+/// and nothing else; the reply is the RFC 8693 §2.2.1 token response.
 ///
 /// # Errors
-/// Returns an unauthenticated error for every credential rejection, so no
-/// caller can distinguish which condition failed.
+/// Answers the RFC 6749 §5.2 body: `invalid_request` for a malformed
+/// request and, per RFC 8693 §2.2.2, for every credential rejection,
+/// indistinguishably; `invalid_target` for an unsupported `audience`;
+/// `unsupported_grant_type` for another grant; and
+/// `server_error` when the platform store or its audit fails.
 #[utoipa::path(
     post,
     path = "/auth/platform/token",
-    request_body = PlatformTokenRequest,
+    request_body(content = TokenRequest, content_type = "application/x-www-form-urlencoded"),
     responses(
-        (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
-        (status = 401, description = "Credential rejected, indistinguishably for every cause \
-          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 200, description = "Short-lived platform session", body = TokenResponse),
+        (status = 400, description = "`invalid_request`, including every credential \
+          rejection, `invalid_target`, or `unsupported_grant_type`", body = OAuthErrorResponse),
+        (status = 500, description = "`server_error`: a platform store read or write \
+          failed", body = OAuthErrorResponse)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
     security(()),
     tag = "Platform"
 )]
-#[tracing::instrument(level = "info", skip(state, request))]
+#[tracing::instrument(level = "info", skip_all)]
 async fn platform_token(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
-    Json(request): Json<PlatformTokenRequest>,
-) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
-    let fallback_request_id: String;
-    let req_id = match request_id.as_ref() {
-        Some(axum::Extension(id)) => id.as_str(),
-        None => {
-            fallback_request_id = uuid::Uuid::new_v4().to_string();
-            &fallback_request_id
-        }
+    form: OAuthForm,
+) -> Result<Response, OAuthError> {
+    match form.get("grant_type") {
+        Some(TOKEN_EXCHANGE) => {}
+        Some(_) => return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType)),
+        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
+    }
+    let TokenRequest::TokenExchange {
+        subject_token,
+        subject_token_type: ExchangeTokenType::ApiKey,
+        actor_token: None,
+        actor_token_type: None,
+        audience: None,
+    } = form.token_request()?
+    else {
+        return Err(OAuthError(OAuthErrorCode::InvalidRequest));
     };
-    let Some(operator) = state.postgres.operator_pool() else {
-        return Err(not_configured());
-    };
-    let Some(issuing_key) = state.auth.issuing_key.clone() else {
-        return Err(not_configured());
+    let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
+    let (Some(operator), Some(issuing_key)) = (
+        state.postgres.operator_pool(),
+        state.auth.issuing_key.clone(),
+    ) else {
+        return Err(OAuthError::from(not_configured().0));
     };
 
     let sessions = PlatformSessions::new(operator, issuing_key, Arc::clone(&state.audit_outbox));
-    let presented = SecretString::from(request.credential.expose().to_owned());
-    match sessions.exchange(&presented, req_id).await {
-        Ok(session) => Ok(Json(PlatformTokenResponse {
-            access_token: SecretBearer::new(session.token.expose_secret().to_owned()),
-            token_type: "Bearer".to_owned(),
-            expires_in: u64::try_from(DEFAULT_PLATFORM_TOKEN_TTL_MINUTES * 60).unwrap_or(900),
-        })),
+    let presented = SecretString::from(subject_token.expose().to_owned());
+    match sessions.exchange(&presented, request_id.as_str()).await {
+        Ok(session) => Ok(no_store(
+            StatusCode::OK,
+            Json(TokenResponse {
+                issued_token_type: Some(ExchangeTokenType::AccessToken),
+                ..platform_session_response(session.token.expose_secret())
+            }),
+        )),
         Err(PlatformSessionError::Invalid) => {
-            Err(WyrdErrorResponse::from(WyrdError::Unauthenticated {
+            Err(OAuthError::request(WyrdError::Unauthenticated {
                 message: "invalid platform credential".to_owned(),
                 details: serde_json::json!({ "plane": "platform" }),
             }))
         }
-        Err(error) => Err(WyrdErrorResponse::from(internal_failure(
+        Err(error) => Err(OAuthError::from(internal_failure(
             "platform session could not be issued",
             &error,
         ))),
+    }
+}
+
+/// The RFC 6749 §5.1 response carrying a freshly minted platform session.
+pub(crate) fn platform_session_response(session: &str) -> TokenResponse {
+    TokenResponse {
+        access_token: SecretBearer::new(session.to_owned()),
+        token_type: TokenType::Bearer,
+        expires_in: u64::try_from(DEFAULT_PLATFORM_TOKEN_TTL_MINUTES * 60).unwrap_or(900),
+        refresh_token: None,
+        issued_token_type: None,
     }
 }
 

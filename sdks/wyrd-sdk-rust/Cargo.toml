@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 # The integrated Service journey builds its native LLM-judge Prompt.
 skald-prompt = { workspace = true }
+skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 url = { workspace = true }

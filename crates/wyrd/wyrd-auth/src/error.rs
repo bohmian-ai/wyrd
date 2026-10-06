@@ -1,9 +1,12 @@
 //! Cross-cutting auth error converters shared by all three token-issuing flows.
 
+use std::fmt::Display;
+
 use serde_json::json;
-use wyrd_auth_oidc::ScreenError;
+use wyrd_auth_oidc::{RelyingPartyError, ScreenError};
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_spec::error::WyrdError;
+use wyrd_sql::SqlError;
 
 /// Convert an outbound address-screening refusal to the public catalog.
 ///
@@ -11,10 +14,79 @@ use wyrd_spec::error::WyrdError;
 /// be reached, never which address range it resolved to, because that answer is
 /// a probe of the deployment's internal network.
 pub(crate) fn screen_error(error: &ScreenError) -> WyrdError {
-    tracing::warn!(%error, "identity provider request refused by address screening");
+    provider_unreachable(format_args!(
+        "request refused by address screening: {error}"
+    ))
+}
+
+/// The identity provider could not be reached, failed, or answered unusably.
+///
+/// Logs `cause` server-side and returns the one public refusal every provider
+/// transport failure shares, naming no address, status, or body detail.
+pub(crate) fn provider_unreachable(cause: impl Display) -> WyrdError {
+    tracing::warn!(error = %cause, "identity provider unavailable");
     WyrdError::DiscoveryUnavailable {
         message: "identity provider could not be reached".to_owned(),
         details: json!({}),
+    }
+}
+
+/// Convert a relying-party refusal to the public catalog.
+///
+/// Screening refusals and provider outages are the one provider-unreachable
+/// refusal; an issuer mismatch keeps its stable
+/// `details.reason = "issuer_mismatch"`; a token-endpoint outage is a
+/// retryable `503`; every refused code or ID token is
+/// [`WyrdError::InvalidToken`] with its cause logged server-side only.
+pub(crate) fn relying_party_error(error: RelyingPartyError) -> WyrdError {
+    match error {
+        RelyingPartyError::Screened(error) => screen_error(&error),
+        RelyingPartyError::IssuerMismatch => {
+            tracing::warn!("OIDC discovery names a different issuer");
+            WyrdError::DiscoveryUnavailable {
+                message: "the provider discovery document names a different issuer".to_owned(),
+                details: json!({ "reason": "issuer_mismatch" }),
+            }
+        }
+        RelyingPartyError::DiscoveryUnavailable(cause) => {
+            provider_unreachable(format_args!("OIDC discovery failed: {cause}"))
+        }
+        RelyingPartyError::TokenEndpointUnavailable(cause) => {
+            tracing::warn!(error = %cause, "OIDC token endpoint unavailable");
+            WyrdError::AuthVerifyUnavailable {
+                message: "OIDC token endpoint unavailable".to_owned(),
+                details: json!({ "retry_after_seconds": 1 }),
+            }
+        }
+        RelyingPartyError::InvalidNonce => WyrdError::InvalidNonce {
+            message: "id token nonce is missing or mismatched".to_owned(),
+            details: json!({}),
+        },
+        RelyingPartyError::Configuration(cause) => WyrdError::Internal {
+            message: format!("relying-party configuration is unusable: {cause}"),
+            details: json!({}),
+        },
+        error @ (RelyingPartyError::TokenRejected(_)
+        | RelyingPartyError::UnknownKey
+        | RelyingPartyError::InvalidIdToken(_)) => {
+            tracing::warn!(error = %error, "OIDC sign-in refused");
+            invalid_token("sign-in was refused")
+        }
+    }
+}
+
+/// Map an auth store failure to the fail-closed backend error, logging the
+/// cause server-side only.
+///
+/// Every auth workflow that reads or writes the tenant auth tables answers a
+/// store outage the same way: a retryable `503` that names no table, query, or
+/// driver detail.
+pub(crate) fn store_error(error: impl Into<SqlError>) -> WyrdError {
+    let error = error.into();
+    tracing::warn!(error = %error, "auth store unavailable");
+    WyrdError::AuthVerifyUnavailable {
+        message: "auth backend unavailable".to_owned(),
+        details: json!({ "retry_after_seconds": 1 }),
     }
 }
 

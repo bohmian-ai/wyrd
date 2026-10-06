@@ -88,10 +88,22 @@ pub enum Resource {
     Policy,
     /// Trigger cards.
     Triggers,
+    /// Accepted server Workflow runs: submission, inspection, and
+    /// cancellation.
+    Workflows,
     /// Service and agent API-key principals.
     ServiceAccounts,
     /// Human user administration.
     Users,
+    /// The tenant's human OIDC login connection: staging, testing,
+    /// activating, deactivating, and removing the provider its people sign in
+    /// through.
+    ///
+    /// Separate from [`Resource::ServiceAccounts`] so that holding credential
+    /// administration alone never confers authority over who may sign in to
+    /// the tenant. The built-in `admin` role reaches it through its wildcard;
+    /// no other built-in role grants it.
+    IdentityConnections,
     /// The tenant directory itself: creating, inspecting, suspending, and
     /// recovering administration for a tenant.
     ///
@@ -219,8 +231,10 @@ impl Resource {
             Self::Audit => "audit",
             Self::Policy => "policy",
             Self::Triggers => "triggers",
+            Self::Workflows => "workflows",
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
+            Self::IdentityConnections => "identity_connections",
             Self::Tenants => "tenants",
             Self::PlatformIdentity => "platform_identity",
             Self::PlatformCredentials => "platform_credentials",
@@ -402,6 +416,16 @@ impl Permission {
         }
     }
 
+    /// Administer the tenant's human OIDC login connection.
+    #[must_use]
+    pub const fn identity_connections_write() -> Self {
+        Self {
+            resource: Resource::IdentityConnections,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// Read the tenant's redacted Operator connections.
     #[must_use]
     pub const fn operators_read() -> Self {
@@ -448,6 +472,17 @@ impl Permission {
         Self {
             resource: Resource::Triggers,
             action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Submit, inspect, and cancel the caller's own accepted server
+    /// Workflow runs.
+    #[must_use]
+    pub const fn workflow_run() -> Self {
+        Self {
+            resource: Resource::Workflows,
+            action: Action::Run,
             scope: PermissionScope::All,
         }
     }
@@ -754,8 +789,10 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "audit" => Resource::Audit,
         "policy" => Resource::Policy,
         "triggers" => Resource::Triggers,
+        "workflows" => Resource::Workflows,
         "service_accounts" => Resource::ServiceAccounts,
         "users" => Resource::Users,
+        "identity_connections" => Resource::IdentityConnections,
         "bifrost_table" => Resource::BifrostTable,
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_peer" => Resource::BifrostPeer,
@@ -934,8 +971,10 @@ mod tests {
             Resource::Audit,
             Resource::Policy,
             Resource::Triggers,
+            Resource::Workflows,
             Resource::ServiceAccounts,
             Resource::Users,
+            Resource::IdentityConnections,
             Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
             Resource::Wildcard,
         ];

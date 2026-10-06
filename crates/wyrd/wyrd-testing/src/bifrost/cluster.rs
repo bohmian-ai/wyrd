@@ -10,6 +10,7 @@ use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
@@ -141,9 +142,8 @@ pub struct BifrostClusterSpec {
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Oracle runtime bounds every Oracle node boots with, when not the defaults.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
-    /// Local mock upstream every node's built-in gateway adapters target, when
-    /// a journey drives gateway calls through the cluster.
-    gateway_provider_root: Option<url::Url>,
+    /// Local mock upstream every node's built-in gateway adapters reach.
+    gateway_provider_root: Option<Url>,
 }
 
 impl BifrostClusterSpec {
@@ -207,14 +207,15 @@ impl BifrostClusterSpec {
         self
     }
 
-    /// Roots every node's built-in gateway adapters at one local mock
-    /// upstream `root`, so a journey can invoke the gateway on any pod.
+    /// Boots every node with its built-in gateway adapters rooted at one
+    /// local mock upstream `root`.
     ///
-    /// Delegates to
-    /// [`crate::server::WyrdTestServerBuilder::with_gateway_provider_root_for_test`]
-    /// on every start and restart.
+    /// The value passes through
+    /// [`WyrdTestServerBuilder::with_gateway_provider_root_for_test`], so a
+    /// journey drives governed model calls on a cluster pod without reaching
+    /// a real provider.
     #[must_use]
-    pub fn with_gateway_provider_root_for_test(mut self, root: url::Url) -> Self {
+    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
         self.gateway_provider_root = Some(root);
         self
     }
@@ -885,8 +886,8 @@ pub struct WyrdTestCluster {
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Oracle runtime bounds every node start and restart boots with.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
-    /// Mock upstream every node start and restart roots its gateway adapters at.
-    gateway_provider_root: Option<url::Url>,
+    /// Mock upstream root every node start and restart roots its gateway at.
+    gateway_provider_root: Option<Url>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.

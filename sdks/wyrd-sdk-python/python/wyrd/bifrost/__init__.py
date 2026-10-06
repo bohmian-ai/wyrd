@@ -249,15 +249,16 @@ class TableConfig:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name.
 
         Every transport argument is optional; an omitted one resolves through
-        the same chain the client constructor uses.
+        the same chain the client constructor uses, including ``tenant``.
         """
 
         return TableConfig._from_native(
-            _native.bifrost.TableConfig.describe(table, server_url, credential, grpc_url)
+            _native.bifrost.TableConfig.describe(table, server_url, credential, grpc_url, tenant)
         )
 
     @property
@@ -412,6 +413,7 @@ class _BifrostBase:
         credential: str | None = None,
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
+        tenant: str | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect one client, optionally already bound to a write target.
@@ -430,7 +432,10 @@ class _BifrostBase:
             client: an existing ``WyrdClient``, such as one returned by
                 ``on_behalf_of``. Bifrost then uses its authentication and
                 transport; it cannot be combined with ``server_url``,
-                ``credential``, or ``grpc_url``.
+                ``credential``, ``grpc_url``, or ``tenant``.
+            tenant: the tenant route key that selects one server\'s
+                saved login or the workload-token tenant; an explicit credential, access token, or API key
+                already names its tenant and refuses it.
             client_byte_limit_bytes: the handle-wide ingestion byte budget
                 shared by every table this client writes. 256 MiB if omitted.
 
@@ -449,6 +454,7 @@ class _BifrostBase:
             credential,
             grpc_url,
             client,
+            tenant,
             client_byte_limit_bytes,
         )
 

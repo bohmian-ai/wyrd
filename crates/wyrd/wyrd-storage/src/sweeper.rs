@@ -222,7 +222,7 @@ impl Sweeper {
     /// Returns [`StorageError`] when cross-tenant batch discovery fails.
     async fn sweep_expired_uploads_batch(&self) -> Result<(), StorageError> {
         let rows = wyrd_sql::queries::storage::admin::multipart_uploads::expired_uploads_batch(
-            self.operator_pool.pool(),
+            &self.operator_pool,
             self.cfg.batch_size,
             self.cfg.init_grace,
         )
@@ -259,7 +259,7 @@ impl Sweeper {
     /// Cleanup is best effort: SQL failures are logged so a later tick can retry.
     async fn reap_expired_idempotency_keys(&self) {
         match wyrd_sql::queries::storage::admin::idempotency::reap_idempotency_keys(
-            self.operator_pool.pool(),
+            &self.operator_pool,
             self.cfg.idempotency_batch_size,
         )
         .await

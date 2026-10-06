@@ -15,11 +15,52 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
 use wyrd_sql::{
     MIGRATION_LEASE_WAIT, OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return the bound tenant's Active human connection binding, seeding a public
+/// Active connection when the tenant has none.
+///
+/// Every human session is bound to the exact connection revision it logged in
+/// through, and issuance refuses one whose connection is not Active. Tests
+/// that mint or rotate human sessions without driving a provider use this to
+/// give the session a real, Active connection to belong to.
+///
+/// # Errors
+/// Returns [`SqlError`] when the read or insert fails.
+pub async fn seed_active_human_connection(
+    conn: &mut TenantConn<'_>,
+) -> Result<HumanConnectionBinding, SqlError> {
+    sqlx::query_as::<_, HumanConnectionBinding>(
+        "WITH existing AS (
+             SELECT connection_id, revision AS connection_revision
+               FROM wyrd.auth_human_connections
+              WHERE state = 'Active' AND removed_at IS NULL),
+         inserted AS (
+             INSERT INTO wyrd.auth_human_connections (
+                 connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+                 client_auth, claim_mapping, group_role_map, jwks_ttl_secs, jwks_uri)
+             SELECT $1, $2,
+                    (SELECT COALESCE(max(revision), 0) + 1 FROM wyrd.auth_human_connections),
+                    'Active', 'https://idp.fixture.test', 'wyrd-fixture', 'Public',
+                    '{\"subject\": \"sub\"}'::jsonb, '{}'::jsonb, 300,
+                    'https://idp.fixture.test/jwks'
+              WHERE NOT EXISTS (SELECT 1 FROM existing)
+             RETURNING connection_id, revision AS connection_revision)
+         SELECT connection_id, connection_revision FROM existing
+         UNION ALL
+         SELECT connection_id, connection_revision FROM inserted",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(conn.data_tenant_id().as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
 
 /// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
@@ -320,6 +361,41 @@ impl PgFixture {
     }
 }
 
+/// An isolated, fixture-owned database with no migration applied.
+///
+/// Upgrade tests use it to stop the schema at a chosen historical version,
+/// stage legacy rows, and then prove how a later migration treats them. The
+/// database is dropped when this value drops.
+pub struct UnmigratedDatabase {
+    /// Migrator-role pool on the empty database. Precedes `_test_db` so it
+    /// drops before the database is removed.
+    migrator: PgPool,
+    /// Database owner whose drop removes the isolated database.
+    _test_db: TestDatabase,
+}
+
+impl UnmigratedDatabase {
+    /// Create an empty isolated database and connect the migrator role to it.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the test DSNs are unset or invalid, or the
+    /// database cannot be created, granted, or connected.
+    pub async fn create() -> Result<Self, FixtureError> {
+        let test_db = TestDatabase::create_empty().await?;
+        let migrator = test_db.owner_pool().await?;
+        Ok(Self {
+            migrator,
+            _test_db: test_db,
+        })
+    }
+
+    /// The migrator-role pool, which owns DDL on this database.
+    #[must_use]
+    pub fn migrator_pool(&self) -> &PgPool {
+        &self.migrator
+    }
+}
+
 /// Owns one ephemeral database and the admin authority required to clean it up.
 struct TestDatabase {
     /// Unique database name allocated for this fixture instance.
@@ -351,6 +427,16 @@ impl TestDatabase {
     /// Returns [`SqlError`] when the admin DSN is missing or invalid, the
     /// database cannot be created, or migrations fail.
     async fn create() -> Result<Self, SqlError> {
+        let test_db = Self::create_empty().await?;
+        test_db.migrate().await?;
+        Ok(test_db)
+    }
+
+    /// Creates an isolated database without applying migrations.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when database creation fails.
+    async fn create_empty() -> Result<Self, SqlError> {
         let admin_dsn = test_database_admin_dsn("wyrd")?;
         let name = unique_database_name();
         let admin_pool = build_pool(admin_dsn.expose_secret(), PoolConfig::migrator_defaults())
@@ -363,13 +449,11 @@ impl TestDatabase {
             .map_err(SqlError::from)?;
         admin_pool.close().await;
 
-        let test_db = Self {
+        Ok(Self {
             name,
             admin_dsn,
             owned: true,
-        };
-        test_db.migrate().await?;
-        Ok(test_db)
+        })
     }
 
     /// Binds to an already-created, already-migrated fixture database.

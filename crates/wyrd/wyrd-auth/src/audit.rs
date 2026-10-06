@@ -23,6 +23,12 @@ pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.
 pub const CARD_SCOPE_MINT_OPERATION: &str = "auth.card_scope.mint";
+/// Operation for a human login a provider callback completed: its User is
+/// signed in and its authorization code or device approval recorded.
+pub const LOGIN_OPERATION: &str = "auth.login";
+/// Operation for a human login whose provider-asserted groups changed the
+/// User's durable role assignments.
+pub const USER_ROLES_SYNC_OPERATION: &str = "auth.user.roles.sync";
 
 /// Parse the caller's request id into the audit correlation id.
 ///
@@ -36,10 +42,8 @@ pub fn audit_request_id(request_id: &str) -> RequestId {
 
 /// Build one auth audit event attributed to the acting principal.
 ///
-/// The resource is the acting card when there is one, otherwise the principal
-/// id. The permission is the operation name, because these grants authenticate
-/// rather than evaluate a dynamic permission; callers that did evaluate one
-/// overwrite `permission` (and `resource`) on the returned event.
+/// [`principal_event`] with `detail` attached; see it for the resource and
+/// permission rules.
 #[must_use]
 pub fn auth_event(
     request_id: &str,
@@ -49,6 +53,32 @@ pub fn auth_event(
     card_ref: Option<CardRef>,
     outcome: AuditOutcome,
     detail: AuditDetail,
+) -> AuditEvent {
+    principal_event(
+        request_id,
+        operation,
+        principal_id,
+        principal_kind,
+        card_ref,
+        outcome,
+    )
+    .with_detail(detail)
+}
+
+/// Build one detail-less auth audit event attributed to the acting principal.
+///
+/// The resource is the acting card when there is one, otherwise the principal
+/// id. The permission is the operation name, because these grants authenticate
+/// rather than evaluate a dynamic permission; callers that did evaluate one
+/// overwrite `permission` (and `resource`) on the returned event.
+#[must_use]
+pub fn principal_event(
+    request_id: &str,
+    operation: &str,
+    principal_id: PrincipalId,
+    principal_kind: PrincipalKindTag,
+    card_ref: Option<CardRef>,
+    outcome: AuditOutcome,
 ) -> AuditEvent {
     let resource = card_ref
         .as_ref()
@@ -64,7 +94,6 @@ pub fn auth_event(
         operation.to_owned(),
         outcome,
     )
-    .with_detail(detail)
 }
 
 /// Map a stored `principal_kind` column value onto its audit tag.
@@ -99,6 +128,7 @@ pub fn auth_failure_code(error: &WyrdError) -> AuditErrorCode {
         | WyrdError::BadTokenFormat { .. }
         | WyrdError::InvalidNonce { .. }
         | WyrdError::InvalidState { .. }
+        | WyrdError::DeviceAuthorization { .. }
         | WyrdError::CredentialRevoked { .. } => AuditErrorCode::InvalidToken,
         WyrdError::PrincipalNotFound { .. } | WyrdError::RegistryCardNotFound { .. } => {
             AuditErrorCode::NotFound

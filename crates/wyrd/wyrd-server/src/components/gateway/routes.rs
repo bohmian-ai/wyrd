@@ -41,6 +41,7 @@ use wyrd_storage::StorageError;
 
 use super::batches::{BatchAnswer, GatewayBatches};
 use super::capture::object_path;
+use super::ingress::{FALLBACK_HEADER_DOC, requested_fallback};
 use super::invocation::{
     GatewayCallRequest, GatewayCallResponse, GatewayInvocation, invalid_request,
 };
@@ -831,6 +832,7 @@ pub(crate) async fn get_capture(
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
+    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
     request_body(content = GatewayChatCompletionsRequest, description = "OpenAI-compatible chat completion request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
         (status = 200, description = "Chat completion response as JSON, or server-sent events when `stream` is true", content(
@@ -859,6 +861,7 @@ pub(crate) async fn get_capture(
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     openai_call(
@@ -866,6 +869,7 @@ pub(crate) async fn chat_completions(
         caller,
         typed_body::<GatewayChatCompletionsRequest>(request).map(|body| (body, None)),
         GatewayOperation::ChatCompletions,
+        Some(&headers),
     )
     .await
 }
@@ -873,6 +877,7 @@ pub(crate) async fn chat_completions(
 #[utoipa::path(
     post,
     path = "/v1/responses",
+    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
     request_body(content = GatewayResponsesRequest, description = "OpenAI-compatible Responses request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
         (status = 200, description = "Response object as JSON, or server-sent events when `stream` is true", content(
@@ -900,6 +905,7 @@ pub(crate) async fn chat_completions(
 pub(crate) async fn responses(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     openai_call(
@@ -907,6 +913,7 @@ pub(crate) async fn responses(
         caller,
         typed_body::<GatewayResponsesRequest>(request).map(|body| (body, None)),
         GatewayOperation::Responses,
+        Some(&headers),
     )
     .await
 }
@@ -946,6 +953,7 @@ pub(crate) async fn embeddings(
         caller,
         typed_body::<GatewayEmbeddingsRequest>(request).map(|body| (body, None)),
         GatewayOperation::Embeddings,
+        None,
     )
     .await
 }
@@ -1021,7 +1029,7 @@ pub(crate) async fn image_edits(
         FileSink::Memory,
     )
     .await;
-    openai_call(&state, caller, request, GatewayOperation::Images).await
+    openai_call(&state, caller, request, GatewayOperation::Images, None).await
 }
 
 #[utoipa::path(
@@ -1063,7 +1071,7 @@ pub(crate) async fn image_variations(
         FileSink::Memory,
     )
     .await;
-    openai_call(&state, caller, request, GatewayOperation::Images).await
+    openai_call(&state, caller, request, GatewayOperation::Images, None).await
 }
 
 #[utoipa::path(
@@ -1222,7 +1230,7 @@ async fn audio_form(
             "was not read",
         ))),
     };
-    openai_call(state, caller, request, GatewayOperation::Audio).await
+    openai_call(state, caller, request, GatewayOperation::Audio, None).await
 }
 
 /// Runs a JSON media `route` of its operation family, whose body must decode
@@ -1254,6 +1262,7 @@ async fn json_media(
         caller,
         body.map(|body| (body, Some(media))),
         operation,
+        None,
     )
     .await
 }
@@ -1314,14 +1323,19 @@ pub(crate) async fn models(
 /// relayed incrementally, and a stream that ends without its terminator or
 /// terminal error aborts the response. The request-id middleware correlates
 /// every response through the `wyrd-request-id` header.
+///
+/// `fallback_headers` are the request headers of a route that accepts the
+/// `wyrd-gateway-fallback` override; routes that do not pass `None` and keep
+/// tenant fallback policy.
 async fn openai_call(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
+    fallback_headers: Option<&HeaderMap>,
 ) -> Response {
     let result = match caller {
-        Ok(caller) => invoke_openai(state, &caller, request, operation).await,
+        Ok(caller) => invoke_openai(state, &caller, request, operation, fallback_headers).await,
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     match result {
@@ -1747,13 +1761,15 @@ async fn form_body(
 ///
 /// # Errors
 /// Returns the decoding error of `request`, `GatewayInvalidRequest` for a
-/// `model` that is not an exact projection, and every error of
+/// `model` that is not an exact projection, every error of
+/// [`requested_fallback`] for `fallback_headers`, and every error of
 /// [`GatewayInvocation::invoke`].
 async fn invoke_openai(
     state: &AppState,
     caller: &Caller,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
+    fallback_headers: Option<&HeaderMap>,
 ) -> Result<GatewayCallResponse, WyrdError> {
     let (body, media) = request?;
     let model = body
@@ -1762,6 +1778,10 @@ async fn invoke_openai(
         .ok_or_else(|| GatewayContractError::new("model", "must be <provider>/<model>"))
         .and_then(ModelRef::from_projection)
         .map_err(invalid_request)?;
+    let fallback = match fallback_headers {
+        Some(headers) => requested_fallback(headers, &model)?,
+        None => None,
+    };
     let usage_bound = usage_bound(operation, &body);
     GatewayInvocation::new(state)
         .invoke(
@@ -1770,7 +1790,7 @@ async fn invoke_openai(
                 operation,
                 ingress: IngressDialect::OpenAi,
                 model,
-                fallback: None,
+                fallback,
                 stream: body.get("stream") == Some(&Value::Bool(true)),
                 body,
                 media,
@@ -1806,7 +1826,10 @@ pub(super) fn openai_error(error: &WyrdError) -> Response {
 /// `n`, Responses by `max_output_tokens`, and a request without that maximum
 /// is unbounded; Embeddings produce no output tokens. Other operations have no
 /// token bound here.
-fn usage_bound(operation: GatewayOperation, body: &Value) -> Option<Vec<GatewayUsageAmount>> {
+pub(super) fn usage_bound(
+    operation: GatewayOperation,
+    body: &Value,
+) -> Option<Vec<GatewayUsageAmount>> {
     let field = |name: &str| body.get(name).and_then(Value::as_u64);
     let output = match operation {
         GatewayOperation::ChatCompletions => Some(

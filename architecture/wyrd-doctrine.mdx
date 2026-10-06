@@ -166,7 +166,15 @@ authoring syntax. Composite registration may use `Sibling` to distinguish a
 same-request target, but the server rewrites it to a UID-bearing `Ref` before
 durable persistence. `CardRef` carries `kind`, `name`, one `version` field,
 optional `space`, and optional `uid`. The server derives relationships from
-these references; users do not author a parallel lineage graph.
+these references; users do not author a parallel lineage graph. Ref and
+InlineableRef values are untagged: identity mapping, local path string, or native
+inline body. Do not add discriminator wrappers or a second reference inventory.
+
+Workflow is a declarative Card, not a principal. Standalone loading hydrates
+through existing shared-client owners, automatically resolving registered
+Agent/Prompt refs when present. Fully local loading is registry-free. Invocation
+uses the caller's authority; reused Agents transfer no credentials or privileges.
+WyrdState retains its Service-root contract.
 
 A Verifier is a reusable, subject-less peer with one typed Drift or Eval
 implementation; `Drift` and `Eval` are not Card kinds. Deployment composition
@@ -241,6 +249,17 @@ Bifrost follows one client path: each language SDK wraps
 transport to call `wyrd-server`.
 Scribe, Oracle, and Forge remain server-owned subsystems; Gate is their server
 dispatcher, not a role or client type.
+
+Workflow surfaces are scoped by capability rather than mirrored everywhere.
+Rust, Python, and TypeScript load and run authored and registered Workflows
+locally through the one Skald runtime. Accepted server runs are submitted,
+read, and cancelled only through the Rust `wyrd_client::Workflows` handle, the
+`/v1/workflow-runs` HTTP resource, and `wyrd workflow`; MCP has no Workflow
+surface. Every surface returns the same `WorkflowRun` snapshot. A model-call
+route is owned by the process executing the step: `native` uses that
+process's providers, `wyrd_gateway` the governed gateway under the caller's
+identity, and `ext_gateway` that process's configured external binding.
+Server runs accept only the two gateway routes.
 
 The public protocol remains open to every language. A client needs only the
 HTTP and MCP contracts, generated schemas, machine-readable documentation, and

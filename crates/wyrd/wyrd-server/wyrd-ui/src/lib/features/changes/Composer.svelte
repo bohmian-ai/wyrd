@@ -5,7 +5,6 @@
   import Markdown from './Markdown.svelte';
   let {
     view,
-    csrf,
     operation = 'comment',
     threadId = '',
     commentId = '',
@@ -16,7 +15,6 @@
     result
   }: {
     view: ChangeView;
-    csrf: string;
     operation?: string;
     threadId?: string;
     commentId?: string;
@@ -39,7 +37,7 @@
   );
 </script>
 <form method="POST" action="?/review" class="stack composer" use:enhance={() => { busy = true; return async ({ result: response, update }) => { await update({ reset: false }); if (response.type === 'success') body = ''; busy = false; }; }}>
-  <input type="hidden" name="csrf" value={csrf} /><input type="hidden" name="operation" value={operation} /><input type="hidden" name="revision" value={revision} /><input type="hidden" name="requestKey" value={`${view.requestKey}:${operation}:${threadId}`} /><input type="hidden" name="threadId" value={threadId} /><input type="hidden" name="commentId" value={commentId} /><input type="hidden" name="expected" value={expectedRevision} />{#if anchor}<input type="hidden" name="anchor" value={JSON.stringify({ ...anchor, revision })} />{/if}
+  <input type="hidden" name="operation" value={operation} /><input type="hidden" name="revision" value={revision} /><input type="hidden" name="requestKey" value={`${view.requestKey}:${operation}:${threadId}`} /><input type="hidden" name="threadId" value={threadId} /><input type="hidden" name="commentId" value={commentId} /><input type="hidden" name="expected" value={expectedRevision} />{#if anchor}<input type="hidden" name="anchor" value={JSON.stringify({ ...anchor, revision })} />{/if}
   <div class="composer-field"><textarea aria-label={`${label} · GitHub Flavored Markdown`} name="body" bind:value={body} maxlength="10000" required placeholder="Write a comment… @ mentions people and teams" rows="2"></textarea><button class="control primary" disabled={busy || !view.capabilities.review}>{busy ? 'Posting…' : label}</button></div>
   {#if matches.length}<div aria-label="Mention suggestions" class="row">{#each matches as person}<button type="button" class="control" onclick={() => body = body.replace(/@[a-zA-Z0-9_.-]*$/, `@${person.name} `)}>@{person.name} — {person.team}</button>{/each}</div>{/if}
   {#if preview}<Markdown {body} />{/if}

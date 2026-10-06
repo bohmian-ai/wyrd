@@ -29,7 +29,7 @@ Apply instructions in this order:
    spec-driven change;
 4. the ready implementation or remediation task derived from that revision;
 5. tests that express the mapped specification obligations;
-6. repository conventions and established owner patterns;
+6. repository conventions consistent with the authorities above;
 7. local implementation preferences.
 
 The request fixes required behavior, acceptance outcomes, explicitly approved
@@ -63,6 +63,14 @@ is complete.
 Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
 structure, or other reversible choices. The implementation agent owns them.
+
+Before adding architectural machinery, revalidate the task's source-backed
+reuse map against existing owners and their complete callers. Record the gap
+and selected extension in existing task evidence. A task's prescribed private
+mechanics do not authorize duplicate graph, traversal, parsing, validation,
+transport, or lifecycle logic. Resolve reversible choices within the established
+owner; route contradictory task instructions to `wyrd-plan`, and material
+approved-contract changes to `wyrd-spec`.
 
 ## Three execution classes
 

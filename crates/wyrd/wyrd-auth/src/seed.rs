@@ -112,7 +112,7 @@ mod pg_tests {
             .expect("workload row deletes");
 
         sqlx::raw_sql(include_str!(
-            "../../wyrd-sql/migrations/20261002000000_workload_role.sql"
+            "../../wyrd-sql/migrations/20261002000100_workload_role.sql"
         ))
         .execute(&mut **conn.transaction())
         .await

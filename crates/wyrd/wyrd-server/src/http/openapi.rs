@@ -1,6 +1,8 @@
 //! Generated OpenAPI document for the public HTTP surface.
 
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme,
+};
 use utoipa::openapi::{Content, OpenApi as OpenApiDocument};
 use utoipa::{Modify, OpenApi};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
@@ -13,9 +15,14 @@ use wyrd_spec::vala::api::{
 /// Name the contract gives the one Wyrd authentication scheme.
 pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
+/// Name of RFC 7617 HTTP Basic client authentication (RFC 6749 §2.3.1), the
+/// confidential OAuth client's alternative to a public client's `client_id`
+/// on the OAuth client endpoints. It authenticates a client, never a caller.
+pub(crate) const OAUTH_CLIENT_BASIC_SCHEME: &str = "oauthClientBasic";
+
 /// Declares how every Wyrd surface authenticates.
 ///
-/// One scheme, because there is one header: `X-Wyrd-Access-Token` carries the
+/// One caller scheme, because there is one header: `X-Wyrd-Access-Token` carries the
 /// token on every plane. The public gateway inference ingress additionally
 /// accepts the same Wyrd access token in the header its provider SDK sends
 /// (`Authorization`, `x-api-key`, or `x-goog-api-key`); no other route reads the
@@ -24,6 +31,9 @@ pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// the handful of operations a caller reaches before it has a session clear the
 /// requirement themselves with `security(())`, beside the handler, where the
 /// fact is checkable against the code rather than against a second list.
+/// The OAuth client endpoints (token, device authorization, revocation) add
+/// [`OAUTH_CLIENT_BASIC_SCHEME`] beside that empty requirement: client, not
+/// caller, authentication, which a public client replaces with `client_id`.
 ///
 /// Written as a modifier rather than repeated on each `#[utoipa::path]` so the
 /// requirement cannot drift route by route. It is applied by
@@ -32,9 +42,23 @@ pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 pub(crate) struct SecurityAddon;
 
 impl Modify for SecurityAddon {
-    /// Register the scheme and require it document-wide.
+    /// Register the caller scheme, require it document-wide, and register the
+    /// OAuth client Basic scheme the OAuth client endpoints offer.
     fn modify(&self, openapi: &mut OpenApiDocument) {
         let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            OAUTH_CLIENT_BASIC_SCHEME,
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Basic)
+                    .description(Some(
+                        "OAuth confidential client authentication (`client_secret_basic`): \
+                         the client id and secret as RFC 7617 Basic credentials. A public \
+                         client sends `client_id` in the form instead.",
+                    ))
+                    .build(),
+            ),
+        );
         components.add_security_scheme(
             WYRD_ACCESS_TOKEN_SCHEME,
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
@@ -148,6 +172,10 @@ fn is_problem(content: Option<&Content>) -> bool {
         (
             name = "Admin",
             description = "Tenant administration of trusted OIDC issuers and workload bindings"
+        ),
+        (
+            name = "Identity",
+            description = "Tenant human OIDC login connection administration"
         ),
         (
             name = "Cards",

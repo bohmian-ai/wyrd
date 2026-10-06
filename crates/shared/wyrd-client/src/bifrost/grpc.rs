@@ -917,7 +917,7 @@ mod tests {
                     serde_json::json!({
                         "access_token": token,
                         "token_type": "Bearer",
-                        "expires_at": chrono::Utc::now() + chrono::Duration::seconds(900),
+                        "expires_in": 900,
                     }),
                 ))
                 .up_to_n_times(1)

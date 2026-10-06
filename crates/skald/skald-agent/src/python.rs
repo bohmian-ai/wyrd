@@ -203,7 +203,7 @@ impl Agent {
         }
 
         if let Some(base_url) = provider_base_url {
-            let provider_name = agent.prompt.native().request.provider();
+            let provider_name = agent.prompt.native().provider();
             let registry = skald_runtime::ProviderRegistry::for_provider(
                 &provider_name,
                 base_url,

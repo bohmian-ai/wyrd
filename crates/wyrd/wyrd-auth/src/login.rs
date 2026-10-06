@@ -1,228 +1,150 @@
-//! Human OIDC login initiation and login-state storage.
+//! Tenant human OIDC login initiation.
+//!
+//! A login begins at the authorization endpoint
+//! ([`HumanConnections::authorize`]), at a device verification page
+//! ([`crate::cli_logins::CliLogins::approve`]), or as a candidate connection
+//! test ([`HumanConnections::begin_test`]). Each resolves the tenant from its
+//! route key, requires the connection it signs in through, and writes a
+//! login-state row keyed by the SHA-256 of a random state value that exists
+//! only in the returned provider authorization URL, bound to how the login
+//! was initiated. The common callback
+//! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row and
+//! records the outcome: an authorization code for the OAuth client, an
+//! approval on the device authorization, or a tested candidate. No tokens are
+//! minted until a code or device code is redeemed at the token endpoint. No
+//! request header ever selects a tenant, connection, or redirect.
 
 use std::time::Duration;
 
-use base64::Engine;
-use rand::RngCore;
-use secrecy::{ExposeSecret, SecretString};
-use sha2::{Digest, Sha256};
-use url::Url;
-use wyrd_auth_oidc::{OidcProvider, ScreenedHttp, TrustedIssuer};
-
-use crate::error::screen_error;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
+use serde_json::json;
+use wyrd_spec::auth::{AbsoluteUrl, ClientAuthorization, LoginInitiation, Sha256Hex};
 use wyrd_spec::error::WyrdError;
-use wyrd_sql::queries::auth::{insert_login_state, take_login_state};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_spec::ids::TenantSlug;
+use wyrd_sql::queries::auth::{LoginState, insert_login_state};
+
+use crate::connections::HumanConnections;
+use crate::error::{relying_party_error, store_error};
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
-/// round-trip and hit `/auth/callback` within this window or the state is gone.
-const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
+/// round-trip and reach `/auth/callback` within this window or the state is
+/// gone. A candidate test sign-in's state shares it.
+pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
-/// Short-lived state row stored server-side during the OIDC login flow.
-#[derive(Debug, Clone)]
-pub struct LoginStateEntry {
-    /// Server-generated PKCE verifier.
-    pub code_verifier: SecretString,
-    /// Server-generated nonce.
-    pub nonce: String,
-    /// Trusted issuer URL.
-    pub issuer: String,
-    /// Callback redirect URI.
-    pub redirect_uri: String,
-}
-
-/// Postgres-backed login-state store.
-#[derive(Debug, Clone)]
-pub struct PgLoginStateStore {
-    pool: sqlx::PgPool,
-}
-
-impl PgLoginStateStore {
-    /// Build a store from the runtime app pool.
-    #[must_use]
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
-    }
-
-    /// Store one login-state row whose expiry `PostgreSQL` derives from `ttl`.
-    pub async fn put(
+impl HumanConnections {
+    /// Begin the tenant login that answers an OAuth authorization request
+    /// (RFC 6749 §4.1.1) and return the provider authorization URL to send
+    /// the browser to.
+    ///
+    /// The caller has already matched `authorization`'s client and exact
+    /// redirect URI against the client registration and required an S256
+    /// PKCE challenge; this binds them to the login so the callback can issue
+    /// the code to exactly that client, redirect URI, and challenge.
+    ///
+    /// # Errors
+    /// Returns the refusals of [`Self::begin_bound`].
+    pub async fn authorize(
         &self,
-        tenant: DataTenantId,
-        state: &str,
-        entry: LoginStateEntry,
-        ttl: Duration,
-    ) -> Result<(), SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        insert_login_state(
-            &mut conn,
-            state,
-            entry.code_verifier.expose_secret(),
-            &entry.nonce,
-            &entry.issuer,
-            &entry.redirect_uri,
-            ttl,
-        )
-        .await?;
-        conn.commit().await
+        tenant_route_key: &TenantSlug,
+        authorization: ClientAuthorization,
+    ) -> Result<AbsoluteUrl, WyrdError> {
+        self.begin_bound(tenant_route_key, LoginInitiation::Authorize(authorization))
+            .await
     }
 
-    /// Consume a login-state row exactly once.
-    pub async fn take(
+    /// Begin a tenant human SSO login bound to `initiation` and return the
+    /// provider authorization URL.
+    ///
+    /// Everything that can refuse without the network runs first, before any
+    /// provider IO or state write: a configured public origin. The route key then resolves the
+    /// tenant, and the tenant must have an Active connection; an unknown
+    /// tenant and a tenant without one fail with the same generic refusal, so
+    /// the endpoint cannot enumerate tenants or their login configuration.
+    ///
+    /// The provider comes from the relying party's per-issuer cache, which
+    /// discovers through the screened HTTP capability on a miss, and the
+    /// relying party screens the authorization endpoint by scheme and
+    /// generates the state, nonce, and PKCE verifier. The redirect URI is
+    /// always the deployment's configured callback. The state row binds the
+    /// exact connection revision, issuer, and client id, the PKCE verifier,
+    /// the nonce, and the initiation binding; only the SHA-256 of the state is
+    /// stored, and the raw state is returned only inside the URL. The
+    /// unique binding index lets a device authorization name at most one
+    /// login.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when no public origin is configured;
+    /// [`WyrdError::InvalidState`] for a binding
+    /// already recorded for another login; [`WyrdError::InvalidToken`] when
+    /// the route key names no active tenant or the tenant has no Active
+    /// connection; [`WyrdError::DiscoveryUnavailable`] when the issuer is
+    /// refused by screening, discovery fails, or the authorization endpoint's
+    /// scheme is refused; and [`WyrdError::AuthVerifyUnavailable`] when a
+    /// store read or the state write fails. No URL is returned unless its
+    /// state row is durable; cancellation before the commit persists nothing.
+    pub(crate) async fn begin_bound(
         &self,
-        tenant: DataTenantId,
-        state: &str,
-    ) -> Result<Option<LoginStateEntry>, SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        let row = take_login_state(&mut conn, state).await?;
-        conn.commit().await?;
-        Ok(row.map(|row| LoginStateEntry {
-            code_verifier: SecretString::from(row.code_verifier),
-            nonce: row.nonce,
-            issuer: row.issuer,
-            redirect_uri: row.redirect_uri,
-        }))
+        tenant_route_key: &TenantSlug,
+        initiation: LoginInitiation,
+    ) -> Result<AbsoluteUrl, WyrdError> {
+        let redirect_uri = self.require_callback()?.clone();
+        let tenant = self
+            .postgres()
+            .resolve_tenant_slug(tenant_route_key)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(login_unavailable)?;
+        let active = self
+            .active_connection(tenant)
+            .await?
+            .ok_or_else(login_unavailable)?;
+        let trusted = &active.trusted;
+        let provider = self
+            .relying_party()
+            .cached(&trusted.issuer)
+            .await
+            .map_err(relying_party_error)?;
+        let authorization = self
+            .relying_party()
+            .authorize(&provider, &trusted.client_id, redirect_uri.as_str())
+            .map_err(relying_party_error)?;
+        let authorization_url = AbsoluteUrl::new(authorization.url.as_str().to_owned())
+            .map_err(|_| invalid_token("authorization URL is invalid"))?;
+        let row = LoginState {
+            connection: active.binding,
+            issuer: trusted.issuer.to_string(),
+            client_id: trusted.client_id.clone(),
+            redirect_uri: redirect_uri.to_string(),
+            code_verifier: authorization.code_verifier,
+            nonce: authorization.nonce,
+            initiation,
+        };
+        let mut conn = self
+            .postgres()
+            .tenant_conn(tenant)
+            .await
+            .map_err(store_error)?;
+        let state_hash = Sha256Hex::digest(authorization.state.as_bytes());
+        if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(WyrdError::InvalidState {
+                message: "this login binding was already used; start a new login".to_owned(),
+                details: json!({ "reason": "login_binding_reused" }),
+            });
+        }
+        conn.commit().await.map_err(store_error)?;
+        Ok(authorization_url)
     }
 }
 
-/// Resolve the `IdP` authorization URL and persist login state for the callback.
-///
-/// # Errors
-/// Returns [`WyrdError`] when the issuer's authorization endpoint cannot be
-/// discovered, when the authorization URL cannot be built from the trusted
-/// issuer's configuration, or when the login state cannot be persisted. No
-/// redirect is returned unless its state row is durable.
-pub async fn prepare_login(
-    pool: &sqlx::PgPool,
-    tenant_id: DataTenantId,
-    trusted: &TrustedIssuer,
-    issuer: &IssuerUrl,
-    redirect_uri: String,
-    http: ScreenedHttp,
-) -> Result<LoginInitResponse, WyrdError> {
-    let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer, http).await?;
-    let state_key = auth_state_key();
-    let code_verifier = pkce_verifier();
-    let nonce = auth_nonce();
-    let authz_url = build_authorization_url(
-        &authorization_endpoint,
-        &trusted.client_id,
-        &redirect_uri,
-        &state_key,
-        code_verifier.expose_secret(),
-        &nonce,
-    );
-    let init = LoginInitResponse {
-        authorization_url: AbsoluteUrl::new(authz_url.as_str().to_owned())
-            .map_err(|_| invalid_token("authorization URL is invalid"))?,
-        state: state_key.clone(),
-    };
-    PgLoginStateStore::new(pool.clone())
-        .put(
-            tenant_id,
-            &state_key,
-            LoginStateEntry {
-                code_verifier,
-                nonce,
-                issuer: issuer.to_string(),
-                redirect_uri,
-            },
-            LOGIN_STATE_TTL,
-        )
-        .await
-        .map_err(sql_error)?;
-    Ok(init)
-}
-
-/// Resolve the trusted issuer's OIDC `authorization_endpoint` via discovery.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
-/// the address behind it is refused by `http`, or the metadata request or
-/// response is invalid. Cancellation can interrupt discovery without
-/// persisting state.
-///
-/// The address is screened by `http` at the moment of the request, so an
-/// issuer that resolved publicly when it was configured cannot resolve inward
-/// now.
-pub async fn discover_authorization_endpoint(
-    issuer: &IssuerUrl,
-    http: ScreenedHttp,
-) -> Result<Url, WyrdError> {
-    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "trusted issuer URL could not be parsed".to_owned(),
-        details: serde_json::json!({}),
-    })?;
-    let client = http
-        .client_for(&issuer_url)
-        .await
-        .map_err(|error| screen_error(&error))?;
-    let provider = OidcProvider::discover(issuer_url, client)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC discovery failed");
-            WyrdError::DiscoveryUnavailable {
-                message: "OIDC discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            }
-        })?;
-    Ok(provider.metadata.authorization_endpoint)
-}
-
-/// Generate an unguessable login-state key.
-pub(crate) fn auth_state_key() -> String {
-    random_b64url(32)
-}
-
-/// Generate the nonce the returned ID token must echo.
-pub(crate) fn auth_nonce() -> String {
-    random_b64url(32)
-}
-
-/// Generate a PKCE code verifier.
-pub(crate) fn pkce_verifier() -> SecretString {
-    SecretString::from(random_b64url(48))
-}
-
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn random_b64url(bytes: usize) -> String {
-    let mut buf = vec![0_u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// Build the provider authorization URL for one login attempt.
-///
-/// Takes the client identifier rather than a whole trusted issuer because the
-/// platform control plane's connection is not a tenant's issuer, and the URL
-/// depends on nothing else about the issuer's trust configuration.
-pub(crate) fn build_authorization_url(
-    authorization_endpoint: &Url,
-    client_id: &str,
-    redirect_uri: &str,
-    state: &str,
-    code_verifier: &str,
-    nonce: &str,
-) -> Url {
-    let mut url = authorization_endpoint.clone();
-    let challenge = pkce_challenge(code_verifier);
-    let mut query = url.query_pairs_mut();
-    query.append_pair("response_type", "code");
-    query.append_pair("client_id", client_id);
-    query.append_pair("redirect_uri", redirect_uri);
-    query.append_pair("scope", "openid profile email");
-    query.append_pair("code_challenge", &challenge);
-    query.append_pair("code_challenge_method", "S256");
-    query.append_pair("state", state);
-    query.append_pair("nonce", nonce);
-    drop(query);
-    url
+/// The one refusal for a route key that names no active tenant or a tenant
+/// with no Active connection, so neither can be told apart.
+pub(crate) fn login_unavailable() -> WyrdError {
+    WyrdError::InvalidToken {
+        message: "SSO login is not available for this tenant".to_owned(),
+        details: json!({}),
+    }
 }
 
 fn invalid_token(message: &str) -> WyrdError {
@@ -232,91 +154,84 @@ fn invalid_token(message: &str) -> WyrdError {
     }
 }
 
-fn sql_error(error: impl Into<SqlError>) -> WyrdError {
-    let error = error.into();
-    tracing::warn!(error = %error, "OIDC login SQL unavailable");
-    WyrdError::AuthVerifyUnavailable {
-        message: "auth backend unavailable".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": 1 }),
-    }
-}
-
+/// Login initiation refusals against a real tenant store.
 #[cfg(test)]
 mod pg_tests {
-    use super::{LoginStateEntry, PgLoginStateStore};
-    use secrecy::{ExposeSecret, SecretString};
-    use std::time::Duration;
+    use url::Url;
+    use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::TenantSlug;
+    use wyrd_spec::auth::{ClientAuthorization, OAuthClientId};
 
-    #[tokio::test]
-    async fn login_state_store_consumes_single_use_rows_once() {
-        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-            .await
-            .expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let store_a = PgLoginStateStore::new(fixture.app_pool().clone());
-        let store_b = PgLoginStateStore::new(fixture.app_pool().clone());
+    use crate::audit::test_outbox::outbox;
+    use crate::connections::HumanConnections;
 
-        store_a
-            .put(
-                tenant,
-                "state-1",
-                LoginStateEntry {
-                    code_verifier: SecretString::from("verifier-1".to_owned()),
-                    nonce: "nonce-1".to_owned(),
-                    issuer: "https://idp.example.com/realms/acme".to_owned(),
-                    redirect_uri: "https://app.example.com/auth/callback".to_owned(),
-                },
-                Duration::from_mins(5),
-            )
-            .await
-            .expect("state inserts");
-
-        let consumed = store_b.take(tenant, "state-1").await.expect("state takes");
-        let consumed = consumed.expect("state exists");
-        assert_eq!(consumed.nonce, "nonce-1");
-        assert_eq!(consumed.issuer, "https://idp.example.com/realms/acme");
-        assert_eq!(
-            consumed.redirect_uri,
-            "https://app.example.com/auth/callback"
-        );
-        assert_eq!(consumed.code_verifier.expose_secret(), "verifier-1");
-
-        let replay = store_a
-            .take(tenant, "state-1")
-            .await
-            .expect("state replay reads");
-        assert!(replay.is_none());
+    /// A connection owner over `fixture` with a public origin, no keyring, and
+    /// an audit outbox nothing in these tests stages on.
+    ///
+    /// # Panics
+    /// Panics when the fixed origin does not parse.
+    fn connections(fixture: &PgFixture) -> HumanConnections {
+        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
+        HumanConnections::new(
+            fixture.wyrd_postgres().clone(),
+            None,
+            ScreenedHttp::allowing_internal(),
+            Some(&origin),
+            outbox(fixture),
+        )
     }
 
-    #[tokio::test]
-    async fn expired_login_state_returns_none() {
-        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-            .await
-            .expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let store = PgLoginStateStore::new(fixture.app_pool().clone());
+    /// A `wyrd-ui` authorization request with a fixed S256 challenge.
+    fn authorization() -> ClientAuthorization {
+        ClientAuthorization {
+            client: OAuthClientId::WyrdUi,
+            redirect_uri: "https://wyrd.example.com/login/callback".to_owned(),
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+            state: None,
+        }
+    }
 
-        store
-            .put(
-                tenant,
-                "state-expired",
-                LoginStateEntry {
-                    code_verifier: SecretString::from("verifier-expired".to_owned()),
-                    nonce: "nonce-expired".to_owned(),
-                    issuer: "https://idp.example.com/realms/acme".to_owned(),
-                    redirect_uri: "https://app.example.com/auth/callback".to_owned(),
-                },
-                Duration::from_secs(0),
+    /// Number of login-state rows in the fixture tenant.
+    ///
+    /// # Panics
+    /// Panics when the count query fails.
+    async fn state_rows(fixture: &PgFixture) -> i64 {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_login_state")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("state count runs")
+    }
+
+    /// An unknown tenant and a tenant with no Active connection get the same
+    /// generic refusal, so the authorization endpoint does not enumerate
+    /// tenants, and neither writes login state.
+    ///
+    /// # Panics
+    /// Panics when either authorization is accepted or the refusals differ.
+    #[tokio::test]
+    async fn unknown_tenant_and_no_connection_are_indistinguishable() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let owner = connections(&fixture);
+
+        let unknown = owner
+            .authorize(
+                &TenantSlug::new("no-such-tenant").expect("slug is valid"),
+                authorization(),
             )
             .await
-            .expect("state inserts");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let consumed = store
-            .take(tenant, "state-expired")
+            .expect_err("unknown tenant refuses");
+        let unconfigured = owner
+            .authorize(
+                &TenantSlug::new(fixture.tenant_slug()).expect("slug is valid"),
+                authorization(),
+            )
             .await
-            .expect("expired state read succeeds");
-        assert!(consumed.is_none());
+            .expect_err("tenant without a connection refuses");
+
+        assert_eq!(unknown.code(), unconfigured.code());
+        assert_eq!(unknown.to_string(), unconfigured.to_string());
+        assert_eq!(state_rows(&fixture).await, 0);
     }
 }

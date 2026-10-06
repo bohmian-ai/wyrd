@@ -1,8 +1,9 @@
 # Skald Architecture
 
 Skald is Wyrd's LLM runtime crate family. It stays provider-native and depends
-on neutral infrastructure plus Skald crates only. Wyrd and Vala depend on Skald;
-Skald does not depend on `wyrd-*` or `vala-*`.
+on neutral infrastructure, Skald crates, shared `wyrd-*` foundation crates, and
+the foundational `wyrd-spec` contract crate. Wyrd and Vala depend on Skald;
+Skald never depends on `wyrd-server` or other Wyrd server code, or on `vala-*`.
 
 ## Crate Map
 
@@ -23,30 +24,46 @@ Skald does not depend on `wyrd-*` or `vala-*`.
   requests to registered providers and returns native `ProviderResponse`.
   `MockProvider` is public here for offline runtime tests.
 - `skald-agent`: live agent runtime. It owns `Agent`, `AgentDef`, the bounded
-  tool loop, `Observer`, `AgentTool`, `ToolRegistry`, and the
+  tool loop, `AgentTool`, `ToolRegistry`, and the
   `SKALD_AGENT_*` error catalog.
-- `skald-workflow`: workflow runtime. It owns `Workflow`, `WorkflowDef`,
-  `Task`/`TaskDef`, `Context`, the DAG executor, `execute_task`,
-  `MessageConversion`-routed handoff, and stable Wyrd workflow error codes.
+- `skald-workflow`: explicit-binding Agent DAG runtime. It owns `Workflow`,
+  `WorkflowBuilder`, and `WorkflowExecutionDependencies`. Steps are Agents
+  whose Prompt variables bind to exact `input.<name>` or
+  `steps.<id>.output.text|structured` sources; dependency edges only order
+  execution. Each step's model calls follow its `LlmRoute`: the native
+  provider registry, a governed Wyrd gateway, or a bound external gateway.
+  Runs execute in one owned, bounded task set with Workflow retries,
+  per-attempt and total deadlines, cancellation, and size limits, and always
+  return the portable `wyrd_spec` `WorkflowRun` snapshot with stable Wyrd
+  workflow error codes. It depends on `wyrd-spec` for the Workflow Card and
+  run contracts.
 - `skald-prompt`: Python authoring boundary. It builds native prompt/request
   values and exposes the `wyrd.prompt.Prompt` Python class.
 
 ## Dependency Direction
 
 `skald-spec` is the bottom crate. It has zero Wyrd dependencies. Wyrd contracts
-that need prompt/provider shapes depend upward on `skald-spec`; Skald engine
-crates do not depend on `wyrd-spec`.
+that need prompt/provider shapes depend upward on `skald-spec`. Skald crates
+consume the foundational `wyrd-spec` contract crate only where they project a
+shared Wyrd contract: `skald-workflow` uses its Workflow Card and run contracts,
+and `skald-agent`, `skald-tool`, and `skald-prompt` use its error catalog,
+references, and metadata types. `skald-providers` uses the shared `wyrd-tls`
+foundation crate. No Skald crate depends on `wyrd-server`, other Wyrd server
+code, or any `vala-*` crate.
 
 The dependency layers are:
 
 ```text
 skald-workflow -> skald-agent -> skald-runtime
-                                  |
-                                  v
-                {skald-providers, skald-cache, skald-tool} -> skald-spec
-                                                           ^
-                                                           |
-                                                skald-prompt
+      |                               |
+      |                               v
+      |            {skald-providers, skald-cache, skald-tool} -> skald-spec
+      |                                                       ^
+      |                                                       |
+      |                                            skald-prompt
+      v
+  wyrd-spec   (Workflow Card and run contracts; skald-agent, skald-tool,
+               and skald-prompt also depend on it)
 ```
 
 `skald-prompt` is the Python authoring boundary and uses Wyrd Python
@@ -62,9 +79,9 @@ read provider output through `ResponseAdapter`.
 `MockProvider` is a public `skald-runtime` type so runtime behavior can be
 tested without credentials or live provider calls.
 
-`skald-agent` and `skald-workflow` observe runtime activity through the injected
-`Observer` trait and `tracing` spans. They never link `vala-client`; Wyrd/Vala
-consumers provide observer implementations from their own layer.
+`skald-agent` and `skald-workflow` report runtime activity only through plain
+`tracing` spans without payloads. They never link `vala-client`; consumers
+collect the spans with their own `tracing` subscriber.
 
 ## PyO3 Scope
 

@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from uuid import uuid4
@@ -377,8 +378,14 @@ def access_token(server: WyrdTestServer, credential: str) -> str:
     """Exchange an API key for a Wyrd access token through the public token route."""
     request = urllib.request.Request(
         f"{server.base_url}/auth/token",
-        data=json.dumps({"grant_type": "wyrd_api_key", "api_key": credential}).encode(),
-        headers={"content-type": "application/json"},
+        data=urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": credential,
+                "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
+            }
+        ).encode(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
         method="POST",
     )
     with urllib.request.urlopen(request) as response:

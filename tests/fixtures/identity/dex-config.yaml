@@ -30,3 +30,11 @@ staticClients:
     public: false
     redirectURIs:
       - http://localhost:8888/callback
+
+  # Public human-login client: the UI journey's second provider. Dex accepts any
+  # http://localhost:<port> callback for a public client with no redirectURIs,
+  # which covers the journey's bound server origin, and authenticates its
+  # PKCE token exchange by client id alone.
+  - id: wyrd-human
+    name: Wyrd Human (Dex)
+    public: true

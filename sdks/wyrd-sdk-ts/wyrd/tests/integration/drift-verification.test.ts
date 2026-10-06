@@ -764,11 +764,14 @@ ${spec}`;
       metadata: { name: "ts-judge-prompt", version: "1.0.0", space: "default" },
       spec: {
         request: {
-          model: "gpt-test",
-          messages: [{ role: "user", content: "Grade the answer ${answer}." }],
-          response_format: {
-            type: "json_schema",
-            json_schema: { name: "judge_result", schema: JUDGE_SCHEMA },
+          provider: "open_ai_chat_completion",
+          body: {
+            model: "gpt-test",
+            messages: [{ role: "user", content: "Grade the answer ${answer}." }],
+            response_format: {
+              type: "json_schema",
+              json_schema: { name: "judge_result", schema: JUDGE_SCHEMA },
+            },
           },
         },
         model: "gpt-test",

@@ -3,80 +3,34 @@
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::json;
+use skald_workflow::{Workflow, card_body_dependencies};
+use wyrd_semver::VersionSpec;
+use wyrd_spec::AgentSpec;
+use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::data::{ArrowFormat, DataInterface};
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::operator::{OperatorAction, OperatorSpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::card::workflow::{WorkflowCard, jcs_len};
+use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::graph::graph_ready_submissions;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::cards::{get_card_by_uid, select_card_uids_by_ref_batch};
+use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid, select_card_uids_by_ref_batch};
 use wyrd_sql::queries::operator_connections::find_connection;
+use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
 use crate::state::registry_db_error;
 use wyrd_sql::queries::verification::BindingSchedule;
 
 /// Identity key used to look up a resolved external reference.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
-
-/// Resolve every external (non-sibling) `CardRef` to its `CardUid` under RLS.
-///
-/// Walks each submitted spec with the canonical [`ReferenceSlotVisitor`],
-/// rejects loader-only paths and siblings the request did not submit, batches
-/// the remaining identities into one RLS-scoped registry read, and then checks
-/// every verification binding against the effective specs those refs name. All
-/// of it runs before the caller opens its write transaction, so any refusal
-/// here persists nothing.
-///
-/// # Errors
-/// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
-/// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a reference is a loader-only
-/// path, names an unsubmitted sibling, or has no Card in this tenant; the
-/// binding refusals listed on [`EffectiveSpecs::validate_bindings`]; and the
-/// underlying registry error when the batch read or a by-UID read fails.
-pub async fn resolve_card_references(
-    conn: &mut TenantConn<'_>,
-    submissions: &[CardSubmission],
-) -> Result<ResolvedRefs, WyrdError> {
-    let siblings = sibling_identities(submissions)?;
-    let mut refs = Vec::new();
-
-    for submission in submissions {
-        let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-        validate_and_collect_refs(&spec, &siblings, &mut refs)?;
-        if let Spec::Operator(operator) = &spec {
-            check_operator(conn, operator, "spec", None).await?;
-        }
-    }
-
-    refs.sort_by_key(display_ref);
-    refs.dedup_by(|left, right| left.same_identity(right));
-
-    let resolved_refs = select_card_uids_by_ref_batch(conn, &refs).await?;
-    if let Some(missing) = refs.iter().find(|card_ref| {
-        !resolved_refs
-            .iter()
-            .any(|(resolved, _)| resolved.same_identity(card_ref))
-    }) {
-        let identity = display_ref(missing);
-        return Err(WyrdError::RegistryUnresolvedDependency {
-            message: format!("card dependency {identity} was not found"),
-            details: serde_json::json!({ "card_ref": identity }),
-        });
-    }
-
-    let mut effective = EffectiveSpecs::new(submissions, resolved_refs)?;
-    effective.validate_bindings(conn, submissions).await?;
-    effective.validate_baselines(conn, submissions).await?;
-    Ok(effective.resolved)
-}
 
 /// Reject a Trigger activation that cannot run the Verifier's implementation.
 ///
@@ -157,21 +111,88 @@ async fn check_operator(
     })
 }
 
-/// Effective spec bodies for referenced binding targets, keyed by identity.
+/// Registration preflight: effective spec bodies for referenced targets,
+/// keyed by provenance and identity.
 ///
-/// Owns the request's resolved external UIDs alongside the decoded bodies, so
-/// binding validation is one method on this handle rather than a call graph
-/// that re-threads the connection and the resolution table per lookup. Seeded
-/// with the request's own submissions, so a sibling ref never reads the
-/// registry; an external ref is loaded once by its resolved UID and cached.
-struct EffectiveSpecs {
-    /// Decoded spec per exact Card identity.
-    specs: HashMap<CardRefIdentity, Spec>,
+/// [`EffectiveSpecs::resolve`] is the preflight entry point. It owns the
+/// request's resolved external UIDs alongside the decoded bodies, so binding,
+/// baseline, and Workflow validation are methods on this owner rather than a
+/// call graph that re-threads the resolution table per lookup. It borrows the
+/// caller's tenant connection for each read; acquiring and committing that
+/// connection, audit, and every durable write stay with the caller. A
+/// `Sibling` reference reads only the request's own submissions and an
+/// external `Ref` only the registry body at its resolved UID, loaded once and
+/// cached, so a submitted sibling never stands in for an external dependency
+/// with the same identity.
+pub(super) struct EffectiveSpecs {
+    /// Decoded submitted spec per exact Card identity.
+    siblings: HashMap<CardRefIdentity, Spec>,
+    /// Registry spec per exact identity, loaded at its resolved external UID.
+    externals: HashMap<CardRefIdentity, Spec>,
     /// External references this request already resolved to a `CardUid`.
     resolved: ResolvedRefs,
 }
 
 impl EffectiveSpecs {
+    /// Resolve every external (non-sibling) `CardRef` to its `CardUid` under RLS.
+    ///
+    /// Walks each submitted spec with the canonical [`ReferenceSlotVisitor`],
+    /// rejects loader-only paths and siblings the request did not submit, batches
+    /// the remaining identities into one RLS-scoped registry read, and then checks
+    /// every verification binding, Drift baseline, and Workflow graph against the
+    /// effective specs those refs name. All
+    /// of it runs before the caller opens its write transaction, so any refusal
+    /// here persists nothing. Cancellation may stop after completed registry reads
+    /// but always before Card persistence.
+    ///
+    /// # Errors
+    /// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
+    /// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a reference is a loader-only
+    /// path, names an unsubmitted sibling, or has no Card in this tenant; the
+    /// binding refusals listed on [`validate_bindings`](Self::validate_bindings);
+    /// the Workflow graph refusals listed on
+    /// [`validate_workflows`](Self::validate_workflows);
+    /// and the underlying registry error when the batch read or a by-UID read
+    /// fails.
+    pub(super) async fn resolve(
+        conn: &mut TenantConn<'_>,
+        submissions: &[CardSubmission],
+    ) -> Result<ResolvedRefs, WyrdError> {
+        let siblings = sibling_identities(submissions)?;
+        let mut refs = Vec::new();
+
+        for submission in submissions {
+            let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            validate_and_collect_refs(&spec, &siblings, &mut refs)?;
+            if let Spec::Operator(operator) = &spec {
+                check_operator(conn, operator, "spec", None).await?;
+            }
+        }
+
+        refs.sort_by_key(display_ref);
+        refs.dedup_by(|left, right| left.same_identity(right));
+
+        let resolved_refs = select_card_uids_by_ref_batch(conn, &refs).await?;
+        if let Some(missing) = refs.iter().find(|card_ref| {
+            !resolved_refs
+                .iter()
+                .any(|(resolved, _)| resolved.same_identity(card_ref))
+        }) {
+            let identity = display_ref(missing);
+            return Err(WyrdError::RegistryUnresolvedDependency {
+                message: format!("card dependency {identity} was not found"),
+                details: serde_json::json!({ "card_ref": identity }),
+            });
+        }
+
+        let mut effective = Self::new(submissions, resolved_refs)?;
+        effective.validate_bindings(conn, submissions).await?;
+        effective.validate_baselines(conn, submissions).await?;
+        effective.validate_workflows(conn, submissions).await?;
+        Ok(effective.resolved)
+    }
+
     /// Decode every pinned submission into the identity cache.
     ///
     /// Submissions without a resolved space and version cannot be a sibling
@@ -180,7 +201,7 @@ impl EffectiveSpecs {
     /// # Errors
     /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable spec.
     fn new(submissions: &[CardSubmission], resolved: ResolvedRefs) -> Result<Self, WyrdError> {
-        let mut specs = HashMap::new();
+        let mut siblings = HashMap::new();
         for submission in submissions {
             let (Some(space), Some(version)) = (
                 &submission.metadata.space,
@@ -198,9 +219,13 @@ impl EffectiveSpecs {
             .identity_key();
             let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-            specs.insert(identity, spec);
+            siblings.insert(identity, spec);
         }
-        Ok(Self { specs, resolved })
+        Ok(Self {
+            siblings,
+            externals: HashMap::new(),
+            resolved,
+        })
     }
 
     /// Check every submitted binding against the effective specs its refs name.
@@ -256,10 +281,10 @@ impl EffectiveSpecs {
         binding: &VerificationBinding,
         field: &str,
     ) -> Result<(), WyrdError> {
-        let verifier = self.load(conn, binding.verifier.as_card_ref()).await?;
+        let verifier = self.load(conn, Some(&binding.verifier)).await?;
         let trigger = match &binding.runs_on {
             InlineableRef::Inline(trigger) => Some(Spec::Trigger((**trigger).clone())),
-            reference => self.load(conn, reference.as_card_ref()).await?,
+            reference => self.load(conn, reference.to_durable().as_ref()).await?,
         };
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)
@@ -280,7 +305,7 @@ impl EffectiveSpecs {
         for (index, operator) in binding.on_failure.iter().enumerate() {
             let operator = match operator {
                 InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
-                reference => self.load(conn, reference.as_card_ref()).await?,
+                reference => self.load(conn, reference.to_durable().as_ref()).await?,
             };
             let field = format!("{field}.on_failure[{index}]");
             match operator {
@@ -343,7 +368,7 @@ impl EffectiveSpecs {
             else {
                 continue;
             };
-            let Some(Spec::Data(data)) = self.load(conn, baseline_ref.as_card_ref()).await? else {
+            let Some(Spec::Data(data)) = self.load(conn, Some(baseline_ref)).await? else {
                 return Err(baseline_error(
                     "signal.baseline_ref must name a registered Data Card",
                     json!({ "field": "signal.baseline_ref" }),
@@ -381,31 +406,356 @@ impl EffectiveSpecs {
         Ok(())
     }
 
-    /// Return the effective spec a resolved ref names, loading it once if external.
+    /// Validate every submitted Workflow against its effective resolved graph.
     ///
-    /// Returns `None` for an absent ref; unresolved refs were already rejected.
+    /// Each Workflow submission's Agent and Prompt references come from the
+    /// canonical reference-slot inventory with their authored provenance;
+    /// [`load`](Self::load) supplies a sibling from the submissions and an
+    /// external ref from the registry body at its resolved UID — the same UID
+    /// registration binds. Each loaded Agent contributes its own Prompt
+    /// reference, and a Prompt named only inside an already-registered Agent
+    /// is resolved through the same Active, tenant-scoped batch lookup before
+    /// loading. Skald then runs the pure contract and the declarative
+    /// resolved checks (bindings, outputs, Prompt coverage, route dialect)
+    /// over exactly those bodies without binding tools, so sibling and
+    /// external dependencies fail identically.
+    ///
+    /// This runs in the preflight transaction before the write transaction:
+    /// cancellation may stop after completed registry reads but before any
+    /// Card persistence, and a refusal persists nothing.
+    ///
+    /// # Errors
+    /// Returns the `WYRD_WORKFLOW_*` contract and graph refusals of
+    /// [`Workflow::validate_card_bodies`],
+    /// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a needed body has no
+    /// Active Card in this tenant, `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an
+    /// undecodable submission, and registry read failures unchanged.
+    async fn validate_workflows(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        submissions: &[CardSubmission],
+    ) -> Result<(), WyrdError> {
+        // A fresh root may omit or scope its version; the server allocates the
+        // pin only at write time. These transient holders carry the graph-only
+        // placeholder pin, which names no dependency and is discarded after
+        // validation; the authored submissions stay untouched.
+        let holders = graph_ready_submissions(submissions)
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+        for holder in holders.iter().filter(|s| s.kind == CardKind::Workflow) {
+            let workflow = WorkflowCard::from_envelope(submission_card(holder)?)?;
+            let mut pending = card_body_dependencies(&Spec::Workflow(workflow.spec.clone()));
+            while let Some(dependency) = pending.pop() {
+                if let Ref::Ref(card_ref) = &dependency
+                    && external_uid(card_ref, &self.resolved).is_none()
+                {
+                    let found =
+                        select_card_uids_by_ref_batch(conn, std::slice::from_ref(card_ref)).await?;
+                    self.resolved.extend(found);
+                }
+                let spec = self.load(conn, Some(&dependency)).await?.ok_or_else(|| {
+                    let identity = dependency
+                        .as_card_ref()
+                        .map_or_else(|| "<unresolved path>".to_owned(), display_ref);
+                    WyrdError::RegistryUnresolvedDependency {
+                        message: format!("card dependency {identity} was not found"),
+                        details: serde_json::json!({ "card_ref": identity }),
+                    }
+                })?;
+                pending.extend(card_body_dependencies(&spec));
+            }
+            Workflow::validate_card_bodies(workflow, &|dependency| self.body(dependency))?;
+        }
+        Ok(())
+    }
+
+    /// Return the already-loaded effective spec a reference names from its
+    /// own provenance: a `Sibling` from the submissions and an external `Ref`
+    /// from the registry body cached at its resolved UID.
+    ///
+    /// Returns `None` for a path or a body that was never loaded.
+    fn body(&self, reference: &Ref) -> Option<Spec> {
+        match reference {
+            Ref::Sibling { sibling } => self.siblings.get(&sibling_key(sibling)).cloned(),
+            Ref::Ref(card_ref) => self.externals.get(&card_ref.identity_key()).cloned(),
+            Ref::Path(_) => None,
+        }
+    }
+
+    /// Return the effective spec a reference names from its own provenance.
+    ///
+    /// A `Sibling` reads only the submitted body; an external `Ref` reads only
+    /// the registry body at its resolved UID, loaded once and cached. Returns
+    /// `None` for an absent ref, a path, an unsubmitted sibling, or an
+    /// unresolved external ref; those were already rejected upstream.
+    ///
+    /// Cancellation may drop the in-flight by-UID read; nothing is written.
     ///
     /// # Errors
     /// Returns the registry error from loading an external Card by UID.
     async fn load(
         &mut self,
         conn: &mut TenantConn<'_>,
-        card_ref: Option<&CardRef>,
+        reference: Option<&Ref>,
     ) -> Result<Option<Spec>, WyrdError> {
-        let Some(card_ref) = card_ref else {
-            return Ok(None);
+        let card_ref = match reference {
+            None | Some(Ref::Path(_)) => return Ok(None),
+            Some(Ref::Sibling { sibling }) => {
+                return Ok(self.siblings.get(&sibling_key(sibling)).cloned());
+            }
+            Some(Ref::Ref(card_ref)) => card_ref,
         };
-        let identity = sibling_key(card_ref);
-        if let Some(spec) = self.specs.get(&identity) {
+        let identity = card_ref.identity_key();
+        if let Some(spec) = self.externals.get(&identity) {
             return Ok(Some(spec.clone()));
         }
         let Some(uid) = external_uid(card_ref, &self.resolved) else {
             return Ok(None);
         };
         let row = get_card_by_uid(conn, &uid).await?;
-        self.specs.insert(identity, row.spec.clone());
+        self.externals.insert(identity, row.spec.clone());
         Ok(Some(row.spec))
     }
+}
+
+/// Server Workflow admission bounds on a graph's declared shape and the JCS
+/// bytes of the bodies it executes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphBounds {
+    /// Declared steps one Workflow may have.
+    pub(crate) max_steps: usize,
+    /// Declared dependency edges, duplicates included.
+    pub(crate) max_edges: usize,
+    /// JCS bytes of the Workflow spec and every unique pinned Agent and
+    /// Prompt spec.
+    pub(crate) max_bytes: usize,
+}
+
+/// The exact active Workflow graph one accepted server run executes.
+///
+/// [`PinnedWorkflowGraph::pin`] reads the root Workflow and every Agent and
+/// Prompt Card it names at their exact registered identities, refusing any
+/// Card that is not active, so a later re-registration, deprecation, or
+/// deletion cannot change what an accepted run executes. Bodies are keyed by
+/// exact identity and served only to an external reference with that
+/// identity.
+pub(crate) struct PinnedWorkflowGraph {
+    /// The active root Workflow Card.
+    workflow: WorkflowCard,
+    /// Every pinned Agent and Prompt spec the Workflow names, by identity.
+    bodies: HashMap<CardRefIdentity, Spec>,
+}
+
+impl PinnedWorkflowGraph {
+    /// Read and pin the active Workflow at `workflow_ref` and its Agent and
+    /// Prompt closure within `bounds`.
+    ///
+    /// The step and edge counts are checked on the root spec before any
+    /// dependency is read, and every body is charged against the byte budget
+    /// before it is retained, so an oversized graph is refused without being
+    /// held. Each dependency is read once, at its bound UID when the stored
+    /// reference carries one. No Card is written; cancellation may stop
+    /// after completed reads.
+    ///
+    /// # Errors
+    /// Returns the reference errors of [`Self::check_ref`]; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow exists at
+    /// that identity or UID; `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when
+    /// the root or a dependency is not active, names a path or sibling, or
+    /// its bound UID names another identity; `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE`
+    /// when a bound is exceeded; the Workflow envelope errors of
+    /// [`WorkflowCard::from_envelope`]; and registry read failures unchanged.
+    pub(crate) async fn pin(
+        conn: &mut TenantConn<'_>,
+        workflow_ref: &CardRef,
+        bounds: GraphBounds,
+    ) -> Result<Self, WyrdError> {
+        Self::check_ref(workflow_ref)?;
+        let root = active_row(conn, workflow_ref).await?;
+        let workflow = WorkflowCard::from_envelope(row_card(root))?;
+        let steps = workflow.spec.steps.len();
+        let edges = workflow.spec.steps.iter().fold(0_usize, |edges, step| {
+            edges.saturating_add(step.depends_on.len())
+        });
+        if steps > bounds.max_steps {
+            return Err(graph_too_large("max_steps_per_run", bounds.max_steps));
+        }
+        if edges > bounds.max_edges {
+            return Err(graph_too_large(
+                "max_dependency_edges_per_run",
+                bounds.max_edges,
+            ));
+        }
+        let mut charged = jcs_len(&workflow.spec);
+        if charged > bounds.max_bytes {
+            return Err(graph_too_large(
+                "max_resolved_graph_bytes",
+                bounds.max_bytes,
+            ));
+        }
+        let mut bodies = HashMap::new();
+        let mut pending = card_body_dependencies(&Spec::Workflow(workflow.spec.clone()));
+        while let Some(dependency) = pending.pop() {
+            let Ref::Ref(card_ref) = &dependency else {
+                return Err(WyrdError::RegistryUnresolvedDependency {
+                    message: "a registered Workflow names a dependency outside the registry"
+                        .to_owned(),
+                    details: json!({}),
+                });
+            };
+            let identity = card_ref.identity_key();
+            if bodies.contains_key(&identity) {
+                continue;
+            }
+            let row = active_row(conn, card_ref).await?;
+            charged = charged.saturating_add(jcs_len(&row.spec));
+            if charged > bounds.max_bytes {
+                return Err(graph_too_large(
+                    "max_resolved_graph_bytes",
+                    bounds.max_bytes,
+                ));
+            }
+            pending.extend(card_body_dependencies(&row.spec));
+            bodies.insert(identity, row.spec);
+        }
+        Ok(Self { workflow, bodies })
+    }
+
+    /// Check that `workflow_ref` can name a pinnable Workflow: a Workflow
+    /// reference with an explicit space.
+    ///
+    /// Request parsing calls this before any authorization decision so a
+    /// malformed reference is refused as request shape; [`Self::pin`] calls it
+    /// again because it reads by that space.
+    ///
+    /// # Errors
+    /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` naming `workflow` for another
+    /// kind or a reference without a space.
+    pub(crate) fn check_ref(workflow_ref: &CardRef) -> Result<(), WyrdError> {
+        if workflow_ref.kind != CardKind::Workflow || workflow_ref.space.is_none() {
+            return Err(WyrdError::WorkflowRunRequest {
+                message: "workflow must be a Workflow CardRef with an explicit space".to_owned(),
+                details: json!({ "field": "workflow" }),
+            });
+        }
+        Ok(())
+    }
+
+    /// The pinned root Workflow Card.
+    pub(crate) fn workflow(&self) -> &WorkflowCard {
+        &self.workflow
+    }
+
+    /// Every pinned Agent spec the Workflow's steps reference.
+    pub(crate) fn agents(&self) -> impl Iterator<Item = &AgentSpec> {
+        self.bodies.values().filter_map(|spec| match spec {
+            Spec::Agent(agent) => Some(agent),
+            _ => None,
+        })
+    }
+
+    /// Return the pinned spec an external reference names by its exact
+    /// identity, or `None` for a sibling, a path, or an unpinned identity.
+    pub(crate) fn body(&self, reference: &Ref) -> Option<Spec> {
+        match reference {
+            Ref::Ref(card_ref) => self.bodies.get(&card_ref.identity_key()).cloned(),
+            Ref::Sibling { .. } | Ref::Path(_) => None,
+        }
+    }
+}
+
+/// Read the active Card `card_ref` names: at its bound UID when it carries
+/// one, otherwise at its exact identity.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Card exists there,
+/// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the bound UID names another
+/// identity or the Card is not active, `WYRD_REGISTRY_400_INVALID_CARD_SPEC`
+/// for a reference without a space, and registry read failures unchanged.
+async fn active_row(
+    conn: &mut TenantConn<'_>,
+    card_ref: &CardRef,
+) -> Result<ParsedCardRow, WyrdError> {
+    let row = match &card_ref.uid {
+        Some(uid) => get_card_by_uid(conn, uid).await?,
+        None => {
+            let space = card_ref.space.as_ref().ok_or_else(|| {
+                WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
+            })?;
+            get_card_by_ref(
+                conn,
+                card_ref.kind.clone(),
+                space,
+                &card_ref.name,
+                &card_ref.version,
+            )
+            .await?
+        }
+    };
+    let pinned = CardRef {
+        kind: row.kind.clone(),
+        name: row.name.clone(),
+        version: row.version.clone(),
+        space: Some(row.space.clone()),
+        uid: None,
+    };
+    let unresolved = |reason: &str| WyrdError::RegistryUnresolvedDependency {
+        message: format!("card dependency {} {reason}", display_ref(card_ref)),
+        details: json!({ "card_ref": display_ref(card_ref) }),
+    };
+    if !pinned.same_identity(card_ref) {
+        return Err(unresolved("is bound to another Card's UID"));
+    }
+    if row.status != CardStatus::Active {
+        return Err(unresolved("is not active"));
+    }
+    Ok(row)
+}
+
+/// Build the Card envelope of a registry row for typed decoding.
+fn row_card(row: ParsedCardRow) -> Card {
+    Card {
+        api_version: ApiVersion::v1(),
+        kind: row.kind,
+        metadata: Metadata {
+            name: row.name,
+            version: Some(VersionSpec::Pin(row.version)),
+            bump: None,
+            space: Some(row.space),
+            uid: Some(row.card_uid),
+            labels: row.labels,
+            annotations: row.annotations,
+            spec_hash: None,
+            artifact_hash: None,
+            origin: None,
+        },
+        spec: row.spec,
+        relationships: Relationships::default(),
+        status: None,
+    }
+}
+
+/// The graph-size refusal naming the server bound a graph exceeded.
+fn graph_too_large(bound: &str, max: usize) -> WyrdError {
+    WyrdError::WorkflowGraphTooLarge {
+        message: format!("the Workflow graph exceeds workflow.{bound}"),
+        details: json!({ "bound": bound, "max": max }),
+    }
+}
+
+/// Convert a registration submission into a Card envelope for typed decoding.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable spec.
+fn submission_card(submission: &CardSubmission) -> Result<Card, WyrdError> {
+    let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+        .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+    Ok(Card {
+        api_version: ApiVersion::v1(),
+        kind: submission.kind.clone(),
+        metadata: submission.metadata.clone(),
+        spec,
+        relationships: Relationships::default(),
+        status: None,
+    })
 }
 
 /// Build the Drift validation refusal for an unusable baseline.

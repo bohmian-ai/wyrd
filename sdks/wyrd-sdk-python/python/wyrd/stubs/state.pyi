@@ -154,6 +154,7 @@ class WyrdState:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.

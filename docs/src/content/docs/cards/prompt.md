@@ -10,7 +10,7 @@ order: 13
 
 Version prompt content and the contract around its inputs and outputs.
 
-<CardSummary kind={"prompt"} title={"Prompt"} purpose={"Version prompt content and the contract around its inputs and outputs."} required={["model", "request"]} optionalCount={4} />
+<CardSummary kind={"prompt"} title={"Prompt"} purpose={"Version prompt content and the contract around its inputs and outputs."} required={["model", "request"]} optionalCount={5} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -24,6 +24,7 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | --- | --- | --- |
 | `media_variables` | `array` | no |
 | `model` | `string` | yes |
+| `provider` | `object` | no |
 | `request` | `object` | yes |
 | `response_type` | `object` | no |
 | `variables` | `array` | no |

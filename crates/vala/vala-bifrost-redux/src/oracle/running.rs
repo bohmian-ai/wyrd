@@ -4,6 +4,7 @@
 //! parameters, Arrow batches, and result rows stay with execution owners.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -32,6 +33,12 @@ pub struct RunningQueryEntry {
     participant_cut: Arc<OracleQueryAttemptCut>,
     /// Cooperative cancellation signal shared with execution owners.
     cancellation: CancellationToken,
+    /// Telemetry marker that classifies the query's terminal as cancelled.
+    ///
+    /// The query's telemetry owner adopts it once the entry is registered, and
+    /// a registry cancel sets it, so a query cancelled before its stream exists
+    /// is recorded as cancelled rather than as a failure.
+    telemetry_cancelled: Arc<AtomicBool>,
 }
 
 /// Exactly-once terminal settlement removed from the active-query registry.
@@ -98,6 +105,7 @@ impl RunningQueryEntry {
             started_at,
             participant_cut: Arc::new(participant_cut),
             cancellation: CancellationToken::new(),
+            telemetry_cancelled: Arc::default(),
         }
     }
 
@@ -118,7 +126,14 @@ impl RunningQueryEntry {
             started_at,
             participant_cut: Arc::new(participant_cut),
             cancellation,
+            telemetry_cancelled: Arc::default(),
         }
+    }
+
+    /// Returns the marker a registry cancel sets for this query's telemetry.
+    #[must_use]
+    pub(in crate::oracle) fn telemetry_cancelled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.telemetry_cancelled)
     }
 
     /// Returns the tenant that owns this entry.
@@ -268,6 +283,8 @@ impl RunningQueryRegistry {
 
     /// Marks one tenant-visible query for cancellation exactly once.
     ///
+    /// The query's telemetry marker is set before its token is cancelled, so
+    /// whatever terminal the cancellation produces is recorded as cancelled.
     /// Returns `None` when the request is absent in the named tenant, avoiding
     /// a cross-tenant existence signal. Repeated calls return `Some` with
     /// `cancellation_started` set to `false`.
@@ -285,6 +302,10 @@ impl RunningQueryRegistry {
         if cancellation_started {
             state.cancellation_requested = true;
             state.lifecycle = RunningQueryLifecycleState::Cancelling;
+            state
+                .entry
+                .telemetry_cancelled
+                .store(true, Ordering::Release);
             state.entry.cancellation.cancel();
         }
         Some(CancelRunningQueryResponse {

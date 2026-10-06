@@ -204,6 +204,7 @@ impl RuntimeServiceFixture {
     const EXPECTED_ALIASES: &[&str] = &[
         "agent_inline",
         "agent_triage",
+        "default-Agent-triage-1.0.0",
         "default-Data-training-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
         "default-Verifier-model-drift-1.0.0",
@@ -2437,7 +2438,7 @@ mod pg_tests {
             ),
             (
                 "cli-rollback",
-                "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  name: cli-rollback\n  version: 1.0.0\n  space: default\nspec:\n  steps: []\n",
+                "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  name: cli-rollback\n  version: 1.0.0\n  space: default\nspec:\n  steps:\n    - id: rollback\n      action:\n        type: agent\n        target:\n          prompt:\n            model: gpt-5-5\n            provider:\n              custom: mock\n            request:\n              provider: open_ai_chat_completion\n              body:\n                model: gpt-5-5\n                messages:\n                  - role: user\n                    content: Roll back.\n            response_type: text\n          tool_names: []\n  outputs:\n    result: steps.rollback.output.text\n",
             ),
             (
                 "cli-rollback-operator",

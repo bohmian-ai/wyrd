@@ -46,9 +46,8 @@ pub struct ConfigurePlatformOidcRequest {
     /// address screening — so configuring a connection cannot be used to point
     /// the server's key fetches at an arbitrary host.
     pub issuer_url: String,
-    /// Audience pinned as the `aud` of every accepted token.
-    pub expected_audience: String,
-    /// Wyrd's client identifier at the provider.
+    /// Wyrd's client identifier at the provider, and therefore the `aud`
+    /// every accepted ID token must name.
     pub client_id: String,
     /// How Wyrd authenticates to the provider.
     pub client_auth: PlatformClientAuth,
@@ -71,9 +70,7 @@ pub struct PlatformOidcConnectionView {
     pub issuer_url: String,
     /// JWKS endpoint.
     pub jwks_uri: String,
-    /// Expected audience.
-    pub expected_audience: String,
-    /// Client identifier.
+    /// Client identifier, which is also the ID-token audience.
     pub client_id: String,
     /// Client authentication method name only — never the secret itself.
     pub client_auth: String,
@@ -119,6 +116,12 @@ pub struct PlatformCallbackRequest {
     pub code: String,
     /// Opaque state key issued when the login began.
     pub state: String,
+    /// RFC 9207 authorization-response issuer identifier, when the provider
+    /// sends one. It must equal the login's recorded issuer exactly, and is
+    /// required when the provider's discovery advertises
+    /// `authorization_response_iss_parameter_supported`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
 }
 
 /// One platform principal as an operator sees it.

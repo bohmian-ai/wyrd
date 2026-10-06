@@ -233,7 +233,7 @@ async fn refresh_reads_the_refresh_token_from_the_environment() {
             "access_token": "rotated-access",
             "refresh_token": "rotated-refresh",
             "token_type": "Bearer",
-            "expires_at": "2030-01-01T00:00:00Z"
+            "expires_in": 300
         })))
         .mount(&server)
         .await;
@@ -257,8 +257,11 @@ async fn refresh_reads_the_refresh_token_from_the_environment() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("rotated-refresh"));
     let requests = server.received_requests().await.expect("requests recorded");
-    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body is JSON");
-    assert_eq!(body["refresh_token"], "refresh-sentinel");
+    assert!(
+        url::form_urlencoded::parse(&requests[0].body)
+            .any(|(name, value)| name == "refresh_token" && value == "refresh-sentinel"),
+        "the form body carries the environment refresh token"
+    );
 
     let missing = run(arguments, Vec::new()).await;
     failed_with(&missing, "WYRD_CLI_401_NO_REFRESH_TOKEN");

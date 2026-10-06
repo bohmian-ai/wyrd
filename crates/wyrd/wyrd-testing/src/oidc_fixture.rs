@@ -1,13 +1,15 @@
 //! Real OIDC provider fixture for identity e2e tests.
 //!
 //! `OidcIssuerFixture` wraps a running Keycloak or Dex container and provides
-//! helpers to drive human login (Keycloak only), mint workload tokens, and
+//! helpers to drive human login (Keycloak and Dex), mint workload tokens, and
 //! force signing-key rotation (Keycloak only).  The harness smoke test (commit
 //! 08) verifies discovery; the journey tests (commit 09) drive the full flows.
 
+use std::sync::Arc;
+
 use url::Url;
 use wiremock::MockServer;
-use wyrd_auth_oidc::{OidcProvider, ProviderMetadata};
+use wyrd_auth_oidc::{ProviderMetadata, RelyingParty, ScreenedHttp};
 use wyrd_spec::auth::IssuerUrl;
 
 /// Keycloak-specific admin context needed for privileged operations.
@@ -23,14 +25,17 @@ pub struct KeycloakAdmin {
     pub realm: String,
 }
 
-/// Result of a driven human login: the `code` and `state` query parameters
-/// delivered to the redirect URI.
+/// Result of a driven human login: the `code`, `state`, and optional RFC 9207
+/// `iss` query parameters delivered to the redirect URI.
 #[derive(Debug, Clone)]
 pub struct LoginResult {
     /// Authorization code returned by the IdP.
     pub code: String,
     /// State value echoed back from the authorization request.
     pub state: String,
+    /// RFC 9207 authorization-response issuer, when the IdP sent one; a
+    /// callback that binds the response issuer must forward it.
+    pub iss: Option<String>,
 }
 
 /// Connected OIDC provider fixture.
@@ -40,7 +45,7 @@ pub struct LoginResult {
 pub struct OidcIssuerFixture {
     /// Normalized issuer URL (used for `TrustedIssuer.issuer`).
     pub issuer: IssuerUrl,
-    provider: OidcProvider,
+    provider: Arc<ProviderMetadata>,
     http: reqwest::Client,
     admin: Option<KeycloakAdmin>,
 }
@@ -63,17 +68,11 @@ impl OidcIssuerFixture {
             .build()
             .expect("reqwest client builds");
 
-        let provider = {
-            let discover_client = reqwest::Client::new();
-            OidcProvider::discover(
-                issuer_base.parse().expect("issuer URL parses"),
-                discover_client,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"))
-        };
-
         let issuer = IssuerUrl::new_for_tests(issuer_base);
+        let provider = RelyingParty::new(ScreenedHttp::allowing_internal())
+            .discover(&issuer)
+            .await
+            .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"));
 
         Self {
             issuer,
@@ -92,22 +91,19 @@ impl OidcIssuerFixture {
 
     /// Discovery metadata from the provider.
     pub fn metadata(&self) -> &ProviderMetadata {
-        &self.provider.metadata
+        &self.provider
     }
 
-    /// Drive a full human login against a Keycloak HTML login form.
+    /// Drive a full human login at this provider for a caller-built request.
     ///
-    /// The method:
-    /// 1. Builds the authorization URL with the given params.
-    /// 2. GETs it (without following redirects) to reach the Keycloak login page.
-    /// 3. Parses the HTML form `action` URL.
-    /// 4. POSTs the user credentials.
-    /// 5. Follows the 302 to `redirect_uri` and captures `code` and `state`.
-    ///
-    /// Only works with Keycloak; panics if called against a non-Keycloak issuer.
+    /// Builds the authorization URL from this provider's discovered
+    /// endpoint and the given parameters, signs `username` in through
+    /// [`provider_sign_in`], and returns the `code`, `state`, and RFC 9207
+    /// `iss` the provider redirected to `redirect_uri` with.
     ///
     /// # Panics
-    /// Panics when the login flow cannot be completed.
+    /// Panics when the login flow cannot be completed or the return omits
+    /// `code` or `state`.
     // justification: test fixture mirrors the OIDC authorization-code login flow inputs (client_id, username, password, redirect_uri, state, code_challenge, nonce) 1:1; wrapping in a struct would add indirection for a single call site
     #[allow(clippy::too_many_arguments)]
     pub async fn human_login(
@@ -120,101 +116,29 @@ impl OidcIssuerFixture {
         code_challenge: &str,
         nonce: &str,
     ) -> LoginResult {
-        let authz_url = self.provider.metadata.authorization_endpoint.clone();
-
-        let authz_url = {
-            let mut u = authz_url;
-            u.query_pairs_mut()
-                .append_pair("response_type", "code")
-                .append_pair("client_id", client_id)
-                .append_pair("redirect_uri", redirect_uri.as_str())
-                .append_pair("scope", "openid email profile")
-                .append_pair("state", state)
-                .append_pair("nonce", nonce)
-                .append_pair("code_challenge", code_challenge)
-                .append_pair("code_challenge_method", "S256");
-            u
+        let mut authz_url = self.provider.authorization_endpoint().url().clone();
+        authz_url
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect_uri.as_str())
+            .append_pair("scope", "openid email profile")
+            .append_pair("state", state)
+            .append_pair("nonce", nonce)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
+        let callback_url =
+            provider_sign_in(&authz_url, username, password, redirect_uri.as_str()).await;
+        let param = |name: &str| {
+            callback_url
+                .query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
         };
-
-        // Step 1: GET authorization URL → Keycloak returns HTML login page
-        let resp = self
-            .http
-            .get(authz_url.clone())
-            .send()
-            .await
-            .expect("GET authorization URL succeeds");
-
-        let (html, cookie) = if resp.status().is_redirection() {
-            // Follow the redirect manually (Keycloak may redirect to the login page)
-            let location = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .expect("redirect has Location header")
-                .to_str()
-                .expect("Location is valid UTF-8")
-                .to_owned();
-            let session_cookie = extract_session_cookie(&resp);
-            let mut req = self.http.get(&location);
-            if let Some(ref cookie) = session_cookie {
-                req = req.header(reqwest::header::COOKIE, cookie.as_str());
-            }
-            let login_page = req.send().await.expect("GET login page succeeds");
-            let session_cookie_final =
-                session_cookie.or_else(|| extract_session_cookie(&login_page));
-            let body = login_page.text().await.expect("login page body is text");
-            (body, session_cookie_final)
-        } else {
-            let session_cookie = extract_session_cookie(&resp);
-            let body = resp.text().await.expect("login page body is text");
-            (body, session_cookie)
-        };
-
-        // Step 2: Parse the form action URL from the HTML
-        let form_action = parse_form_action(&html)
-            .unwrap_or_else(|| panic!("could not find login form action in HTML:\n{html}"));
-
-        // Step 3: POST credentials
-        let mut post_req = self
-            .http
-            .post(&form_action)
-            .form(&[("username", username), ("password", password)]);
-        if let Some(ref c) = cookie {
-            post_req = post_req.header(reqwest::header::COOKIE, c.as_str());
-        }
-        let post_resp = post_req
-            .send()
-            .await
-            .expect("POST login credentials succeeds");
-
-        // Step 4: Follow the redirect to the redirect_uri and capture code+state
-        let location = post_resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .unwrap_or_else(|| {
-                panic!(
-                    "login POST returned {} without Location header",
-                    post_resp.status()
-                )
-            })
-            .to_str()
-            .expect("Location header is valid UTF-8")
-            .to_owned();
-
-        let callback_url: Url = location.parse().expect("callback URL parses");
-        let code = callback_url
-            .query_pairs()
-            .find(|(k, _)| k == "code")
-            .map(|(_, v)| v.into_owned())
-            .expect("callback URL contains 'code' param");
-        let returned_state = callback_url
-            .query_pairs()
-            .find(|(k, _)| k == "state")
-            .map(|(_, v)| v.into_owned())
-            .expect("callback URL contains 'state' param");
-
         LoginResult {
-            code,
-            state: returned_state,
+            code: param("code").expect("callback URL contains 'code' param"),
+            state: param("state").expect("callback URL contains 'state' param"),
+            iss: param("iss"),
         }
     }
 
@@ -236,10 +160,9 @@ impl OidcIssuerFixture {
     ) -> String {
         let token_url = self
             .provider
-            .metadata
-            .token_endpoint
-            .as_ref()
-            .expect("provider exposes a token endpoint");
+            .token_endpoint()
+            .expect("provider exposes a token endpoint")
+            .url();
 
         let resp = self
             .http
@@ -430,25 +353,99 @@ impl OidcIssuerFixture {
     }
 }
 
-/// Extract the first `KC_RESTART` or `AUTH_SESSION_ID` cookie from a response.
-fn extract_session_cookie(resp: &reqwest::Response) -> Option<String> {
-    resp.headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find(|v| v.starts_with("AUTH_SESSION_ID") || v.starts_with("KC_RESTART"))
-        .map(|v| v.split(';').next().unwrap_or(v).to_owned())
+/// Sign `username` in at a real provider's HTML login form, starting from a
+/// complete `authorization_url`, and return the URL the provider finally
+/// redirects the browser to under `redirect_uri` — with every query parameter
+/// it added (`code`, `state`, and any RFC 9207 `iss`).
+///
+/// Acts as a cookie-keeping browser that does not follow redirects on its
+/// own: it follows each provider redirect, submits the first login form it
+/// reaches once, and stops at the first redirect into `redirect_uri` without
+/// requesting it. A provider that redirects there without a form (an existing
+/// session or a mock) returns at once. Keycloak names the account field
+/// `username` and Dex names it `login`; both are sent and each provider
+/// ignores the other.
+///
+/// # Panics
+/// Panics when a request fails, the provider answers with neither a redirect
+/// nor a login form, shows the form again after the credentials (a refused
+/// sign-in), or never redirects into `redirect_uri`.
+pub async fn provider_sign_in(
+    authorization_url: &Url,
+    username: &str,
+    password: &str,
+    redirect_uri: &str,
+) -> Url {
+    wyrd_tls::install_crypto_provider()
+        .expect("Wyrd's AWS-LC provider must own fixture TLS before client construction");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client builds");
+    let mut cookies = std::collections::BTreeMap::<String, String>::new();
+    let mut current = authorization_url.clone();
+    let mut request = http.get(current.clone());
+    let mut credentials_sent = false;
+    for _ in 0..20 {
+        if !cookies.is_empty() {
+            let header = cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            request = request.header(reqwest::header::COOKIE, header);
+        }
+        let response = request.send().await.expect("provider answers");
+        for set in response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+        {
+            let pair = set.split(';').next().unwrap_or(set);
+            if let Some((name, value)) = pair.split_once('=') {
+                cookies.insert(name.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+        if let Some(location) = response.headers().get(reqwest::header::LOCATION) {
+            let next = current
+                .join(location.to_str().expect("Location is valid UTF-8"))
+                .expect("Location resolves");
+            if next.as_str().starts_with(redirect_uri) {
+                return next;
+            }
+            current = next;
+            request = http.get(current.clone());
+            continue;
+        }
+        let status = response.status();
+        let html = response.text().await.expect("provider page is text");
+        assert!(
+            status.is_success() && !credentials_sent,
+            "provider sign-in stopped with {status} at {current}:\n{html}"
+        );
+        let action = parse_form_action(&html)
+            .unwrap_or_else(|| panic!("no login form at {current}:\n{html}"));
+        current = current.join(&action).expect("form action resolves");
+        request = http.post(current.clone()).form(&[
+            ("username", username),
+            ("login", username),
+            ("password", password),
+        ]);
+        credentials_sent = true;
+    }
+    panic!("provider sign-in never returned to {redirect_uri}");
 }
 
 /// Parse the `action` attribute of the first `<form>` element in an HTML page.
 fn parse_form_action(html: &str) -> Option<String> {
-    // Keycloak login form: <form id="kc-form-login" ... action="...">
+    // Keycloak: <form id="kc-form-login" ... action="...">; Dex: <form method="post" action="...">
     let marker = "action=\"";
     let start = html.find(marker)?;
     let rest = &html[start + marker.len()..];
     let end = rest.find('"')?;
     let raw = &rest[..end];
-    // Keycloak HTML-encodes `&` as `&amp;` in form actions
+    // Both providers HTML-encode `&` as `&amp;` in form actions
     Some(raw.replace("&amp;", "&"))
 }
 
@@ -469,7 +466,7 @@ pub struct DiscoveryFixture {
 }
 
 impl DiscoveryFixture {
-    /// Start an issuer serving only its discovery document.
+    /// Start an issuer serving its discovery document and an empty key set.
     pub async fn start() -> Self {
         let server = wiremock::MockServer::start().await;
         let issuer = server.uri();
@@ -483,8 +480,18 @@ impl DiscoveryFixture {
                     "authorization_endpoint": format!("{issuer}/authorize"),
                     "token_endpoint": format!("{issuer}/token"),
                     "jwks_uri": format!("{issuer}/jwks"),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
                     "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
                 })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "keys": [] })),
             )
             .mount(&server)
             .await;

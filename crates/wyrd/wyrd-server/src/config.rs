@@ -21,14 +21,15 @@ use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SecretKey;
 use wyrd_gateway::{
     CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
-    read_secret_file,
 };
-use wyrd_spec::auth::IssuerTokenPolicy;
+use wyrd_spec::auth::{IssuerTokenPolicy, Sha256Hex};
+use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
 use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
 use wyrd_spec::security::SecretRef;
 use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_telemetry::TelemetryConfig;
+use wyrd_utils::secret::{read_secret_file, read_secret_ref};
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
 
@@ -59,23 +60,26 @@ pub enum ConfigError {
         /// The missing path.
         path: PathBuf,
     },
-    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` could not be read.
-    #[error("signing-key file at {path} could not be read")]
+    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` was refused by
+    /// [`read_secret_file`]: unreadable, not a regular owner-only file, or
+    /// larger than one secret.
+    #[error("signing-key file at {path} {reason}")]
     ReadSigningKey {
-        /// Path that failed to read.
+        /// Path that was refused.
         path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        /// The loader's static refusal; it names no key material.
+        reason: &'static str,
     },
-    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` could not be read.
-    #[error("sealing-key file at {path} could not be read")]
+    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` or
+    /// `WYRD_SEALING_RETAINED_KEYS_FILE` was refused by
+    /// [`read_secret_file`]: unreadable, not a regular owner-only file, or
+    /// larger than one secret.
+    #[error("sealing-key file at {path} {reason}")]
     ReadSealingKey {
-        /// Path that failed to read.
+        /// Path that was refused.
         path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        /// The loader's static refusal; it names no key material.
+        reason: &'static str,
     },
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
@@ -1648,6 +1652,152 @@ impl Default for VerificationConfig {
     }
 }
 
+/// Bounds and bindings of accepted server Workflow runs under `[workflow]`.
+///
+/// Every omitted field takes its value from the manual [`Default`], so an
+/// operator overrides only the bounds they set. Accepted runs are
+/// process-local; terminal runs are retained for a fixed 24 hours within the
+/// retained-run ceilings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerWorkflowConfig {
+    /// Total run deadline applied when a request names none.
+    pub default_timeout_seconds: u64,
+    /// Largest total run deadline a request may name.
+    pub max_timeout_seconds: u64,
+    /// Ready steps one run executes concurrently.
+    pub max_concurrency_per_run: usize,
+    /// Preparing and active runs across every tenant.
+    pub max_active_global: usize,
+    /// Preparing and active runs of one tenant.
+    pub max_active_per_tenant: usize,
+    /// Terminal runs retained across every tenant.
+    pub max_retained_global: usize,
+    /// Terminal runs retained for one tenant.
+    pub max_retained_per_tenant: usize,
+    /// Declared steps one Workflow may have.
+    pub max_steps_per_run: usize,
+    /// Declared dependency edges one Workflow may have, duplicates included.
+    pub max_dependency_edges_per_run: usize,
+    /// JCS bytes of the Workflow and every unique pinned Agent and Prompt
+    /// body it executes.
+    pub max_resolved_graph_bytes: usize,
+    /// JCS bytes of one run's input.
+    pub max_input_bytes: usize,
+    /// JCS bytes of one step's normalized result.
+    pub max_step_result_bytes: usize,
+    /// JCS bytes of one run's complete snapshot, including its terminal
+    /// reserve.
+    pub max_run_bytes: usize,
+    /// External gateway bindings, each assigned to exactly one tenant.
+    pub external_gateway_bindings:
+        BTreeMap<CredentialBindingName, ServerExternalGatewayBindingConfig>,
+}
+
+impl Default for ServerWorkflowConfig {
+    /// The approved server Workflow bounds and no external gateway bindings.
+    fn default() -> Self {
+        const MIB: usize = 1024 * 1024;
+        Self {
+            default_timeout_seconds: 1800,
+            max_timeout_seconds: 7200,
+            max_concurrency_per_run: 8,
+            max_active_global: 32,
+            max_active_per_tenant: 4,
+            max_retained_global: 128,
+            max_retained_per_tenant: 32,
+            max_steps_per_run: 1024,
+            max_dependency_edges_per_run: 4096,
+            max_resolved_graph_bytes: 8 * MIB,
+            max_input_bytes: MIB,
+            max_step_result_bytes: MIB,
+            max_run_bytes: 4 * MIB,
+            external_gateway_bindings: BTreeMap::new(),
+        }
+    }
+}
+
+impl ServerWorkflowConfig {
+    /// Rejects bounds that cannot admit a run or that contradict each other,
+    /// so the server fails boot.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first zero bound, a default
+    /// timeout above the maximum, a per-tenant active or retained ceiling
+    /// above its global ceiling, or a step-result bound above the run bound.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| Err(ConfigError::Invalid { message });
+        let timeouts = [
+            ("default_timeout_seconds", self.default_timeout_seconds),
+            ("max_timeout_seconds", self.max_timeout_seconds),
+        ];
+        let ceilings = [
+            ("max_concurrency_per_run", self.max_concurrency_per_run),
+            ("max_active_global", self.max_active_global),
+            ("max_active_per_tenant", self.max_active_per_tenant),
+            ("max_retained_global", self.max_retained_global),
+            ("max_retained_per_tenant", self.max_retained_per_tenant),
+            ("max_steps_per_run", self.max_steps_per_run),
+            (
+                "max_dependency_edges_per_run",
+                self.max_dependency_edges_per_run,
+            ),
+            ("max_resolved_graph_bytes", self.max_resolved_graph_bytes),
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_step_result_bytes", self.max_step_result_bytes),
+            ("max_run_bytes", self.max_run_bytes),
+        ];
+        let zero = timeouts
+            .iter()
+            .find(|(_, value)| *value == 0)
+            .map(|(name, _)| name)
+            .or_else(|| {
+                ceilings
+                    .iter()
+                    .find(|(_, value)| *value == 0)
+                    .map(|(name, _)| name)
+            });
+        if let Some(name) = zero {
+            return invalid(format!("workflow.{name} must be positive"));
+        }
+        if self.default_timeout_seconds > self.max_timeout_seconds {
+            return invalid(
+                "workflow.default_timeout_seconds must not exceed max_timeout_seconds".to_owned(),
+            );
+        }
+        if self.max_active_per_tenant > self.max_active_global {
+            return invalid(
+                "workflow.max_active_per_tenant must not exceed max_active_global".to_owned(),
+            );
+        }
+        if self.max_retained_per_tenant > self.max_retained_global {
+            return invalid(
+                "workflow.max_retained_per_tenant must not exceed max_retained_global".to_owned(),
+            );
+        }
+        if self.max_step_result_bytes > self.max_run_bytes {
+            return invalid(
+                "workflow.max_step_result_bytes must not exceed max_run_bytes".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One server external gateway binding and the tenant it is assigned to.
+///
+/// The server keeps the secret references and resolves only the binding a
+/// run of `tenant` selects, during that run's preparation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerExternalGatewayBindingConfig {
+    /// The only tenant whose runs may select this binding.
+    pub tenant: DataTenantId,
+    /// Protocol, origin, and secret headers of the binding.
+    #[serde(flatten)]
+    pub binding: ExternalGatewayBindingConfig,
+}
+
 /// Source of the 32-byte key-encryption keys (KEKs) that wrap each Operator
 /// connection's data key.
 ///
@@ -1991,6 +2141,9 @@ pub struct WyrdServerConfig {
     /// Operator-owned gateway credential sources.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// Accepted server Workflow run bounds and external gateway bindings.
+    #[serde(default)]
+    pub workflow: ServerWorkflowConfig,
 }
 
 impl WyrdServerConfig {
@@ -2112,7 +2265,7 @@ pub struct AuthConfig {
     /// Boot has no request `Host` to derive the tenant from, so the operator
     /// declares it here (or via `WYRD_SERVER_TENANT_SLUG`). Required when any
     /// `[[trusted_issuers]]` or `[[workload_bindings]]` entry is configured; the
-    /// slug is resolved at boot through the same `resolve_by_slug_for_app` path
+    /// slug is resolved at boot through the same `WyrdPostgres::resolve_tenant_slug`
     /// the request handlers use, so the bound tenant matches request-time lookups.
     #[serde(default)]
     pub tenant_slug: Option<TenantSlug>,
@@ -2125,22 +2278,54 @@ pub struct AuthConfig {
     /// separately. `None` when unset; production boot fails closed without it.
     #[serde(skip)]
     pub signing_key: Option<SecretString>,
-    /// Base64-encoded 32-byte AES-256-GCM sealing key for issuer client secrets.
+    /// Base64-encoded 32-byte AES-256-GCM write key for stored provider secrets.
     ///
     /// Env-injected only — never read from the TOML file. Loaded at config time
     /// from `WYRD_SEALING_KEY_FILE` (path to a mounted secret; primary) or
     /// `WYRD_SEALING_KEY_BASE64` (inline base64; fallback). Boot decodes this to
-    /// a 32-byte key. `None` when unset; boot fails closed if any seeded issuer
-    /// carries a client secret without a sealing key configured.
+    /// a 32-byte key and makes it the write key of the deployment
+    /// `SealingKeyring`: every new provider secret (tenant human connections,
+    /// workload issuers, the platform connection) is sealed under it with a
+    /// versioned `key_id` envelope. `None` when unset; storing a secret without
+    /// a configured key fails closed.
     ///
-    /// **Single-key limitation:** there is currently no key-id column or keyring.
-    /// All rows are encrypted under this one key; live rotation without downtime
-    /// is not yet supported. If the key leaks: (1) rotate the client secrets at
-    /// the IdP, (2) re-register the issuers with the new secrets, (3) rotate this
-    /// env var. The existing `client_secret_enc` rows then encrypt stale secrets
-    /// and are harmless. Tracked in issue #72.
+    /// **Rotation:** add the new key to every replica as a retained key, switch
+    /// this write key while listing the old one in
+    /// [`Self::sealing_retained_keys`], and restart. Boot rewraps every stored
+    /// secret under the write key and logs any value it could not open. Remove
+    /// the old retained key only after boot reports zero values needing rewrap.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
+    /// Base64-encoded 32-byte keys retained only to open secrets sealed before
+    /// the latest rotation.
+    ///
+    /// Env-injected only. Loaded from `WYRD_SEALING_RETAINED_KEYS_FILE` (a file
+    /// holding one base64 key per line; primary) or
+    /// `WYRD_SEALING_RETAINED_KEYS_BASE64` (comma-separated base64; fallback).
+    /// Empty when unset.
+    #[serde(skip)]
+    pub sealing_retained_keys: Vec<SecretString>,
+    /// Deployment-controlled public origin (scheme, host, optional port) that
+    /// browsers and identity providers reach Wyrd on.
+    ///
+    /// Loaded from `WYRD_PUBLIC_ORIGIN` or `[auth] public_origin`. The tenant
+    /// human-connection callback URL shown to administrators is this origin
+    /// plus `/auth/callback`; it is never assembled from request headers.
+    /// `None` leaves OIDC administration unable to stage a connection while
+    /// every non-OIDC path keeps working.
+    #[serde(default)]
+    pub public_origin: Option<url::Url>,
+    /// SHA-256 hashes of the client secret the production UI's confidential
+    /// OAuth client `wyrd-ui` authenticates with (RFC 6749 §2.3.1).
+    ///
+    /// Env-injected only. Loaded from `WYRD_UI_CLIENT_SECRET_SHA256`: one or,
+    /// during a rotation overlap, two comma-separated lowercase-hex SHA-256
+    /// digests of the raw secret. Empty leaves `wyrd-ui` unable to
+    /// authenticate, so a deployment without the production UI accepts no
+    /// authorization-code grant. The secret authenticates only the client,
+    /// never tenant API authority.
+    #[serde(skip)]
+    pub ui_client_secret_hashes: Vec<Sha256Hex>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2412,7 +2597,7 @@ impl GatewayConfig {
     /// wrapping key out of per-tenant configuration, so that fails boot.
     ///
     /// A mounted file carries tenant wrapping authority, so it is read through
-    /// [`read_secret_file`] under the same open-handle, regular-file,
+    /// [`read_secret_ref`] under the same open-handle, regular-file,
     /// owner-only, bounded rule the request path applies to an operator
     /// binding: a `0644` mount is refused here rather than accepted.
     ///
@@ -2432,15 +2617,9 @@ impl GatewayConfig {
             };
             let mut versions = BTreeMap::new();
             for (version, secret) in &configured.versions {
-                let encoded = match secret {
-                    SecretRef::Env { name } => env::var(name)
-                        .map_err(|_| invalid(version, "names an unset environment variable"))?,
-                    SecretRef::File { path } => read_secret_file(Path::new(path))
-                        .map_err(|reason| invalid(version, reason))?,
-                    _ => return Err(invalid(version, "must be an env or file secret reference")),
-                };
+                let encoded = read_secret_ref(secret).map_err(|reason| invalid(version, reason))?;
                 let bytes: [u8; 32] = BASE64_STANDARD
-                    .decode(encoded.trim())
+                    .decode(encoded.expose_secret().trim())
                     .ok()
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or_else(|| {
@@ -3054,6 +3233,22 @@ impl WyrdServerConfig {
         if let Some(key) = load_sealing_key()? {
             self.auth.sealing_key = Some(key);
         }
+        let retained = load_sealing_retained_keys()?;
+        if !retained.is_empty() {
+            self.auth.sealing_retained_keys = retained;
+        }
+        if let Some(hashes) = env_opt("WYRD_UI_CLIENT_SECRET_SHA256")? {
+            self.auth.ui_client_secret_hashes = parse_ui_client_secret_hashes(&hashes)?;
+        }
+        if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
+            self.auth.public_origin =
+                Some(
+                    url::Url::parse(&origin).map_err(|e| ConfigError::BadEnvVar {
+                        key: "WYRD_PUBLIC_ORIGIN".to_string(),
+                        message: e.to_string(),
+                    })?,
+                );
+        }
 
         Ok(())
     }
@@ -3105,6 +3300,7 @@ impl WyrdServerConfig {
                 .validate()
                 .map_err(|message| ConfigError::Invalid { message })?;
             self.validate_oracle_calibration()?;
+            self.workflow.validate()?;
         }
 
         // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
@@ -3438,8 +3634,36 @@ impl WyrdServerConfig {
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Parse `WYRD_UI_CLIENT_SECRET_SHA256`: one or two comma-separated
+/// lowercase-hex SHA-256 digests, the second accepted only for a bounded
+/// rotation overlap.
+///
+/// # Errors
+/// Returns [`ConfigError::BadEnvVar`] for an empty entry, a value that is not a
+/// SHA-256 digest, or more than two entries.
+fn parse_ui_client_secret_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigError> {
+    let bad = |message: String| ConfigError::BadEnvVar {
+        key: "WYRD_UI_CLIENT_SECRET_SHA256".to_string(),
+        message,
+    };
+    let hashes = value
+        .split(',')
+        .map(|entry| Sha256Hex::new(entry.trim()).map_err(|error| bad(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    if hashes.len() > 2 {
+        return Err(bad(
+            "at most two secret hashes (current and rotating) are accepted".to_string(),
+        ));
+    }
+    Ok(hashes)
+}
+
 /// Read an environment variable, returning `None` if unset and
 /// `Err(EmptyEnvVar)` if set but empty.
+///
+/// # Errors
+/// Returns [`ConfigError::EmptyEnvVar`] for a set but empty value and
+/// [`ConfigError::BadEnvVar`] for a value that is not valid UTF-8.
 fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
     match env::var(key) {
         Ok(v) if v.is_empty() => Err(ConfigError::EmptyEnvVar {
@@ -3483,7 +3707,13 @@ where
 /// `WYRD_SIGNING_KEY_FILE` (a path to a mounted secret) is the primary source;
 /// `WYRD_SIGNING_KEY_PEM` (inline PEM) is the fallback. The file form is
 /// preferred because a k8s Secret volume keeps the PEM out of the process
-/// environment and `env` dumps. Setting both is a configuration error.
+/// environment and `env` dumps. Setting both is a configuration error. The
+/// file is read through [`read_secret_file`], the same loader the sealing keys
+/// use, so it must be a regular, owner-only file no larger than one secret.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSigningKey`] when the file is refused.
 fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
     let file = env_opt("WYRD_SIGNING_KEY_FILE")?;
     let inline = env_opt("WYRD_SIGNING_KEY_PEM")?;
@@ -3496,8 +3726,8 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
         }),
         (Some(path), None) => {
             let path = PathBuf::from(path);
-            let pem = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSigningKey { path, source })?;
+            let pem = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSigningKey { path, reason })?;
             Ok(Some(SecretString::from(pem)))
         }
         (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
@@ -3510,8 +3740,14 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
 /// `WYRD_SEALING_KEY_FILE` (a path to a mounted secret) is the primary source;
 /// `WYRD_SEALING_KEY_BASE64` (inline base64) is the fallback. The file form is
 /// preferred for the same reason as the signing key. Setting both is a
-/// configuration error. Surrounding whitespace (e.g. a trailing newline in a
-/// mounted secret file) is trimmed; boot decodes the base64 to a 32-byte key.
+/// configuration error. The file is read through [`read_secret_file`], so it
+/// must be a regular, owner-only file no larger than one secret. Surrounding
+/// whitespace (e.g. a trailing newline in a mounted secret file) is trimmed;
+/// boot decodes the base64 to a 32-byte key.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSealingKey`] when the file is refused.
 fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
     let file = env_opt("WYRD_SEALING_KEY_FILE")?;
     let inline = env_opt("WYRD_SEALING_KEY_BASE64")?;
@@ -3524,13 +3760,53 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
         }),
         (Some(path), None) => {
             let path = PathBuf::from(path);
-            let encoded = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
+            let encoded = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
             Ok(Some(SecretString::from(encoded.trim().to_owned())))
         }
         (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
         (None, None) => Ok(None),
     }
+}
+
+/// Load the base64-encoded retained sealing keys from the environment.
+///
+/// `WYRD_SEALING_RETAINED_KEYS_FILE` names a mounted file with one base64 key
+/// per line (blank lines ignored); `WYRD_SEALING_RETAINED_KEYS_BASE64` holds a
+/// comma-separated list. Setting both is a configuration error. The file is
+/// read through [`read_secret_file`] under the same rules as the active key.
+/// Boot decodes and validates each key.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSealingKey`] when the file is refused.
+fn load_sealing_retained_keys() -> Result<Vec<SecretString>, ConfigError> {
+    let file = env_opt("WYRD_SEALING_RETAINED_KEYS_FILE")?;
+    let inline = env_opt("WYRD_SEALING_RETAINED_KEYS_BASE64")?;
+    let (text, separator) = match (file, inline) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::ConflictingEnvVars {
+                keys: vec![
+                    "WYRD_SEALING_RETAINED_KEYS_FILE".to_string(),
+                    "WYRD_SEALING_RETAINED_KEYS_BASE64".to_string(),
+                ],
+            });
+        }
+        (Some(path), None) => {
+            let path = PathBuf::from(path);
+            let text = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
+            (text, '\n')
+        }
+        (None, Some(text)) => (text, ','),
+        (None, None) => return Ok(Vec::new()),
+    };
+    Ok(text
+        .split(separator)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(|key| SecretString::from(key.to_owned()))
+        .collect())
 }
 
 /// Parse a boolean flag from a `0`/`1` string.
@@ -3585,6 +3861,33 @@ mod tests {
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The `wyrd-ui` client-secret hash list accepts one secret or a
+    /// two-secret rotation overlap and refuses malformed digests and a third.
+    #[test]
+    fn ui_client_secret_hashes_accept_at_most_two_digests() {
+        let one = "a".repeat(64);
+        let two = format!("{one}, {}", "b".repeat(64));
+        assert_eq!(
+            parse_ui_client_secret_hashes(&one).expect("one key").len(),
+            1
+        );
+        assert_eq!(
+            parse_ui_client_secret_hashes(&two).expect("two keys").len(),
+            2
+        );
+        for bad in [
+            format!("{two},{}", "c".repeat(64)),
+            "A".repeat(64),
+            "abc".to_owned(),
+            format!("{one},"),
+        ] {
+            assert!(
+                parse_ui_client_secret_hashes(&bad).is_err(),
+                "{bad} is refused"
+            );
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -5755,6 +6058,244 @@ provider = "anthropic"
                 !message.contains(KEY) && !message.contains(&KEY[..8]),
                 "{case} refusal quotes key material: {message}"
             );
+        }
+    }
+
+    /// The signing-key file loads through [`read_secret_file`], and its
+    /// refusal quotes no key material.
+    ///
+    /// The PEM mints every access token, so it shares the sealing keys'
+    /// owner-only rule; that reader's full refusal matrix is proven by the
+    /// sealing-key test, so this proves only the wiring: an owner-only file
+    /// loads and a permissive one is refused as [`ConfigError::ReadSigningKey`].
+    ///
+    /// # Panics
+    /// Panics when a key file cannot be written, when the owner-only file is
+    /// refused, or when the permissive file is accepted, refused with another
+    /// error, or refused with text containing the key.
+    #[test]
+    fn the_signing_key_file_requires_a_restrictive_regular_bounded_file() {
+        const PEM: &str =
+            "-----BEGIN PRIVATE KEY-----\nsigning-key-body\n-----END PRIVATE KEY-----\n";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let owner_only = directory.path().join("owner-only.pem");
+        write_key_file(&owner_only, PEM, 0o600);
+        let permissive = directory.path().join("permissive.pem");
+        write_key_file(&permissive, PEM, 0o644);
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SIGNING_KEY_FILE", Some(owner_only.as_os_str())),
+                ("WYRD_SIGNING_KEY_PEM", None),
+            ],
+            || {
+                let loaded = load_signing_key().expect("owner-only signing key loads");
+                assert_eq!(
+                    loaded.map(|key| key.expose_secret().to_owned()).as_deref(),
+                    Some(PEM)
+                );
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SIGNING_KEY_FILE", Some(permissive.as_os_str())),
+                ("WYRD_SIGNING_KEY_PEM", None),
+            ],
+            || {
+                let error = load_signing_key().expect_err("permissive file is refused");
+                let message = error.to_string();
+                assert!(
+                    matches!(error, ConfigError::ReadSigningKey { .. }),
+                    "refusal is a signing-key read error: {message}"
+                );
+                assert!(
+                    !message.contains("signing-key-body"),
+                    "refusal quotes key material: {message}"
+                );
+            },
+        );
+    }
+
+    /// Active and retained sealing-key files load only from bounded,
+    /// owner-only regular files, and no refusal quotes key material.
+    ///
+    /// Both files can decrypt every stored provider secret, so they share the
+    /// tenant wrapping key rule: permissive, non-regular, and oversized mounts
+    /// are refused as [`ConfigError::ReadSealingKey`].
+    ///
+    /// # Panics
+    /// Panics when a key file cannot be written, when an owner-only file is
+    /// refused, or when a refused file is accepted, refused with another
+    /// error, or refused with text containing the key.
+    #[test]
+    fn sealing_key_files_require_a_restrictive_regular_bounded_file() {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let owner_only = directory.path().join("owner-only.key");
+        write_key_file(&owner_only, KEY, 0o600);
+        let permissive = directory.path().join("permissive.key");
+        write_key_file(&permissive, KEY, 0o644);
+        let oversized = directory.path().join("oversized.key");
+        write_key_file(&oversized, &KEY.repeat(4096), 0o600);
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SEALING_KEY_FILE", Some(owner_only.as_os_str())),
+                (
+                    "WYRD_SEALING_RETAINED_KEYS_FILE",
+                    Some(owner_only.as_os_str()),
+                ),
+            ],
+            || {
+                let active = load_sealing_key().expect("owner-only active file loads");
+                assert_eq!(
+                    active.map(|key| key.expose_secret().to_owned()).as_deref(),
+                    Some(KEY)
+                );
+                let retained =
+                    load_sealing_retained_keys().expect("owner-only retained file loads");
+                assert_eq!(retained.len(), 1);
+            },
+        );
+
+        for (case, path) in [
+            ("permissive", permissive.as_path()),
+            ("non-regular", directory.path()),
+            ("oversized", oversized.as_path()),
+        ] {
+            temp_env::with_vars(
+                [
+                    ("WYRD_SEALING_KEY_FILE", Some(path.as_os_str())),
+                    ("WYRD_SEALING_RETAINED_KEYS_FILE", Some(path.as_os_str())),
+                ],
+                || {
+                    let active = load_sealing_key().expect_err(case);
+                    let retained = load_sealing_retained_keys().expect_err(case);
+                    for error in [active, retained] {
+                        let message = error.to_string();
+                        assert!(
+                            matches!(error, ConfigError::ReadSealingKey { .. }),
+                            "{case} refusal is a sealing-key read error: {message}"
+                        );
+                        assert!(
+                            !message.contains(KEY) && !message.contains(&KEY[..8]),
+                            "{case} refusal quotes key material: {message}"
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    /// Server Workflow config fills omitted fields from the approved defaults,
+    /// parses a tenant-assigned external gateway binding beside its flattened
+    /// shared shape, and rejects unknown binding members.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a default differs, the binding does not parse, or an
+    /// unknown member is accepted.
+    #[test]
+    fn workflow_config_defaults_and_tenant_bindings_parse() {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let config = toml::from_str::<ServerWorkflowConfig>(&format!(
+            r#"
+max_active_per_tenant = 2
+
+[external_gateway_bindings.team-llm]
+tenant = "{tenant}"
+protocol = "openai_chat"
+origin = "https://llm.example"
+secret_headers = {{ authorization = {{ source = "env", name = "TEAM_LLM_KEY" }} }}
+"#
+        ))
+        .expect("workflow config parses");
+        assert_eq!(config.max_active_per_tenant, 2);
+        assert_eq!(config.default_timeout_seconds, 1800);
+        assert_eq!(config.max_timeout_seconds, 7200);
+        assert_eq!(config.max_concurrency_per_run, 8);
+        assert_eq!(config.max_active_global, 32);
+        assert_eq!(config.max_retained_global, 128);
+        assert_eq!(config.max_retained_per_tenant, 32);
+        assert_eq!(config.max_steps_per_run, 1024);
+        assert_eq!(config.max_dependency_edges_per_run, 4096);
+        assert_eq!(config.max_resolved_graph_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.max_input_bytes, 1024 * 1024);
+        assert_eq!(config.max_step_result_bytes, 1024 * 1024);
+        assert_eq!(config.max_run_bytes, 4 * 1024 * 1024);
+        let binding = config
+            .external_gateway_bindings
+            .values()
+            .next()
+            .expect("binding parses");
+        assert_eq!(binding.tenant, tenant);
+        assert_eq!(binding.binding.origin.as_str(), "https://llm.example/");
+        assert!(binding.binding.secret_headers.contains_key("authorization"));
+        config.validate().expect("workflow config validates");
+        let unknown = toml::from_str::<ServerWorkflowConfig>(&format!(
+            r#"
+[external_gateway_bindings.team-llm]
+tenant = "{tenant}"
+protocol = "openai_chat"
+origin = "https://llm.example"
+api_key = "plaintext"
+"#
+        ));
+        assert!(
+            unknown.is_err(),
+            "an unknown binding member must be refused"
+        );
+        assert!(toml::from_str::<ServerWorkflowConfig>("max_runs = 1").is_err());
+    }
+
+    /// Server Workflow validation rejects every zero bound, a default timeout
+    /// above the maximum, per-tenant ceilings above their global ceilings, and
+    /// a step-result bound above the run bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a contradictory configuration validates.
+    #[test]
+    fn workflow_config_rejects_zero_and_contradictory_bounds() {
+        /// One edit that makes a default Workflow configuration invalid.
+        type Contradiction = fn(&mut ServerWorkflowConfig);
+        let refused: [(&str, Contradiction); 17] = [
+            ("default_timeout_seconds", |c| c.default_timeout_seconds = 0),
+            ("max_timeout_seconds", |c| c.max_timeout_seconds = 0),
+            ("max_concurrency_per_run", |c| c.max_concurrency_per_run = 0),
+            ("max_active_global", |c| c.max_active_global = 0),
+            ("max_active_per_tenant", |c| c.max_active_per_tenant = 0),
+            ("max_retained_global", |c| c.max_retained_global = 0),
+            ("max_retained_per_tenant", |c| c.max_retained_per_tenant = 0),
+            ("max_steps_per_run", |c| c.max_steps_per_run = 0),
+            ("max_dependency_edges_per_run", |c| {
+                c.max_dependency_edges_per_run = 0;
+            }),
+            ("max_resolved_graph_bytes", |c| {
+                c.max_resolved_graph_bytes = 0
+            }),
+            ("max_input_bytes", |c| c.max_input_bytes = 0),
+            ("max_step_result_bytes", |c| c.max_step_result_bytes = 0),
+            ("max_run_bytes", |c| c.max_run_bytes = 0),
+            ("default_timeout_seconds", |c| {
+                c.default_timeout_seconds = 7201
+            }),
+            ("max_active_per_tenant", |c| c.max_active_per_tenant = 33),
+            ("max_retained_per_tenant", |c| {
+                c.max_retained_per_tenant = 129
+            }),
+            ("max_step_result_bytes", |c| c.max_run_bytes = 1024),
+        ];
+        for (field, mutate) in refused {
+            let mut config = ServerWorkflowConfig::default();
+            mutate(&mut config);
+            let Err(ConfigError::Invalid { message }) = config.validate() else {
+                panic!("{field} must be refused");
+            };
+            assert!(message.contains(field), "{field}: {message}");
         }
     }
 }

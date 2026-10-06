@@ -334,6 +334,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         scribe.base_url(),
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
+        None,
     )?;
     let uidless = CardRef {
         uid: None,

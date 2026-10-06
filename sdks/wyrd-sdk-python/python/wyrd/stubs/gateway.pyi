@@ -241,8 +241,17 @@ class Gateway:
     reach a managed secret write. Use the Wyrd CLI or the scoped MCP tool.
     """
 
-    def __init__(self, server_url: str | None = None, credential: str | None = None) -> None:
-        """Connect to a Wyrd server; omitted options resolve from the environment."""
+    def __init__(
+        self,
+        server_url: str | None = None,
+        credential: str | None = None,
+        tenant: str | None = None,
+    ) -> None:
+        """Connect to a Wyrd server; omitted options resolve from the environment.
+
+        ``tenant`` is the optional tenant route key that selects one
+        server\'s saved login or the workload-token tenant; an explicit credential, access token, or API key already names its tenant and refuses it.
+        """
         ...
 
     def credential(self, name: str) -> ProviderCredentialView:

@@ -78,29 +78,6 @@ pub async fn user_by_id(
     .await
 }
 
-/// Look up a user by email.
-///
-/// Email is unique per tenant.
-///
-/// # Errors
-/// Returns a SQLx error when Postgres rejects the query or row decoding fails.
-pub async fn user_by_email(
-    conn: &mut TenantConn<'_>,
-    email: &str,
-) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>(
-        r#"
-        SELECT id, email, auth_type, status, created_at, updated_at
-          FROM wyrd.auth_users
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND email = $1
-        "#,
-    )
-    .bind(email)
-    .fetch_optional(&mut **conn.transaction())
-    .await
-}
-
 /// Soft-delete a user by marking `status = 'deleted'`.
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.

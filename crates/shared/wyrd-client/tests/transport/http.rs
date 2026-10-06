@@ -490,12 +490,15 @@ mod transport_behavior {
         );
     }
 
+    /// Builds the mock `/auth/token` body as an RFC 6749 §5.1 token response,
+    /// so the transport's API-key exchange decodes it the same way it decodes
+    /// the real server's reply. `expires_in` is relative, per §5.1.
     fn token_response(access: &str) -> String {
         serde_json::json!({
             "access_token": access,
             "refresh_token": "drop",
             "token_type": "Bearer",
-            "expires_at": "2099-01-01T00:00:00Z",
+            "expires_in": 3600,
         })
         .to_string()
     }

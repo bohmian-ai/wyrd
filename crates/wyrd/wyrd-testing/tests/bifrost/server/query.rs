@@ -572,7 +572,7 @@ fn value_row(value: i64) -> Vec<u8> {
     format!(r#"{{"value": {value}}}"#).into_bytes()
 }
 
-/// Bounded polls the peer-loss phase waits on an Analytical lifecycle change.
+/// Bounded polls a scheduled journey waits on an Analytical lifecycle change.
 const ANALYTICAL_POLLS: usize = 100;
 
 /// A scheduled Analytical query whose peer dies produces no outcome and no leak.
@@ -769,7 +769,7 @@ async fn prove_scheduled_analytical_completion(
     assert_eq!(outcome.terminal.query_class, QueryClass::Analytical);
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
-    assert_scheduled_owners_released(cluster)?;
+    assert_scheduled_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 1
@@ -821,14 +821,15 @@ async fn prove_scheduled_analytical_completion(
     let scheduled = tokio::spawn(async move { caller.run(query).await });
     let entered =
         tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_paused()).await;
+    // The held follower is released by the graph cancel itself, so the cancel
+    // always lands while the leader is still opening and fails that open.
     cancellation.cancel();
-    pause.release();
     entered?;
     let error = scheduled
         .await?
         .expect_err("an actively cancelled schedule has no outcome");
-    assert_eq!(error.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
-    assert_scheduled_owners_released(cluster)?;
+    assert_eq!(error.code(), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
+    assert_scheduled_owners_released(cluster).await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 2
@@ -836,13 +837,21 @@ async fn prove_scheduled_analytical_completion(
     Ok(())
 }
 
-/// Checks ownership at the scheduled return boundary, without a later polling grace period.
+/// Checks ownership after a scheduled query returns.
+///
+/// The leader retires its public running-query entry only after its own graph
+/// and admission owner are released, so an empty running-query list at return
+/// proves the leader settled. A follower frees its graph on its own once the
+/// leader closes the grant stream, so the graph check first waits for every
+/// node through [`await_clean_analytical`] before the strict checks run.
 ///
 /// # Errors
-/// Returns inspection failure or retained query/graph/admission/resource evidence.
-fn assert_scheduled_owners_released(
+/// Returns inspection failure, a follower graph still held when the bounded
+/// wait ends, or retained query/admission/resource evidence.
+async fn assert_scheduled_owners_released(
     cluster: &wyrd_testing::bifrost::WyrdTestCluster,
 ) -> Result<(), ServerJourneyError> {
+    await_clean_analytical(cluster).await?;
     for server in cluster.servers() {
         let Some(query) = server.state().bifrost_query() else {
             continue;

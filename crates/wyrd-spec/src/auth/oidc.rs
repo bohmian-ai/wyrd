@@ -7,8 +7,13 @@ use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Digest as _;
+#[cfg(feature = "server")]
+use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
+use uuid::Uuid;
 
-use crate::auth::SecretBearer;
+use crate::auth::{OAuthClientId, PrincipalId, PrincipalKindTag, SecretBearer};
+use crate::error::WyrdError;
 
 /// Absolute URL used by auth contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -163,7 +168,11 @@ impl utoipa::PartialSchema for IssuerUrl {
 #[cfg(feature = "server")]
 impl utoipa::ToSchema for IssuerUrl {}
 
-/// `GET /auth/login` response.
+/// Platform-administrator login initiation response.
+///
+/// The platform plane posts the provider's `code` and `state` back itself, so
+/// it receives the state here. Tenant human login never does: the browser
+/// carries it to the provider inside the authorization redirect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -174,16 +183,253 @@ pub struct LoginInitResponse {
     pub state: String,
 }
 
-/// `GET /auth/callback` query.
+/// A SHA-256 digest in its canonical wire form: exactly 64 lowercase
+/// hexadecimal characters.
+///
+/// Used where the server records only the digest of a secret it handed out,
+/// such as a login state, authorization code, or device code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha256Hex([u8; 32]);
+
+impl Sha256Hex {
+    /// Parse a canonical digest.
+    ///
+    /// # Errors
+    /// Returns [`Sha256HexError`] when the value is not exactly 64 lowercase
+    /// hexadecimal characters. Uppercase is refused rather than normalized so
+    /// one digest has one wire form.
+    pub fn new(value: &str) -> Result<Self, Sha256HexError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Sha256HexError);
+        }
+        let mut digest = [0_u8; 32];
+        hex::decode_to_slice(value, &mut digest).map_err(|_| Sha256HexError)?;
+        Ok(Self(digest))
+    }
+
+    /// Digest `bytes` with SHA-256.
+    #[must_use]
+    pub fn digest(bytes: &[u8]) -> Self {
+        Self(sha2::Sha256::digest(bytes).into())
+    }
+
+    /// The raw 32-byte digest.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for Sha256Hex {
+    /// Wrap an already-computed raw digest, such as one read back from storage.
+    fn from(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+impl fmt::Display for Sha256Hex {
+    /// Write the canonical wire form: the 32 raw bytes as 64 lowercase
+    /// hexadecimal characters, the only form [`Sha256Hex::new`] accepts.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] only when the underlying formatter's writer
+    /// fails; encoding itself cannot fail.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Serialize for Sha256Hex {
+    /// Serialize as the canonical lowercase-hex string produced by
+    /// [`fmt::Display`], so the wire form round-trips through
+    /// [`Deserialize`].
+    ///
+    /// # Errors
+    /// Returns the serializer's error when it cannot accept a string.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Hex {
+    /// Deserialize from a string and validate it with [`Sha256Hex::new`], so
+    /// the wire accepts exactly the canonical lowercase-hex form.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the input is not a string, and a
+    /// custom error carrying [`Sha256HexError`] when the string is not exactly
+    /// 64 lowercase hexadecimal characters.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for Sha256Hex {
+    /// Name the schema `Sha256Hex` so generated contracts reference one shared
+    /// definition.
+    fn schema_name() -> String {
+        "Sha256Hex".to_owned()
+    }
+
+    /// Describe the canonical wire form as a 64-character string constrained
+    /// by [`SHA256_HEX_PATTERN`], mirroring the validation in
+    /// [`Sha256Hex::new`] and the `OpenAPI` projection.
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(SHA256_HEX_DESCRIPTION.to_owned()),
+                ..Default::default()
+            })),
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                min_length: Some(64),
+                max_length: Some(64),
+                pattern: Some(SHA256_HEX_PATTERN.to_owned()),
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for Sha256Hex {
+    /// Describe the canonical wire form for `OpenAPI` with the same length,
+    /// pattern, and description as the JSON Schema projection, so both
+    /// generated contracts agree with [`Sha256Hex::new`].
+    fn schema() -> utoipa::openapi::RefOr<OpenApiSchema> {
+        utoipa::openapi::RefOr::T(OpenApiSchema::Object(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .min_length(Some(64))
+                .max_length(Some(64))
+                .pattern(Some(SHA256_HEX_PATTERN))
+                .description(Some(SHA256_HEX_DESCRIPTION))
+                .build(),
+        ))
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for Sha256Hex {}
+
+/// Description shared by the JSON Schema and `OpenAPI` projections of
+/// [`Sha256Hex`].
+const SHA256_HEX_DESCRIPTION: &str =
+    "SHA-256 digest as exactly 64 lowercase hexadecimal characters.";
+
+/// Pattern shared by the JSON Schema and `OpenAPI` projections of
+/// [`Sha256Hex`].
+const SHA256_HEX_PATTERN: &str = "^[0-9a-f]{64}$";
+
+/// A value that is not a canonical [`Sha256Hex`] digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expected a SHA-256 digest as 64 lowercase hexadecimal characters")]
+pub struct Sha256HexError;
+
+/// How a tenant human login was initiated: what its verified sign-in grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginInitiation {
+    /// An OAuth authorization request (RFC 6749 §4.1.1): the sign-in issues
+    /// that client an authorization code.
+    Authorize(ClientAuthorization),
+    /// A device-code login (RFC 8628) bound to its device authorization id:
+    /// the sign-in records the device's approval.
+    Device(Uuid),
+    /// A candidate connection test begun by this principal. Its sign-in marks
+    /// the bound candidate revision tested and issues nothing.
+    ConnectionTest(ConnectionTester),
+}
+
+/// The validated authorization request (RFC 6749 §4.1.1) a login answers.
+///
+/// Recorded on the login state, so the authorization code the callback issues
+/// is bound to exactly this client, redirect URI, and PKCE challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuthorization {
+    /// The requesting client.
+    pub client: OAuthClientId,
+    /// The client's registered redirect URI the request named exactly.
+    pub redirect_uri: String,
+    /// The PKCE S256 code challenge (RFC 7636 §4.3).
+    pub code_challenge: String,
+    /// The client's opaque `state`, echoed on the redirect.
+    pub state: Option<String>,
+}
+
+/// The authorized caller a candidate connection test was begun by.
+///
+/// Recorded on the test's login state so the callback can re-check that
+/// principal's authority before it marks the candidate tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionTester {
+    /// The principal that began the test.
+    pub principal_id: PrincipalId,
+    /// That principal's kind, which names where its roles are stored.
+    pub principal_kind: PrincipalKindTag,
+}
+
+/// `GET /auth/callback` query: the provider's redirect back to the common
+/// callback. It carries no tenant selector.
+///
+/// `state` is required, with exactly one of the success `code` (RFC 6749
+/// §4.1.2) or the provider's `error` (§4.1.2.1); [`Self::response`] names
+/// which. The RFC 9207 `iss` response parameter is retained when present so
+/// the callback can bind the response to the issuer the login state recorded
+/// before any token-endpoint request. Other provider response parameters
+/// (`error_description`, Keycloak's `session_state`) are ignored, as RFC 6749
+/// §4.1.2 requires of the client, so no provider text is ever reflected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
 pub struct CallbackQuery {
-    /// Authorization code from the identity provider callback.
-    pub code: SecretBearer,
+    /// Authorization code from the identity provider, on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<SecretBearer>,
+    /// The provider's RFC 6749 §4.1.2.1 error code, when it refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Opaque login state generated by Wyrd.
     #[schemars(schema_with = "state_key_schema")]
     pub state: String,
+    /// RFC 9207 authorization-response issuer identifier, when the provider
+    /// sends one. It must equal the login's recorded issuer exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+}
+
+impl CallbackQuery {
+    /// The provider's answer: its code or its error, never both or neither.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the query carries both `code`
+    /// and `error`, or neither.
+    pub fn response(&self) -> Result<ProviderResponse, WyrdError> {
+        match (&self.code, &self.error) {
+            (Some(code), None) => Ok(ProviderResponse::Code(code.clone())),
+            (None, Some(error)) => Ok(ProviderResponse::Error(error.clone())),
+            _ => Err(WyrdError::Validation {
+                message: "the callback carries exactly one of `code` or `error`".to_owned(),
+                details: serde_json::json!({}),
+            }),
+        }
+    }
+}
+
+/// What the identity provider's authorization response answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResponse {
+    /// RFC 6749 §4.1.2: the authorization code to redeem.
+    Code(SecretBearer),
+    /// RFC 6749 §4.1.2.1: the provider's error code, such as
+    /// `access_denied`.
+    Error(String),
 }
 
 /// URL validation failure.
@@ -285,7 +531,11 @@ fn openapi_url_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
+    use super::{
+        AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, ProviderResponse, Sha256Hex,
+        UrlParseError,
+    };
+    use crate::auth::SecretBearer;
 
     #[test]
     fn issuer_url_normalizes_trailing_slash() {
@@ -401,13 +651,96 @@ mod tests {
         );
     }
 
+    /// A callback carrying the RFC 9207 `iss` parameter retains it typed,
+    /// and one without it parses with no issuer; `state` remains mandatory.
     #[test]
-    fn callback_query_rejects_unknown_fields() {
+    fn callback_query_retains_the_response_issuer() {
         let json = serde_json::json!({
             "code": "auth-code",
             "state": "state-123",
-            "extra": true
+            "iss": "https://idp.example.com/realms/acme"
         });
-        assert!(serde_json::from_value::<CallbackQuery>(json).is_err());
+        let query = serde_json::from_value::<CallbackQuery>(json).expect("callback parses");
+        assert_eq!(query.state, "state-123");
+        assert_eq!(
+            query.iss.as_deref(),
+            Some("https://idp.example.com/realms/acme")
+        );
+        let bare = serde_json::from_value::<CallbackQuery>(
+            serde_json::json!({ "code": "auth-code", "state": "state-123" }),
+        )
+        .expect("callback without iss parses");
+        assert_eq!(bare.iss, None);
+        assert!(
+            serde_json::from_value::<CallbackQuery>(serde_json::json!({ "code": "auth-code" }))
+                .is_err()
+        );
+    }
+
+    /// A callback answers exactly one of the provider's `code` or `error`;
+    /// both or neither is refused, and `error_description` is never kept.
+    ///
+    /// # Panics
+    /// Panics when a response is classified differently.
+    #[test]
+    fn callback_query_carries_exactly_one_provider_response() {
+        let parse = |json| {
+            serde_json::from_value::<CallbackQuery>(json)
+                .expect("callback parses")
+                .response()
+        };
+        assert_eq!(
+            parse(serde_json::json!({ "code": "auth-code", "state": "s" })).expect("code"),
+            ProviderResponse::Code(SecretBearer::new("auth-code".to_owned()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "error": "access_denied",
+                "error_description": "<script>",
+                "state": "s"
+            }))
+            .expect("error"),
+            ProviderResponse::Error("access_denied".to_owned())
+        );
+        assert!(parse(serde_json::json!({ "state": "s" })).is_err());
+        assert!(
+            parse(serde_json::json!({ "code": "c", "error": "access_denied", "state": "s" }))
+                .is_err()
+        );
+    }
+
+    /// Unrelated provider response parameters (Keycloak's `session_state`)
+    /// are tolerated and ignored, as RFC 6749 §4.1.2 requires.
+    #[test]
+    fn callback_query_tolerates_unrelated_provider_parameters() {
+        let json = serde_json::json!({
+            "code": "auth-code",
+            "state": "state-123",
+            "session_state": "kc-session",
+            "iss": "https://idp.example.com/realms/acme"
+        });
+        let query = serde_json::from_value::<CallbackQuery>(json).expect("callback parses");
+        assert_eq!(query.state, "state-123");
+        assert_eq!(
+            query.iss.as_deref(),
+            Some("https://idp.example.com/realms/acme")
+        );
+    }
+
+    /// A digest parses only in its canonical lowercase 64-hex form and
+    /// serializes back to it.
+    #[test]
+    fn sha256_hex_accepts_only_the_canonical_form() {
+        let digest = Sha256Hex::digest(b"flow");
+        let wire = digest.to_string();
+        assert_eq!(wire.len(), 64);
+        assert_eq!(Sha256Hex::new(&wire), Ok(digest));
+        assert!(Sha256Hex::new(&wire.to_uppercase()).is_err());
+        assert!(Sha256Hex::new(&wire[..63]).is_err());
+        assert!(Sha256Hex::new(&format!("{}g", &wire[..63])).is_err());
+        assert_eq!(
+            serde_json::to_value(digest).expect("serializes"),
+            serde_json::json!(wire)
+        );
     }
 }

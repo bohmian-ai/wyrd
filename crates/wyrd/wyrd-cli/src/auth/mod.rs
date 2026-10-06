@@ -1,6 +1,6 @@
 /// `wyrd auth issue-key`: mint an API key bound to a Card.
 pub mod issue_key;
-/// `wyrd auth login`: interactive OIDC login exchanged for Wyrd tokens.
+/// `wyrd auth login`, `logout`, and `status`: the saved human user login.
 pub mod login;
 /// `wyrd auth refresh`: rotate a Wyrd refresh token.
 pub mod refresh;
@@ -20,8 +20,14 @@ use crate::error::WyrdCliError;
 pub enum AuthCommand {
     /// Issue an API key bound to a card ref (POST /auth/issue-key).
     IssueKey(issue_key::IssueKeyArgs),
-    /// Initiate an OIDC login flow and exchange the callback code for a Wyrd access token.
+    /// Sign in to a tenant through the browser and save the Wyrd user login
+    /// every local SDK uses; no token is printed.
     Login(login::LoginArgs),
+    /// End a saved login: delete it locally, then revoke it on the server
+    /// best-effort.
+    Logout(login::LogoutArgs),
+    /// Show saved logins (server, tenant, expiry) without tokens.
+    Status,
     /// Rotate a Wyrd refresh token and print the new access and refresh tokens.
     Refresh(refresh::RefreshArgs),
     /// Manage trusted OIDC issuers (add, list, rm).
@@ -40,7 +46,9 @@ pub enum AuthCommand {
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
-        AuthCommand::Login(args) => login::dispatch(args).await,
+        AuthCommand::Login(args) => login::login(args).await,
+        AuthCommand::Logout(args) => login::logout(args).await,
+        AuthCommand::Status => login::status().await,
         AuthCommand::Refresh(args) => refresh::dispatch(args).await,
         AuthCommand::TrustedIssuer(cmd) => trusted_issuer::dispatch(cmd).await,
         AuthCommand::WorkloadBinding(cmd) => workload_binding::dispatch(cmd).await,

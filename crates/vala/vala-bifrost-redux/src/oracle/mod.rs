@@ -2211,11 +2211,11 @@ impl Oracle {
         // exact child split of that same envelope. Deriving them afterwards
         // would ask the guard for resources it no longer holds.
         if let Err(error) = admitted.retain_physical_projections(&planned.cuts) {
-            return release_error(deadline, admitted, error, "projection rejection");
+            return release_error(deadline, admitted, error, "projection rejection").await;
         }
         match self.register_running_query(context, query_class, &admitted, participant_cut) {
             Ok(running_query) => Ok((admitted, running_query)),
-            Err(error) => release_error(deadline, admitted, error, "running-query rejection"),
+            Err(error) => release_error(deadline, admitted, error, "running-query rejection").await,
         }
     }
 
@@ -2356,6 +2356,14 @@ impl Oracle {
             .await?;
         if let Some(telemetry) = query_telemetry.as_mut() {
             telemetry.admitted();
+            // A registry cancel marks this query cancelled even before it has
+            // a stream that could mark itself.
+            if let Some(entry) = self
+                .running_queries
+                .get(context.data_tenant_id, &context.request_id)
+            {
+                telemetry.explicit_cancelled = entry.telemetry_cancelled();
+            }
         }
         let bound = match self.audit_and_bind(
             CutAuditInput {
@@ -2372,7 +2380,9 @@ impl Oracle {
             &mut phases,
         ) {
             Ok(bound) => bound,
-            Err(error) => return release_error(deadline, admitted, error, "source rejection"),
+            Err(error) => {
+                return release_error(deadline, admitted, error, "source rejection").await;
+            }
         };
         // Protection moves out of the plan here, before execution builds
         // anything from the cuts, so the guard outlives every provider and
@@ -2401,7 +2411,7 @@ impl Oracle {
                 execution
             }
             Err(error) => {
-                return release_error(deadline, admitted, error, "execution rejection");
+                return release_error(deadline, admitted, error, "execution rejection").await;
             }
         };
         // The terminal reads the one accumulator listing and live leaves record on.
@@ -4191,17 +4201,17 @@ impl AttemptSettlement {
 /// object error means a data file the pinned cut referenced was already deleted
 /// when the scan reached it; there is no second attempt to move to, so the
 /// attempt is cancelled, its distributed children are joined, and the query
-/// fails. Any other first-batch failure, a missing telemetry guard, or a
-/// schema-frame failure settles the distributed children and releases the
-/// admitted owner before returning, so no child outlives its parent on a
-/// failure path.
+/// fails. A cancellation before the first batch, any other first-batch
+/// failure, a missing telemetry guard, or a schema-frame failure settles the
+/// distributed children and the Analytical graph and releases the admitted
+/// owner before returning, so no child outlives its parent on a failure path.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryTimeout`] when the first batch does not arrive
-/// before the deadline, [`BifrostError::QueryExecutionFailed`] for a stale first
-/// batch or a missing telemetry guard, and the mapped first-batch failure
-/// otherwise.
+/// before the deadline, [`BifrostError::QueryExecutionFailed`] when the query is
+/// cancelled first, for a stale first batch, or for a missing telemetry guard,
+/// and the mapped first-batch failure otherwise.
 async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
@@ -4212,7 +4222,7 @@ async fn settle_attempt_output(
         mut batches,
         scan_stats,
         degraded_sources,
-        mut admitted,
+        admitted,
         running_query,
         query_class,
         reader_protection,
@@ -4221,9 +4231,24 @@ async fn settle_attempt_output(
         deadline,
         deadline_ms,
     } = settle;
-    let Ok(first) =
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next()).await
-    else {
+    // A cancel before the first batch ends the wait, exactly as a cancel of
+    // an open stream ends its next read; the distributed children are then
+    // cancelled and joined like any other first-batch failure.
+    let cancellation = admitted.cancellation.clone();
+    let next = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next());
+    let Ok(first) = (tokio::select! {
+        first = next => first,
+        () = cancellation.cancelled() => {
+            return settle_distributed_failure(
+                deadline,
+                batches,
+                admitted,
+                BifrostError::QueryExecutionFailed,
+                "first-batch cancellation",
+            )
+            .await;
+        }
+    }) else {
         return settle_distributed_failure(
             deadline,
             batches,
@@ -4240,13 +4265,13 @@ async fn settle_attempt_output(
         admitted.cancellation.cancel();
         drop(batches);
         admitted.distributed_settlement.join().await;
-        admitted.drain_children().await;
         return release_error(
             deadline,
             admitted,
             BifrostError::QueryExecutionFailed,
             "stale first batch",
-        );
+        )
+        .await;
     }
     if let Some(error) = map_first_batch_failure(first.as_ref()) {
         return settle_distributed_failure(
@@ -4409,17 +4434,30 @@ pub fn is_tenant_invariant_error(error: &datafusion::error::DataFusionError) -> 
 
 /// Release an admitted query after an attempt-local terminal error.
 ///
+/// A selected Analytical attempt settles as failed first, through the same
+/// [`settle_analytical`](query_stream::settle_analytical) an ending stream
+/// uses, so the error is not returned before the graph's cleanup has joined.
+/// Whatever admission the graph did not take is released afterwards.
+///
 /// # Errors
 ///
 /// Always returns the caller-supplied original error after the cleanup attempt.
-fn release_error<T>(
+async fn release_error<T>(
     _deadline: Instant,
     admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
     tracing::error!(phase, error = ?original, "Oracle query released after failure");
-    admitted.release();
+    let mut admitted = Some(admitted);
+    query_stream::settle_analytical(
+        &mut admitted,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Failed,
+    )
+    .await;
+    if let Some(admitted) = admitted {
+        admitted.release();
+    }
     Err(original)
 }
 
@@ -4427,7 +4465,7 @@ fn release_error<T>(
 async fn settle_distributed_failure<T>(
     deadline: Instant,
     batches: SendableRecordBatchStream,
-    mut admitted: AdmittedQueryGuard,
+    admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
@@ -4435,8 +4473,7 @@ async fn settle_distributed_failure<T>(
     admitted.request_cancellation.cancel();
     drop(batches);
     admitted.distributed_settlement.join().await;
-    admitted.drain_children().await;
-    release_error(deadline, admitted, original, phase)
+    release_error(deadline, admitted, original, phase).await
 }
 
 /// Awaits the actual first physical batch while retaining admission ownership.
@@ -5161,6 +5198,45 @@ mod tests {
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
         );
+    }
+
+    /// A registry cancel before the stream exists records the query cancelled.
+    ///
+    /// The telemetry owner shares the registered entry's marker, so the cancel
+    /// classifies the pre-stream terminal, while a query that fails before its
+    /// stream without any cancel is still recorded as failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either pre-stream terminal records a different outcome.
+    #[test]
+    fn oracle_pre_stream_registry_cancel_records_cancelled() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = RunningQueryRegistry::new();
+            let tenant_id = DataTenantId::new_v7();
+            let request_id = RequestId::now_v7();
+            let entry = running::tests::entry(tenant_id, request_id.clone());
+            assert!(registry.insert(entry.clone()));
+            let mut cancelled = OracleTelemetry::start_query(QueryClass::Analytical);
+            cancelled.explicit_cancelled = entry.telemetry_cancelled();
+            assert!(registry.cancel(tenant_id, &request_id).is_some());
+            drop(cancelled);
+
+            drop(OracleTelemetry::start_query(QueryClass::Analytical));
+        });
+        let snapshot = recorder.snapshot();
+        for outcome in ["cancelled", "failed"] {
+            let count = snapshot
+                .histograms
+                .iter()
+                .find(|(series, _)| {
+                    series.starts_with("oracle_query_duration_seconds{")
+                        && series.contains(&format!("outcome=\"{outcome}\""))
+                })
+                .map(|(_, histogram)| histogram.count);
+            assert_eq!(count, Some(1), "{outcome}: {snapshot:?}");
+        }
     }
 
     /// Drives every locally observable Oracle capacity signal exactly once.

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 import threading
 from hashlib import sha256
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pandas as pd
 import pytest
+import yaml
 from sklearn.linear_model import LogisticRegression
 from wyrd import WyrdError
 from wyrd.cards import (
@@ -30,6 +36,9 @@ from wyrd.model import (
     SklearnInterface,
 )
 from wyrd.prompt import Prompt, PromptCard
+from wyrd.testing import WyrdTestServer
+
+from ..gateway.support import Received, Upstream, deploy
 
 
 class JsonDataInterface(DataInterface):
@@ -471,3 +480,280 @@ def test_card_registry_enforces_cross_tenant_isolation(wyrd_server) -> None:
         cards_b.prompt.delete(uid=card.uid)
 
     cards.prompt.delete(uid=card.uid)
+
+
+_REPO = Path(__file__).parents[5]
+_FIXTURES = _REPO / "tests" / "fixtures" / "workflow-loading"
+
+
+def _refs(receipt) -> dict[str, dict[str, str]]:
+    """Exact reference of every Card a receipt registered, keyed by name, as wire JSON."""
+    return {
+        outcome.card_ref.name: {
+            "kind": outcome.card_ref.kind.name,
+            "name": outcome.card_ref.name,
+            "version": outcome.card_ref.version,
+            "space": outcome.card_ref.space,
+            "uid": outcome.card_ref.uid,
+        }
+        for outcome in receipt.outcomes
+    }
+
+
+def _apply(wyrd_server, api_key: str, path: Path) -> dict[str, dict[str, str]]:
+    """Register ``path`` with the installed ``wyrd apply`` and return each Card's exact reference."""
+    environment = os.environ.copy()
+    environment.update(WYRD_SERVER_URL=wyrd_server.base_url, WYRD_API_KEY=api_key)
+    completed = subprocess.run(
+        [str(Path(sys.executable).with_name("wyrd")), "apply", str(path), "--format", "json"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    receipt = json.loads(completed.stdout)
+    return {outcome["card_ref"]["name"]: outcome["card_ref"] for outcome in receipt["outcomes"]}
+
+
+def _routed_example(directory: Path, route: str) -> Path:
+    """Copy the code-review example with its Workflow ``llm_route`` replaced by ``route``."""
+    shutil.copytree(_REPO / "examples" / "workflows" / "code-review", directory)
+    workflow = directory / "workflow.yaml"
+    text = workflow.read_text()
+    assert "    kind: wyrd_gateway\n" in text
+    workflow.write_text(text.replace("    kind: wyrd_gateway\n", route, 1))
+    return workflow
+
+
+def _bind_review_gateway(config_home: Path, origin: str, secret: str) -> None:
+    """Configure the ``review-gateway`` binding to send an owner-only secret file to ``origin``."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    secret_file = config_home / "review-secret"
+    secret_file.write_text(secret)
+    secret_file.chmod(0o600)
+    (config_home / "config.toml").write_text(
+        "[workflow.external_gateway_bindings.review-gateway]\n"
+        'protocol = "openai_chat"\n'
+        f'origin = "{origin}"\n'
+        f'secret_headers = {{ x-review-secret = {{ source = "file", path = "{secret_file}" }} }}\n'
+    )
+
+
+def _chat_calls(received: Received) -> list[dict[str, str]]:
+    """Headers of every Chat Completions request a recording upstream received."""
+    return [headers for path, headers in received if path == "/v1/chat/completions"]
+
+
+def _access_token(wyrd_server, api_key: str) -> str:
+    """Exchange an API key for a Wyrd access token through the public auth route."""
+    response = httpx.post(
+        f"{wyrd_server.base_url}/auth/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": api_key,
+            "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
+        },
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def _envelope(wyrd_server, token: str, ref: dict[str, str]) -> dict:
+    """Read one registered Card envelope through the public HTTP route."""
+    response = httpx.get(
+        f"{wyrd_server.base_url}/v1/cards/by-uid/{ref['kind']}/{ref['uid']}",
+        headers={"x-wyrd-access-token": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["card"]
+
+
+def _outbound(card: dict) -> list[dict[str, str]]:
+    """Server-derived outbound relationship targets of a Card envelope, by name."""
+    targets = [relationship["ref"] for relationship in card["relationships"]["outbound_refs"]]
+    return sorted(targets, key=lambda target: target["name"])
+
+
+# The fixture Prompts send their Native Chat request to the built-in `mock`
+# provider, which answers with the rendered user message. Each output therefore
+# shows which Prompt body ran and what was bound into it.
+_LOCAL_REVIEW = (
+    "final review of diff | local security review of diff | local correctness review of diff"
+)
+_REGISTERED_REVIEW = (
+    "final review of diff"
+    " | registered security review of diff"
+    " | registered correctness review of diff"
+)
+
+
+@pytest.mark.integration
+def test_workflow_loading_journey(
+    gateway_server: tuple[WyrdTestServer, Received], tmp_path: Path, monkeypatch
+) -> None:
+    """Load and run Workflow files and registered Workflows; see tests/fixtures/workflow-loading."""
+    from wyrd.agent import Workflow
+
+    wyrd_server, upstream = gateway_server
+
+    writer_key = wyrd_server.bootstrap_service(["writer"], name=_name("workflow-writer"))
+    reader_key = wyrd_server.bootstrap_service(["reader"], name=_name("workflow-reader"))
+    no_roles_key = wyrd_server.bootstrap_service([], name=_name("workflow-no-roles"))
+    writer = Cards(server_url=wyrd_server.base_url, credential=writer_key)
+    reader = Cards(server_url=wyrd_server.base_url, credential=reader_key)
+    no_roles = Cards(server_url=wyrd_server.base_url, credential=no_roles_key)
+
+    # Workflow.from_path reads credentials from the environment, so start with none.
+    monkeypatch.setenv("WYRD_SERVER_URL", wyrd_server.base_url)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("WYRD_API_KEY", raising=False)
+    monkeypatch.delenv("WYRD_ACCESS_TOKEN", raising=False)
+
+    # 1. Wholly local Workflow files load and run without credentials.
+    local = Workflow.from_path(_FIXTURES / "shadowed" / "local-workflow.yaml")
+    run = local.run({"code": "diff"})
+    assert run.status == "succeeded"
+    assert run.outputs == {"security": "local security review of diff", "review": _LOCAL_REVIEW}
+
+    # The code-review example calls models through the Wyrd gateway, which a
+    # plain run does not have, so its run is refused before any step starts.
+    example = Workflow.from_path(_REPO / "examples" / "workflows" / "code-review" / "workflow.yaml")
+    assert list(example.steps) == ["security", "correctness", "final_review"]
+    with pytest.raises(WyrdError) as unavailable:
+        example.run({"code": "diff"})
+    assert unavailable.value.code == "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE"
+
+    # 2. The team registers its reviewer Agents with `wyrd apply`.
+    team = _apply(wyrd_server, writer_key, _FIXTURES / "team" / "security.yaml")
+    team.update(_apply(wyrd_server, writer_key, _FIXTURES / "team" / "correctness.yaml"))
+
+    # 3. A file referencing registered Agents needs a credential that can read them.
+    mixed = _FIXTURES / "mixed" / "workflow.yaml"
+    with pytest.raises(WyrdError) as missing:
+        Workflow.from_path(mixed)
+    assert missing.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
+
+    monkeypatch.setenv("WYRD_API_KEY", no_roles_key)
+    with pytest.raises(WyrdError) as denied:
+        Workflow.from_path(mixed)
+    assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    monkeypatch.setenv("WYRD_API_KEY", reader_key)
+    run = Workflow.from_path(str(mixed)).run({"code": "diff"})
+    assert run.status == "succeeded"
+    assert run.outputs == {"review": _REGISTERED_REVIEW}
+
+    # 4. A local sibling and the registered Agent with the same identity each
+    #    run their own Prompt.
+    run = Workflow.from_path(_FIXTURES / "shadowed" / "workflow.yaml").run({"code": "diff"})
+    assert run.status == "succeeded"
+    assert run.outputs == {
+        "security": "local security review of diff",
+        "registered_security": "registered security review of diff",
+        "review": _LOCAL_REVIEW,
+    }
+
+    # 5. A reference to a deleted Card is refused.
+    retired = _refs(writer.register_from_path(_FIXTURES / "retired" / "retired-prompt.yaml"))
+    writer.prompt.delete(uid=retired["retired-prompt"]["uid"])
+    with pytest.raises(WyrdError) as inactive:
+        Workflow.from_path(_FIXTURES / "retired" / "workflow.yaml")
+    assert inactive.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+
+    # 6. Apply the mixed Workflow, register a newer security Agent, then load
+    #    the applied Workflow by identity and by UID: both stay pinned to 1.0.0
+    #    and never run the newer Prompt ("v2 security review of diff").
+    refs = {**team, **_apply(wyrd_server, writer_key, mixed)}
+    workflow_uid = refs["code-review"]["uid"]
+    writer.register_from_path(_FIXTURES / "team-v2" / "security.yaml")
+    agents = [refs["security-reviewer"], refs["correctness-reviewer"], refs["final-reviewer"]]
+
+    # The Python SDK has no generic Card envelope read, so the public HTTP
+    # route shows the stored spec references and server-derived relationships.
+    token = _access_token(wyrd_server, reader_key)
+    stored = _envelope(wyrd_server, token, refs["code-review"])
+    assert [step["action"]["target"] for step in stored["spec"]["steps"]] == agents
+    assert _outbound(stored) == sorted(agents, key=lambda agent: agent["name"])
+    for agent, prompt in [
+        ("security-reviewer", "security-review-prompt"),
+        ("correctness-reviewer", "correctness-review-prompt"),
+        ("final-reviewer", "final-review-prompt"),
+    ]:
+        stored_agent = _envelope(wyrd_server, token, refs[agent])
+        assert stored_agent["spec"]["prompt"] == refs[prompt], agent
+        assert _outbound(stored_agent) == [refs[prompt]], agent
+
+    by_identity = reader.workflow.load(
+        space="workflow-loading", name="code-review", version="1.0.0"
+    )
+    by_uid = reader.workflow.load(uid=workflow_uid)
+    for workflow in [by_identity, by_uid]:
+        assert workflow.version == "1.0.0"
+        loaded = yaml.safe_load(workflow.to_yaml())
+        assert [step["action"]["target"] for step in loaded["spec"]["steps"]] == agents
+        run = workflow.run({"code": "diff"})
+        assert run.status == "succeeded"
+        assert run.outputs == {"review": _REGISTERED_REVIEW}
+        assert run.steps["final_review"]["text"] == _REGISTERED_REVIEW
+
+    # 7. Incomplete, mixed, wrong-kind, and unauthorized selectors are refused.
+    with pytest.raises(WyrdError) as versionless:
+        reader.workflow.load(space="workflow-loading", name="code-review")
+    assert versionless.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
+    with pytest.raises(WyrdError) as mixed_selector:
+        reader.workflow.load(uid=workflow_uid, space="workflow-loading")
+    assert mixed_selector.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
+    # An Agent's UID names no Workflow.
+    with pytest.raises(WyrdError) as wrong_kind:
+        reader.workflow.load(uid=team["security-reviewer"]["uid"])
+    assert wrong_kind.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
+    with pytest.raises(WyrdError) as unauthorized:
+        no_roles.workflow.load(uid=workflow_uid)
+    assert unauthorized.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    # 8. The code-review example runs locally through the public Wyrd gateway
+    #    and through an external gateway binding; applying it runs nothing.
+    deploy(wyrd_server, "openai", "gpt-5-5", ["chat_completions"])
+    monkeypatch.setenv("WYRD_API_KEY", wyrd_server.api_key)
+    example = _REPO / "examples" / "workflows" / "code-review" / "workflow.yaml"
+    example_input = json.loads(example.with_name("input.json").read_text())
+    run = Workflow.from_path(example).run(example_input)
+    assert run.status == "succeeded", run.error
+    assert run.outputs == {"review": "hi"}
+    assert len(_chat_calls(upstream)) == 3
+
+    external_received: Received = []
+    handler = type("ExternalGateway", (Upstream,), {"received": external_received})
+    external_gateway = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=external_gateway.serve_forever, daemon=True).start()
+    try:
+        origin = f"http://127.0.0.1:{external_gateway.server_address[1]}"
+        secret = "review-secret-value"
+        _bind_review_gateway(tmp_path / "config", origin, secret)
+        external = _routed_example(
+            tmp_path / "external",
+            "    kind: ext_gateway\n"
+            "    protocol: openai_chat\n"
+            f"    base_url: {origin}/v1\n"
+            "    credential_binding: review-gateway\n",
+        )
+        run = Workflow.from_path(external).run(example_input)
+    finally:
+        external_gateway.shutdown()
+    assert run.status == "succeeded", run.error
+    assert run.outputs == {"review": "hi"}
+    external_calls = _chat_calls(external_received)
+    assert len(external_calls) == 3
+    assert all(headers["x-review-secret"] == secret for headers in external_calls)
+    assert all("authorization" not in headers for headers in external_calls)
+    assert len(_chat_calls(upstream)) == 3
+
+    _apply(wyrd_server, wyrd_server.api_key, example.parent)
+    assert len(_chat_calls(upstream)) == 3
+    admin = Cards(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+    registered = admin.workflow.load(space="engineering", name="code-review", version="1.0.0")
+    run = registered.run(example_input)
+    assert run.status == "succeeded", run.error
+    assert run.outputs == {"review": "hi"}
+    assert len(_chat_calls(upstream)) == 6

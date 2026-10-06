@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use crate::error::SqlError;
+use crate::operator_pool::OperatorPool;
 use serde::Serialize;
-use sqlx::PgPool;
 use sqlx::types::{Uuid, chrono};
 
 /// Upload row selected for sweeper reclamation.
@@ -41,7 +41,7 @@ pub struct ExpiredUpload {
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the query.
 pub async fn expired_uploads_batch(
-    admin_pool: &PgPool,
+    operator: &OperatorPool,
     limit: i64,
     init_grace: Duration,
 ) -> Result<Vec<ExpiredUpload>, SqlError> {
@@ -70,7 +70,7 @@ pub async fn expired_uploads_batch(
     )
     .bind(limit)
     .bind(init_grace.as_secs().cast_signed())
-    .fetch_all(admin_pool)
+    .fetch_all(operator.pool())
     .await
     .map_err(SqlError::from)?;
 

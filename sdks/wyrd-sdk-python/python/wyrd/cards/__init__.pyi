@@ -3,8 +3,9 @@
 #### begin imports ####
 
 from collections.abc import Mapping
-from typing import Protocol, TypeAlias
+from typing import Protocol, TypeAlias, overload
 
+from ..agent import Workflow
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
 from ..prompt import Prompt, PromptCard, PromptReference
@@ -238,13 +239,21 @@ class Cards:
             client configuration supplies it.
         credential: Optional credential override for this handle. When omitted, the
             shared Wyrd client configuration supplies credentials.
+        tenant: Optional tenant route key that selects one server\'s
+            saved login or the workload-token tenant; an explicit credential, access token, or API key
+            already names its tenant and refuses it.
 
     Raises:
         WyrdError: If local configuration or the API-key override cannot be
             loaded.
     """
 
-    def __init__(self, server_url: str | None = ..., credential: str | None = ...) -> None: ...
+    def __init__(
+        self,
+        server_url: str | None = ...,
+        credential: str | None = ...,
+        tenant: str | None = ...,
+    ) -> None: ...
     @property
     def data(self) -> DataCardRegistry:
         """Return the typed registry view for `DataCard` operations."""
@@ -258,6 +267,11 @@ class Cards:
     @property
     def prompt(self) -> PromptCardRegistry:
         """Return the typed registry view for `PromptCard` operations."""
+        ...
+
+    @property
+    def workflow(self) -> WorkflowCards:
+        """Return the typed view for loading registered Workflows."""
         ...
 
     def register(
@@ -629,6 +643,69 @@ class ModelCardRegistry:
         """
         ...
 
+class WorkflowCards:
+    """Load registered Workflows from the Wyrd registry.
+
+    Obtain this view from `Cards.workflow`. A loaded Workflow runs the exact
+    Agent and Prompt versions it was registered with; registering a newer
+    Agent version later does not change it.
+
+    Example:
+        ```python
+        from wyrd.cards import Cards
+
+        cards = Cards()
+        workflow = cards.workflow.load(
+            space="reviews", name="code-review", version="1.0.0"
+        )
+        same = cards.workflow.load(uid=workflow_uid)
+        ```
+    """
+
+    @overload
+    def load(self, *, space: str, name: str, version: str) -> Workflow:
+        """Load one registered Workflow by its exact identity.
+
+        Args:
+            space (str): Space the Workflow is registered in.
+            name (str): Workflow name.
+            version (str): Exact registered version, such as `"1.0.0"`.
+                Version ranges and omitted versions are refused.
+
+        Returns:
+            Workflow: A validated, runnable `wyrd.agent.Workflow` whose Agents
+                and Prompts are the exact versions it was registered with.
+
+        Raises:
+            WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
+                Workflow exists or it was deleted;
+                `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
+                read Cards; `WYRD_WORKFLOW_400_INVALID_CARD_REF` when
+                `version` is missing or a field is malformed; a Workflow validation error
+                when the stored graph is invalid.
+        """
+        ...
+
+    @overload
+    def load(self, *, uid: str) -> Workflow:
+        """Load one registered Workflow by its UID.
+
+        Args:
+            uid (str): The Workflow Card's UID, as returned by registration.
+
+        Returns:
+            Workflow: A validated, runnable `wyrd.agent.Workflow` whose Agents
+                and Prompts are the exact versions it was registered with.
+
+        Raises:
+            WyrdError: `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow has
+                this UID; `WYRD_PERMISSION_403_DENIED_RBAC` when the
+                credential cannot read Cards;
+                `WYRD_WORKFLOW_400_INVALID_CARD_REF` when `uid` is combined
+                with `space`, `name`, or `version`.
+        """
+        ...
+
 class PromptCardRegistry:
     """Typed operations for registered `PromptCard` objects.
 
@@ -824,4 +901,5 @@ __all__ = [
     "CardList",
     "RegistrationOutcome",
     "RegistrationReceipt",
+    "WorkflowCards",
 ]

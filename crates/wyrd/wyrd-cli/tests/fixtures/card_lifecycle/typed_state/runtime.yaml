@@ -5,4 +5,10 @@ metadata:
   version: 1.0.0
   space: default
 spec:
-  steps: []
+  steps:
+    - id: triage
+      action:
+        type: agent
+        target: ./agent-triage.yaml
+  outputs:
+    answer: steps.triage.output.text

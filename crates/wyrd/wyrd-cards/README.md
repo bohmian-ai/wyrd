@@ -5,7 +5,7 @@ Local card holders and filesystem materialization helpers.
 ```python
 from wyrd import Workflow
 
-run = Workflow.load("research.yaml").run("climate change")
+run = Workflow.from_path("research.yaml").run("climate change")
 print(run.outcomes)
 ```
 

@@ -16,6 +16,7 @@ use wyrd_tonic::prost::Message;
 
 /// Typed context for one worker attempt, checked against receiver state.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct PeerTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]
@@ -144,6 +145,7 @@ impl StageOperationV1 {
 /// lifecycles: a sibling distributed graph under the same public query, or a
 /// replayed graph identity under a different public query, must both fail.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct StageTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]
@@ -222,6 +224,7 @@ pub struct StageTicketClaims {
 /// is not in this attempt's cut, which is what makes a frozen destination fail
 /// rather than silently redirect to its replacement.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct StageParticipantV1 {
     /// Participant node UUID bytes.
     #[prost(bytes, tag = "1")]
@@ -488,6 +491,7 @@ impl ReservationOperationV1 {
 /// for a follower that has since restarted must not be honoured by its
 /// successor.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 pub struct ReservationTicketClaims {
     /// Fixed private protocol version.
     #[prost(uint32, tag = "1")]

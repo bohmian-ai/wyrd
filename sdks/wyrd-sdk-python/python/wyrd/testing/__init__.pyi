@@ -1,5 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
+import os
+
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
 
@@ -31,6 +33,9 @@ class WyrdTestServer:
     ``live_providers`` instead points every built-in adapter at its real
     provider endpoint, which only the opt-in live smoke lane asks for. It
     cannot be combined with ``provider_base_url``.
+
+    ``human_sso=True`` serves the public origin the identity lane's Keycloak
+    clients register, so saved user login journeys can sign in against it.
     """
 
     def __init__(
@@ -41,6 +46,7 @@ class WyrdTestServer:
         verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
+        human_sso: bool = False,
     ) -> None: ...
     def access_token(self) -> str:
         """Exchange the harness API key for a Wyrd access token."""
@@ -113,6 +119,28 @@ class WyrdTestServer:
         self, tenant_id: str, roles: list[str], name: str = "svc"
     ) -> str:
         """Mint a service principal under an explicit tenant."""
+        ...
+
+    def activate_human_sso(self, admin_key: str) -> None:
+        """Activate the identity lane's Keycloak sign-in for ``admin_key``'s tenant."""
+        ...
+
+    def save_human_login(
+        self, config_home: str | os.PathLike[str], tenant: str, username: str, password: str
+    ) -> None:
+        """Save ``username``'s login to ``tenant`` under ``config_home`` as ``wyrd auth login`` does."""
+        ...
+
+    def expire_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:
+        """Make the saved login stale, so the next client renews it."""
+        ...
+
+    def saved_login_is_stale(self, config_home: str | os.PathLike[str], tenant: str) -> bool:
+        """Return whether the saved login's access token has expired."""
+        ...
+
+    def revoke_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:
+        """Revoke the saved login's refresh chain on the server, keeping the record."""
         ...
 
 __all__ = ["WyrdTestServer"]

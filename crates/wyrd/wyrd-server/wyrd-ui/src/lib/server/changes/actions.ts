@@ -1,15 +1,13 @@
 import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
-import { sessions, reject } from '../auth/session';
+import { reject } from '../auth/session';
 import { safeProblem } from '../problem';
 import type { Draft, Subject } from '$lib/features/changes/types';
 
 export async function actionForm(event: RequestEvent): Promise<FormData> {
-  if (!event.locals.session || !event.locals.wyrd) reject('unauthenticated');
+  if (!event.locals.wyrd) reject('unauthenticated');
   if (Number(event.request.headers.get('content-length') ?? 0) > 250000)
     reject('validation');
-  const form = await event.request.formData();
-  sessions.checkAction(event.locals.session, event.request, form.get('csrf'));
-  return form;
+  return event.request.formData();
 }
 function text(form: FormData, name: string, max = 10000): string {
   const value = form.get(name) ?? '';

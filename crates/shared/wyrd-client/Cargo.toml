@@ -29,6 +29,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 indicatif = { workspace = true }
+oauth2 = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
@@ -38,14 +39,19 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-providers = { workspace = true }
+skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+skald-tool = { workspace = true }
+skald-workflow = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 urlencoding = { workspace = true }
@@ -59,6 +65,9 @@ wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-utils = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 workspace-hack.workspace = true

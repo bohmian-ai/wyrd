@@ -76,7 +76,7 @@ async fn query_command_reads_seeded_table() {
     let fixture = seed_query_fixture(&server, "cli-success")
         .await
         .expect("query fixture seeds");
-    let sql = format!("SELECT id, value FROM {}", fixture.table);
+    let sql = format!("SELECT id, value FROM {} ORDER BY id", fixture.table);
     let output = crate::principal_journey::run_cli_with_credential(
         &[
             "query",

@@ -120,7 +120,7 @@ fn respond(
     calls: &Arc<Mutex<HashMap<String, usize>>>,
 ) -> String {
     if request.starts_with("POST /auth/token") {
-        let token = r#"{"access_token":"test-token","token_type":"Bearer","expires_at":"2099-01-01T00:00:00Z"}"#;
+        let token = r#"{"access_token":"test-token","token_type":"Bearer","expires_in":3600}"#;
         return ok_json(token);
     }
     let line = request.lines().next().unwrap_or_default();

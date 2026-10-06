@@ -744,6 +744,11 @@ impl BoundServer {
         let shutdown_probe = self.shutdown_probe.clone();
         let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
         let deadline = tokio::time::Instant::now() + drain;
+        // Accepted Workflow runs drain first, while the gateway, query, and
+        // Bifrost services their in-flight steps and tool queries settle
+        // through are still up. Admission closes and every preparation and
+        // run is cancelled; the remaining budget is shared, never restarted.
+        let workflows_drained = self.state.workflows.drain(deadline).await;
         let supervised_drained = drain_with_shutdown_hooks(
             set,
             shutdown,
@@ -798,6 +803,9 @@ impl BoundServer {
             .is_ok();
         let terminal = match terminal {
             Some(message) => Some(message),
+            None if !workflows_drained => {
+                Some("Workflow runs did not drain before the shutdown deadline".to_owned())
+            }
             None if !mcp_drained => {
                 Some("MCP in-flight work did not drain before the shutdown deadline".to_owned())
             }

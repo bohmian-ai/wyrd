@@ -24,7 +24,6 @@ FAMILY_WYRD=(
 FAMILY_SKALD=(
   skald-agent
   skald-cache
-  skald-observer
   skald-prompt
   skald-providers
   skald-runtime

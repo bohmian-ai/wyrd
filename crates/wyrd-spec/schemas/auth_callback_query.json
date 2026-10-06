@@ -1,19 +1,35 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CallbackQuery",
-  "description": "`GET /auth/callback` query.",
+  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.\n\n`state` is required, with exactly one of the success `code` (RFC 6749 §4.1.2) or the provider's `error` (§4.1.2.1); [`Self::response`] names which. The RFC 9207 `iss` response parameter is retained when present so the callback can bind the response to the issuer the login state recorded before any token-endpoint request. Other provider response parameters (`error_description`, Keycloak's `session_state`) are ignored, as RFC 6749 §4.1.2 requires of the client, so no provider text is ever reflected.",
   "type": "object",
   "required": [
-    "code",
     "state"
   ],
   "properties": {
     "code": {
-      "description": "Authorization code from the identity provider callback.",
-      "allOf": [
+      "description": "Authorization code from the identity provider, on success.",
+      "anyOf": [
         {
           "$ref": "#/definitions/SecretBearer"
+        },
+        {
+          "type": "null"
         }
+      ]
+    },
+    "error": {
+      "description": "The provider's RFC 6749 §4.1.2.1 error code, when it refused.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "iss": {
+      "description": "RFC 9207 authorization-response issuer identifier, when the provider sends one. It must equal the login's recorded issuer exactly.",
+      "type": [
+        "string",
+        "null"
       ]
     },
     "state": {
@@ -23,7 +39,6 @@
       "minLength": 1
     }
   },
-  "additionalProperties": false,
   "definitions": {
     "SecretBearer": {
       "description": "Opaque secret. Redacted in logs and audit payloads.",

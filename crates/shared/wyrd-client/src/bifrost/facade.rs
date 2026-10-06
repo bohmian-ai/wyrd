@@ -971,7 +971,7 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
 /// Returns the stable no-credentials error when the chain yields nothing, or a
 /// transport error when the HTTP client cannot be built.
 pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
-    client_from_options(None, None, None)
+    client_from_options(None, None, None, None)
 }
 
 /// Assemble a [`WyrdClient`] from optionally-overridden transport values.
@@ -982,7 +982,9 @@ pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
 /// `server_url`), `ClientConfig::resolve_credential` for the credential, whose
 /// floor is `~/.config/wyrd/credentials.toml` `[default].api_key`. An explicit
 /// value is written into the config's tier-0 slot, so it wins over the
-/// environment rather than racing it.
+/// environment rather than racing it. `tenant` (a tenant route key)
+/// replaces `WYRD_TENANT` as the selector of the saved user login and of the
+/// workload-token tenant.
 ///
 /// This is the one door the Python and TypeScript constructors use, so their
 /// "omitted resolves, explicit overrides" behavior is the Rust one and cannot
@@ -996,12 +998,16 @@ pub fn client_from_options(
     server_url: Option<&str>,
     credential: Option<&str>,
     grpc_url: Option<&str>,
+    tenant: Option<&str>,
 ) -> Result<WyrdClient, BifrostClientError> {
     let mut config = ClientConfig::from_global_with_overrides(
         &crate::global_config::GlobalConfig::default(),
         server_url,
         grpc_url,
     );
+    if let Some(tenant) = tenant {
+        config.tenant = Some(tenant.to_owned());
+    }
     if let Some(credential) = credential {
         config.credential = Some(secrecy::SecretString::from(credential.to_owned()));
     }

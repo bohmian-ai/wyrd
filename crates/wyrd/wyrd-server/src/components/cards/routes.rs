@@ -143,11 +143,40 @@ async fn get_card_by_ref_http(
     Query(query): Query<CardRefQuery>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let card_ref = query.into_card_ref()?;
-    authorize_card_read(&state, &caller, "card.read.ref", &card_resource(&card_ref))?;
-    service::get_card_by_ref(&state, &caller, &card_ref)
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+    Ok(Json(get_card_by_ref_for(&state, &caller, &card_ref).await?))
+}
+
+/// Authorize, audit, and read one Card by its exact identity.
+///
+/// Shared by HTTP and the Workflow `cards.get` tool so both audit `cards:read`
+/// under the same exact-reference resource. A reference that also names a
+/// UID must name the UID of the Card at that identity.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
+/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
+/// and the errors of [`service::get_card_by_ref`].
+pub(crate) async fn get_card_by_ref_for(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<GetCardResponse, WyrdError> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_read(),
+        "card.read.ref",
+        &card_resource(card_ref),
+    )?;
+    let response = service::get_card_by_ref(state, caller, card_ref).await?;
+    if let Some(uid) = &card_ref.uid
+        && response.card.metadata.uid.as_ref() != Some(uid)
+    {
+        return Err(WyrdError::registry_card_not_found(
+            "card UID does not match the referenced identity",
+        ));
+    }
+    Ok(response)
 }
 
 /// Resolve the newest stable Active Card in an identity line.

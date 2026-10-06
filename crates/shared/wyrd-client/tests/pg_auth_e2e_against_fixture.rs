@@ -28,6 +28,16 @@
 // Wrapped in `mod pg_tests` so the fast family lane skips it via
 // `--skip pg_tests` (it needs the real `WyrdTestServer` + Postgres); the
 // infra e2e lane selects it by `--test` and runs it.
+use std::os::unix::fs::PermissionsExt;
+
+use secrecy::ExposeSecret;
+use wyrd_client::saved_login::canonical_origin;
+use wyrd_spec::ids::TenantSlug;
+use wyrd_testing::human_login::{
+    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
+    saved_logins,
+};
+
 mod pg_tests {
     use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
@@ -102,4 +112,196 @@ mod pg_tests {
 
         let _ = srv.shutdown().await;
     }
+}
+
+/// Environment marking a [`saved_renewal_child`] process.
+const RENEWAL_CHILD: &str = "WYRD_SAVED_RENEWAL_CHILD";
+
+/// One local process minting through the saved login, as an SDK script does,
+/// run only as the child [`mint_in_children`] starts.
+///
+/// Prints `outcome=ok` or `outcome=<error>`; the error carries the stable
+/// reason and never a token.
+///
+/// # Panics
+/// Panics when the client cannot be assembled for a reason other than the
+/// saved login.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a child process of concurrent_saved_renewal"]
+async fn saved_renewal_child() {
+    if std::env::var(RENEWAL_CHILD).is_err() {
+        return;
+    }
+    let mut config = wyrd_client::config::ClientConfig::from_env();
+    config.tenant = Some(FIXTURE_TENANT_SLUG.to_owned());
+    let outcome = match wyrd_client::WyrdClient::with_config(config) {
+        Ok(client) => client
+            .auth()
+            .bearer()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match outcome {
+        Ok(()) => println!("outcome=ok"),
+        Err(error) => println!("outcome={error}"),
+    }
+}
+
+/// Start `count` separate processes minting through the saved login under
+/// `config` at once, and return each one's printed outcome.
+///
+/// # Panics
+/// Panics when a child cannot run or prints no outcome.
+async fn mint_in_children(count: usize, config: &std::path::Path, server: &str) -> Vec<String> {
+    let children: Vec<_> = (0..count)
+        .map(|_| {
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "saved_renewal_child",
+                    "--include-ignored",
+                    "--nocapture",
+                ])
+                .env(RENEWAL_CHILD, "1")
+                .env("WYRD_CONFIG_HOME", config)
+                .env("WYRD_SERVER_URL", server)
+                .env_remove("WYRD_ACCESS_TOKEN")
+                .env_remove("WYRD_WORKLOAD_TOKEN")
+                .env_remove("WYRD_API_KEY")
+                .env_remove("WYRD_TENANT")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("child starts")
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        children
+            .into_iter()
+            .map(|child| {
+                let output = child.wait_with_output().expect("child exits");
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("outcome=").map(ToOwned::to_owned))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "child printed no outcome: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    })
+            })
+            .collect()
+    })
+    .await
+    .expect("children join")
+}
+
+/// Separate local processes sharing one saved login renew it once under the
+/// file lock and never replay a rotated refresh token; an unsafe file fails
+/// closed; and a logout racing renewals leaves no record behind.
+///
+/// # Panics
+/// Panics when any step differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn concurrent_saved_renewal() {
+    let srv = wyrd_testing::WyrdTestServerBuilder::default()
+        .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
+        .start_bound()
+        .await
+        .expect("server starts");
+    let server = srv.base_url().expect("bound server has a URL").to_owned();
+    let origin = canonical_origin(&server).expect("origin");
+    let admin = srv
+        .bootstrap_service("renewal-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let sso = HumanSso::new(&server);
+    sso.activate_keycloak(admin.api_key().expect("admin key").expose_secret())
+        .await;
+    let config = wyrd_testing::human_login::private_config_home();
+    sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
+        .await;
+    let store = saved_logins(config.path());
+    let current = || saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
+
+    // Four processes race one stale login: the first rotates it under the
+    // lock, the rest reread the file and use the rotated token.
+    let stale = current();
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    let outcomes = mint_in_children(4, config.path(), &server).await;
+    assert!(
+        outcomes.iter().all(|outcome| outcome == "ok"),
+        "{outcomes:?}"
+    );
+    let winner = current();
+    assert_ne!(
+        winner.refresh_token.expose(),
+        stale.refresh_token.expose(),
+        "the refresh token rotated"
+    );
+    assert!(winner.access_expires_at > chrono::Utc::now());
+
+    // The winner's chain was never replayed, so it still renews.
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    assert_eq!(mint_in_children(1, config.path(), &server).await, ["ok"]);
+    assert_ne!(
+        current().refresh_token.expose(),
+        winner.refresh_token.expose()
+    );
+
+    // An unsafe file is refused, not read.
+    {
+        let record = config.path().join("credentials.toml");
+        std::fs::set_permissions(
+            &record,
+            <std::fs::Permissions as PermissionsExt>::from_mode(0o644),
+        )
+        .expect("chmod");
+        let unsafe_store = mint_in_children(1, config.path(), &server).await;
+        assert!(
+            unsafe_store[0].contains("(unsafe_store)"),
+            "{unsafe_store:?}"
+        );
+        std::fs::set_permissions(
+            &record,
+            <std::fs::Permissions as PermissionsExt>::from_mode(0o600),
+        )
+        .expect("chmod");
+    }
+
+    // A logout racing renewals leaves no record behind: it deletes under the
+    // same lock the renewals hold.
+    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
+    let tenant_key = TenantSlug::new(FIXTURE_TENANT_SLUG).expect("tenant key");
+    let racers = mint_in_children(3, config.path(), &server);
+    let logout = {
+        let (store, origin, server) = (store.clone(), origin.clone(), server.clone());
+        async move {
+            let removed = tokio::task::spawn_blocking(move || store.remove(&origin, &tenant_key))
+                .await
+                .expect("joins")
+                .expect("removes");
+            if let Some(login) = removed {
+                HumanSso::new(&server).revoke(&login.refresh_token).await;
+            }
+        }
+    };
+    let (outcomes, ()) = tokio::join!(racers, logout);
+    assert!(
+        store.list().expect("lists").is_empty(),
+        "no renewal restored a logged-out login: {outcomes:?}"
+    );
+    // Each racer renewed before the logout, found the login gone under the
+    // lock, or started after it and found no credential at all.
+    assert!(
+        outcomes.iter().all(|outcome| outcome == "ok"
+            || outcome.contains("(logged_out)")
+            || outcome.starts_with("no credentials available")),
+        "{outcomes:?}"
+    );
+
+    srv.shutdown().await.expect("server stops");
 }

@@ -30,9 +30,9 @@ use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, IssuerUrl, LoginInitResponse, PlatformCallbackRequest,
     PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
-    PlatformPrincipalListResponse, PlatformPrincipalSummary, PlatformTokenResponse, PrincipalId,
-    PrincipalKindTag, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
-    SetPlatformPrincipalStatusRequest,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, PrincipalId, PrincipalKindTag,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
+    TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
@@ -176,9 +176,18 @@ pub(super) async fn authorize_read(
 
 /// Install or replace the deployment's platform OIDC connection.
 ///
+/// Before anything is stored, the issuer is discovered in full, provider
+/// metadata and its advertised key set, through the process-owned platform
+/// login's relying party; the discovered `jwks_uri` is persisted and the fresh
+/// provider replaces this process's cached one.
+///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the client
-/// secret cannot be sealed, or the write fails.
+/// Returns a `400` when the issuer URL is malformed, resolves to a blocked
+/// address, or the client secret cannot be sealed;
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` when the issuer cannot be
+/// reached, its discovery document or key set is unavailable or undecodable,
+/// or the document names another issuer; and a stable Wyrd error when the
+/// caller is unauthorized or the write fails.
 #[utoipa::path(
     put,
     path = "/platform/oidc/connection",
@@ -186,12 +195,17 @@ pub(super) async fn authorize_read(
     responses(
         (status = 200, description = "Connection installed; the JWKS endpoint comes from discovery",
          body = PlatformOidcConnectionView),
-        (status = 400, description = "Issuer invalid, unreachable, resolving to a blocked address, \
-          or a client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "Issuer URL malformed or resolving to a blocked address, or a \
+          client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The issuer could not be reached, or its discovery document \
+          or key set is unavailable, undecodable, or names another issuer \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -221,9 +235,10 @@ async fn configure_connection(
         }
         PlatformClientAuth::Public => ClientAuth::Public,
     };
-    // Discovery is the only network call on this path, and it is screened
-    // against the deployment's blocked address ranges and pinned against DNS
-    // rebinding by the same owner the tenant issuer path uses. Taking a
+    // Discovery (metadata, then the advertised key set) is the only network
+    // traffic on this path, and it is screened against the deployment's
+    // blocked address ranges and pinned against DNS rebinding by the same
+    // transport the tenant login path uses. Taking a
     // caller-supplied JWKS URL instead would make this route an SSRF primitive:
     // the anonymous login route drives outbound fetches to whatever is stored.
     // The parser's message names the URL library, so the caller is told which
@@ -235,9 +250,16 @@ async fn configure_connection(
             details: serde_json::json!({ "field": "issuer_url" }),
         })
     })?;
-    let jwks_uri =
-        crate::components::admin::routes::discover_jwks_uri(&issuer, state.deployment_profile)
-            .await?;
+    // Full discovery through the process-owned relying party: the provider
+    // and its key set must load as login will load them, and the fresh entry
+    // replaces any cached one before the new row commits, so this process's
+    // next begin and callback use it.
+    let provider = login_service(&state)?
+        .relying_party()
+        .discover(&issuer)
+        .await
+        .map_err(|error| crate::components::admin::routes::discovery_error(&issuer, error))?;
+    let jwks_uri = provider.jwks_uri().url().clone();
 
     let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
         .map_err(|error| {
@@ -259,7 +281,6 @@ async fn configure_connection(
         &mut decision,
         issuer.as_str(),
         jwks_uri.as_str(),
-        &request.expected_audience,
         &request.client_id,
         client_auth_label(&client_auth),
         &platform_claim_mapping(),
@@ -273,7 +294,6 @@ async fn configure_connection(
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: issuer.as_str().to_owned(),
         jwks_uri: jwks_uri.to_string(),
-        expected_audience: request.expected_audience,
         client_id: request.client_id,
         client_auth: client_auth_label(&client_auth).to_owned(),
         jwks_ttl_secs: request.jwks_ttl_secs,
@@ -328,7 +348,6 @@ async fn read_connection(
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: row.issuer_url,
         jwks_uri: row.jwks_uri,
-        expected_audience: row.expected_audience,
         client_id: row.client_id,
         client_auth: row.client_auth,
         jwks_ttl_secs: row.jwks_ttl_secs,
@@ -644,37 +663,18 @@ async fn set_admin_status(
     }
 }
 
-/// Build the platform login service from server state.
+/// The process-owned platform login service, built once at boot.
 ///
 /// # Errors
-/// Returns an internal error when the platform plane, the token verifier, or
-/// the signing key is not configured.
-fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
-    let pool = operator(state)?;
-    let issuing_key = state.auth.issuing_key.clone().ok_or_else(|| {
+/// Returns an internal error when the platform plane or the signing key is not
+/// configured, so no platform login owner was built.
+fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> {
+    state.auth.platform_login.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform session issuance is not configured".to_owned(),
+            message: "platform federated login is not configured".to_owned(),
             details: serde_json::json!({ "plane": "platform" }),
         })
-    })?;
-    let verifier = state.auth.external_verifier.clone().ok_or_else(|| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "external token verification is not configured".to_owned(),
-            details: serde_json::json!({ "plane": "platform" }),
-        })
-    })?;
-    let sessions = Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
-        pool.clone(),
-        issuing_key,
-        Arc::clone(&state.audit_outbox),
-    ));
-    Ok(PlatformLogin::new(
-        pool,
-        state.auth.sealing_key.clone(),
-        verifier,
-        sessions,
-        state.deployment_profile.screened_http(),
-    ))
+    })
 }
 
 /// Begin a platform federated login.
@@ -723,7 +723,7 @@ async fn begin_login(
     request_body = PlatformCallbackRequest,
     responses(
         (status = 200, description = "Platform session for the resolved administrator",
-         body = PlatformTokenResponse),
+         body = TokenResponse),
         (status = 401, description = "Identity not accepted, indistinguishably for every cause \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 503, description = "Identity provider unavailable \
@@ -741,7 +741,7 @@ async fn complete_login(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<PlatformCallbackRequest>,
-) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
+) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;
     let req_id = match request_id.as_ref() {
         Some(axum::Extension(id)) => id.as_str(),
@@ -751,18 +751,18 @@ async fn complete_login(
         }
     };
     let token = login_service(&state)?
-        .complete(SecretString::from(request.code), &request.state, req_id)
+        .complete(
+            SecretString::from(request.code),
+            &request.state,
+            request.iss.as_deref(),
+            req_id,
+        )
         .await
         .map_err(login_error)?;
 
-    Ok(Json(PlatformTokenResponse {
-        access_token: SecretBearer::new(token.expose_secret().to_owned()),
-        token_type: "Bearer".to_owned(),
-        expires_in: u64::try_from(
-            wyrd_auth::platform_sessions::DEFAULT_PLATFORM_TOKEN_TTL_MINUTES * 60,
-        )
-        .unwrap_or(900),
-    }))
+    Ok(Json(
+        crate::components::platform::routes::platform_session_response(token.expose_secret()),
+    ))
 }
 
 /// Project a platform authorization failure onto the public catalog.
@@ -796,6 +796,7 @@ fn login_error(error: PlatformLoginError) -> WyrdErrorResponse {
                 details: serde_json::json!({ "plane": "platform" }),
             })
         }
+        PlatformLoginError::EndpointRefused(error) => WyrdErrorResponse::from(*error),
         PlatformLoginError::ProviderUnavailable(_) | PlatformLoginError::ConnectionUnusable => {
             WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
                 message: "identity provider unavailable".to_owned(),

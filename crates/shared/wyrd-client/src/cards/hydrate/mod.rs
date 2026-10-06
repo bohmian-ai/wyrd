@@ -1,7 +1,9 @@
-//! Client-side Card graph hydration and bundle publication.
+//! Client-side Card graph hydration, bundle publication, and in-memory
+//! Workflow composition.
 
 mod bundle;
 mod graph;
+mod workflow;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +17,8 @@ pub use wyrd_spec::registry::{
 
 use crate::cards::{CardSelector, RegistryContext};
 
-use self::{bundle::HydrationBundleWriter, graph::resolve_graph, workspace::HydrationWorkspace};
+pub(crate) use self::workflow::WorkflowBodies;
+use self::{bundle::HydrationBundleWriter, graph::GraphScope, workspace::HydrationWorkspace};
 
 /// Machine-readable result of a published hydration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +37,8 @@ pub struct HydrationSummary {
     pub downloaded_artifact_count: usize,
 }
 
-/// Hydrates a resolved Card graph into a locally published bundle.
+/// Hydrates a resolved Card graph into a locally published bundle or an
+/// in-memory Workflow.
 ///
 /// The hydrator owns graph-oriented orchestration while sharing the authenticated registry
 /// context used by other client capabilities. It does not add graph behavior to [`crate::cards::Cards`].
@@ -73,7 +77,7 @@ impl CardGraphHydrator {
         destination: &Path,
         mode: HydrationMode,
     ) -> Result<HydrationSummary, WyrdError> {
-        let graph = resolve_graph(&self.context.engine, selector).await?;
+        let graph = self.resolve_graph(selector, GraphScope::Bundle).await?;
         let workspace = HydrationWorkspace::prepare(destination)?;
         let write_result = {
             let writer = HydrationBundleWriter::new(&self.context, workspace.staging(), mode);

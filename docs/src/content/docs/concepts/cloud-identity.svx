@@ -13,8 +13,10 @@ secret: Kubernetes service accounts, SPIFFE JWTs, GCP Workload Identity, GitHub
 Actions. The server holds two kinds of data:
 
 - **Trusted issuers** are OIDC issuers whose JWTs Wyrd will verify. Each issuer
-  is scoped to one tenant and carries a `principal_kind` of `Workload` (for
-  machines) or `Human` (for human OIDC login).
+  is scoped to one tenant and carries `principal_kind = Workload`. Human
+  sign-in is configured separately, as a tenant OIDC connection (see
+  [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on)); a `Human`
+  trusted issuer is refused with `WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED`.
 - **Workload bindings** are server-owned mappings from
   `(issuer, subject, audience) → CardRef`. The binding tells Wyrd which Service or
   Agent principal a given workload assertion represents.
@@ -81,12 +83,12 @@ Issuer fields:
     ['client_id', 'Yes', 'Wyrd\'s OAuth2 client id at this IdP.'],
     ['expected_audience', 'Yes', 'Expected aud claim in tokens from this issuer.'],
     ['client_auth', 'Yes', 'How Wyrd authenticates to the IdP token endpoint: "public" (PKCE, no secret), "private_key_jwt", or a secret variant { secret_basic = "…" } / { secret_post = "…" }. Secret variants are encrypted at rest with the sealing key.'],
-    ['principal_kind', 'No', '"workload" or "human". Defaults to "human".'],
+    ['principal_kind', 'Yes', 'Must be "workload". Trusted issuers are workload-only: an omitted value defaults to "human", and boot and the admin API both refuse a human issuer. Human sign-in is configured as a tenant OIDC connection; see SSO and OIDC.'],
     ['claim_mapping.subject', 'No', 'JWT claim path for the subject identity. Defaults to "sub".'],
-    ['claim_mapping.email', 'No', 'JWT claim path for email. Meaningful for human issuers.'],
-    ['claim_mapping.groups', 'No', 'JWT claim path for group membership. Meaningful for human issuers.'],
-    ['group_role_map', 'No', 'Map from IdP group name to a list of Wyrd role names. Meaningful for human issuers.'],
-    ['default_roles', 'No', 'Baseline Wyrd role names granted to every federated user from this issuer.'],
+    ['claim_mapping.email', 'No', 'Not used by workload federation.'],
+    ['claim_mapping.groups', 'No', 'Not used by workload federation.'],
+    ['group_role_map', 'No', 'Not used by workload federation: a workload acts with the authority of the principal its workload binding names.'],
+    ['default_roles', 'No', 'Not used by workload federation.'],
     ['jwks_ttl_secs', 'No', 'JWKS cache TTL in seconds. Omit to use the boot default.']
   ]}
 />
@@ -114,24 +116,9 @@ with `ServerBootError::IssuerSeal`. Issuers that use `public` (PKCE) or
 `private_key_jwt` client authentication carry no secret and do not require the
 sealing key.
 
-<Aside title="Single-key limitation" type="caution">
-
-The current implementation uses one static process-wide key with no key-id
-column. Live rotation without downtime is not yet supported.
-
-**If the key leaks:**
-
-1. Rotate the client secret at each affected IdP.
-2. Re-register the issuers via `POST /v1/admin/trusted-issuers` with the new
-   secrets (this re-seals them under the current key).
-3. Replace `WYRD_SEALING_KEY_FILE` / `WYRD_SEALING_KEY_BASE64` with a new
-   32-byte key and restart. Existing `client_secret_enc` rows now encrypt the
-   old (already-rotated) secrets and are harmless.
-
-Key-id versioning, keyring support, KMS-backed key-encryption keys, and AAD
-binding remain future work.
-
-</Aside>
+Every sealed value records the key that sealed it, so the server can hold
+retained keys and rotate without downtime. The rotation procedure is in
+[Authentication](/self-hosting/authentication/#rotating-the-sealing-key).
 
 ## Workload identity setup
 
@@ -157,8 +144,8 @@ To authenticate a Kubernetes service account to Wyrd:
 3. Mount the projected service account token into the pod
    (`audience: <your-audience>`).
 4. The workload calls `POST /auth/token` with
-   `grant_type: urn:ietf:params:oauth:grant-type:jwt-bearer` and the projected
-   token as the `assertion`.
+   a form-encoded body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`
+   and the projected token as `assertion` (RFC 7523 §2.1).
 5. Wyrd verifies the token, resolves the binding, loads the principal and its
    roles, and returns an access token. No secret is stored in the pod.
 

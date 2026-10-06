@@ -10,6 +10,51 @@ order: 4
 
 All tables are pre-declared `DomainTable` instances registered at boot. The physical schemas below are what DataFusion sees at scan time; they include system columns. The Rust record types in `wyrd-spec` (`SpanRecord`, `GenAiSpanRecord`, etc.) are the canonical source; this page documents the derived physical layout.
 
+## Storage format
+
+Every table is Iceberg format v3. Appends assign v3 row lineage, and
+compaction preserves each row's hidden `_row_id` and
+`_last_updated_sequence_number`. Those lineage columns are Iceberg metadata:
+they never appear in a table schema, its fingerprint, or a query result.
+
+## Variant columns
+
+A `Variant` column holds an open, self-describing value. On the Arrow wire it
+is the `arrow.parquet.variant` extension over a `metadata`/`value` binary
+Struct, and every Variant field, including one nested in a List or Struct, must
+carry that extension. A value reads back with its own type: integers stay
+integers, doubles keep their IEEE meaning, strings, booleans, bytes, arrays,
+and objects keep their type, and a missing key stays distinct from a key whose
+value is null. Object keys are unique; when an OpenTelemetry attribute
+collection repeats a key, the final occurrence is stored.
+
+JSON input converts an integer in the signed 64-bit range to an integer,
+another integer that fits a Variant decimal to a decimal, and any other number
+to a double. A value is refused before acknowledgement with a stable code:
+
+| Condition | Code |
+|---|---|
+| Missing or foreign Variant extension | `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` |
+| Encoded metadata plus value over 8,388,608 bytes | `WYRD_VALA_413_VARIANT_TOO_LARGE` |
+| Invalid JSON or Variant encoding | `WYRD_VALA_400_VARIANT_INVALID_JSON` |
+| Nesting deeper than 64 containers | `WYRD_VALA_400_VARIANT_TOO_DEEP` |
+| Integer no Variant numeric type holds | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
+
+Query a Variant with these operators and functions:
+
+| Expression | Result |
+|---|---|
+| `v -> 'key'`, `v -> n` | The Variant at an object key or array index, or null when absent |
+| `v ->> 'key'`, `v ->> n` | The same value as text: a string as itself, any other value as its JSON text, null when absent or JSON null |
+| `parse_json(text)` | The Variant for JSON text; invalid JSON fails with `WYRD_VALA_400_VARIANT_INVALID_JSON` |
+| `try_parse_json(text)` | The same, returning null on invalid JSON |
+| `to_json(v)` | The JSON text of a Variant |
+
+Operators chain (`attributes -> 'http' ->> 'route'`), and a `->>` result casts
+with ordinary SQL semantics (`(attributes ->> 'retries')::bigint`). `->` and
+`->>` apply to Variant columns only; query a JSON text column as
+`parse_json(column) ->> 'key'`. Struct fields use `s['field']`.
+
 ## Table namespaces
 
 ### Shared signal tables
@@ -58,76 +103,155 @@ table — there are no child tables.
 | `trace_id` | `FixedSizeBinary(16)` | 128-bit trace ID |
 | `span_id` | `FixedSizeBinary(8)` | 64-bit span ID |
 | `parent_span_id` | `FixedSizeBinary(8)` nullable | Absent for root span |
-| `trace_state` | `Utf8` | W3C tracestate |
-| `flags` | `Int64` | OpenTelemetry span flags; Iceberg has no unsigned integer type |
-| `name` | `Utf8` | Span operation name |
+| `trace_state` | `Utf8` | |
+| `flags` | `Int64` | Iceberg has no unsigned integer type |
+| `name` | `Utf8` | |
 | `kind` | `Int32` | OTLP `SpanKind` enum value |
-| `start_time_unix_nano` | `Int64` | Span start |
-| `end_time_unix_nano` | `Int64` | Span end |
+| `start_time_unix_nano` | `Int64` | |
+| `end_time_unix_nano` | `Int64` | |
 | `duration_nano` | `Int64` | `end_time_unix_nano - start_time_unix_nano` |
 | `status_present` | `Bool` | Distinguishes an absent status from a present empty one |
 | `status_code` | `Int32` nullable | |
-| `status_message` | `Utf8` nullable | **payload-gated** |
-| `attributes` | `Binary` | Canonical KeyValue encoding, **payload-gated** |
+| `status_message` | `Utf8` nullable | |
+| `attributes` | `Variant` | **payload-gated** |
 | `dropped_attributes_count` | `Int64` | |
-| `events` | `List<Struct>` | Nested span events, **payload-gated** |
+| `events` | `List<Struct>` | **payload-gated** |
 | `dropped_events_count` | `Int64` | |
-| `links` | `List<Struct>` | Nested span links, **payload-gated** |
+| `links` | `List<Struct>` | **payload-gated** |
 | `dropped_links_count` | `Int64` | |
 | `resource_present` | `Bool` | |
-| `resource_attributes` | `Binary` | **payload-gated** |
+| `resource_attributes` | `Variant` | **payload-gated** |
 | `resource_dropped_attributes_count` | `Int64` | |
 | `resource_schema_url` | `Utf8` | |
-| `resource_entity_refs` | `List<Binary>` | Pinned `EntityRef` encoding, **payload-gated** |
+| `resource_entity_refs` | `List<Struct>` | OTel entity references, **payload-gated** |
 | `scope_present` | `Bool` | |
 | `scope_name` | `Utf8` | |
 | `scope_version` | `Utf8` | |
-| `scope_attributes` | `Binary` | **payload-gated** |
+| `scope_attributes` | `Variant` | **payload-gated** |
 | `scope_dropped_attributes_count` | `Int64` | |
 | `scope_schema_url` | `Utf8` | |
-| `service_name` | `Utf8` nullable | Promoted from resource attributes |
+| `service_name` | `Utf8` nullable | Resource `service.name` |
 | `gen_ai_operation_name` | `Utf8` nullable | Promoted GenAI attribute |
 | `gen_ai_provider_name` | `Utf8` nullable | Promoted GenAI attribute |
 | `gen_ai_request_model` | `Utf8` nullable | Promoted GenAI attribute |
 | `gen_ai_conversation_id` | `Utf8` nullable | Promoted GenAI attribute |
 | `gen_ai_usage_input_tokens` | `Int64` nullable | Promoted GenAI attribute |
 | `gen_ai_usage_output_tokens` | `Int64` nullable | Promoted GenAI attribute |
+| `service_version` | `Utf8` nullable | Resource `service.version` |
+| `deployment_environment` | `Utf8` nullable | Resource `deployment.environment.name`, else `deployment.environment` |
+| `http_request_method` | `Utf8` nullable | Span `http.request.method` |
+| `http_route` | `Utf8` nullable | Span `http.route` |
+| `http_response_status_code` | `Int64` nullable | Span `http.response.status_code` |
+| `url_full` | `Utf8` nullable | Span `url.full` |
+| `exception_type` | `Utf8` nullable | On the span's last event named `exception` |
+| `exception_message` | `Utf8` nullable | On the span's last event named `exception` |
+| `exception_stacktrace` | `Utf8` nullable | On the span's last event named `exception` |
 | + system columns | | |
 
-Nested `events` elements carry `time_unix_nano`, `name`, `attributes`, and
-`dropped_attributes_count`. Nested `links` elements carry `trace_id`,
-`span_id`, `trace_state`, `flags`, `attributes`, and
+Nested `events` elements carry `time_unix_nano`, `name`, Variant `attributes`,
+and `dropped_attributes_count`. Nested `links` elements carry `trace_id`,
+`span_id`, `trace_state`, `flags`, Variant `attributes`, and
 `dropped_attributes_count`. Both subtrees are entirely caller content and are
-omitted by a metadata-only projection.
+omitted by a metadata-only projection. Each `resource_entity_refs` element
+carries `type`, `id_keys` (`List<Utf8>`), `description_keys` (`List<Utf8>`),
+and `schema_url`. Each promoted column is null when its source is absent or has
+another type.
 
 ## vala.metrics.points
 
-Source type: `MetricRecord`.
+One row is one data point of one metric; `metric_type` selects which
+kind-specific columns that row owns, and every column another kind owns stays
+null.
 
-| Column | Physical type |
-|---|---|
-| `metric_name` | `Utf8` |
-| `time` | `Timestamp(µs, UTC)` |
-| `metric_type` | `Utf8` |
-| `value` | `Float64` nullable |
-| `attributes` | `Utf8` nullable |
-| + system columns | |
+| Column | Physical type | Notes |
+|---|---|---|
+| `metric_name` | `Utf8` | |
+| `description` | `Utf8` | |
+| `unit` | `Utf8` | |
+| `metadata` | `Variant` | **payload-gated** |
+| `metric_type` | `Utf8` | Selects the kind-specific columns the row owns |
+| `time_unix_nano` | `Int64` | |
+| `start_time_unix_nano` | `Int64` | |
+| `flags` | `Int64` | |
+| `attributes` | `Variant` | **payload-gated** |
+| `int_value` | `Int64` nullable | |
+| `double_value` | `Float64` nullable | |
+| `aggregation_temporality` | `Int32` nullable | |
+| `is_monotonic` | `Bool` nullable | |
+| `histogram_count` | `Int64` nullable | |
+| `histogram_sum` | `Float64` nullable | |
+| `histogram_min` | `Float64` nullable | |
+| `histogram_max` | `Float64` nullable | |
+| `bucket_counts` | `List<Int64>` nullable | |
+| `explicit_bounds` | `List<Float64>` nullable | |
+| `exponential_scale` | `Int32` nullable | |
+| `exponential_zero_count` | `Int64` nullable | |
+| `exponential_zero_threshold` | `Float64` nullable | |
+| `positive_buckets` | `Struct` nullable | |
+| `negative_buckets` | `Struct` nullable | |
+| `summary_count` | `Int64` nullable | |
+| `summary_sum` | `Float64` nullable | |
+| `quantile_values` | `List<Struct>` nullable | |
+| `exemplars` | `List<Struct>` | **payload-gated** |
+| `resource_present` | `Bool` | |
+| `resource_attributes` | `Variant` | **payload-gated** |
+| `resource_dropped_attributes_count` | `Int64` | |
+| `resource_schema_url` | `Utf8` | |
+| `resource_entity_refs` | `List<Struct>` | OTel entity references, **payload-gated** |
+| `scope_present` | `Bool` | |
+| `scope_name` | `Utf8` | |
+| `scope_version` | `Utf8` | |
+| `scope_attributes` | `Variant` | **payload-gated** |
+| `scope_dropped_attributes_count` | `Int64` | |
+| `scope_schema_url` | `Utf8` | |
+| `service_name` | `Utf8` nullable | Resource `service.name` |
+| `service_version` | `Utf8` nullable | Resource `service.version` |
+| `deployment_environment` | `Utf8` nullable | Resource `deployment.environment.name`, else `deployment.environment` |
+| + system columns | | |
+
+`positive_buckets` and `negative_buckets` carry `offset` (`Int32`) and
+`bucket_counts` (`List<Int64>`). Each `quantile_values` element carries
+`quantile` and `value`. Each `exemplars` element carries `time_unix_nano`,
+nullable `int_value` and `double_value`, Variant `filtered_attributes`, and
+nullable `trace_id` and `span_id`. `resource_entity_refs` is as on
+`vala.traces.spans`.
 
 ## vala.logs.records
 
-Source type: `LogRecord`.
+| Column | Physical type | Notes |
+|---|---|---|
+| `time_unix_nano` | `Int64` | |
+| `observed_time_unix_nano` | `Int64` | |
+| `severity_number` | `Int32` | |
+| `severity_text` | `Utf8` | |
+| `event_name` | `Utf8` nullable | |
+| `body` | `Variant` nullable | **payload-gated** |
+| `trace_id` | `FixedSizeBinary(16)` nullable | 128-bit trace ID |
+| `span_id` | `FixedSizeBinary(8)` nullable | 64-bit span ID |
+| `flags` | `Int64` | |
+| `attributes` | `Variant` | **payload-gated** |
+| `dropped_attributes_count` | `Int64` | |
+| `resource_present` | `Bool` | |
+| `resource_attributes` | `Variant` | **payload-gated** |
+| `resource_dropped_attributes_count` | `Int64` | |
+| `resource_schema_url` | `Utf8` | |
+| `resource_entity_refs` | `List<Struct>` | OTel entity references, **payload-gated** |
+| `scope_present` | `Bool` | |
+| `scope_name` | `Utf8` | |
+| `scope_version` | `Utf8` | |
+| `scope_attributes` | `Variant` | **payload-gated** |
+| `scope_dropped_attributes_count` | `Int64` | |
+| `scope_schema_url` | `Utf8` | |
+| `service_name` | `Utf8` nullable | Resource `service.name` |
+| `service_version` | `Utf8` nullable | Resource `service.version` |
+| `deployment_environment` | `Utf8` nullable | Resource `deployment.environment.name`, else `deployment.environment` |
+| `exception_type` | `Utf8` nullable | The record's own `exception.type` attribute |
+| `exception_message` | `Utf8` nullable | The record's own `exception.message` attribute |
+| `exception_stacktrace` | `Utf8` nullable | The record's own `exception.stacktrace` attribute |
+| `body_text` | `Utf8` nullable | The body when it is a string |
+| + system columns | | |
 
-| Column | Physical type |
-|---|---|
-| `time` | `Timestamp(µs, UTC)` nullable |
-| `observed_time` | `Timestamp(µs, UTC)` |
-| `severity_number` | `Int64` nullable |
-| `severity_text` | `Utf8` nullable |
-| `event_name` | `Utf8` nullable, **payload-gated** |
-| `body` | `Utf8` nullable, **payload-gated** |
-| `trace_id` | `FixedSizeBinary(16)` nullable |
-| `span_id` | `FixedSizeBinary(8)` nullable |
-| + system columns | |
+`resource_entity_refs` is as on `vala.traces.spans`.
 
 ## vala.drift.observations
 
@@ -157,11 +281,11 @@ matching `observations_ready` binding. The observed subject is the managed
 |---|---|
 | `record_id` | `Utf8` |
 | `session_id` | `Utf8` nullable |
-| `context` | `Utf8` (canonical JSON), **payload-gated** |
+| `context` | `Variant`, **payload-gated** |
 | `trace_id` | `FixedSizeBinary(16)` nullable |
 | `span_id` | `FixedSizeBinary(8)` nullable |
 | `created_at` | `Timestamp(µs, UTC)` |
-| `media` | `Utf8` (canonical JSON) nullable, **payload-gated** |
+| `media` | `Variant` nullable, **payload-gated** |
 | + system columns | |
 
 ## vala.verification.results
@@ -186,8 +310,16 @@ and the managed `card_uid` is the Verifier Card.
 | `window_end` | `Timestamp(µs, UTC)` nullable |
 | `started_at` | `Timestamp(µs, UTC)` |
 | `ended_at` | `Timestamp(µs, UTC)` |
-| `details` | `Utf8` nullable, **payload-gated** |
+| `drift_report` | `Struct` nullable, **payload-gated** |
+| `eval_summary` | `Struct` nullable, **payload-gated** |
 | + system columns | |
+
+A scored Drift result sets only `drift_report`: `method` (`Utf8`), `features`
+(`Variant`, keyed by feature name), and `verdict` (`Utf8`). A scored Eval
+result sets only `eval_summary`: `total_tasks`, `passed_tasks`, and
+`failed_tasks` (`Int32`), `pass_rate` (`Float64`), and `duration_ms`
+(`Int64`). A completed Drift execution that could not score valid input sets
+neither. There is no `details` column.
 
 ## vala.drift.result_features
 
@@ -224,8 +356,8 @@ are set only for a skip.
 | `task_id` | `Utf8` |
 | `outcome_kind` | `Utf8` |
 | `passed` | `Bool` nullable |
-| `actual` | `Utf8` nullable, **payload-gated** |
-| `expected` | `Utf8` nullable, **payload-gated** |
+| `actual` | `Variant` nullable, **payload-gated** |
+| `expected` | `Variant` nullable, **payload-gated** |
 | `operator` | `Utf8` nullable |
 | `message` | `Utf8` nullable, **payload-gated** |
 | `stage` | `Int32` nullable |
@@ -246,10 +378,15 @@ Source type: `AgentTraceRecord`.
 | `commit_sha` | `Utf8` nullable |
 | `branch` | `Utf8` nullable |
 | `run_id` | `Utf8` |
+| `trace_id` | `FixedSizeBinary(16)` nullable |
+| `span_id` | `FixedSizeBinary(8)` nullable |
+| `role` | `Utf8` |
+| `model` | `Utf8` |
+| `provider` | `Utf8` |
+| `messages` | `Variant`, **payload-gated** |
+| `tool_io` | `Variant` nullable, **payload-gated** |
 | `started_at` | `Timestamp(µs, UTC)` |
 | `ended_at` | `Timestamp(µs, UTC)` |
-| `messages` | `Utf8`, **payload-gated** |
-| `tool_io` | `Utf8` nullable, **payload-gated** |
 | + system columns | |
 
 ## Type mapping
@@ -259,6 +396,8 @@ Source type: `AgentTraceRecord`.
 | `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id |
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
 | `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
-| `Utf8` | `String` or `serde_json::Value` | Attributes are JSON-parsed |
+| `Utf8` | `String` | |
+| `Variant` | JSON value | The `arrow.parquet.variant` extension over a `metadata`/`value` binary Struct; typed row terminals decode it to the language's native open value |
+| `List<T>`, `Struct` | Array, object | Nested typed collections |
 | `Int64` nullable | `Option<i64>` | Token counts, counts, and other unsigned OTLP values |
 | `Float64` nullable | `Option<f64>` | Scores, values |

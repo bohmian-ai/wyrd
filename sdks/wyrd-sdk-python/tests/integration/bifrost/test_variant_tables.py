@@ -52,21 +52,6 @@ def is_variant(field: pyarrow.Field) -> bool:
     return (field.metadata or {}).get(b"ARROW:extension:name") == b"arrow.parquet.variant"
 
 
-def json_text_schema(bifrost: Bifrost) -> pyarrow.Schema:
-    """The table's Arrow schema with its Variant columns written as JSON text."""
-
-    declared = bifrost.table.arrow_schema
-    return pyarrow.schema(
-        [
-            declared.field("id"),
-            pyarrow.field("payload", pyarrow.string()),
-            pyarrow.field("mixed", pyarrow.string()),
-            declared.field("point"),
-            declared.field("tags"),
-        ]
-    )
-
-
 def test_model_fields_become_variant_struct_and_list_columns(bifrost: Bifrost) -> None:
     schema = bifrost.table.arrow_schema
 
@@ -101,10 +86,8 @@ def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTest
 def test_arrow_json_text_is_stored_as_variant(
     bifrost: Bifrost, wyrd_server: WyrdTestServer
 ) -> None:
-    arrow = pyarrow.Table.from_pylist(
-        [{"id": 1, "payload": '{"n": 9007199254740993}', "mixed": '"seven"'}],
-        schema=json_text_schema(bifrost),
-    )
+    # Variant columns take JSON text; omitted nullable columns are null.
+    arrow = pyarrow.table({"id": [1], "payload": ['{"n": 9007199254740993}'], "mixed": ['"seven"']})
     bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])
     wyrd_server.flush_bifrost()
 
@@ -159,10 +142,7 @@ def test_undeclared_field_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestServ
 
 
 def test_invalid_json_text_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestServer) -> None:
-    arrow = pyarrow.Table.from_pylist(
-        [{"id": 1, "payload": "{not json"}],
-        schema=json_text_schema(bifrost),
-    )
+    arrow = pyarrow.table({"id": [1], "payload": ["{not json"]})
 
     with pytest.raises(WyrdError) as error:
         bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])

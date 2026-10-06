@@ -219,3 +219,24 @@ Defect found during D11 (6c518085b):
 
 The eval journey's `context LIKE` lookup was refused at planning because
 `context` is a Variant. It now reads `context ->> 'marker'`.
+
+### Final verification on 44840ebb3
+
+Every lane exited 0:
+- **Formatting and lint lanes:** `mise run fmt`, `mise run lints`,
+  `mise run py:format`, `mise run py:lints` and `mise run ts:typecheck`.
+- **Task lanes:** V1–V15, V16 `mise run codegen:check`, `mise run docs:check`,
+  `mise run check:docs`, V17 `git diff --check`, and `git diff --check 79f60eec3`.
+- **Focused late-terminal tests:** the three Oracle tests, the tonic test and
+  the client test named above, each run through an exact `cargo nextest`
+  selector.
+- **Touched-crate lanes:**
+  - libraries: `wyrd-queue` lib; `vala-sql` audit_staging; `vala-bifrost-redux` lib (Postgres);
+  - clients and server: `wyrd-client` lib; `wyrd-tonic` query_conversion; `wyrd-server` query, verification, gRPC and MCP lib (Postgres); `wyrd-server` gateway (Postgres);
+  - journeys: all `eval_verification` and `verification_runtime` journeys;
+  - forks: the fork V12/V13.
+
+On the first pass, v16, docs:check, check:docs and V17 failed with
+`No space left on device`. The `wyrd-server` lib lane also failed: it ran
+without the Postgres wrapper, so `PgFixture` panicked. All five were rerun
+after freeing space, with the wrapper, and passed.

@@ -446,7 +446,7 @@ impl ScalarUDFImpl for VariantAsText {
                 Variant::Null => text.append_null(),
                 value => match value.as_string() {
                     Some(string) => text.append_value(string),
-                    None => text.append_value(value.to_json_string()?),
+                    None => text.append_value(value.to_json_value()?.to_string()),
                 },
             }
         }
@@ -513,7 +513,7 @@ impl ScalarUDFImpl for ToJson {
             if variant.is_null(row) {
                 text.append_null();
             } else {
-                text.append_value(variant.try_value(row)?.to_json_string()?);
+                text.append_value(variant.try_value(row)?.to_json_value()?.to_string());
             }
         }
         Ok(ColumnarValue::Array(Arc::new(text.finish())))

@@ -280,9 +280,10 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
 /// of `metadata`/`value` bytes. Installing this factory on a writer's
 /// [`EncoderOptions`] makes every field
 /// carrying the `arrow.parquet.variant` extension — top level or nested in a
-/// Struct or List — render through upstream [`VariantArray`], so every
-/// row-as-JSON surface shares one rendering. Other fields keep Arrow's
-/// default encoders.
+/// Struct or List — render through upstream [`VariantArray`] as the same JSON
+/// value [`variant_bytes_to_json`] yields, so every row-as-JSON surface shares
+/// one rendering and a double such as `3.0` stays a float. Other fields keep
+/// Arrow's default encoders.
 #[derive(Debug, Default)]
 pub struct VariantJsonEncoderFactory;
 
@@ -315,7 +316,8 @@ impl EncoderFactory for VariantJsonEncoderFactory {
                 }
                 variants
                     .try_value(row)
-                    .and_then(|value| value.to_json_string())
+                    .and_then(|value| value.to_json_value())
+                    .map(|json| json.to_string())
                     .map_err(|_| {
                         ArrowError::JsonError(format!(
                             "field {} row {row} is not a decodable Variant",
@@ -977,7 +979,7 @@ mod tests {
             ]),
             vec![
                 Arc::new(StringArray::from(vec!["psi", "psi"])) as ArrayRef,
-                column(&[Some(json!({"k": 1})), Some(json!([1, "a"]))]),
+                column(&[Some(json!({"k": 1, "score": 3.0})), Some(json!([1, "a"]))]),
             ],
             None,
         );
@@ -1006,7 +1008,7 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"v": {"big": 9_007_199_254_740_993_i64, "z": null}, "s": {"method": "psi", "features": {"k": 1}}},
+                {"v": {"big": 9_007_199_254_740_993_i64, "z": null}, "s": {"method": "psi", "features": {"k": 1, "score": 3.0}}},
                 {"v": null, "s": {"method": "psi", "features": [1, "a"]}},
             ])
         );

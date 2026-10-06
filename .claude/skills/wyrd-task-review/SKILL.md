@@ -46,8 +46,9 @@ Run independent discovery, conditional follow-up, and validation:
 
 1. **Independent discovery, in parallel:** always spawn two task implementation
    reviewers (`behavior-rev` and `invariant-rev`), a repository-standards
-   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), and a
-   system-resilience reviewer (`system-rev`). Also spawn one domain reviewer
+   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), a
+   system-resilience reviewer (`system-rev`), and a reuse reviewer
+   (`reuse-rev`). Also spawn one domain reviewer
    (`domain-rev`) for each materially changed sensitive domain, including
    security/RBAC, tenancy, concurrency, durability, persistent data, or another
    boundary whose correctness needs domain expertise.
@@ -220,6 +221,35 @@ Each finding needs a source-local ID, violated obligation or regression
 boundary, exact location, observable system consequence, and testable
 correction. A healthy-path test alone cannot prove a changed recovery path.
 
+## Independent reuse review (`reuse-rev`)
+
+Give this specialist the immutable subject, complete cumulative diff, base
+revision, repository root, and the task's pinned dependency and fork diffs. Do
+not provide other reviewers' conclusions or an intended verdict. It has one job:
+find every place the candidate added a mechanism that is semantically
+equivalent to, or parallel with, one that already exists, instead of reusing or
+extending the existing owner. Differently written code that does the same job
+counts; textual similarity is not required.
+
+For every added or materially changed type, function, module, conversion,
+encoder/decoder, validator, error mapping or carrier, rendering, schema/type
+mapping, wire field, test fixture or harness helper, and configuration, search
+the base tree (`git grep <term> <base>`, and CodeGraph callers, callees, and
+symbol search when `.codegraph/` exists) and the installed dependencies' public
+APIs for an existing owner that already does the job or should have been
+extended. Also find duplicates inside the candidate: the same branch pasted
+into several callers, two implementations of one job in one file, or one case
+given its own path beside the general one.
+
+Return `reuse-review.md`. For each confirmed duplicate, give a source-local ID,
+the new location, the existing owner (file:line or crate API), evidence that
+both do the same job, and the smallest consolidation that deletes the
+duplicate side. Then list each checked surface found not duplicated, one line
+each, with the owner searched. End with one overall `PASS`, `FAIL`, or
+`BLOCKED` result. A confirmed duplicate is a `VIOLATION` of
+[AGENTS.md](../../../AGENTS.md) §15 and is blocking in every review round.
+Uncovered added surfaces block this review.
+
 ## Independent sensitive domain review (`domain-rev`)
 
 Spawn a separate `domain-rev` for each sensitive domain materially changed by
@@ -253,8 +283,9 @@ predetermined count or obtain agreement.
 Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
 complete, even when their proposed finding union is empty. Give it the
 immutable subject, applicable authorities, complete diff, both task-review
-reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`, and any `followup-review.md`, but no intended verdict.
+reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`,
+`reuse-review.md`, every `domain-review-<domain>.md`, and any
+`followup-review.md`, but no intended verdict.
 
 The `ponytail-rev` independently inspects the actual source, validates every
 proposed finding and correction, including claims from only one reviewer. It
@@ -321,8 +352,8 @@ blocks the review. Preserve its final ledger and recommendations as
 ## Verdict and remediation task
 
 In the established review directory, preserve both task-review reports,
-`standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`,
+`standards-review.md`, `maintainer-review.md`, `system-review.md`,
+`reuse-review.md`, every `domain-review-<domain>.md`,
 any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
 containing the immutable subject, reconciled acceptance matrix, independent
 review results, the follow-up decision, validated finding ledger, verification

@@ -1,4 +1,6 @@
-import { resolve } from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -22,9 +24,11 @@ export interface ServerOptions {
 
 /**
  * Export `server`'s address and writer key the way a deployment's environment
- * does, so every SDK and CLI call resolves them without arguments.
+ * does, so every SDK and CLI call resolves them without arguments. An empty
+ * config home keeps the developer's saved logins out of every story.
  */
 function deploy(server: NativeWyrdTestServer): void {
+  vi.stubEnv("WYRD_CONFIG_HOME", mkdtempSync(join(tmpdir(), "wyrd-ts-config-")));
   vi.stubEnv("WYRD_SERVER_URL", server.baseUrl);
   vi.stubEnv("WYRD_GRPC_URL", server.grpcUrl);
   vi.stubEnv("WYRD_API_KEY", server.apiKey);

@@ -1,6 +1,8 @@
+mod ambiguous_retry;
 mod backpressure;
 mod budgets;
 mod cross_shard;
+mod describe;
 mod fencing;
 mod horizontal_ingest;
 mod ingest_bounds;

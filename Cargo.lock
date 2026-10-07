@@ -11358,7 +11358,6 @@ dependencies = [
  "skald-spec",
  "skald-tool",
  "skald-workflow",
- "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -11635,29 +11634,24 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
- "arrow",
- "base64 0.22.1",
  "chrono",
- "hex",
- "parquet",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "skald-prompt",
  "skald-workflow",
  "tempfile",
  "tokio",
- "url",
- "uuid",
  "wiremock",
  "workspace-hack",
  "wyrd-cli",
  "wyrd-client",
+ "wyrd-sdk-rust",
  "wyrd-spec",
  "wyrd-testing",
- "wyrd-tonic",
 ]
 
 [[package]]

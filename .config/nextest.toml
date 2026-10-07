@@ -113,6 +113,14 @@ fail-fast = false
 filter = 'test(=sustained::scribe_sustained_ingest_oracle_hot_read_journey)'
 threads-required = 'num-test-threads'
 
+# The paced drift journey asserts that client-owned bytes stay flat because
+# the server drains as fast as the client emits. Sibling journeys slowing the
+# server's drain make the client queue grow for reasons of the host, not of
+# the client, so it reserves every slot for the same reason.
+[[profile.journey.overrides]]
+filter = 'package(wyrd-testing) and binary(server) and test(=observe_ingest::sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_bytes)'
+threads-required = 'num-test-threads'
+
 # Every Bifrost peer cluster gives its pods the canonical public, gRPC, and
 # peer ports on distinct loopback addresses starting at 127.0.0.2, as a real
 # deployment does. Two clusters alive together therefore bind the same sockets

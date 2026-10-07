@@ -517,6 +517,99 @@ mod sdk {
         );
     }
 
+    /// A sink that parks every send until released, then acknowledges and
+    /// counts the rows it delivered.
+    #[derive(Default)]
+    struct ReleasingSink {
+        /// Set once the first send reaches the sink.
+        started: AtomicBool,
+        /// Set once the test lets parked sends acknowledge.
+        released: AtomicBool,
+        /// Rows acknowledged after release.
+        sent_rows: std::sync::atomic::AtomicUsize,
+        /// Wakes parked sends on release.
+        wake: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl BatchSink<ClientByteGuard> for ReleasingSink {
+        /// Parks until released, then acknowledges the batch and counts its rows.
+        ///
+        /// # Errors
+        ///
+        /// None; the `Result` is the [`BatchSink`] contract.
+        async fn send(
+            &self,
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.released.load(Ordering::SeqCst) {
+                let notified = self.wake.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+            let rows = usize::try_from(batch.rows).unwrap_or(usize::MAX);
+            self.sent_rows.fetch_add(rows, Ordering::SeqCst);
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
+        }
+    }
+
+    /// A stalled downstream refuses with a bounded queue-full, and once it
+    /// drains every accepted row is delivered and the next write is accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stall produces no refusal, a refusal carries another
+    /// code, or the released sink does not deliver exactly the accepted rows.
+    #[test]
+    fn downstream_stall_remains_bounded_and_recovers_after_drain() {
+        let sink = Arc::new(ReleasingSink::default());
+        let bifrost = client_over(sink.clone(), saturating_config());
+        bifrost.use_table(table("ns.tbl"));
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        bifrost.insert(row(), correlated()).expect("first accepted");
+        wait_for("the sink never started", &|| {
+            sink.started.load(Ordering::SeqCst)
+        });
+        let mut accepted = 1_usize;
+        let mut rejected = 0_usize;
+        for _ in 0..100 {
+            match bifrost.insert(row(), correlated()) {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    assert_eq!(WyrdError::from(&error).code(), "WYRD_CLIENT_429_QUEUE_FULL");
+                    rejected += 1;
+                }
+            }
+        }
+        assert!(rejected > 0, "a stalled downstream refuses, bounded");
+
+        sink.released.store(true, Ordering::SeqCst);
+        sink.wake.notify_waiters();
+        wait_for("the released sink did not drain", &|| {
+            sink.sent_rows.load(Ordering::SeqCst) >= accepted
+        });
+        bifrost
+            .insert(row(), correlated())
+            .expect("post-drain write accepted");
+        wait_for("the post-drain write was not delivered", &|| {
+            sink.sent_rows.load(Ordering::SeqCst) > accepted
+        });
+        assert_eq!(sink.sent_rows.load(Ordering::SeqCst), accepted + 1);
+    }
+
     struct RecordingTransport {
         seen: Mutex<Vec<[u8; 16]>>,
     }
@@ -609,6 +702,91 @@ mod sdk {
         assert_eq!(
             wyrd_spec::error::WyrdError::from(&error).code(),
             "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
+        );
+    }
+
+    /// A table swapped in while registration is in flight keeps its own identity.
+    ///
+    /// `register` releases the active-table lock for its network round trip, so
+    /// the response can arrive after `use_table` has rebound the client. The
+    /// swap is deterministic rather than timed: the register future is polled
+    /// exactly once, which builds its request and parks on the HTTP response,
+    /// and only then is the binding replaced. Each table's registration answers
+    /// with its own identity, so a stamped foreign identity is visible.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-flight response overwrites the rebound table's
+    /// identity or a registration does not complete.
+    #[tokio::test]
+    async fn register_never_stamps_one_tables_identity_onto_another() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wyrd_spec::vala::api::RegisterOutcome;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        for (name, uid, fingerprint) in [
+            ("bound", "11".repeat(16), "aa".repeat(32)),
+            ("inflight", "22".repeat(16), "bb".repeat(32)),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/bifrost/tables"))
+                .and(body_partial_json(serde_json::json!({ "name": name })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "outcome": "Created",
+                    "table_uid": uid,
+                    "fingerprint": fingerprint
+                })))
+                .mount(&server)
+                .await;
+        }
+        let client = crate::WyrdClient::with_config(config_with_key(&server.uri(), "secret"))
+            .expect("client assembles");
+        let bifrost = Bifrost::with_sink(
+            &client,
+            Some(table("vala.datasets.bound")),
+            Arc::new(MockSink::new()),
+            QueueConfig::default(),
+        );
+        assert_eq!(
+            bifrost.register().await.expect("register the bound table"),
+            RegisterOutcome::Created
+        );
+        let bound = bifrost.table().expect("the bound table stays bound");
+        let bound_identity = bound.resolved().cloned().expect("bound table resolved");
+
+        bifrost.use_table(table("vala.datasets.inflight"));
+        let register = bifrost.register();
+        tokio::pin!(register);
+        tokio::select! {
+            biased;
+            _ = &mut register => panic!("register cannot settle before the server answers"),
+            () = std::future::ready(()) => {}
+        }
+        bifrost.use_table(bound);
+        assert_eq!(
+            register
+                .await
+                .expect("the in-flight registration completes"),
+            RegisterOutcome::Created
+        );
+
+        let active = bifrost.table().expect("the rebound table stays bound");
+        assert_eq!(active.fqn(), "vala.datasets.bound");
+        assert_eq!(
+            active.resolved(),
+            Some(&bound_identity),
+            "a response must never overwrite the identity of a different table"
         );
     }
 

@@ -24,30 +24,26 @@ wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
-arrow = { workspace = true }
-base64 = { workspace = true }
+# The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
+wyrd-sdk-rust = { path = ".", features = ["cli"] }
 chrono = { workspace = true }
-hex = { workspace = true }
-parquet = { workspace = true, features = ["arrow"] }
-# The workload-role journey issues its Service key over the public HTTP route.
+# The stock OpenTelemetry exporter the OTLP export story configures from
+# `OTEL_EXPORTER_OTLP_*`.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+# The OpenAI-compatible Chat Completions caller of the gateway inference story.
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-# The integrated Service journey builds its native LLM-judge Prompt.
-skald-prompt = { workspace = true }
 skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-url = { workspace = true }
-uuid = { workspace = true, features = ["v7"] }
-# Local OpenAI-compatible judge and HTTP Operator endpoint of the integrated
-# Service journey.
+# Local judge, model upstream, and Operator hook the stories call through the
+# server.
 wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
-# OTLP/gRPC span export the Eval trace-join journey correlates against.
-wyrd-tonic = { workspace = true, features = ["client"] }
 
 [lints]
 workspace = true

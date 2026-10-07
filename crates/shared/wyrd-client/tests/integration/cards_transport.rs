@@ -212,9 +212,22 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     assert!(page.items.is_empty());
     let requests = server.requests().await;
     assert_eq!(requests[0].method, "GET");
+    let (path, query) = requests[0]
+        .target
+        .split_once('?')
+        .expect("the listing carries its filters as a query string");
+    let mut parameters = query.split('&').collect::<Vec<_>>();
+    parameters.sort_unstable();
+    assert_eq!(path, "/v1/cards");
     assert_eq!(
-        requests[0].target,
-        "/v1/cards?kind=Prompt&space=prod&include_prerelease=false&limit=20&cursor=opaque-next"
+        parameters,
+        [
+            "cursor=opaque-next",
+            "include_prerelease=false",
+            "kind=Prompt",
+            "limit=20",
+            "space=prod"
+        ]
     );
     assert!(requests[0].body.is_empty());
 }

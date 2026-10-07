@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import BaseModel
@@ -20,10 +21,14 @@ from wyrd import cli
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.cards import CardRef, Cards
 from wyrd.model import ModelInterface
+from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Received, Upstream
+
+if TYPE_CHECKING:
+    from wyrd.operators import OperatorConnectionView
 
 FIXTURES = Path(__file__).resolve().parents[4] / "fixtures"
 """The repository-root fixture corpus shared by the Rust, Python, and TypeScript journeys."""
@@ -223,6 +228,43 @@ def unfitted_assistant(
     bundle = download("unfitted-assistant", tmp_path)
     monkeypatch.setenv("WYRD_API_KEY", service_key(wyrd_server, "unfitted-assistant"))
     return WyrdState.from_path(bundle, interfaces={"model": StandInModel()})
+
+
+ON_CALL_TOKEN = "on-call-bearer-token"
+"""The bearer secret the ``on-call-hooks`` connection presents to the receiver."""
+
+
+@pytest.fixture(scope="session")
+def on_call_hooks(wyrd_server: WyrdTestServer, receiver: Receiver) -> OperatorConnectionView:
+    """The ``on-call-hooks`` HTTP connection: the receiver's origin and a bearer token."""
+    return OperatorConnections().create(
+        {
+            "provider": "http",
+            "name": "on-call-hooks",
+            "origin": receiver.url,
+            "auth": {"scheme": "bearer", "token": ON_CALL_TOKEN},
+        }
+    )
+
+
+@pytest.fixture
+def latency_watch(
+    wyrd_server: WyrdTestServer,
+    cards: Cards,
+    on_call_hooks: OperatorConnectionView,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[WyrdState]:
+    """The ``latency-watch`` Service, fitted and hydrated, with Bifrost started under its key."""
+    register(cards, "cards/latency_baseline/latency-baseline.yaml")
+    registered = register(cards, "cards/scheduled_drift_alerts_operator/latency-watch.yaml")
+    wyrd_server.wait_for_baseline(str(registered["latency-shift"].uid), BASELINE_TIMEOUT_SECONDS)
+    bundle = download("latency-watch", tmp_path)
+    monkeypatch.setenv("WYRD_API_KEY", service_key(wyrd_server, "latency-watch"))
+    state = WyrdState.from_path(bundle)
+    state.start_bifrost()
+    yield state
+    state.shutdown()
 
 
 class QueryRow(BaseModel):

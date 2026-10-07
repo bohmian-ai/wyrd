@@ -192,6 +192,28 @@ impl WyrdPyError {
         .into()
     }
 
+    /// Parse caller-supplied JSON into `T`, refusing malformed input as a
+    /// request validation failure.
+    ///
+    /// Every `model_validate_json` entry point parses text the caller wrote, so
+    /// a syntax error, an unknown tag, or a missing field is the caller's
+    /// input fault, not an internal one. The generic `From<serde_json::Error>`
+    /// conversion stays internal because it also covers serialization of
+    /// values this crate built itself.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_VALIDATION`, carrying the parser message under
+    /// `details.source`, when `json` does not deserialize into `T`.
+    pub fn parse_json_input<T: serde::de::DeserializeOwned>(json: &str) -> CardPyResult<T> {
+        serde_json::from_str(json).map_err(|error| {
+            WyrdError::Validation {
+                message: format!("JSON input failed validation: {error}"),
+                details: json!({ "source": error.to_string() }),
+            }
+            .into()
+        })
+    }
+
     /// Build an internal interface error.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())

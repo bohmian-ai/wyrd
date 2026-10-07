@@ -33,4 +33,4 @@ def test_reference_of_an_unknown_kind_is_refused(fixtures_dir: Path) -> None:
     with pytest.raises(WyrdError) as error:
         PromptReference.model_validate_json(text)
 
-    assert error.value.code == "WYRD_SPEC_500_INTERNAL"
+    assert error.value.code == "WYRD_SPEC_400_VALIDATION"

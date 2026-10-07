@@ -13,4 +13,5 @@ mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod support;
+mod verify_in_real_time;
 mod workflow_loading;

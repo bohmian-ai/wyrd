@@ -1,0 +1,30 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: latency-shift
+  version: 1.0.0
+  space: default
+spec:
+  description: Daily check that request latency has not shifted from the healthy baseline.
+  implementation:
+    kind: drift
+    spec:
+      method: Psi
+      signal:
+        kind: Distribution
+        baseline_ref:
+          kind: Data
+          name: latency-baseline
+          version: 1.0.0
+          space: default
+        features: [latency]
+      condition:
+        kind: Statistical
+      profile:
+        kind: Psi
+        binning_strategy:
+          kind: EqualWidth
+          n_bins: 10
+        threshold:
+          kind: Fixed
+          value: 0.25

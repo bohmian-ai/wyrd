@@ -1,0 +1,22 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: model
+      ref:
+        kind: Model
+        name: support-model
+        version: 1.0.0
+        space: default
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./no-refund-promise.yaml
+          runs_on: ./every-batch.yaml
+          on_failure:
+            - ./notify-support.yaml

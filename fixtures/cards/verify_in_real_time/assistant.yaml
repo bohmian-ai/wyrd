@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: assistant
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./answer-is-yes.yaml
+          runs_on: {kind: observations_ready}
+        - verifier: ./answer-is-judged.yaml
+          runs_on: {kind: observations_ready}
+    - alias: model
+      ref: ./latency-model.yaml
+      verified_by:
+        - verifier: ./latency-drift.yaml
+          runs_on: {kind: schedule, cron: "0 0 * * *"}

@@ -1,0 +1,10 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: assistant-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt: ./assistant-prompt.yaml
+  run_config:
+    max_iterations: 1

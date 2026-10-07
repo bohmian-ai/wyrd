@@ -1,0 +1,22 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  name: ask-external
+  version: 1.0.0
+  space: default
+spec:
+  llm_route:
+    kind: wyrd_gateway
+  inputs:
+    question:
+      type: str
+      value: ""
+  steps:
+    - id: ask
+      action:
+        type: agent
+        target: {kind: Agent, name: ask-agent, version: 1.0.0, space: default}
+      inputs:
+        question: input.question
+  outputs:
+    answer: steps.ask.output.text

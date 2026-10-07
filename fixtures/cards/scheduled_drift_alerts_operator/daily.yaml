@@ -1,0 +1,10 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  name: daily
+  version: 1.0.0
+  space: default
+spec:
+  description: Once a day at midnight UTC.
+  kind: schedule
+  cron: "0 0 * * *"

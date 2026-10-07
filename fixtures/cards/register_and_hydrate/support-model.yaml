@@ -1,0 +1,25 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  name: support-model
+  version: 1.0.0
+  space: default
+spec:
+  interface:
+    kind: Custom
+    meta:
+      framework_version: 0.1.0
+      loader_module: support
+      loader_class: SupportModel
+      extra: {}
+  task_type: Other
+  signature:
+    inputs:
+      - name: question
+        dtype: string
+    outputs:
+      - name: answer
+        dtype: string
+artifacts:
+  - relative_path: support-model.bin
+    content_type: application/octet-stream

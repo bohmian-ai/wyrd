@@ -1,0 +1,13 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: observed-service
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./observed-agent.yaml
+    - alias: model
+      ref: ./observed-model.yaml

@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: support-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt: ./support-prompt.yaml
+  run_config:
+    max_iterations: 2
+    timeout_ms: 1000

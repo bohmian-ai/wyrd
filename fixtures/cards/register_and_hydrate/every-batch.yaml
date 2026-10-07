@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  name: every-batch
+  version: 1.0.0
+  space: default
+spec:
+  description: Run on every committed observation batch.
+  kind: observations_ready

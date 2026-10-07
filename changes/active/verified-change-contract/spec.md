@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 65
+revision: 66
 status: approved
 ---
 
@@ -1559,13 +1559,19 @@ table on `(data_tenant_id, result_id)`.
   - **Checked-in YAML only.** Cards come from fixture directories under a
     repository-root `fixtures/cards/<story>/`, shared by the three SDKs. Test
     code never builds or edits YAML, JSON, digests, or URLs.
-  - **Deployment-shaped server.** A session `WyrdTestServer` exports its
-    address and key the way a deployment's environment does, and SDK and CLI
-    calls resolve them without arguments. Only a test about credentials passes
-    them explicitly.
-  - **Public surfaces only.** A test uses the public SDK modules, the CLI
-    functions (REQ-196), the three test controls, and the credential
-    fixtures (REQ-195). It uses no
+  - **Deployment-shaped server.** (revised in revision 66) A session
+    `WyrdTestServer` exports its address and key the way a deployment's
+    environment does, and SDK and CLI calls made as that deployment's default
+    principal resolve them without arguments. A test that acts as any other
+    principal passes a `WyrdClient` built for that principal's key through
+    the call's optional `client` argument, the way a multi-tenant program
+    would, and never changes the process environment to switch principal.
+    Ambient resolution itself is proved once per SDK by one test about
+    configuration; in Rust, where changing the environment of a running test
+    process is unsound, only that test may run in a child process.
+  - **Public surfaces only.** A test uses the public SDK modules, the
+    test-only CLI functions (REQ-196), the three test controls, and the
+    credential fixtures (REQ-195). It uses no
     private or extension import, subprocess, raw HTTP, SQL against server
     tables, digest computation, YAML or JSON parsing of results, sleep, or
     polling loop.
@@ -1621,16 +1627,31 @@ table on `(data_tenant_id, result_id)`.
   Card. They stand in for the operator who grants Roles in a deployment;
   no public surface grants a Role. A Card-scoped key without added Roles is
   still issued through the CLI (REQ-199).
-- **REQ-196**: The `wyrd` CLI ships with all three SDKs and its commands are
-  callable in-process: Python `wyrd.cli.<command>(...)`, TypeScript
-  `cli.<command>(...)` from `@wyrd/sdk`, and Rust `wyrd_sdk::cli::<command>`
-  behind an optional `cli` feature. Each function runs the same Rust command
-  implementation as the `wyrd` executable, takes the command's options as
-  typed arguments, returns the typed result the command prints with
-  `--format json`, and raises `WyrdError` instead of returning an exit code.
-  At minimum `plan`, `apply`, `get`, and `load` are exposed; any further
-  command a journey needs is exposed the same way. Python and TypeScript
-  also install the `wyrd` executable.
+
+  (revised in revision 66) The saved-user-login story additionally uses the
+  test server's saved-login fixtures: enable human single sign-on on the
+  test server, save a human login for a tenant into a configuration home,
+  expire it, revoke its refresh chain, and report whether it is stale. They
+  stand in for the identity provider and the passage of time, exist only on
+  `WyrdTestServer`, and are used by no other story.
+- **REQ-196**: (revised in revision 66) The `wyrd` executable ships with the
+  Python and TypeScript packages and is the product surface for CLI
+  commands. The in-process command functions are a test surface only and are
+  absent from production builds: Python `wyrd.testing.cli.<command>(...)`,
+  present only when the extension is built with its `testing` feature;
+  TypeScript `cli.<command>(...)` from `@wyrd/testing`; and Rust
+  `wyrd_sdk::cli::<command>` behind the `testing` feature, which replaces the
+  `cli` feature. Production `wyrd.cli` keeps only the executable entry point,
+  `@wyrd/sdk` exports no in-process command, and no compatibility alias is
+  kept. Each function runs the same Rust command implementation as the
+  `wyrd` executable, takes the command's options as typed arguments, returns
+  the typed result the command prints with `--format json`, and raises
+  `WyrdError` instead of returning an exit code. A networked command takes
+  an optional `client` (`WyrdClient`); omitted, it resolves the server and
+  credential from the ambient chain exactly as the executable does. The
+  `client` argument replaces the `server` argument. At minimum `plan`,
+  `apply`, `get`, and `load` are exposed; any further command a journey
+  needs is exposed the same way.
 - **REQ-197**: An observation emit never blocks the caller. A full queue
   refuses with `WYRD_CLIENT_429_QUEUE_FULL`; this is the documented contract,
   and no SDK adds a blocking or retrying emit.
@@ -1687,6 +1708,15 @@ table on `(data_tenant_id, result_id)`.
   client, like any warehouse table; no SDK history API is added. How
   `vala.verification.results` stores its Drift and Eval summaries is owned by
   `SPEC-bifrost-variant` in `wyrd-forge`.
+- **REQ-207**: (added in revision 66) Loading an authored Workflow accepts an
+  optional `client` in all three SDKs: Python
+  `Workflow.from_path(path, client=None)`, TypeScript
+  `Workflow.fromPath(path, { client })`, and Rust
+  `Workflow::from_path_with_client(path, client)` beside the unchanged
+  `Workflow::from_path(path)`. Registry Card refs are then read, and the
+  loaded Workflow's Gateway calls are made, as that client's principal;
+  omitted, the ambient chain is used as today. A wholly local Workflow still
+  needs neither a client nor a server.
 
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
@@ -2681,10 +2711,14 @@ published image pinned by an immutable registry digest before release.
   and succeeds after `wait_for_baseline`.
 - **AC-050**: Run views expose `alias` and no `card_ref` / `cardRef` in all
   three SDKs, and `codegen:check` passes.
-- **AC-051**: In each SDK a journey runs `apply` and `get` in-process through
-  the CLI functions against the test server; a refused command raises
+- **AC-051**: (revised in revision 66) In each SDK a journey runs `apply`
+  and `get` through the test-only CLI functions against the test server, in
+  the test's own process, with an explicit `client`; a refused command raises
   `WyrdError` with its catalog code; and the installed `wyrd` executable runs
-  from Python and TypeScript packages.
+  from Python and TypeScript packages. The production Python wheel and the
+  published `@wyrd/sdk` package expose no in-process command function, and
+  no Rust journey other than the one ambient-configuration test runs in a
+  child process.
 - **AC-052**: Rust callers import `wyrd_sdk::WyrdError`, and no journey reads
   a refusal code out of `UpstreamFailure` details.
 - **AC-053**: A journey calls the Gateway through the stock OpenAI SDK with
@@ -2704,8 +2738,17 @@ published image pinned by an immutable registry digest before release.
   standard `OTEL_EXPORTER_OTLP_*` settings and an `x-wyrd-api-key` header
   exports a span that is then read back through the Bifrost client
   (REQ-205).
+- **AC-059**: (added in revision 66) In each SDK a journey loads a Workflow
+  whose Agent and Prompt refs are registry Cards with an explicit `client`
+  holding read access while the ambient credential has none, and the
+  Workflow loads and runs as that client (REQ-207).
 
 ## Open material decisions
+
+Revision 66:
+
+- None. The user approved the revision, including the saved-login fixtures
+  in REQ-195, on 2026-10-07.
 
 Revision 65:
 
@@ -2746,6 +2789,22 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 66 Test-only CLI functions and explicit clients (2026-10-07,
+  approved):** An independent readability review of the TASK-017 rewrites found
+  that every Rust journey needing a credential re-ran its own test binary as
+  a child process, because the CLI functions and Workflow loading read their
+  credential only from the environment and a Rust test cannot change its own
+  environment soundly. The user decided that the in-process CLI functions
+  are a test surface, not a product surface: they move behind each SDK's
+  existing testing gate, with no new feature, and gain an optional
+  `WyrdClient` that replaces `server` (REQ-196). Tests acting as a non-default
+  principal pass that client instead of changing the environment, and
+  ambient resolution is proved once per SDK (REQ-192). Workflow loading gains
+  the same optional client as product API, because Workflows also run
+  locally (REQ-207). The saved-user-login story's fixtures are sanctioned
+  with the credential fixtures (REQ-195). Removing the in-process CLI from
+  the production Python wheel and `@wyrd/sdk` is a breaking change with no
+  alias.
 - **Revision 65 Credential fixtures (2026-10-07, approved by the user):**
   Journeys need keys holding Roles (`reader`, `writer`, `agent`, another
   tenant's `admin`), and no public surface grants a Role. REQ-195 now

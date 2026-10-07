@@ -1645,6 +1645,60 @@ impl WyrdTestServer {
             .collect()
     }
 
+    /// Read the Parquet leaf column paths stored in one tenant table's hot objects.
+    ///
+    /// Lists the objects through [`Self::published_hot_files_for_test`], reads
+    /// each through the table's own FileIO, and returns every footer leaf path
+    /// (`events.list.element.attributes.typed_value…`). A journey uses it to
+    /// prove what layout Scribe actually stored, which a query result alone
+    /// cannot show because both readers unshred before rows leave the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when listing the hot objects fails, the table does not
+    /// load, an object cannot be read, or its footer does not parse.
+    pub async fn stored_leaf_paths_for_test(
+        &self,
+        tenant: DataTenantId,
+        namespace: BifrostNamespace,
+        table_name: &str,
+    ) -> Result<BTreeSet<String>, WyrdTestServerError> {
+        let start = |error: &dyn std::fmt::Display| WyrdTestServerError::Start(error.to_string());
+        let binding = TenantTableBinding::resolve((tenant, TableRef::new(namespace, table_name)))
+            .map_err(|error| start(&error))?;
+        let table = self
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .map_err(|error| start(&error))?;
+        let mut paths = BTreeSet::new();
+        for file in self
+            .published_hot_files_for_test(tenant, namespace.as_str(), table_name)
+            .await?
+        {
+            let bytes = table
+                .file_io()
+                .new_input(&file.object_key)
+                .map_err(|error| start(&error))?
+                .read()
+                .await
+                .map_err(|error| start(&error))?;
+            let footer = parquet::file::metadata::ParquetMetaDataReader::new()
+                .parse_and_finish(&bytes)
+                .map_err(|error| start(&error))?;
+            paths.extend(
+                footer
+                    .file_metadata()
+                    .schema_descr()
+                    .columns()
+                    .iter()
+                    .map(|column| column.path().string()),
+            );
+        }
+        Ok(paths)
+    }
+
     /// Wait until no Oracle audit outbox commit is still in flight.
     ///
     /// Oracle stages each read decision in `vala.audit_staging` from a

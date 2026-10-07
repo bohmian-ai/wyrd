@@ -6,6 +6,7 @@
 //! closed writer role.
 
 use arrow::datatypes::Schema;
+use iceberg::writer::file_writer::variant_shredding::variant_leaves;
 use num_traits::ToPrimitive;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -39,35 +40,28 @@ impl VariantWriter {
 
 /// Share of a file's Variant bytes held in residual `value` leaves.
 ///
-/// Sums uncompressed leaf sizes over every top-level Variant column of
-/// `logical`: the root `value` leaf against every leaf of the column except
-/// `metadata`. Returns `None` when the file has no Variant bytes to measure.
+/// Sums uncompressed leaf sizes over every Variant field of `logical`, at
+/// any Struct or List depth, located in the footer by the fork's
+/// [`variant_leaves`]: each field's root `value` leaf against every leaf of
+/// the field except `metadata`. Returns `None` when the file has no Variant
+/// bytes to measure or its schema cannot be read.
 #[must_use]
 pub fn variant_residual_share(metadata: &ParquetMetaData, logical: &Schema) -> Option<f64> {
-    let columns: Vec<&str> = logical
-        .fields()
-        .iter()
-        .filter(|field| wyrd_types::variant::is_variant(field))
-        .map(|field| field.name().as_str())
-        .collect();
+    let variants = variant_leaves(logical, metadata).ok()?;
     let mut residual = 0_i64;
     let mut total = 0_i64;
-    for chunk in metadata
-        .row_groups()
-        .iter()
-        .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
-    {
-        let path = chunk.column_path().parts();
-        let (Some(root), Some(leaf)) = (path.first(), path.get(1)) else {
-            continue;
-        };
-        if !columns.contains(&root.as_str()) || (path.len() == 2 && leaf == "metadata") {
-            continue;
-        }
-        let bytes = chunk.uncompressed_size();
-        total += bytes;
-        if path.len() == 2 && leaf == "value" {
-            residual += bytes;
+    for group in metadata.row_groups() {
+        for variant in &variants {
+            for leaf in variant.all.clone() {
+                if variant.metadata == Some(leaf) {
+                    continue;
+                }
+                let bytes = group.column(leaf).uncompressed_size();
+                total += bytes;
+                if variant.value == Some(leaf) {
+                    residual += bytes;
+                }
+            }
         }
     }
     if total == 0 {
@@ -98,7 +92,8 @@ mod tests {
             .expect("footer")
     }
 
-    /// An unshredded column is all residual; a fully shredded one is mostly not.
+    /// An unshredded column is all residual and a fully shredded one mostly
+    /// not, whether the Variant is a column or inside a List of Structs.
     #[test]
     fn residual_share_measures_unshredded_bytes() {
         let json: ArrayRef = Arc::new(StringArray::from_iter_values(
@@ -125,6 +120,46 @@ mod tests {
         let shredded = footer(&batch, &sampler.layout());
         let share = variant_residual_share(&shredded, &schema).expect("Variant bytes");
         assert!(share < 0.5, "shredded keys leave the residual: {share}");
+
+        let attributes = wyrd_types::variant::variant_field("attributes", true);
+        let element = arrow::datatypes::Field::new(
+            "element",
+            arrow::datatypes::DataType::Struct(vec![attributes.clone()].into()),
+            true,
+        );
+        let events = arrow::array::ListArray::new(
+            Arc::new(element.clone()),
+            arrow::buffer::OffsetBuffer::from_lengths(vec![1; batch.num_rows()]),
+            Arc::new(arrow::array::StructArray::new(
+                vec![attributes].into(),
+                vec![Arc::clone(batch.column(0))],
+                None,
+            )),
+            None,
+        );
+        let nested = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "events",
+            arrow::datatypes::DataType::List(Arc::new(element)),
+            true,
+        )]));
+        let nested_batch =
+            RecordBatch::try_new(Arc::clone(&nested), vec![Arc::new(events)]).expect("batch");
+        let unshredded_nested = footer(&nested_batch, &VariantLayout::default());
+        assert_eq!(
+            variant_residual_share(&unshredded_nested, &nested),
+            Some(1.0)
+        );
+        let mut sampler = VariantSampler::new(&nested, policy, 0, &[nested_batch.num_rows()]);
+        sampler
+            .offer(&nested_batch, &vec![0; nested_batch.num_rows()], 0)
+            .expect("sample");
+        let shredded_nested = footer(&nested_batch, &sampler.layout());
+        let nested_share =
+            variant_residual_share(&shredded_nested, &nested).expect("Variant bytes");
+        assert!(
+            nested_share < 0.5,
+            "nested keys leave the residual: {nested_share}"
+        );
 
         let plain = Schema::new(vec![arrow::datatypes::Field::new(
             "v",

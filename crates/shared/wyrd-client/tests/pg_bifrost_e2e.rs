@@ -2811,6 +2811,18 @@ mod pg_tests {
                 lenient: None,
             }]
         );
+        // The finish reason above was read from a shredded event attribute,
+        // not from the residual: Scribe stored it as its own typed leaf.
+        let stored = srv
+            .stored_leaf_paths_for_test(srv.data_tenant_id(), BifrostNamespace::Traces, "spans")
+            .await
+            .expect("read the stored span leaves");
+        assert!(
+            stored.contains(
+                "events.list.element.attributes.typed_value.gen_ai.finish_reason.typed_value"
+            ),
+            "event attributes are shredded: {stored:?}"
+        );
 
         let invalid = bifrost
             .sql(&format!("SELECT parse_json('{{bad') AS v {parent}"))

@@ -428,6 +428,79 @@ Commands:
 `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration --run-ignored all && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored all'`;
 fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core`.
 
+#### Nested shredding evidence (spec revision 23)
+
+One name-path walk in the fork (`iceberg::arrow::nested_variant`) finds every
+Variant at any Struct or List depth (`variant_field_paths`) and replaces it in
+place (`map_variant_field(s)`). The writer shreds, the sampler samples (each
+List element is one root), the footer combine counts, and both readers
+unshred through it. The hot per-file read is one UDF, `FileRead`: the
+per-file adapter narrows its argument to `CAST(column AS <only the read
+leaves>)`, which the DataFusion fork's cast clipping decodes alone; the UDF
+then gates and canonicalizes every Variant through the same walk and
+rebuilds the logical type by name (`rebuild_by_name`). The published reader
+takes the hot plan's `LeafPaths::leaf_mask`, so both readers trim the same
+leaves. `LeafPathPushdown` now follows `array_element` with a literal index
+and passes demand through `unnest` of a List.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-020 nested Variants sampled and shredded (List element = root) | fork `ColumnSample::values`, `VariantLayout::shred` via `map_variant_field` | fork `variants_inside_lists_are_sampled_shredded_and_combined`, `nested_variants_shred_and_unshred_in_place` | PASS |
+| REQ-021 footer combine counts nested leaves | fork `FooterCounts::{locate, descend}`, `variant_leaves` | same fork test asserts the nested leaf paths | PASS |
+| REQ-022 both readers unshred at any depth | fork `unshred_variants` (published); `FileRead` (hot) | `oracle::nested_pushdown::tests::*`, `oracle::leaf_paths::tests::published_reads_decode_only_struct_and_variant_paths` | PASS |
+| AC-006 hot and published round-trip before and after compaction | fork `shreds_only_variants` (nested physical schema check) | redux `forge::managed_rewrite::standard_variant_layouts_round_trip_per_file` (`events[].attributes` shredded like `v`, rows unchanged after rewrite) | PASS |
+| AC-007 `events[1]['attributes'] ->> 'k'` and `unnest` decode only the `k` leaves (+ `metadata`), hot and published, equal to an all-residual read | `Demand::path`, `LeafPathPushdown::unnest_input`, `FileRead::narrow`, `VariantFileAdapter::narrow_reads` | `trimmed_struct_reads_only_its_paths_leaves`, `published_reads_decode_only_struct_and_variant_paths` (`TRIMMED_LEAVES` lists exactly `events.list.element.attributes.{metadata, typed_value.k.value, typed_value.k.typed_value}`) | PASS |
+| No regression to stock DataFusion results (List and unnest forms) | same | `literal_key_reads_trim_the_scan_and_match_stock_datafusion` (16 queries, 6 new on `events`/`unnest`); `other_uses_read_the_column_whole` (5 new: whole `events`, non-literal index, mixed use, whole `u`, unused `u`) | PASS |
+| Span journey reads shredded event attributes | `WyrdTestServer::stored_leaf_paths_for_test` | `wyrd-client pg_bifrost_e2e pg_tests::builtin_variant_and_struct_payloads_are_queryable` asserts the stored `events.list.element.attributes.typed_value.gen_ai.finish_reason.typed_value` leaf beside the query | PASS |
+| Residual metric covers nested Variants | `variant_residual_share` over fork `variant_leaves` | `parquet::variant_residual::tests::residual_share_measures_unshredded_bytes` (nested: 1.0 unshredded, < 0.5 shredded) | PASS |
+| Neighbors and journeys | — | redux lib (Postgres) 872/872; redux `integration -P journey --run-ignored=all` 73/73; `wyrd-testing --test oracle -P journey --run-ignored all` 53/53; fork iceberg lib 1801/1801; compaction core 153/153; `check:workspace-hack` clean | PASS |
+| Lints | — | nightly fmt; clippy `-D warnings` on `vala-bifrost-redux`, `wyrd-testing`, `wyrd-client` `--all-features --all-targets`; fork clippy `iceberg --all-targets`; `git diff --check` | PASS |
+
+Pins: iceberg-rust `0b1a0660a16045289f9820f43454bb0628fcc5e3`, iceberg-compaction `7a54131207166bdfa3e84f823493cdca62e95898` (both pushed).
+
+Out of scope (spec): List element filter pushdown; arrays inside a Variant
+value stay residual. Known, unchanged: the published reader's fork unshred
+does not apply `mask_placeholders` first (true for top-level Variants before
+this revision too).
+
+Diagnoses:
+
+- **Nested physical schema refused.** Symptom: the generalized Forge
+  round-trip failed rewrite with "Physical schema differs from the table
+  schema beyond Variant shredding". Evidence: fork
+  `ParquetWriterBuilder::with_physical_schema` compared top-level types only;
+  `events` (List of Struct holding a shredded Variant) differs below the top
+  level. Cause: the check accepted a shredded Variant only as a top-level
+  column. Fix site: fork `shreds_only_variants`, recursing through List and
+  Struct; its one caller is `with_physical_schema`. Pinned by the nested case
+  in `accepts_per_file_variant_physical_schema`.
+- **`events[1]` alone.** Symptom: the path `["element"]` was recorded for a
+  whole-element read. Cause: a List step adds the element name. It reads the
+  column whole (`FileRead::narrow` returns `None`), so no special case was
+  added; the test lists the path.
+
+Consolidation (user request): `OracleVariantSql::literal_keys` is the one
+parser of literal string arguments (used by `literal_key_path` and
+`Demand::path`); `Demand::merge_at` replaces four copies of the slot merge;
+the published test derives its Iceberg schema from the fixture file; the
+fixture builds both Variants through one `variant_of`.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| fork `arrow::nested_variant::{is_variant_field, variant_field_paths, map_variant_field(s), unshred_variants, rebuild_by_name, placeholder}` | fork `RecordBatchTransformer::promote`, reader `unshred_variant_columns`, writer `variant_columns`, Arrow `cast` | replaces three top-level-only copies with one any-depth walk; `promote` moved here as `rebuild_by_name` |
+| fork `variant_shredding::{VariantLeaves, variant_leaves, leaf_count, child_leaf}`, `FooterCounts::{locate, descend}`, `ColumnSample::values` | `FooterCounts` (top-level only), Wyrd `variant_residual_share` (own footer walk) | one footer walk for combine and the residual metric; the Parquet-`Type` `leaf_count` in the reader counts a different type |
+| fork `parquet_writer::shreds_only_variants` | `with_physical_schema` inline check | the inline check could not recurse |
+| `oracle::variant_sql::FileRead`, `VariantFileAdapter::narrow_reads`, `OracleVariantSql::literal_keys` | `VariantUnshred`, `StructTrim`, `literal_key_path` | replaces `VariantUnshred` and `StructTrim` (both deleted) with one per-file read for Struct, List and Variant |
+| `oracle::leaf_paths::{Demand::path, Demand::merge_at, LeafPathPushdown::unnest_input}` | DataFusion projection pushdown, existing `Demand` | DataFusion pushes whole columns only |
+| `WyrdTestServer::stored_leaf_paths_for_test` | `published_hot_files_for_test`, `distributed.rs` footer reads | no server helper exposed a stored hot file's layout to an SDK journey |
+| test fixtures: `nested_pushdown` `events` (`EVENT_ATTRIBUTES`, `events_type`, `variant_of`), `managed_rewrite::events_field`, `leaf_paths::{trimmed_paths, TRIMMED_LEAVES}` | existing fixtures in the same modules | extended in place |
+
+Commands:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored all'`;
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all -E "test(/builtin_variant_and_struct_payloads_are_queryable$/)"'`;
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::(leaf_paths|nested_pushdown|variant_sql)::/)'`;
+fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core`.
+
 ### Hot-reader fix: a key the file did not shred
 
 Diagnosis:

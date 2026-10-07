@@ -25,7 +25,7 @@ use iceberg::metadata_columns::{
 };
 use iceberg::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType, Operation};
 use iceberg::table::Table;
-use parquet_variant_compute::{VariantArray, unshred_variant, variant_to_json};
+use parquet_variant_compute::{VariantArray, variant_to_json};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
@@ -1568,6 +1568,21 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
 /// One logical row of the Variant scenario: its key and its JSON document.
 type VariantRow = (i64, serde_json::Value);
 
+/// The span-event column of the Variant scenario: one event per row whose
+/// `attributes` Variant holds the row's document again, so every assertion
+/// on `v` also covers a Variant inside a List of Structs.
+fn events_field() -> Field {
+    Field::new(
+        "events",
+        DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(vec![variant_field("attributes", true)].into()),
+            true,
+        ))),
+        true,
+    )
+}
+
 /// Builds one ingress batch of `docs` whose event times land `day` days before
 /// the fixture day, so each batch is its own closed partition and Forge plan.
 ///
@@ -1584,10 +1599,28 @@ fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
     for (_, doc) in docs {
         variants.append(&EncodedVariant::from_json(doc).expect("fixture Variant encodes"));
     }
+    let variants = variants.finish();
+    let DataType::List(element) = events_field().data_type().clone() else {
+        unreachable!("events is a List");
+    };
+    let DataType::Struct(children) = element.data_type().clone() else {
+        unreachable!("an event is a Struct");
+    };
+    let events = arrow::array::ListArray::new(
+        element,
+        arrow::buffer::OffsetBuffer::from_lengths(vec![1; docs.len()]),
+        Arc::new(arrow::array::StructArray::new(
+            children,
+            vec![Arc::clone(&variants)],
+            None,
+        )),
+        None,
+    );
     RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             Field::new("value", DataType::Int64, false),
             variant_field("v", true),
+            events_field(),
             Field::new(
                 WYRD_EVENT_TIME,
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -1598,7 +1631,8 @@ fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
             Arc::new(Int64Array::from_iter_values(
                 docs.iter().map(|(key, _)| *key),
             )),
-            variants.finish(),
+            variants,
+            Arc::new(events),
             Arc::new(
                 TimestampMicrosecondArray::from_iter_values(
                     (0..i64::try_from(docs.len()).expect("bounded fixture rows"))
@@ -1613,12 +1647,15 @@ fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
 
 /// Reads every row of `batches` as its key and its logical JSON document.
 ///
-/// The Variant column is unshredded first, so a shredded object and an
-/// unshredded scan of the same rows read back identically.
+/// Both Variants are unshredded first, through the fork's one walk, so a
+/// shredded object and an unshredded scan of the same rows read back
+/// identically; each row's event `attributes` must hold the same document
+/// as its `v`.
 ///
 /// # Panics
 ///
-/// Panics when a batch lacks either column or a value cannot be rendered.
+/// Panics when a batch lacks a column, a value cannot be rendered, or a
+/// row's event differs from its `v`.
 fn logical_rows(batches: &[RecordBatch]) -> BTreeSet<(i64, String)> {
     let mut rows = BTreeSet::new();
     for batch in batches {
@@ -1626,11 +1663,30 @@ fn logical_rows(batches: &[RecordBatch]) -> BTreeSet<(i64, String)> {
             .column_by_name("value")
             .expect("the key column")
             .as_primitive::<Int64Type>();
-        let variant = VariantArray::try_new(batch.column_by_name("v").expect("the Variant column"))
-            .expect("Variant storage");
-        let logical: arrow::array::ArrayRef = unshred_variant(&variant).expect("unshred").into();
-        let json = variant_to_json(&logical).expect("Variant JSON");
+        let unshredded = |name: &str| {
+            let schema = batch.schema();
+            let (_, field) = schema.fields().find(name).expect("the Variant column");
+            iceberg::arrow::unshred_variants(field, batch.column_by_name(name).expect(name))
+                .expect("unshred")
+                .1
+        };
+        let json = variant_to_json(&unshredded("v")).expect("Variant JSON");
+        let events = unshredded("events");
+        let events = events.as_list::<i32>();
         for row in 0..batch.num_rows() {
+            let attributes = Arc::clone(
+                events
+                    .value(row)
+                    .as_struct()
+                    .column_by_name("attributes")
+                    .expect("event attributes"),
+            );
+            let event = variant_to_json(&attributes).expect("Variant JSON");
+            assert_eq!(
+                event.value(0),
+                json.value(row),
+                "event {row} holds its row's document"
+            );
             let doc: serde_json::Value =
                 serde_json::from_str(json.value(row)).expect("Variant JSON parses");
             rows.insert((keys.value(row), doc.to_string()));
@@ -1646,7 +1702,8 @@ fn expected_rows(docs: &[VariantRow]) -> BTreeSet<(i64, String)> {
         .collect()
 }
 
-/// Returns the shredded field names of column `v` in one stored object.
+/// Returns the shredded field names of column `v` in one stored object,
+/// asserting the event `attributes` shred the same fields.
 ///
 /// An unshredded object returns no names.
 ///
@@ -1654,15 +1711,33 @@ fn expected_rows(docs: &[VariantRow]) -> BTreeSet<(i64, String)> {
 ///
 /// Panics when the object has no batch or no Variant column.
 fn shredded_fields(batches: &[RecordBatch]) -> Vec<String> {
-    let column = batches[0].column_by_name("v").expect("the Variant column");
-    match VariantArray::try_new(column)
+    let names = |column: &arrow::array::ArrayRef| match VariantArray::try_new(column)
         .expect("Variant storage")
         .typed_value_column()
         .map(arrow::array::Array::data_type)
     {
-        Some(DataType::Struct(fields)) => fields.iter().map(|field| field.name().clone()).collect(),
+        Some(DataType::Struct(fields)) => fields
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
-    }
+    };
+    let fields = names(batches[0].column_by_name("v").expect("the Variant column"));
+    let events = batches[0]
+        .column_by_name("events")
+        .expect("the events column")
+        .as_list::<i32>();
+    let attributes = events
+        .values()
+        .as_struct()
+        .column_by_name("attributes")
+        .expect("event attributes");
+    assert_eq!(
+        names(attributes),
+        fields,
+        "event attributes shred the same fields as v"
+    );
+    fields
 }
 
 /// Returns the top-level keys of every document an object holds, sorted.
@@ -1718,7 +1793,7 @@ async fn published_rows(promoted: &PromotedRewriteFixture) -> BTreeSet<(i64, Str
         .load_table()
         .await
         .scan()
-        .select(["value", "v"])
+        .select(["value", "v", "events"])
         .build()
         .expect("published scan builds")
         .to_arrow()
@@ -1786,6 +1861,7 @@ async fn rewrite_outputs_share_the_combined_source_layout() {
         vec![
             Field::new("value", DataType::Int64, false),
             variant_field("v", true),
+            events_field(),
         ],
         &[variant_batch(0, &docs[..10]), variant_batch(0, &docs[10..])],
     )
@@ -1888,6 +1964,7 @@ async fn standard_variant_layouts_round_trip_per_file() {
         vec![
             Field::new("value", DataType::Int64, false),
             variant_field("v", true),
+            events_field(),
         ],
         &[variant_batch(0, &docs[..2]), variant_batch(1, &docs[2..])],
     )

@@ -291,8 +291,9 @@ impl iceberg::arrow::ParquetFileReadPlanner for PublishedFileReadPlanner {
 #[cfg(test)]
 pub(super) mod tests {
     use arrow::array::{
-        Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
+        Array, ArrayRef, AsArray, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
     };
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use bytes::Bytes;
     use datafusion::common::DFSchema;
@@ -318,8 +319,19 @@ pub(super) mod tests {
         None,
     ];
 
+    /// The `attributes` of every fixture event, in row order: row 0 holds
+    /// two events, row 1 an event with a residual-only key and one with null
+    /// attributes; row 2's list is null and row 3's empty.
+    const EVENT_ATTRIBUTES: [Option<&str>; 4] = [
+        Some(r#"{"k":"v1","x":1}"#),
+        Some(r#"{"k":"v2"}"#),
+        Some(r#"{"x":2,"r":"only residual"}"#),
+        None,
+    ];
+
     /// The table schema every fixture file is read against: an id, a
-    /// nullable Struct `s{a, b}`, and a canonical unshredded Variant `v`.
+    /// nullable Struct `s{a, b}`, a canonical unshredded Variant `v`, and
+    /// span-shaped `events` whose elements hold a Variant `attributes`.
     pub(in crate::oracle) fn logical_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -335,33 +347,68 @@ pub(super) mod tests {
                 true,
             ),
             variant_field("v", true),
+            Field::new(
+                "events",
+                events_type(variant_field("attributes", true)),
+                true,
+            ),
         ]))
     }
 
+    /// The span-event shape: `List<Struct{name, attributes}>` whose element
+    /// is named `element`, as Iceberg names it, with `attributes` stored as
+    /// the given field.
+    fn events_type(attributes: Field) -> DataType {
+        DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(vec![Field::new("name", DataType::Utf8, true), attributes].into()),
+            true,
+        )))
+    }
+
+    /// The Variant of the JSON documents `json`, shredded on the object
+    /// keys and types of `shredding` when given, else unshredded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a document is not JSON or Arrow refuses the layout.
+    fn variant_of(json: &[Option<&str>], shredding: Option<[(&str, DataType); 2]>) -> ArrayRef {
+        let text: ArrayRef = Arc::new(StringArray::from(json.to_vec()));
+        let variant = json_to_variant(&text).expect("JSON documents encode");
+        let Some(shredding) = shredding else {
+            return variant.into();
+        };
+        let layout = shredding
+            .iter()
+            .try_fold(ShreddedSchemaBuilder::new(), |layout, (key, data_type)| {
+                layout.with_path(*key, data_type)
+            })
+            .expect("layout")
+            .build();
+        shred_variant(&variant, &layout).expect("shred").into()
+    }
+
     /// Writes one file holding [`DOCUMENTS`] with `v` shredded on `a: Int64`
-    /// and `b: Utf8` when `shredded`, else stored unshredded. Row 2's struct
+    /// and `b: Utf8`, and [`EVENT_ATTRIBUTES`] with `attributes` shredded on
+    /// `k: Utf8` and `x: Int64`, when `shredded`, else stored unshredded. Row 2's struct
     /// is null over a placeholder child. The footer proves the fixture tenant,
     /// so a hot leaf can read the file too, and fields carry the Iceberg field
-    /// ids `id` 1, `s` 2, `s.a` 3, `s.b` 4, and `v` 5, and `v` the Variant
+    /// ids `id` 1, `s` 2, `s.a` 3, `s.b` 4, `v` 5, `events` 6, its element
+    /// 7, `name` 8, and `attributes` 9, and the Variants the Variant
     /// extension, as published files do.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot be shredded or encoded.
     pub(in crate::oracle) fn write_file(shredded: bool) -> Bytes {
-        let text: ArrayRef = Arc::new(StringArray::from(DOCUMENTS.to_vec()));
-        let variant = json_to_variant(&text).expect("JSON documents encode");
-        let variant = if shredded {
-            let layout = ShreddedSchemaBuilder::new()
-                .with_path("a", &DataType::Int64)
-                .and_then(|layout| layout.with_path("b", &DataType::Utf8))
-                .expect("layout")
-                .build();
-            shred_variant(&variant, &layout).expect("shred")
-        } else {
-            variant
-        };
-        let variant: ArrayRef = variant.into();
+        let variant = variant_of(
+            &DOCUMENTS,
+            shredded.then_some([("a", DataType::Int64), ("b", DataType::Utf8)]),
+        );
+        let attributes = variant_of(
+            &EVENT_ATTRIBUTES,
+            shredded.then_some([("k", DataType::Utf8), ("x", DataType::Int64)]),
+        );
         let id = |field: Field, id: i32| {
             let mut metadata = field.metadata().clone();
             metadata.insert(
@@ -387,6 +434,36 @@ pub(super) mod tests {
             ],
             Some(vec![true, true, false, true].into()),
         );
+        let element = StructArray::new(
+            vec![
+                id(Field::new("name", DataType::Utf8, true), 8),
+                id(
+                    Field::new("attributes", attributes.data_type().clone(), true)
+                        .with_metadata(variant_field("attributes", true).metadata().clone()),
+                    9,
+                ),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("c"),
+                    None,
+                ])) as ArrayRef,
+                attributes,
+            ],
+            None,
+        );
+        let events = ListArray::new(
+            Arc::new(id(
+                Field::new("element", element.data_type().clone(), true),
+                7,
+            )),
+            OffsetBuffer::from_lengths([2, 2, 0, 0]),
+            Arc::new(element),
+            Some(vec![true, true, false, true].into()),
+        );
         let schema = Arc::new(Schema::new(vec![
             id(Field::new("id", DataType::Int64, false), 1),
             id(Field::new("s", structs.data_type().clone(), true), 2),
@@ -395,6 +472,7 @@ pub(super) mod tests {
                     .with_metadata(variant_field("v", true).metadata().clone()),
                 5,
             ),
+            id(Field::new("events", events.data_type().clone(), true), 6),
         ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -402,6 +480,7 @@ pub(super) mod tests {
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
                 Arc::new(structs),
                 variant,
+                Arc::new(events),
             ],
         )
         .expect("fixture batch");
@@ -579,7 +658,11 @@ pub(super) mod tests {
         let schema = logical_schema();
         let column = Arc::new(datafusion::physical_expr::expressions::Column::new("v", 2));
         let projection = ProjectionExprs::new([ProjectionExpr::new(
-            OracleVariantSql::shared().trimmed(column, paths),
+            OracleVariantSql::trimmed(
+                column,
+                &Arc::new(schema.field_with_name("v").expect("v").clone()),
+                paths.iter().cloned().collect(),
+            ),
             "v",
         )]);
         let reader =

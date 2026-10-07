@@ -1,16 +1,17 @@
-//! The literal paths a query reads from each Struct and Variant column,
-//! handed to the Oracle readers so they decode only those paths' leaves.
+//! The literal paths a query reads from each Struct, List, and Variant
+//! column, handed to the Oracle readers so they decode only those paths'
+//! leaves.
 //!
 //! [`LeafPathPushdown`] runs last among the physical optimizer rules of
 //! every Oracle session. It walks the plan from the root, works out how each
 //! column reaching an Oracle leaf is used, and gives the leaf the
-//! [`LeafPaths`] of every column used only through literal paths:
-//! literal-key `variant_get` calls on a Variant, `get_field` chains on a
-//! Struct. The leaf reads a trimmed Variant through
-//! `variant_unshred(v, paths...)`, which decodes `metadata` and those paths'
-//! leaves, and a trimmed Struct through [`StructTrim`], which reads just
-//! those fields. Any other use of a column, or an operator the walk does not
-//! see through, reads it whole.
+//! [`LeafPaths`] of every column used only through literal paths: chains of
+//! `get_field` on a Struct, `array_element` with a literal index on a List,
+//! and literal-key `variant_get` on a Variant, in any order the types
+//! allow, plus the same paths below an `unnest` of a List column. The leaf
+//! reads each such column through [`OracleVariantSql::trimmed`], which
+//! decodes only those paths' leaves. Any other use of a column, or an
+//! operator the walk does not see through, reads it whole.
 //!
 //! A remote placeholder carries its paths to the follower in its codec
 //! payload, where [`LeafPathPushdown::assign`] applies them to the
@@ -19,16 +20,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StructArray, make_array, new_null_array};
-use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{ScalarValue, internal_datafusion_err};
 use datafusion::error::Result;
-use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
-};
 use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
@@ -43,12 +38,13 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::unnest::UnnestExec;
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 use serde::{Deserialize, Serialize};
 use wyrd_types::variant::is_variant;
 
-use super::variant_sql::OracleVariantSql;
+use super::variant_sql::{OracleVariantSql, VARIANT_GET};
 
 /// The literal paths read from each trimmed Struct or Variant column of one
 /// scan.
@@ -66,16 +62,12 @@ impl LeafPaths {
 
     /// Returns the projection a reader evaluates over `schema`: each column
     /// as itself, except a trimmed column, read for its paths through
-    /// [`OracleVariantSql::trimmed`] when it is a Variant and through
-    /// [`StructTrim`] when it is a Struct.
+    /// [`OracleVariantSql::trimmed`].
     pub(crate) fn projection(&self, schema: &SchemaRef) -> ProjectionExprs {
         ProjectionExprs::new(schema.fields().iter().enumerate().map(|(index, field)| {
             let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), index));
             let expr = match self.0.get(field.name()) {
-                Some(paths) if is_variant(field) => OracleVariantSql::shared()
-                    .trimmed(column, &paths.iter().cloned().collect::<Vec<_>>()),
-                Some(paths) => StructTrim::expr(schema, index, paths)
-                    .expect("a Struct path read plans over its own schema"),
+                Some(paths) => OracleVariantSql::trimmed(column, field, paths.clone()),
                 None => column,
             };
             ProjectionExpr::new(expr, field.name())
@@ -109,202 +101,6 @@ impl LeafPaths {
     }
 }
 
-/// Internal name of [`StructTrim`].
-const STRUCT_TRIM: &str = "struct_trim";
-
-/// Rebuilds a Struct column at its full type from the `get_field` reads of
-/// only its literal paths.
-///
-/// Its arguments are one `get_field(column, path...)` per path, so the
-/// per-file plan decodes just those leaves, as for any field access, even
-/// when the file's Struct type differs from the table's. Every other child
-/// is a placeholder (null, or zero where the child is non-nullable), and a
-/// row is null only where a non-nullable child read is null. Only
-/// [`LeafPathPushdown`] places it, and only when every use of the column
-/// is one of its paths, which read the same values from the rebuilt Struct.
-/// Never registered as SQL.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct StructTrim {
-    /// The Struct field being rebuilt.
-    field: Arc<Field>,
-    /// The field-name path each argument reads, in argument order.
-    paths: Vec<Vec<String>>,
-    /// One `get_field` argument per path.
-    signature: Signature,
-}
-
-impl StructTrim {
-    /// Returns the read of the Struct `column`, at index `index` of
-    /// `schema`, through only `paths`.
-    ///
-    /// Each path is cut where it leaves nested Structs, so a path into a Map
-    /// or List child reads that child whole.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `DataFusion` error raised when a `get_field` read does
-    /// not plan over `schema`.
-    fn expr(
-        schema: &Schema,
-        index: usize,
-        paths: &BTreeSet<Vec<String>>,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let field = Arc::clone(&schema.fields()[index]);
-        let paths = paths
-            .iter()
-            .map(|path| {
-                let mut level = field.data_type();
-                path.iter()
-                    .take_while(|name| {
-                        let DataType::Struct(fields) = level else {
-                            return false;
-                        };
-                        fields.find(name).is_some_and(|(_, child)| {
-                            level = child.data_type();
-                            true
-                        })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|path| !path.is_empty())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), index));
-        let args = paths
-            .iter()
-            .map(|path| {
-                let mut args = vec![Arc::clone(&column)];
-                args.extend(path.iter().map(|name| {
-                    Arc::new(Literal::new(ScalarValue::from(name.as_str())))
-                        as Arc<dyn PhysicalExpr>
-                }));
-                Ok(Arc::new(ScalarFunctionExpr::try_new(
-                    datafusion::functions::core::get_field(),
-                    args,
-                    schema,
-                    Arc::new(ConfigOptions::default()),
-                )?) as Arc<dyn PhysicalExpr>)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(ScalarFunctionExpr::new(
-            STRUCT_TRIM,
-            Arc::new(ScalarUDF::new_from_impl(Self {
-                field: Arc::clone(&field),
-                paths,
-                signature: Signature::variadic_any(Volatility::Immutable),
-            })),
-            args,
-            field,
-            Arc::new(ConfigOptions::default()),
-        )))
-    }
-
-    /// Builds a Struct of `fields` from `reads`, each the remaining path of
-    /// one read and its values.
-    ///
-    /// # Errors
-    ///
-    /// Returns the Arrow error raised when a placeholder or the Struct is
-    /// invalid.
-    fn rebuild(fields: &Fields, reads: &[(&[String], &ArrayRef)], len: usize) -> Result<ArrayRef> {
-        let mut nulls = None;
-        let children = fields
-            .iter()
-            .map(|field| {
-                let under = reads
-                    .iter()
-                    .filter_map(|(path, values)| {
-                        let (name, tail) = path.split_first()?;
-                        (name == field.name()).then_some((tail, *values))
-                    })
-                    .collect::<Vec<_>>();
-                let child =
-                    if let Some((_, values)) = under.iter().find(|(tail, _)| tail.is_empty()) {
-                        Arc::clone(values)
-                    } else if let (DataType::Struct(children), false) =
-                        (field.data_type(), under.is_empty())
-                    {
-                        Self::rebuild(children, &under, len)?
-                    } else {
-                        return Self::placeholder(field, len);
-                    };
-                if !field.is_nullable() {
-                    nulls = NullBuffer::union(nulls.as_ref(), child.logical_nulls().as_ref());
-                }
-                Ok(child)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(StructArray::try_new(
-            fields.clone(),
-            children,
-            nulls,
-        )?))
-    }
-
-    /// A never-read stand-in for `field`: all null, or for a non-nullable
-    /// field the same zeroed values with no null buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns the Arrow error raised when the zeroed data is invalid.
-    fn placeholder(field: &Field, len: usize) -> Result<ArrayRef> {
-        let nulls = new_null_array(field.data_type(), len);
-        if field.is_nullable() {
-            return Ok(nulls);
-        }
-        Ok(make_array(
-            nulls.into_data().into_builder().nulls(None).build()?,
-        ))
-    }
-}
-
-impl ScalarUDFImpl for StructTrim {
-    /// The internal name readers project.
-    fn name(&self) -> &str {
-        STRUCT_TRIM
-    }
-
-    /// One `get_field` argument per path.
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    /// The rebuilt Struct's full type.
-    ///
-    /// # Errors
-    ///
-    /// Never fails.
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(self.field.data_type().clone())
-    }
-
-    /// Rebuilds every row at the full type from the path reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error [`StructTrim::rebuild`] raises, or an internal error
-    /// when the rebuilt column is not a Struct.
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let DataType::Struct(fields) = self.field.data_type() else {
-            return Err(internal_datafusion_err!("struct_trim rebuilds a Struct"));
-        };
-        let values = ColumnarValue::values_to_arrays(&args.args)?;
-        let reads = self
-            .paths
-            .iter()
-            .map(Vec::as_slice)
-            .zip(&values)
-            .collect::<Vec<_>>();
-        Ok(ColumnarValue::Array(Self::rebuild(
-            fields,
-            &reads,
-            args.number_rows,
-        )?))
-    }
-}
-
 /// How the operators above use one column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Demand {
@@ -329,24 +125,28 @@ impl Demand {
         };
     }
 
+    /// Merges `used` into the use of column `index` of `columns`; an index
+    /// outside `columns` is ignored.
+    fn merge_at(columns: &mut [Self], index: usize, used: Self) {
+        if let Some(slot) = columns.get_mut(index) {
+            slot.merge(used);
+        }
+    }
+
     /// Records every column use inside `expr`, evaluated over `schema`, into
     /// `columns`.
     ///
-    /// A literal path over a column of its kind uses that path: a
-    /// literal-key `variant_get` over a Variant column, or a literal
-    /// `get_field` chain over a Struct column. Any other column reference
-    /// uses the whole column.
+    /// A literal path over a column (see [`Self::path`]) uses that path. Any
+    /// other column reference uses the whole column.
     fn collect(expr: &Arc<dyn PhysicalExpr>, schema: &Schema, columns: &mut [Self]) {
-        if let Some((column, keys)) = Self::path(expr, schema) {
-            if let Some(demand) = columns.get_mut(column.index()) {
-                demand.merge(Self::Paths(BTreeSet::from([keys])));
-            }
+        if let Some((column, path, _)) = Self::path(expr, schema)
+            && !path.is_empty()
+        {
+            Self::merge_at(columns, column.index(), Self::Paths(BTreeSet::from([path])));
             return;
         }
         if let Some(column) = expr.downcast_ref::<Column>() {
-            if let Some(demand) = columns.get_mut(column.index()) {
-                demand.merge(Self::Whole);
-            }
+            Self::merge_at(columns, column.index(), Self::Whole);
             return;
         }
         for child in expr.children() {
@@ -354,48 +154,61 @@ impl Demand {
         }
     }
 
-    /// Returns the column and literal path of `expr` when it reads one path
-    /// of a column of the matching kind in `schema`.
+    /// Returns the column `expr` reads, the literal path it reads, and the
+    /// field at the end of that path, when `expr` is a column or a literal
+    /// path over one in `schema`.
+    ///
+    /// Each step must fit the type it applies to: `get_field` names a child
+    /// of a Struct that is not a Variant, `array_element` with a literal
+    /// index enters a List element and records the element field's name, and
+    /// `variant_get` with literal string keys reads object keys of a Variant.
     fn path<'e>(
         expr: &'e Arc<dyn PhysicalExpr>,
         schema: &Schema,
-    ) -> Option<(&'e Column, Vec<String>)> {
-        let field = |column: &Column| schema.fields().get(column.index());
-        if let Some((column, keys)) = OracleVariantSql::literal_key_path(expr) {
-            return field(column)
-                .is_some_and(|field| is_variant(field))
-                .then_some((column, keys));
+    ) -> Option<(&'e Column, Vec<String>, FieldRef)> {
+        if let Some(column) = expr.downcast_ref::<Column>() {
+            return Some((
+                column,
+                Vec::new(),
+                Arc::clone(schema.fields().get(column.index())?),
+            ));
         }
-        let (column, names) = Self::field_path(expr)?;
-        field(column)
-            .is_some_and(|field| {
-                matches!(field.data_type(), DataType::Struct(_)) && !is_variant(field)
-            })
-            .then_some((column, names))
-    }
-
-    /// Returns the column and names of `expr` when it is a `get_field` chain
-    /// over a column with only literal string names.
-    fn field_path(expr: &Arc<dyn PhysicalExpr>) -> Option<(&Column, Vec<String>)> {
         let call = expr.downcast_ref::<ScalarFunctionExpr>()?;
-        if call.name() != "get_field" {
-            return None;
+        let (base, steps) = call.args().split_first()?;
+        let (column, mut path, mut field) = Self::path(base, schema)?;
+        match call.name() {
+            "get_field" if !is_variant(&field) => {
+                for name in OracleVariantSql::literal_keys(steps)? {
+                    let DataType::Struct(children) = field.data_type() else {
+                        return None;
+                    };
+                    field = Arc::clone(children.find(&name)?.1);
+                    path.push(name);
+                }
+            }
+            "array_element" => {
+                let [index] = steps else {
+                    return None;
+                };
+                let (DataType::List(element), true) = (
+                    field.data_type(),
+                    index
+                        .downcast_ref::<Literal>()?
+                        .value()
+                        .data_type()
+                        .is_integer(),
+                ) else {
+                    return None;
+                };
+                path.push(element.name().clone());
+                field = Arc::clone(element);
+            }
+            VARIANT_GET if is_variant(&field) => {
+                path.extend(OracleVariantSql::literal_keys(steps)?);
+            }
+            _ => return None,
         }
-        let (base, names) = call.args().split_first()?;
-        let (column, mut path) = match base.downcast_ref::<Column>() {
-            Some(column) => (column, Vec::new()),
-            None => Self::field_path(base)?,
-        };
-        for name in names {
-            path.push(
-                name.downcast_ref::<Literal>()?
-                    .value()
-                    .try_as_str()
-                    .flatten()?
-                    .to_owned(),
-            );
-        }
-        (!names.is_empty()).then_some((column, path))
+        Some((column, path, field))
     }
 }
 
@@ -483,14 +296,15 @@ impl LeafPathPushdown {
             let mut input = vec![Demand::Unused; projection.input().schema().fields().len()];
             for (expr, used) in projection.expr().iter().zip(demand) {
                 match expr.expr.downcast_ref::<Column>() {
-                    Some(column) => {
-                        if let Some(slot) = input.get_mut(column.index()) {
-                            slot.merge(used);
-                        }
-                    }
+                    Some(column) => Demand::merge_at(&mut input, column.index(), used),
                     None => Demand::collect(&expr.expr, &projection.input().schema(), &mut input),
                 }
             }
+            vec![input]
+        } else if let Some(input) = plan
+            .downcast_ref::<UnnestExec>()
+            .and_then(|unnest| Self::unnest_input(unnest, &demand))
+        {
             vec![input]
         } else if Self::keeps_columns(&plan) {
             let projected = plan.downcast_ref::<FilterExec>().and_then(|filter| {
@@ -503,9 +317,7 @@ impl LeafPathPushdown {
                 Some((width, indices)) => {
                     let mut input = vec![Demand::Unused; width];
                     for (&index, used) in indices.iter().zip(demand) {
-                        if let Some(slot) = input.get_mut(index) {
-                            slot.merge(used);
-                        }
+                        Demand::merge_at(&mut input, index, used);
                     }
                     input
                 }
@@ -535,6 +347,50 @@ impl LeafPathPushdown {
             return Ok(plan);
         }
         datafusion::physical_plan::execution_plan::replace_children_if_necessary(plan, children)
+    }
+
+    /// Returns the use of each input column of `unnest` given the use
+    /// `demand` of its outputs, or `None` when its outputs are not its input
+    /// columns one for one.
+    ///
+    /// That holds when it unnests only List columns, each once and one level
+    /// deep: every output is its input column, an unnested one replaced by
+    /// its elements. A path on an element output is the same path below the
+    /// List element on the input. Any other use of an unnested column reads
+    /// it whole, since its lists decide how many rows come out.
+    fn unnest_input(unnest: &UnnestExec, demand: &[Demand]) -> Option<Vec<Demand>> {
+        let schema = unnest.input().schema();
+        if !unnest.struct_column_indices().is_empty()
+            || schema.fields().len() != demand.len()
+            || unnest
+                .list_column_indices()
+                .iter()
+                .any(|list| list.depth != 1)
+        {
+            return None;
+        }
+        let mut input = demand.to_vec();
+        for list in unnest.list_column_indices() {
+            let DataType::List(element) = schema.field(list.index_in_input_schema).data_type()
+            else {
+                return None;
+            };
+            let slot = input.get_mut(list.index_in_input_schema)?;
+            *slot = match slot {
+                Demand::Paths(paths) => Demand::Paths(
+                    paths
+                        .iter()
+                        .map(|path| {
+                            std::iter::once(element.name().clone())
+                                .chain(path.iter().cloned())
+                                .collect()
+                        })
+                        .collect(),
+                ),
+                _ => Demand::Whole,
+            };
+        }
+        Some(input)
     }
 
     /// Returns whether every output column of `plan` is the same column of
@@ -605,7 +461,7 @@ impl LeafPathPushdown {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{AsArray, RecordBatch};
+    use arrow::array::{Array, AsArray, RecordBatch};
     use datafusion::common::tree_node::{Transformed, TreeNode as _};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
@@ -618,6 +474,7 @@ mod tests {
     use super::super::nested_pushdown::tests::{decoded_leaves, logical_schema, read, write_file};
     use super::super::nested_pushdown::{FileReadPlan, PublishedFileReadPlanner};
     use super::*;
+    use bytes::Bytes;
 
     /// Plans `sql` with stock `DataFusion` over an in-memory copy of the
     /// fixture, then swaps the scan for a hot leaf over the shredded fixture
@@ -773,10 +630,10 @@ mod tests {
         paths(&[("v", keys)])
     }
 
-    /// Literal-key reads and Struct field reads in outputs, filters, sort
-    /// keys, nested chains, and under sorts, limits, and grouping trim the
-    /// scan to their
-    /// paths, and every trimmed plan returns exactly the rows stock
+    /// Literal-key reads, Struct field reads, List element reads at a
+    /// literal index, and the same paths on `unnest` elements, in outputs,
+    /// filters, sort keys, nested chains, and under sorts, limits, and
+    /// grouping trim the scan to their paths, and every trimmed plan returns exactly the rows stock
     /// `DataFusion` returns.
     ///
     /// # Panics
@@ -784,7 +641,36 @@ mod tests {
     /// Panics when a scan receives other paths or any row differs.
     #[tokio::test]
     async fn literal_key_reads_trim_the_scan_and_match_stock_datafusion() {
-        let cases: [(&str, LeafPaths); 10] = [
+        let cases: [(&str, LeafPaths); 16] = [
+            (
+                "SELECT events[1] FROM t ORDER BY id",
+                paths(&[("events", &[&["element"]])]),
+            ),
+            (
+                "SELECT events[1]['attributes'] ->> 'k' FROM t ORDER BY id",
+                paths(&[("events", &[&["element", "attributes", "k"]])]),
+            ),
+            (
+                "SELECT events[2]['name'], events[1]['attributes'] FROM t ORDER BY id",
+                paths(&[(
+                    "events",
+                    &[&["element", "name"], &["element", "attributes"]],
+                )]),
+            ),
+            (
+                "SELECT id FROM t WHERE events[1]['attributes'] ->> 'x' = '1' ORDER BY id",
+                paths(&[("events", &[&["element", "attributes", "x"]])]),
+            ),
+            (
+                "SELECT id, u['attributes'] ->> 'k' AS k \
+                 FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, k",
+                paths(&[("events", &[&["element", "attributes", "k"]])]),
+            ),
+            (
+                "SELECT id, u['name'] AS name \
+                 FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, name",
+                paths(&[("events", &[&["element", "name"]])]),
+            ),
             (
                 "SELECT s['b'] FROM t ORDER BY id",
                 paths(&[("s", &[&["b"]])]),
@@ -830,10 +716,10 @@ mod tests {
         }
     }
 
-    /// A bare Variant or Struct use, a non-literal key, an array index, or a
-    /// path used
-    /// above an operator the walk does not see through reads the column
-    /// whole, alone or beside literal-key reads, and the rows equal stock
+    /// A bare Variant, Struct, or List use, a
+    /// non-literal key or List index, a Variant array index, an `unnest`
+    /// whose elements are used whole or not at all, or a path used above an
+    /// operator the walk does not see through reads the column whole, alone or beside literal-key reads, and the rows equal stock
     /// `DataFusion`'s. A window is such an operator: `DataFusion` does not
     /// move a path below it.
     ///
@@ -852,6 +738,11 @@ mod tests {
             "SELECT s FROM t ORDER BY id",
             "SELECT s['b'] FROM t WHERE s IS NOT NULL ORDER BY id",
             "SELECT id, v ->> 'a', row_number() OVER (ORDER BY v ->> 'b', id) FROM t ORDER BY id",
+            "SELECT events FROM t ORDER BY id",
+            "SELECT events[id]['name'] FROM t ORDER BY id",
+            "SELECT events[1]['attributes'] ->> 'k', events FROM t ORDER BY id",
+            "SELECT id, u FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, u['name']",
+            "SELECT id FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id",
         ] {
             let (paths, actual, stock) = trimmed_and_stock(sql).await;
             assert_eq!(paths, LeafPaths::default(), "{sql}");
@@ -859,34 +750,80 @@ mod tests {
         }
     }
 
-    /// Rows of `s['b']` and of `v ->> 'a'` from `batch`: what the two paths
-    /// read. The rebuilt Struct's own nulls are not among them; no path
-    /// reads them.
+    /// Rows of `s['b']`, of `v ->> 'a'`, and of every event's
+    /// `attributes ->> 'k'` from `batch`: what the three paths read. The
+    /// rebuilt Struct's own nulls are not among them; no path reads them.
     ///
     /// # Panics
     ///
     /// Panics when `batch` lacks a column or a path does not evaluate.
     fn read_values(batch: &RecordBatch) -> (Vec<Option<String>>, String) {
-        let s = batch.column_by_name("s").expect("s").as_struct();
-        let b = s.column_by_name("b").expect("s.b").as_string::<i32>();
-        let b = (0..s.len())
-            .map(|row| (s.is_valid(row) && b.is_valid(row)).then(|| b.value(row).to_owned()))
+        let structs = batch.column_by_name("s").expect("s").as_struct();
+        let child = structs.column_by_name("b").expect("s.b").as_string::<i32>();
+        let b = (0..structs.len())
+            .map(|row| {
+                (structs.is_valid(row) && child.is_valid(row)).then(|| child.value(row).to_owned())
+            })
             .collect();
+        let key = |variant: &dyn Array, row: usize, key: &str| {
+            wyrd_queue::variant::variant_cell_to_json(variant, row)
+                .expect("variant")
+                .get(key)
+                .cloned()
+        };
         let v = batch.column_by_name("v").expect("v");
         let a = (0..v.len())
+            .map(|row| key(v.as_ref(), row, "a"))
+            .collect::<Vec<_>>();
+        let events = batch
+            .column_by_name("events")
+            .expect("events")
+            .as_list::<i32>();
+        let k = (0..events.len())
             .map(|row| {
-                wyrd_queue::variant::variant_cell_to_json(v.as_ref(), row)
-                    .expect("variant")
-                    .get("a")
-                    .cloned()
+                events.is_valid(row).then(|| {
+                    let elements = events.value(row);
+                    let attributes = elements
+                        .as_struct()
+                        .column_by_name("attributes")
+                        .expect("attributes");
+                    (0..attributes.len())
+                        .map(|element| key(attributes.as_ref(), element, "k"))
+                        .collect::<Vec<_>>()
+                })
             })
             .collect::<Vec<_>>();
-        (b, format!("{a:?}"))
+        (b, format!("{a:?} {k:?}"))
     }
 
-    /// A Struct read for one field on a hot file decodes only that field's
-    /// leaf and reads the same field values as a whole read; a Variant path
-    /// beside it decodes only its own leaves.
+    /// The paths every trimmed-read test reads: one Struct field, one
+    /// Variant key, and one key of the Variant inside every List element.
+    fn trimmed_paths() -> LeafPaths {
+        paths(&[
+            ("s", &[&["b"]]),
+            ("v", &[&["a"]]),
+            ("events", &[&["element", "attributes", "k"]]),
+        ])
+    }
+
+    /// The Parquet leaves [`trimmed_paths`] decode from a shredded fixture
+    /// file: `id` whole, `s.b`, and for each Variant its `metadata` and the
+    /// key's shredded subtree, not the event `name`, the other shredded key
+    /// `x`, or either residual `value`.
+    const TRIMMED_LEAVES: [&str; 8] = [
+        "id",
+        "s.b",
+        "v.metadata",
+        "v.typed_value.a.value",
+        "v.typed_value.a.typed_value",
+        "events.list.element.attributes.metadata",
+        "events.list.element.attributes.typed_value.k.value",
+        "events.list.element.attributes.typed_value.k.typed_value",
+    ];
+
+    /// A hot read of a Struct field, a Variant key, and a key of the Variant
+    /// inside every List element decodes only those paths' leaves, and reads
+    /// the same values as a whole read of an all-residual file.
     ///
     /// # Panics
     ///
@@ -894,35 +831,27 @@ mod tests {
     #[test]
     fn trimmed_struct_reads_only_its_paths_leaves() {
         let schema = logical_schema();
-        let file = write_file(true);
-        let footer =
-            ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).expect("valid footer");
-        let plan = |paths: &LeafPaths| {
+        let plan = |file: &Bytes, paths: &LeafPaths| {
+            let footer =
+                ArrowReaderMetadata::load(file, ArrowReaderOptions::new()).expect("valid footer");
             FileReadPlan::new(&footer, &schema, paths.projection(&schema), None, 20)
                 .expect("per-file plan")
         };
-        let trimmed_paths = paths(&[("s", &[&["b"]]), ("v", &[&["a"]])]);
-        let trimmed = plan(&trimmed_paths);
-        assert_eq!(
-            decoded_leaves(&file, &trimmed),
-            [
-                "id",
-                "s.b",
-                "v.metadata",
-                "v.typed_value.a.value",
-                "v.typed_value.a.typed_value",
-            ]
-        );
-        let whole = plan(&LeafPaths::default());
+        let file = write_file(true);
+        let trimmed = plan(&file, &trimmed_paths());
+        assert_eq!(decoded_leaves(&file, &trimmed), TRIMMED_LEAVES);
+        let residual = write_file(false);
+        let whole = plan(&residual, &LeafPaths::default());
         assert_eq!(
             read_values(&read(&file, trimmed)),
-            read_values(&read(&file, whole))
+            read_values(&read(&residual, whole))
         );
     }
 
-    /// A published file read through the Iceberg reader with a Struct field
-    /// and a Variant path decodes only their leaves, and the paths read the
-    /// same values as from a whole read.
+    /// A published file read through the Iceberg reader with a Struct
+    /// field, a Variant key, and a key of the Variant inside every List
+    /// element decodes only their leaves, and the paths read the same values
+    /// as a whole published read of an all-residual file.
     ///
     /// # Panics
     ///
@@ -932,50 +861,31 @@ mod tests {
     async fn published_reads_decode_only_struct_and_variant_paths() {
         use futures_util::TryStreamExt as _;
         use iceberg::arrow::ParquetFileReadPlanner as _;
-        use iceberg::spec::{NestedField, PrimitiveType, StructType, Type, VariantType};
 
         let directory = tempfile::tempdir().expect("fixture directory");
         let path = directory.path().join("published.parquet");
         let file = write_file(true);
         std::fs::write(&path, &file).expect("fixture file");
+        let residual_path = directory.path().join("residual.parquet");
+        let residual = write_file(false);
+        std::fs::write(&residual_path, &residual).expect("fixture file");
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        1,
-                        "id",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        2,
-                        "s",
-                        Type::Struct(StructType::new(vec![
-                            Arc::new(NestedField::required(
-                                3,
-                                "a",
-                                Type::Primitive(PrimitiveType::Long),
-                            )),
-                            Arc::new(NestedField::optional(
-                                4,
-                                "b",
-                                Type::Primitive(PrimitiveType::String),
-                            )),
-                        ])),
-                    )),
-                    Arc::new(NestedField::optional(5, "v", Type::Variant(VariantType))),
-                ])
-                .build()
-                .expect("task schema"),
+            iceberg::arrow::arrow_schema_to_schema(
+                ArrowReaderMetadata::load(&residual, ArrowReaderOptions::new())
+                    .expect("valid footer")
+                    .schema(),
+            )
+            .expect("the fixture carries every field id"),
         );
-        let read = |paths: LeafPaths| {
+        let read = |path: &std::path::Path, paths: LeafPaths| {
             let task = iceberg::scan::FileScanTask::builder()
-                .with_file_size_in_bytes(std::fs::metadata(&path).expect("size").len())
+                .with_file_size_in_bytes(std::fs::metadata(path).expect("size").len())
                 .with_start(0)
                 .with_length(0)
                 .with_data_file_path(path.to_string_lossy().into_owned())
                 .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
                 .with_schema(Arc::clone(&iceberg_schema))
-                .with_project_field_ids(vec![1, 2, 5])
+                .with_project_field_ids(vec![1, 2, 5, 6])
                 .with_case_sensitive(false)
                 .build();
             let planner = PublishedFileReadPlanner::new(logical_schema(), None, paths, 20);
@@ -995,14 +905,11 @@ mod tests {
                 arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat")
             }
         };
-        let trimmed_paths = paths(&[("s", &[&["b"]]), ("v", &[&["a"]])]);
-
         let footer =
             ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).expect("valid footer");
-        let narrowing =
-            PublishedFileReadPlanner::new(logical_schema(), None, trimmed_paths.clone(), 20)
-                .plan(&footer, vec![0])
-                .expect("narrowing");
+        let narrowing = PublishedFileReadPlanner::new(logical_schema(), None, trimmed_paths(), 20)
+            .plan(&footer, vec![0])
+            .expect("narrowing");
         let mask = narrowing.projection.expect("trimmed mask");
         let descriptor = footer.metadata().file_metadata().schema_descr();
         assert_eq!(
@@ -1010,15 +917,9 @@ mod tests {
                 .filter(|&leaf| mask.leaf_included(leaf))
                 .map(|leaf| descriptor.column(leaf).path().string())
                 .collect::<Vec<_>>(),
-            [
-                "id",
-                "s.b",
-                "v.metadata",
-                "v.typed_value.a.value",
-                "v.typed_value.a.typed_value",
-            ]
+            TRIMMED_LEAVES
         );
-        let whole = read_values(&read(LeafPaths::default()).await);
-        assert_eq!(read_values(&read(trimmed_paths).await), whole);
+        let whole = read_values(&read(&residual_path, LeafPaths::default()).await);
+        assert_eq!(read_values(&read(&path, trimmed_paths()).await), whole);
     }
 }

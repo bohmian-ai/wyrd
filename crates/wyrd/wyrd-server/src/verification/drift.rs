@@ -1267,10 +1267,11 @@ mod tests {
     /// Panics when a stored profile decodes or is refused with another code.
     #[test]
     fn decode_refuses_missing_and_legacy_baselines() {
-        let refused = |fitted| match FittedBaselines::decode(fitted) {
-            Err(EngineOutcome::Terminal(_, error)) => error.code,
-            Err(_) => panic!("a refusal is terminal"),
-            Ok(_) => panic!("the baseline decoded"),
+        let refused = |fitted| {
+            let Err(EngineOutcome::Terminal(_, error)) = FittedBaselines::decode(fitted) else {
+                panic!("the baseline is refused as terminal");
+            };
+            error.code
         };
 
         assert_eq!(refused(None), BASELINE_NOT_READY);

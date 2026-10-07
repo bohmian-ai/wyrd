@@ -1,5 +1,6 @@
 //! Uniform Parquet writer properties for Bifrost data files.
 
+use iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
@@ -82,6 +83,23 @@ pub fn bifrost_writer_properties_with_metadata(
     }
     builder.build()
 }
+
+/// How every final Bifrost object chooses its shredded Variant layout.
+///
+/// Scribe's final hot objects and every Forge output each retain a prefix of
+/// at most 4,096 rows or 64 MiB of Arrow memory, then shred fields seen in at
+/// least 10% of sampled non-null roots, tracking 1,000 and keeping 300
+/// children per object node to depth 50. These are internal policy constants,
+/// never table, wire, or user configuration. Scribe recovery-stage runs are
+/// never shredded.
+pub const BIFROST_VARIANT_SHREDDING: VariantShreddingPolicy = VariantShreddingPolicy {
+    max_rows: 4_096,
+    max_bytes: 64 * 1024 * 1024,
+    min_frequency_percent: 10,
+    max_tracked_children: 1_000,
+    max_emitted_children: 300,
+    max_depth: 50,
+};
 
 /// Parquet properties for a Forge rewrite output at a table's row-group target.
 ///

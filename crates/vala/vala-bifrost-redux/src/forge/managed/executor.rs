@@ -302,6 +302,9 @@ impl ForgeManagedRewrite {
             &mut position_deletes,
             &mut equality_deletes,
         );
+        let _variant_prefixes = self
+            .reserve_variant_prefixes()
+            .map_err(|error| self.attach_possible_outputs(error))?;
         let result = match compaction.rewrite(planned.plan, table).await {
             Ok(result) => result,
             Err(error) => return Err(self.classify_core_failure(&error)),
@@ -333,6 +336,37 @@ impl ForgeManagedRewrite {
             output_data_files,
         )
         .map_err(|error| self.attach_possible_outputs(error))
+    }
+
+    /// Charges one Variant layout prefix per output stream before a plan runs.
+    ///
+    /// Each output writer retains up to
+    /// [`BIFROST_VARIANT_SHREDDING`](crate::parquet::BIFROST_VARIANT_SHREDDING)`.max_bytes`
+    /// of rows before it chooses its layout, and a plan runs at most
+    /// [`RUNNER_MAX_PARALLELISM`](super::policy::RUNNER_MAX_PARALLELISM) output
+    /// streams with one open output each. The charge is taken from the attempt's
+    /// governed pool and is released exactly once when the returned reservation
+    /// drops, on success, error, or cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Capacity`] when the shared cap cannot hold the
+    /// prefixes, which releases the attempt without consuming retry budget.
+    fn reserve_variant_prefixes(
+        &self,
+    ) -> Result<datafusion::execution::memory_pool::MemoryReservation, ForgeError> {
+        let reservation =
+            datafusion::execution::memory_pool::MemoryConsumer::new("forge-variant-prefix")
+                .register(&self.context.runtime_env().memory_pool);
+        reservation
+            .try_grow(
+                super::policy::RUNNER_MAX_PARALLELISM
+                    * crate::parquet::BIFROST_VARIANT_SHREDDING.max_bytes,
+            )
+            .map_err(|error| ForgeError::Capacity {
+                detail: format!("Forge cannot hold its Variant layout prefixes: {error}"),
+            })?;
+        Ok(reservation)
     }
 
     /// Classifies one core failure for a single plan runner.

@@ -29,7 +29,7 @@ use crate::forge::error::ForgeError;
 use crate::forge::settings::ForgeCompactionType;
 
 /// `RisingWave`'s compactor runner `max_parallelism` default.
-const RUNNER_MAX_PARALLELISM: usize = 4;
+pub(crate) const RUNNER_MAX_PARALLELISM: usize = 4;
 
 /// `RisingWave`'s compactor runner `min_size_per_partition` default (1 GiB).
 const RUNNER_MIN_SIZE_PER_PARTITION: u64 = 1024 * 1024 * 1024;
@@ -376,6 +376,7 @@ impl ForgeTablePolicy {
                 bloom_columns,
                 tenant,
             ))
+            .variant_shredding(crate::parquet::BIFROST_VARIANT_SHREDDING)
             // One runner executes exactly one plan, so the core's own
             // multi-plan concurrency is never used. Memory and spill are left
             // unset here because they come from the attempt's governed

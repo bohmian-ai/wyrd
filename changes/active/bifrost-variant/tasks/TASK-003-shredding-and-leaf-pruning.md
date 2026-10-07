@@ -149,13 +149,38 @@ Each status was found by searching the tree for that scenario's named tests.
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| 1. Only final output files infer a bounded standard layout | **Not started** | No analyzer or `VariantParquetWriterBuilder` in the iceberg-rust fork; no shredding in `scribe/` or `forge/`; tests `recovery_runs_are_unshredded_and_final_objects_infer` and `variant_inference_memory_releases_on_every_terminal` absent |
+| 1. Only final output files infer a bounded standard layout | **Implemented, not pushed** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70` (Variant writer on top of `bee81f957`), iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`; Wyrd changes uncommitted. Evidence and new items below |
 | 2. Recovery and compaction preserve standard logical values | **Not started** | `variant_staging_restores_and_publishes_once`, `rolled_outputs_infer_independent_variant_layouts` and `standard_variant_layouts_round_trip_per_file` absent |
 | 3. Distinct logical semantics share physical pushdown | **Partly done** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`. The DataFusion fork per-file read plan (`per_file_plan_covers_projection_filter_and_pruning` in the fork) and `oracle::nested_pushdown::tests::both_readers_use_shared_per_file_plan` exist. The journey `published::struct_and_variant_share_physical_pushdown` is absent. |
 | 4. Unsigned distributed predicates preserve authority | **Partly done** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). The journeys `distributed::unsigned_leaf_predicates_round_trip_and_execute` and MCP `sensitive_variant_leaf_is_denied_before_io` are absent. |
 | Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
 
 After the merge, resume shredding at Scenario 1.
+
+#### Scenario 1 evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Recovery runs unshredded; final hot objects infer | `encode_batch` passes no policy; `encode_ordered_claim` passes `BIFROST_VARIANT_SHREDDING` (`scribe/parquet_writer.rs`) | focused command 1: 2 passed | PASS |
+| Prefix charged while retained, released once on success/error/retry | Leases held beside `VariantPrefix` in `RollingArtifactWriter::pending`; dropped after replay or with the writer | focused command 1 | PASS |
+| Forge outputs infer fresh per rolled file | `VariantParquetWriterBuilder` in iceberg-rust; compaction-core wraps its `ParquetWriterBuilder` | focused command 2: passed; iceberg writer+arrow 299 passed; compaction core 152 passed | PASS |
+| Forge reservation covers every open output's prefix | `ForgeManagedExecutor::reserve_variant_prefixes` reserves `RUNNER_MAX_PARALLELISM` × 64 MiB before `rewrite` | `cargo check`; redux lib 857 passed (Postgres wrapper) | PASS |
+| Bounds, 10%, caps, widening, incompatible, arrays, depth, order, short/empty close | fork `variant_shredding::tests` (11) | `cargo nextest -p iceberg --lib` | PASS |
+| Lints and boundaries | — | `mise run fmt` 0; redux clippy `--all-features --all-targets -D warnings` 0; `check:workspace-hack` 0; `check:client-tier` 0; `git diff --check` 0 | PASS |
+
+Known limit: a first batch that alone crosses 64 MiB is retained whole (and
+charged whole), not cut to one row. Both memory measures count a slice's
+shared buffers in full, so a per-row cut cannot be measured.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `VariantShreddingPolicy`, `VariantLayout`, `VariantPrefix`, `PrefixStep`, `ReadyPrefix` (iceberg-rust) | iceberg writer, Arrow `parquet::variant` | Arrow offers `shred_variant`/`ShreddedSchemaBuilder` but no inference; one shared analyzer for Scribe and Forge |
+| `VariantParquetWriterBuilder`/`VariantParquetWriter` (iceberg-rust) | `ParquetWriterBuilder`, `RollingFileWriterBuilder` | the task names it; wraps the ordinary builder |
+| `ParquetWriterBuilder::with_physical_schema` | iceberg writer | Iceberg had no way to write a physical schema differing from the logical one |
+| `IcebergExecutionConfig::variant_shredding` (compaction) | compaction config | carries the policy into the writer |
+| `BIFROST_VARIANT_SHREDDING` | `parquet/writer_properties.rs` | the one Bifrost policy value |
+| `RUNNER_MAX_PARALLELISM` | `forge/managed/policy.rs` | was an inline literal; now shared with the reservation |
+| `reserve_variant_prefixes`, `open_inferred`, `write_open`, `roll_if_due`, `variant_error` | `RollingArtifactWriter`, Forge executor | split of the existing write/roll path so replay rolls once |
 
 ### Arrow 60 upgrade (user decision, before Scenario 1)
 
@@ -178,7 +203,7 @@ replace the old revisions; the workspace-hack is regenerated; the
 resolves 0.14.2). Code changes: `Field::with_metadata` takes the map
 directly; `TableProvider::scan` takes `Option<&[usize]>`; two test helpers
 read offset indexes through `page_index_for_row_group`.
-`verify:bifrost`: exit 0 on the Arrow 60 tree (2026-10-07), after fixing five stale tests; diagnoses in `../diagnostics/README.md`.
+`verify:bifrost`: exit 0 on the Arrow 60 tree (2026-10-07), after fixing five stale tests; diagnoses in `../diagnostics/README.md`. Pushed as Wyrd `f84ca165a`.
 
 Open follow-up (recorded at the merge, not done): JSON-row → Arrow value
 conversion (`build_list`, `build_map`, timestamp parsing run by

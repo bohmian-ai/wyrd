@@ -144,9 +144,51 @@ Deferred: sorting system-table files by `principal_id`, so each file is mostly
 one writer and files or row groups prune by writer. Add it only if the
 combined layout proves too wide.
 
-Open, to settle in the spec revision: the sample-size formula, the
-stratum allocation (proportional versus a per-stratum floor so small writers
-are seen), and the frequency threshold.
+Sampling parameters (user-approved values; proposal for the spec revision):
+
+- Objective: a yes/no shred decision per key per stratum, not one overall
+  mean. That is subgroup (domain) estimation, so every stratum gets the same
+  precision. Proportional and Neyman allocation optimize one overall mean and
+  would starve small writers, whose keys are the point; rejected.
+- Per-stratum sample size: Cochran's formula for a proportion,
+  n0 = z^2 * p(1-p) / e^2, with 99% confidence (z = 2.5758), margin e = 0.02,
+  and the worst case p = 0.5: n0 = 4147 rows. The margin then holds for a key
+  of any frequency. Finite-population correction for a stratum of N rows:
+  n = n0 / (1 + (n0 - 1) / N); a stratum below a few thousand rows is read in
+  full.
+- Sample size grows with the number of strata, not with row count: precision
+  depends on rows sampled, not file size. Total is about 4147 x strata.
+- Collapsed strata: writers with fewer than 30 rows merge into one "other"
+  stratum, so a 3-row writer cannot shred every key it holds.
+- Frequency threshold: 10% of non-null Variant rows within a stratum (Spark's
+  rule). Decision rule biased toward recall: shred when the sampled frequency
+  is at least 8% (threshold minus the margin). A missed key slows queries; an
+  extra mostly-null column is cheap.
+- Key cap: keep 300 emitted keys and depth 50. Rank candidates by estimated
+  rows covered (sum over strata of N x sampled frequency), ties by path name.
+- Selection: pass 1 reads only `principal_id` and counts rows per stratum.
+  Pass 2 reads the Variant columns and keeps a row when
+  hash(seed, row position) < n_h / N_h. The seed is the claim or object
+  identity; row position comes from the deterministic merge order. Never sample
+  whole row groups: rows in a sorted row group are alike.
+- Memory: the pre-pass holds only per-stratum key and type counters (bounded
+  by the tracked-children cap), never rows. The writer opens with the layout
+  known, so the first-rows buffer and its `max_rows` / `max_bytes` caps go
+  away. Whether TASK-004's prefix reservation is still needed on these paths
+  is re-checked in the spec revision.
+- Quality metric (statistical process control): record per file the share of
+  non-null Variant bytes left in the residual. A rising trend for a table means
+  the layout is missing keys, which is the trigger for
+  `(principal_id, card_uid)` strata.
+- Cost: Scribe claims re-read local staged Variant columns (cheap). Forge
+  re-reads object-storage Variant columns, about doubling Variant reads per
+  rewrite. Fallback if too costly: reuse the source files' layouts for keys
+  the sample confirms.
+
+Industry baseline for comparison: Spark (and Hudi, which delegates to it)
+infers from the first 4096 rows / 64 MB a writer buffers, with the same 10%
+rule (`InferVariantShreddingSchema`, `minCardinality = (n + 9) / 10`). No
+engine found samples the whole input or stratifies.
 
 ## 3. Nested shredding
 

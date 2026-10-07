@@ -150,3 +150,43 @@ TASK-017 depends on TASK-016 and merges second. It writes tests against the exac
 - Ergonomic reference: `/home/thorrester/Documents/GitHub/opsml/py-opsml/tests/agent/test_promptcard.py`, its `conftest.py`, and `/home/thorrester/Documents/GitHub/opsml/py-opsml/python/opsml/cli/__init__.py` (read-only).
 - `AGENTS.md`; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`; `architecture/bifrost-design.md`.
 - `architecture/references/languages/spec-driven-development.md`; `architecture/references/languages/implementation-execution.md`; `architecture/references/languages/testing-workflows.md`.
+
+## Implementation Evidence
+
+Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language branches merged: Rust `c9a2ced55`, TypeScript `d58579412`, Python `eef1a11ae`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-048 checklist covers every REQ-192 bullet | `TESTING.md` "Client-facing tests" | review against REQ-192 | PASS |
+| AC-057 all 736 audit rows resolved once | Rust 116 (KEEP 46/TIGHTEN 10/REWRITE 7/MOVE 26/DELETE 27); TS 63 (9/26/13/5/10); Py integration 96 (27/35/11/10/13); Py unit 461 (183/132/70/12/64) | reconciliation reports per language | PASS |
+| Every test file in a lane; type-only outside runtime | `*.test-d.ts`, `sdks/wyrd-sdk-python/tests/typecheck/`; stale `test:bifrost:unit:python` removed (`d7524b19b`) | `mise run gate`; `mise run check:ci-selection` 7/7 | PASS |
+| Shared stories use checked-in YAML, matching names | `fixtures/cards/<story>/`, `fixtures/README.md` | three-SDK journeys in gate | PASS |
+| Exact catalog codes per error assertion | journey and unit rewrites | gate | PASS |
+| AC-045..058 workflows covered in Rust/Python/TS | `sdks/wyrd-sdk-{rust,python,ts}` integration journeys | gate | PASS |
+| Public surfaces only, no non-sanctioned hooks | see open gaps below | review | PARTIAL |
+
+### Declared deviations (production code)
+
+- `b620b069f` Oracle executes bind parameters (`with_param_values`); approved by the user; journeys require it. Test `oracle::tests::bound_values_replace_placeholders_as_data`.
+- `ac327a227` `WYRD_VALA_403_BIFROST_CARD_SCOPE` maps to `BifrostError::CardScopeDenied` in `wyrd-client`.
+- `ffaa142b4` audit settlement deletes staged rows before the progress upsert, and freeze skips during an in-flight settle; this fixes a lock-order stall that a gate surfaced. Test `pg_audit_staging::pg_tests::audit_staging::settlement_waiting_on_staged_rows_never_stalls_a_freeze` was red before the fix and green after.
+- `assemble_stubs.py` docstring lint is the MOVE destination for Python stub-docstring tests; the `Judgment.kind` stub source was fixed.
+
+### Open gaps (not fixed here)
+
+- Python role grants use non-sanctioned test-server hooks.
+- Python `test_workflow_loading_journey` is still multi-story.
+- Rust `workflow_loading` uses `CredentialWriter`.
+- Rust `gateway_inference` uses `reqwest` because no Rust OpenAI SDK exists.
+- Python-unit partials: trusted artifact hash, `Split.materialized(CardRef)`, typed Split/ModelCardMetadata accessors, mock provider round-trip, and the ModelResponse builder.
+- Tests pin current production codes:
+  - unknown `PromptReference` kind returns `WYRD_SPEC_500_INTERNAL`;
+  - registry refusals return `WYRD_DATA_400_VALIDATION`;
+  - out-of-range deadline returns `QUERY_INVALID_SQL`;
+  - the retired kind returns `WYRD_LOADER_400_INVALID_ENVELOPE` through `cli.apply` but `WYRD_REGISTRY_400_INVALID_CARD_SPEC` through `register_from_path`.
+- The TypeScript "Bifrost not started" refusal is unit-only.
+
+### Verification
+
+- `mise run gate` exited 0. An earlier run failed with "No space left on device"; this run followed removal of the merged worktrees.
+- `git diff --check 04d1882dc~1..HEAD` reported nothing.

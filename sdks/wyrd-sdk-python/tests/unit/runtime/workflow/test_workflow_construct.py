@@ -37,6 +37,6 @@ def test_workflow_parallel_no_dependencies() -> None:
 
 def test_workflow_sequential_rejects_non_agent_positional() -> None:
     with pytest.raises(WyrdError) as exc:
-        Workflow.sequential("research", "not-an-agent")
+        Workflow.sequential("research", "not-an-agent")  # ty: ignore[invalid-argument-type]
     assert exc.value.code == "WYRD_WORKFLOW_422_VALIDATION"
     assert exc.value.details["argument"] == "agents"

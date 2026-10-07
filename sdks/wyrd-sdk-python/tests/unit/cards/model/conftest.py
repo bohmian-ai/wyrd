@@ -77,16 +77,15 @@ def huggingface_model() -> Any:
     """A one-layer BERT sequence classifier."""
     from transformers import BertConfig, BertForSequenceClassification
 
-    return BertForSequenceClassification(
-        BertConfig(
-            vocab_size=16,
-            hidden_size=8,
-            num_hidden_layers=1,
-            num_attention_heads=1,
-            intermediate_size=16,
-            num_labels=2,
-        )
+    config = BertConfig(
+        vocab_size=16,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=16,
     )
+    config.num_labels = 2
+    return BertForSequenceClassification(config)
 
 
 @pytest.fixture

@@ -40,6 +40,7 @@ def test_typed_openai_settings_round_trip() -> None:
     prompt = Prompt.openai_chat("gpt-4o", messages="hello", model_settings=settings)
 
     assert prompt.request.model_dump()["body"]["seed"] == 7
+    assert isinstance(prompt.model_settings, OpenAISettings)
     assert prompt.model_settings.to_dict()["metadata"] == {"purpose": "unit"}
 
 
@@ -48,7 +49,7 @@ def test_provider_settings_mismatch() -> None:
         Prompt.openai_chat(
             "gpt-4o",
             messages="hello",
-            model_settings=AnthropicSettings(max_tokens=128),
+            model_settings=AnthropicSettings(max_tokens=128),  # ty: ignore[invalid-argument-type]
         )
 
     assert error.value.code == "WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH"
@@ -69,6 +70,7 @@ def test_anthropic_default_max_tokens() -> None:
     prompt = Prompt.anthropic("claude-sonnet-4-5", messages="hello")
 
     assert prompt.request.model_dump()["body"]["max_tokens"] == 4096
+    assert isinstance(prompt.model_settings, AnthropicSettings)
     assert prompt.model_settings.to_dict()["max_tokens"] == 4096
 
 
@@ -147,4 +149,5 @@ def test_prompt_card_file_keeps_its_model_settings(fixtures_dir: Path) -> None:
 
     assert card.prompt.request.model_dump()["body"]["seed"] == 123
     assert card.prompt.request.model_dump()["body"]["future_knob"] == {"enabled": True}
+    assert isinstance(card.model_settings, OpenAISettings)
     assert card.model_settings.to_dict()["seed"] == 123

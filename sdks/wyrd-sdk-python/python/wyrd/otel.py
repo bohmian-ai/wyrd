@@ -8,14 +8,15 @@ optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 try:
     from opentelemetry import context as _otel_context
     from opentelemetry import trace as _otel_trace
 except ImportError:  # optional: run correlation becomes a no-op
-    _otel_context = None
-    _otel_trace = None
+    _OTEL_AVAILABLE = False
+else:
+    _OTEL_AVAILABLE = True
 
 
 _CARD_REF = "wyrd.card_ref"
@@ -24,13 +25,22 @@ _RUN_ID = "wyrd.run_id"
 # The Run scope stack lives entirely in this one context value: a tuple of
 # ``(card_ref, run_id)`` pairs, innermost last. Entry and exit each attach a new
 # value and never detach, so no token or per-scope state exists outside it.
-_SCOPE_KEY: Any = None if _otel_context is None else _otel_context.create_key("wyrd.run_scope")
+_SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE else None
 
 # Private marker set on a provider object once the Wyrd processor is offered,
 # so later Run entries skip it. Best effort: a concurrent first entry may add a
 # second processor, which is harmless because the processor is stateless and
 # setting the same two attributes again is idempotent.
 _MARKER = "_wyrd_run_correlation"
+
+
+def _scope_stack(parent_context: Any = None) -> tuple[tuple[str, str], ...]:
+    """Return the Run scope stack stored in ``parent_context``, or ``()``.
+
+    Only this module writes ``_SCOPE_KEY``, always as ``(card_ref, run_id)`` pairs.
+    """
+    stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
+    return cast("tuple[tuple[str, str], ...]", stack) if isinstance(stack, tuple) else ()
 
 
 class _RunCorrelationProcessor:
@@ -42,7 +52,7 @@ class _RunCorrelationProcessor:
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:
         try:
-            stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
+            stack = _scope_stack(parent_context)
             if stack:
                 card_ref, run_id = stack[-1]
                 span.set_attribute(_CARD_REF, card_ref)
@@ -74,14 +84,17 @@ def install_run_correlation(provider: Any = None) -> bool:
     private provider once; the global provider is installed on every ``Run``
     entry.
     """
-    if _otel_trace is None:
+    if not _OTEL_AVAILABLE:
         return False
     try:
         if provider is None:
             provider = _otel_trace.get_tracer_provider()
         if getattr(provider, _MARKER, False):
             return True
-        add = provider.add_span_processor
+        # The API provider has no ``add_span_processor``; only an SDK provider does.
+        add = getattr(provider, "add_span_processor", None)
+        if add is None:
+            return False
         setattr(provider, _MARKER, True)
         add(_RunCorrelationProcessor())
         return True
@@ -95,11 +108,11 @@ def _enter_run(card_ref: str, run_id: str) -> None:
     Stamps the already-active recording span unless it already carries
     ``wyrd.card_ref``, so a nested scope never overwrites an outer correlation.
     """
-    if _otel_context is None:
+    if not _OTEL_AVAILABLE:
         return
     try:
         install_run_correlation()
-        stack = _otel_context.get_value(_SCOPE_KEY) or ()
+        stack = _scope_stack()
         _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, (*stack, (card_ref, run_id))))
         span = _otel_trace.get_current_span()
         if span.is_recording() and not _carries_card_ref(span):
@@ -123,10 +136,10 @@ def _exit_run(card_ref: str, run_id: str) -> None:
     Pops only when the innermost scope is exactly ``(card_ref, run_id)``; a
     mismatched top, empty stack, or failing context call changes nothing.
     """
-    if _otel_context is None:
+    if not _OTEL_AVAILABLE:
         return
     try:
-        stack = _otel_context.get_value(_SCOPE_KEY)
+        stack = _scope_stack()
         if stack and stack[-1] == (card_ref, run_id):
             _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, stack[:-1]))
     except Exception:  # telemetry must never fail the app

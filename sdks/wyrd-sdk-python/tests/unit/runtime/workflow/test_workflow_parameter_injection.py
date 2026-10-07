@@ -77,7 +77,6 @@ def test_workflow_dependencies_inject_no_data() -> None:
         workflow.validate()
 
     assert exc.value.code == "WYRD_WORKFLOW_422_VALIDATION"
-    assert exc.value.details is not None
     assert exc.value.details["field"] == "steps[1].inputs.foo"
 
 

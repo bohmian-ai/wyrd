@@ -18,7 +18,10 @@ type Emit = readonly (string | undefined)[];
  */
 function fakeRun(result: Record<string, unknown> = { valueJson: "null" }) {
   const emits: Emit[] = [];
-  const record = (...args: Emit) => (emits.push(args), result);
+  const record = (...args: Emit) => {
+    emits.push(args);
+    return result;
+  };
   const native = { drift: record, eval: record, record: async (...args: Emit) => record(...args) };
   return { observe: Observe.fromNative(native as unknown as NativeRun), emits };
 }
@@ -111,11 +114,11 @@ test.for<readonly [string, (descriptor: PropertyDescriptor) => unknown, unknown]
 ])("%s is read once and native gets its first value", async ([, input, expected]) => {
   const { observe, emits } = fakeRun();
   const accessors = [readOnce("yes"), readOnce("yes"), readOnce("yes")];
-  const values = accessors.map(({ descriptor }) => () => input(descriptor));
+  let next = 0;
 
-  for (const [index, emit] of everyEmit(observe, () => values.shift()!()).entries()) {
+  for (const [index, emit] of everyEmit(observe, () => input(accessors[next++].descriptor)).entries()) {
     await emit();
-    expect(accessors[index]!.counter.reads).toBe(1);
+    expect(accessors[index].counter.reads).toBe(1);
   }
   expect(emits.map(payload)).toEqual(Array(3).fill(JSON.stringify(expected)));
 });
@@ -178,7 +181,10 @@ test("active span supplies both ids", () => {
   observe.eval({ n: 0 });
   within(ACTIVE, () => observe.eval({ n: 1 }));
 
-  expect(emits.map(ids)).toEqual([[undefined, undefined], [ACTIVE.traceId, ACTIVE.spanId]]);
+  expect(emits.map(ids)).toEqual([
+    [undefined, undefined],
+    [ACTIVE.traceId, ACTIVE.spanId],
+  ]);
 });
 
 test("explicit ids win over the active span", () => {

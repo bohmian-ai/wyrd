@@ -28,7 +28,9 @@ def test_bind_media_returns_new_prompt_and_bind_media_mut_mutates() -> None:
 def test_openai_bound_media_becomes_an_image_url_part() -> None:
     prompt = Prompt("see ${media:img}", "gpt-4o", provider="openai").bind_media("img", LOGO)
 
-    assert prompt.request.openai().messages[0].content.as_parts()[1].kind == "image_url"
+    content = prompt.request.openai().messages[0].content
+    assert content is not None
+    assert content.as_parts()[1].kind == "image_url"
 
 
 @pytest.mark.parametrize("provider", ["gemini", "vertex"])
@@ -77,7 +79,9 @@ def test_binding_media_after_text_completes_the_request() -> None:
         "name", "Ada"
     )
 
-    parts = text_bound.bind_media("logo", LOGO).request.openai().messages[0].content.as_parts()
+    content = text_bound.bind_media("logo", LOGO).request.openai().messages[0].content
+    assert content is not None
+    parts = content.as_parts()
 
     assert [part.kind for part in parts] == ["text", "image_url"]
     assert parts[0].as_text() == "Hi Ada "
@@ -87,7 +91,9 @@ def test_text_value_containing_media_token_remains_literal() -> None:
     prompt = Prompt("Hi {{name}}", "gpt-4o", provider="openai").bind("name", "${media:hack}")
 
     assert prompt.media_variables == []
-    assert prompt.request.openai().messages[0].content.as_text() == "Hi ${media:hack}"
+    content = prompt.request.openai().messages[0].content
+    assert content is not None
+    assert content.as_text() == "Hi ${media:hack}"
 
 
 def test_multiple_media_placeholders_in_one_message_bind_cleanly() -> None:
@@ -96,5 +102,7 @@ def test_multiple_media_placeholders_in_one_message_bind_cleanly() -> None:
         "b", MediaRef.image_url("https://example.test/b.png")
     )
 
-    parts = bound.request.openai().messages[0].content.as_parts()
+    content = bound.request.openai().messages[0].content
+    assert content is not None
+    parts = content.as_parts()
     assert [part.kind for part in parts] == ["text", "image_url", "text", "image_url"]

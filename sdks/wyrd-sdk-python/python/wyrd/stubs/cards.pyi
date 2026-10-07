@@ -1,7 +1,7 @@
 #### begin imports ####
 
 from collections.abc import Mapping
-from typing import Protocol, TypeAlias, overload
+from typing import Any, Protocol, TypeAlias, TypeVar, overload
 
 from .._card_types import (
     AgentSpec,
@@ -43,6 +43,9 @@ from ..prompt import Prompt, PromptCard, PromptReference
 
 #### end of imports ####
 
+_DataInterfaceT = TypeVar("_DataInterfaceT", bound=DataInterface)
+_ModelInterfaceT = TypeVar("_ModelInterfaceT", bound=ModelInterface)
+
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
@@ -64,7 +67,7 @@ class Card(Protocol):
         """Return the holder's single Wyrd envelope conversion."""
         ...
 
-RegisterableCard: TypeAlias = DataCard | ModelCard | PromptCard
+RegisterableCard: TypeAlias = DataCard[Any] | ModelCard[Any] | PromptCard
 
 class AgentCard:
     """Local Agent Card holder backed by the native Agent envelope.
@@ -504,7 +507,7 @@ class DataCardRegistry:
 
     def register(
         self,
-        card: DataCard,
+        card: DataCard[Any],
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | None = ...,
     ) -> RegistrationReceipt:
@@ -520,6 +523,7 @@ class DataCardRegistry:
                 server completion fails.
         """
         ...
+    @overload
     def get(
         self,
         *,
@@ -527,10 +531,24 @@ class DataCardRegistry:
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
-        interface: DataInterface | type[DataInterface] | None = ...,
+        interface: None = ...,
         eager_load: bool = ...,
         load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> DataCard:
+        """Retrieve a `DataCard` whose built-in interface is rebuilt from its metadata."""
+        ...
+    @overload
+    def get(
+        self,
+        *,
+        uid: str | None = ...,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        interface: _DataInterfaceT | type[_DataInterfaceT],
+        eager_load: bool = ...,
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> DataCard[_DataInterfaceT]:
         """Retrieve and validate one complete `DataCard` envelope.
 
         Pass `uid` for an exact lookup, or `space` and `name` for a named one.
@@ -647,7 +665,7 @@ class ModelCardRegistry:
 
     def register(
         self,
-        card: ModelCard,
+        card: ModelCard[Any],
         version_bump: VersionBump = ...,
         save_args: ModelSaveArgs | None = ...,
     ) -> RegistrationReceipt:
@@ -662,6 +680,7 @@ class ModelCardRegistry:
                 server completion fails.
         """
         ...
+    @overload
     def get(
         self,
         *,
@@ -669,10 +688,24 @@ class ModelCardRegistry:
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
-        interface: ModelInterface | type[ModelInterface] | None = ...,
+        interface: None = ...,
         eager_load: bool = ...,
         load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> ModelCard:
+        """Retrieve a `ModelCard` whose built-in interface is rebuilt from its metadata."""
+        ...
+    @overload
+    def get(
+        self,
+        *,
+        uid: str | None = ...,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        interface: _ModelInterfaceT | type[_ModelInterfaceT],
+        eager_load: bool = ...,
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> ModelCard[_ModelInterfaceT]:
         """Retrieve and validate one complete `ModelCard` envelope.
 
         As ``DataCardRegistry.get()``, with a `ModelInterface` for

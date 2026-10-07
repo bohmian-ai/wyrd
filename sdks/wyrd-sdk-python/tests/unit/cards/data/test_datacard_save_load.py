@@ -320,6 +320,7 @@ def test_huggingface_pointer_reloads_as_the_same_pointer(tmp_path: Path) -> None
 
     card = DataCard.from_path(tmp_path / "card.json")
 
+    assert isinstance(card.interface, HuggingfaceInterface)
     assert (card.interface.dataset_id, card.interface.revision) == ("acme/data", "abcdef0")
 
 

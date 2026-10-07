@@ -8,6 +8,7 @@ import threading
 from hashlib import sha256
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
@@ -34,6 +35,10 @@ from wyrd.prompt import Prompt, PromptCard
 from wyrd.testing import WyrdTestServer
 
 from ..gateway.support import Received, Upstream, deploy
+
+if TYPE_CHECKING:
+    # The typed Card envelopes exist only in the stubs.
+    from wyrd.cards import RegisteredCard
 
 
 class JsonDataInterface(DataInterface):
@@ -306,7 +311,7 @@ def test_typed_registry_rejects_a_card_of_the_wrong_kind(cards: Cards) -> None:
     card = PromptCard(Prompt.openai_chat("gpt-4o", messages="Hello"), name="wrong-kind")
 
     with pytest.raises(WyrdError) as raised:
-        cards.data.register(card)
+        cards.data.register(card)  # ty: ignore[invalid-argument-type]
     assert raised.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
@@ -493,7 +498,7 @@ def _chat_calls(received: Received) -> list[dict[str, str]]:
     return [headers for path, headers in received if path == "/v1/chat/completions"]
 
 
-def _outbound(card: dict) -> list[dict[str, str]]:
+def _outbound(card: RegisteredCard) -> list:
     """Server-derived outbound relationship targets of a Card envelope, by name."""
     targets = [relationship["ref"] for relationship in card["relationships"]["outbound_refs"]]
     return sorted(targets, key=lambda target: target["name"])
@@ -596,6 +601,7 @@ def test_workflow_loading_journey(
 
     # The stored envelopes keep the exact references and derive relationships.
     stored = reader.get(_card_ref(refs["code-review"]))
+    assert stored["kind"] == "Workflow"
     assert [step["action"]["target"] for step in stored["spec"]["steps"]] == agents
     assert _outbound(stored) == sorted(agents, key=lambda agent: agent["name"])
     for agent, prompt in [
@@ -604,6 +610,7 @@ def test_workflow_loading_journey(
         ("final-reviewer", "final-review-prompt"),
     ]:
         stored_agent = reader.get(_card_ref(refs[agent]))
+        assert stored_agent["kind"] == "Agent"
         assert stored_agent["spec"]["prompt"] == refs[prompt], agent
         assert _outbound(stored_agent) == [refs[prompt]], agent
 
@@ -620,10 +627,10 @@ def test_workflow_loading_journey(
 
     # 7. Incomplete, mixed, wrong-kind, and unauthorized selectors are refused.
     with pytest.raises(WyrdError) as versionless:
-        reader.workflow.load(space="workflow-loading", name="code-review")
+        reader.workflow.load(space="workflow-loading", name="code-review")  # ty: ignore[no-matching-overload]
     assert versionless.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
     with pytest.raises(WyrdError) as mixed_selector:
-        reader.workflow.load(uid=workflow_uid, space="workflow-loading")
+        reader.workflow.load(uid=workflow_uid, space="workflow-loading")  # ty: ignore[no-matching-overload]
     assert mixed_selector.value.code == "WYRD_WORKFLOW_400_INVALID_CARD_REF"
     # An Agent's UID names no Workflow.
     with pytest.raises(WyrdError) as wrong_kind:

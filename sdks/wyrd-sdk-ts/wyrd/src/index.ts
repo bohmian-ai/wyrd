@@ -1,18 +1,8 @@
-import {
-  Table,
-  tableFromIPC,
-  tableToIPC,
-  type RecordBatch,
-  type Schema,
-} from "apache-arrow";
+import { Table, tableFromIPC, tableToIPC, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
-import type {
-  CardRef,
-  RegisteredCard,
-  VerificationError,
-} from "./card-types.js";
+import type { CardRef, RegisteredCard } from "./card-types.js";
 
 import type {
   NativeBifrostQueryStream,
@@ -265,21 +255,8 @@ export class WyrdError extends Error {
 }
 
 export class IncompleteQueryStreamError extends WyrdError {
-  constructor(
-    status: number,
-    title: string,
-    detail: string,
-    remediation?: string,
-    details?: unknown,
-  ) {
-    super(
-      "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
-      status,
-      title,
-      detail,
-      remediation,
-      details,
-    );
+  constructor(status: number, title: string, detail: string, remediation?: string, details?: unknown) {
+    super("WYRD_VALA_502_QUERY_STREAM_INCOMPLETE", status, title, detail, remediation, details);
     this.name = "IncompleteQueryStreamError";
   }
 }
@@ -301,17 +278,9 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
   const status = metadata.errorStatus ?? 500;
   const title = metadata.errorTitle ?? "Bifrost query failed";
   const remediation = metadata.errorRemediation ?? undefined;
-  const details = metadata.errorDetailsJson == null
-    ? undefined
-    : JSON.parse(metadata.errorDetailsJson) as unknown;
+  const details = metadata.errorDetailsJson == null ? undefined : (JSON.parse(metadata.errorDetailsJson) as unknown);
   if (metadata.errorCode === "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE") {
-    return new IncompleteQueryStreamError(
-      status,
-      title,
-      detail,
-      remediation,
-      details,
-    );
+    return new IncompleteQueryStreamError(status, title, detail, remediation, details);
   }
   return new WyrdError(
     // The native projection only emits codes from the same derive-backed catalog.
@@ -341,10 +310,7 @@ function lifecycleValue<T>(result: NativeLifecycleResult): T {
 }
 
 /** Unwrap one closed native construction result, throwing its catalog error. */
-function nativeHandle<T>(
-  value: T | null | undefined,
-  error: NativeErrorMetadata | null | undefined,
-): T {
+function nativeHandle<T>(value: T | null | undefined, error: NativeErrorMetadata | null | undefined): T {
   const projected = error == null ? undefined : projectedError(error);
   if (projected !== undefined) {
     throw projected;
@@ -383,9 +349,7 @@ async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   }
 }
 
-export class BifrostQueryStream
-  implements AsyncIterableIterator<RecordBatch>
-{
+export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
   readonly #native: NativeBifrostQueryStream;
   #terminal: QueryTerminal | undefined;
   #done = false;
@@ -416,9 +380,7 @@ export class BifrostQueryStream
    */
   get schema(): Schema | undefined {
     const ipc = this.#native.schemaIpc;
-    return ipc === null || ipc === undefined
-      ? undefined
-      : tableFromIPC(ipc).schema;
+    return ipc === null || ipc === undefined ? undefined : tableFromIPC(ipc).schema;
   }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
@@ -630,12 +592,7 @@ export class TableConfig {
       readonly grpcUrl?: string;
     } = {},
   ): Promise<TableConfig> {
-    const described = await describeTableConfig(
-      table,
-      transport.serverUrl,
-      transport.credential,
-      transport.grpcUrl,
-    );
+    const described = await describeTableConfig(table, transport.serverUrl, transport.credential, transport.grpcUrl);
     return new TableConfig(nativeHandle(described.config, described.error));
   }
 
@@ -712,11 +669,7 @@ export class QueryResult {
   readonly #terminal: QueryTerminal;
   readonly #schema: Schema;
 
-  constructor(
-    batches: readonly RecordBatch[],
-    terminal: QueryTerminal,
-    schema: Schema,
-  ) {
+  constructor(batches: readonly RecordBatch[], terminal: QueryTerminal, schema: Schema) {
     this.#batches = batches;
     this.#terminal = terminal;
     this.#schema = schema;
@@ -840,9 +793,7 @@ export class Bifrost {
 
   /** Create the active table; resolves to `created` or `already_exists`. */
   async register(): Promise<"created" | "already_exists"> {
-    return lifecycleValue<"created" | "already_exists">(
-      await this.#native.register(),
-    );
+    return lifecycleValue<"created" | "already_exists">(await this.#native.register());
   }
 
   /**
@@ -853,9 +804,7 @@ export class Bifrost {
    */
   useTable(table: TableConfig): TableConfig | undefined {
     const previous = this.#native.useTable(table.native);
-    return previous === null || previous === undefined
-      ? undefined
-      : TableConfig.fromNative(previous);
+    return previous === null || previous === undefined ? undefined : TableConfig.fromNative(previous);
   }
 
   /** Bind an already-registered table by name, describing it first. */
@@ -866,9 +815,7 @@ export class Bifrost {
   /** The active write binding, if any. */
   get table(): TableConfig | undefined {
     const native = this.#native.table;
-    return native === null || native === undefined
-      ? undefined
-      : TableConfig.fromNative(native);
+    return native === null || native === undefined ? undefined : TableConfig.fromNative(native);
   }
 
   /**
@@ -877,17 +824,8 @@ export class Bifrost {
    * Synchronous and non-blocking; durable after {@link Bifrost.flush}. A
    * saturated queue throws the stable refusal rather than dropping the row.
    */
-  insert(
-    row: Readonly<Record<string, unknown>>,
-    correlation: Correlation = {},
-  ): void {
-    lifecycleValue<null>(
-      this.#native.insert(
-        JSON.stringify(row),
-        correlation.cardRef,
-        correlation.runId,
-      ),
-    );
+  insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardRef, correlation.runId));
   }
 
   /**
@@ -934,16 +872,8 @@ export class Bifrost {
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
    * partially valid result is never returned as success.
    */
-  async sql<T>(
-    query: string,
-    params: readonly QueryParam[],
-    rows: RowSchema<T>,
-  ): Promise<T[]>;
-  async sql<T>(
-    query: string,
-    params?: readonly QueryParam[],
-    rows?: RowSchema<T>,
-  ): Promise<QueryResult | T[]> {
+  async sql<T>(query: string, params: readonly QueryParam[], rows: RowSchema<T>): Promise<T[]>;
+  async sql<T>(query: string, params?: readonly QueryParam[], rows?: RowSchema<T>): Promise<QueryResult | T[]> {
     const stream = await this.stream({ sql: query, params });
     const batches: RecordBatch[] = [];
     for await (const batch of stream) {
@@ -965,15 +895,11 @@ export class Bifrost {
     return result
       .toArrow()
       .toArray()
-      .map((row: { toJSON(): Record<string, unknown> }) =>
-        rows.parse(row.toJSON()),
-      );
+      .map((row: { toJSON(): Record<string, unknown> }) => rows.parse(row.toJSON()));
   }
 
   /** Run one SQL SELECT and iterate its batches as they arrive. */
-  async stream(
-    request: BifrostQueryRequest | string,
-  ): Promise<BifrostQueryStream> {
+  async stream(request: BifrostQueryRequest | string): Promise<BifrostQueryStream> {
     const query = typeof request === "string" ? { sql: request } : request;
     const nativeRequest: NativeQueryRequest = {
       sql: query.sql,
@@ -1014,23 +940,17 @@ export class Bifrost {
 
   /** List active queries visible to the authenticated tenant. */
   async running(): Promise<RunningQuery[]> {
-    return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(
-      runningQuery,
-    );
+    return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(runningQuery);
   }
 
   /** Return one active query by its canonical request ID. */
   async status(requestId: string): Promise<RunningQuery> {
-    return runningQuery(
-      lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)),
-    );
+    return runningQuery(lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)));
   }
 
   /** Request server-side cancellation without closing a local stream. */
   async cancel(requestId: string): Promise<CancelRunningQueryResult> {
-    const wire = lifecycleValue<CancelRunningQueryWire>(
-      await this.#native.cancel(requestId),
-    );
+    const wire = lifecycleValue<CancelRunningQueryWire>(await this.#native.cancel(requestId));
     return {
       requestId: wire.request_id,
       cancellationStarted: wire.cancellation_started,
@@ -1038,13 +958,8 @@ export class Bifrost {
   }
 
   /** Describe one registered table's stored physical schema. */
-  async describeTable(
-    namespace: string,
-    name: string,
-  ): Promise<TableDescription> {
-    return lifecycleValue<TableDescription>(
-      await this.#native.describeTable(namespace, name),
-    );
+  async describeTable(namespace: string, name: string): Promise<TableDescription> {
+    return lifecycleValue<TableDescription>(await this.#native.describeTable(namespace, name));
   }
 }
 
@@ -1154,17 +1069,9 @@ export class WyrdClient {
    * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */
   static connect(
-    options: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-      readonly grpcUrl?: string;
-    } = {},
+    options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
   ): WyrdClient {
-    const result = connectWyrdClient(
-      options.serverUrl,
-      options.credential,
-      options.grpcUrl,
-    );
+    const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
@@ -1201,14 +1108,8 @@ export class WyrdClient {
    * intersection of both. The first exchange runs here; the returned client
    * re-exchanges before expiry.
    */
-  async onBehalfOf(
-    subjectToken: string,
-    options: { readonly audience?: TokenAudience } = {},
-  ): Promise<WyrdClient> {
-    const result = await this.#native.onBehalfOf(
-      subjectToken,
-      options.audience ?? "bifrost",
-    );
+  async onBehalfOf(subjectToken: string, options: { readonly audience?: TokenAudience } = {}): Promise<WyrdClient> {
+    const result = await this.#native.onBehalfOf(subjectToken, options.audience ?? "bifrost");
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 }
@@ -1231,24 +1132,14 @@ export class Cards {
    *
    * Omitted options resolve through the same chain as {@link Bifrost.connect}.
    */
-  static connect(
-    options: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-    } = {},
-  ): Cards {
-    const connection = connectCards(
-      options.serverUrl,
-      options.credential,
-    );
+  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): Cards {
+    const connection = connectCards(options.serverUrl, options.credential);
     return new Cards(nativeHandle(connection.cards, connection.error));
   }
 
   /** Load a Card tree from disk and register it as one composite. */
   async registerFromPath(path: string): Promise<RegistrationReceipt> {
-    return lifecycleValue<RegistrationReceipt>(
-      await this.#native.registerFromPath(path),
-    );
+    return lifecycleValue<RegistrationReceipt>(await this.#native.registerFromPath(path));
   }
 
   /**
@@ -1260,16 +1151,12 @@ export class Cards {
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    */
   async get(ref: CardRef | string): Promise<RegisteredCard> {
-    return lifecycleValue<RegisteredCard>(
-      await this.#native.get(cardRefText(ref)),
-    );
+    return lifecycleValue<RegisteredCard>(await this.#native.get(cardRefText(ref)));
   }
 
   /** List metadata-only Card summaries. */
   async list(request: ListCardsRequest = {}): Promise<ListCardsResponse> {
-    return lifecycleValue<ListCardsResponse>(
-      await this.#native.list(JSON.stringify(request)),
-    );
+    return lifecycleValue<ListCardsResponse>(await this.#native.list(JSON.stringify(request)));
   }
 
   /** Hydrate one Card graph into a published local bundle for {@link WyrdState}. */
@@ -1279,11 +1166,7 @@ export class Cards {
     options: { readonly metadataOnly?: boolean } = {},
   ): Promise<HydrationSummary> {
     return lifecycleValue<HydrationSummary>(
-      await this.#native.hydrate(
-        cardRefText(ref),
-        destination,
-        options.metadataOnly ?? false,
-      ),
+      await this.#native.hydrate(cardRefText(ref), destination, options.metadataOnly ?? false),
     );
   }
 
@@ -1354,31 +1237,13 @@ export class WorkflowCards {
 }
 
 /** Any value JSON can carry: Workflow inputs, outputs, and error details. */
-export type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | readonly JsonValue[]
-  | { readonly [key: string]: JsonValue };
+export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 /** Lifecycle status of a Workflow run. */
-export type WorkflowRunStatus =
-  | "queued"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "timed_out";
+export type WorkflowRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
 
 /** Lifecycle status of one Workflow step. */
-export type WorkflowStepStatus =
-  | "pending"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "unstarted";
+export type WorkflowStepStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "unstarted";
 
 /** Catalog error recorded on a failed run or step. */
 export interface WorkflowRunError {
@@ -1482,9 +1347,7 @@ export class Workflow {
    * are recorded in the returned run.
    */
   async run(input: Record<string, JsonValue> = {}): Promise<WorkflowRun> {
-    return lifecycleValue<WorkflowRun>(
-      await this.#native.run(JSON.stringify(input)),
-    );
+    return lifecycleValue<WorkflowRun>(await this.#native.run(JSON.stringify(input)));
   }
 }
 
@@ -1631,59 +1494,34 @@ export class OperatorConnections {
    *
    * Omitted options resolve through the same chain as {@link Cards.connect}.
    */
-  static connect(
-    options: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-    } = {},
-  ): OperatorConnections {
-    const connection = connectOperatorConnections(
-      options.serverUrl,
-      options.credential,
-    );
-    return new OperatorConnections(
-      nativeHandle(connection.connections, connection.error),
-    );
+  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): OperatorConnections {
+    const connection = connectOperatorConnections(options.serverUrl, options.credential);
+    return new OperatorConnections(nativeHandle(connection.connections, connection.error));
   }
 
   /** Create one connection; requires `operators:write`. */
-  async create(
-    request: CreateOperatorConnectionRequest,
-  ): Promise<OperatorConnectionView> {
-    return lifecycleValue<OperatorConnectionView>(
-      await this.#native.create(JSON.stringify(request)),
-    );
+  async create(request: CreateOperatorConnectionRequest): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(await this.#native.create(JSON.stringify(request)));
   }
 
   /** List the caller tenant's connections; requires `operators:read`. */
   async list(): Promise<readonly OperatorConnectionView[]> {
-    return lifecycleValue<readonly OperatorConnectionView[]>(
-      await this.#native.list(),
-    );
+    return lifecycleValue<readonly OperatorConnectionView[]>(await this.#native.list());
   }
 
   /** Read one connection; requires `operators:read`. */
   async get(connectionId: string): Promise<OperatorConnectionView> {
-    return lifecycleValue<OperatorConnectionView>(
-      await this.#native.get(connectionId),
-    );
+    return lifecycleValue<OperatorConnectionView>(await this.#native.get(connectionId));
   }
 
   /** Update config, re-enable, or rotate the secret; requires `operators:write`. */
-  async update(
-    connectionId: string,
-    request: UpdateOperatorConnectionRequest,
-  ): Promise<OperatorConnectionView> {
-    return lifecycleValue<OperatorConnectionView>(
-      await this.#native.update(connectionId, JSON.stringify(request)),
-    );
+  async update(connectionId: string, request: UpdateOperatorConnectionRequest): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(await this.#native.update(connectionId, JSON.stringify(request)));
   }
 
   /** Disable one connection; requires `operators:write`. */
   async disable(connectionId: string): Promise<OperatorConnectionView> {
-    return lifecycleValue<OperatorConnectionView>(
-      await this.#native.disable(connectionId),
-    );
+    return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
   }
 }
 
@@ -1857,7 +1695,11 @@ function mediaJson(media?: readonly EvalMediaRef[]): string | undefined {
     media.map((item, index) => {
       for (const key of Reflect.ownKeys(item)) {
         if (!MEDIA_KEYS.has(key) || !Object.prototype.propertyIsEnumerable.call(item, key)) {
-          throw invalidObservationInput("media", `$[${index}]`, `has a symbol, hidden, or undeclared key ${String(key)}`);
+          throw invalidObservationInput(
+            "media",
+            `$[${index}]`,
+            `has a symbol, hidden, or undeclared key ${String(key)}`,
+          );
         }
       }
       const { id, kind, uri, mediaType } = item;
@@ -1898,9 +1740,7 @@ export class Observe {
     features: Readonly<Record<string, string | number | boolean>>,
     options: { readonly sessionId?: string } = {},
   ): void {
-    lifecycleValue<null>(
-      this.#native.drift(strictJson("features", features), options.sessionId),
-    );
+    lifecycleValue<null>(this.#native.drift(strictJson("features", features), options.sessionId));
   }
 
   /**
@@ -1916,18 +1756,8 @@ export class Observe {
   eval(context: unknown, options: EvalOptions = {}): void {
     const contextJson = strictJson("context", context);
     const media = mediaJson(options.media);
-    const identity = options.traceId === undefined && options.spanId === undefined
-      ? activeSpanIds()
-      : options;
-    lifecycleValue<null>(
-      this.#native.eval(
-        contextJson,
-        options.sessionId,
-        media,
-        identity.traceId,
-        identity.spanId,
-      ),
-    );
+    const identity = options.traceId === undefined && options.spanId === undefined ? activeSpanIds() : options;
+    lifecycleValue<null>(this.#native.eval(contextJson, options.sessionId, media, identity.traceId, identity.spanId));
   }
 
   /**
@@ -1963,11 +1793,7 @@ export class Observe {
     options: { readonly media?: readonly EvalMediaRef[] } = {},
   ): Promise<Judgment> {
     const judgment = lifecycleValue<Omit<Judgment, "passed">>(
-      await this.#native.verify(
-        verifier,
-        strictJson("input", input),
-        mediaJson(options.media),
-      ),
+      await this.#native.verify(verifier, strictJson("input", input), mediaJson(options.media)),
     );
     return { ...judgment, passed: judgment.verdict === "passed" };
   }
@@ -2151,13 +1977,7 @@ export interface ModelRef {
 }
 
 /** Gateway operation a deployment may serve. */
-export type GatewayOperation =
-  | "chat_completions"
-  | "responses"
-  | "embeddings"
-  | "images"
-  | "audio"
-  | "batches";
+export type GatewayOperation = "chat_completions" | "responses" | "embeddings" | "images" | "audio" | "batches";
 
 /**
  * Redacted credential source. A tenant-submitted managed secret projects to
@@ -2244,9 +2064,7 @@ export type GatewayPolicySubject =
   | { readonly role: { readonly role_name: string } };
 
 /** Subject a rate limit applies to. */
-export type GatewayLimitSubject =
-  | "tenant"
-  | { readonly principal: { readonly principal_id: string } };
+export type GatewayLimitSubject = "tenant" | { readonly principal: { readonly principal_id: string } };
 
 /** Provider or model a limit targets. */
 export type GatewayPolicyTarget =
@@ -2334,12 +2152,7 @@ export class Gateway {
    *
    * Omitted options resolve through the same chain as {@link Bifrost.connect}.
    */
-  static connect(
-    options: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-    } = {},
-  ): Gateway {
+  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): Gateway {
     return new Gateway(connectGateway(options.serverUrl, options.credential));
   }
 
@@ -2354,12 +2167,8 @@ export class Gateway {
   }
 
   /** Create or replace a provider deployment. */
-  async putDeployment(
-    deployment: ProviderDeployment,
-  ): Promise<ProviderDeployment> {
-    return lifecycleValue(
-      await this.#native.putDeployment(JSON.stringify(deployment)),
-    );
+  async putDeployment(deployment: ProviderDeployment): Promise<ProviderDeployment> {
+    return lifecycleValue(await this.#native.putDeployment(JSON.stringify(deployment)));
   }
 
   /** Read one provider deployment. */
@@ -2378,12 +2187,8 @@ export class Gateway {
   }
 
   /** Replace the tenant fallback policy. */
-  async putFallbackPolicy(
-    policy: GatewayFallbackPolicy,
-  ): Promise<GatewayFallbackPolicy> {
-    return lifecycleValue(
-      await this.#native.putFallbackPolicy(JSON.stringify(policy)),
-    );
+  async putFallbackPolicy(policy: GatewayFallbackPolicy): Promise<GatewayFallbackPolicy> {
+    return lifecycleValue(await this.#native.putFallbackPolicy(JSON.stringify(policy)));
   }
 
   /** Read the tenant fallback policy, or the default. */
@@ -2397,12 +2202,8 @@ export class Gateway {
   }
 
   /** Replace the tenant governance policy. */
-  async putGovernancePolicy(
-    policy: GatewayGovernancePolicy,
-  ): Promise<GatewayGovernancePolicy> {
-    return lifecycleValue(
-      await this.#native.putGovernancePolicy(JSON.stringify(policy)),
-    );
+  async putGovernancePolicy(policy: GatewayGovernancePolicy): Promise<GatewayGovernancePolicy> {
+    return lifecycleValue(await this.#native.putGovernancePolicy(JSON.stringify(policy)));
   }
 
   /** Read the tenant governance policy, or the default. */
@@ -2416,12 +2217,8 @@ export class Gateway {
   }
 
   /** Replace the tenant capture policy; returns its versioned view. */
-  async putCapturePolicy(
-    policy: GatewayCapturePolicyWrite,
-  ): Promise<GatewayCapturePolicy> {
-    return lifecycleValue(
-      await this.#native.putCapturePolicy(JSON.stringify(policy)),
-    );
+  async putCapturePolicy(policy: GatewayCapturePolicyWrite): Promise<GatewayCapturePolicy> {
+    return lifecycleValue(await this.#native.putCapturePolicy(JSON.stringify(policy)));
   }
 
   /** Read the tenant capture policy, or the disabled default. */
@@ -2528,9 +2325,7 @@ export const cli = {
     outputDir: string,
     options: CliServerOptions & { readonly metadataOnly?: boolean } = {},
   ): Promise<HydrationSummary> {
-    return lifecycleValue(
-      await cliGet(selector, outputDir, options.metadataOnly, options.server),
-    );
+    return lifecycleValue(await cliGet(selector, outputDir, options.metadataOnly, options.server));
   },
 
   /** Load one Card and materialize its artifacts (`wyrd load`). */
@@ -2564,24 +2359,16 @@ export const cli = {
     write: ProviderCredentialWrite,
     options: CliServerOptions = {},
   ): Promise<ProviderCredentialView> {
-    return lifecycleValue(
-      await cliPutProviderCredential(JSON.stringify(write), options.server),
-    );
+    return lifecycleValue(await cliPutProviderCredential(JSON.stringify(write), options.server));
   },
 
   /** Terminally revoke a provider credential (`wyrd gateway credential revoke`). */
-  async revokeProviderCredential(
-    name: string,
-    options: CliServerOptions = {},
-  ): Promise<ProviderCredentialView> {
+  async revokeProviderCredential(name: string, options: CliServerOptions = {}): Promise<ProviderCredentialView> {
     return lifecycleValue(await cliRevokeProviderCredential(name, options.server));
   },
 
   /** Delete an unreferenced provider credential; an absent name succeeds. */
-  async deleteProviderCredential(
-    name: string,
-    options: CliServerOptions = {},
-  ): Promise<void> {
+  async deleteProviderCredential(name: string, options: CliServerOptions = {}): Promise<void> {
     lifecycleValue<null>(await cliDeleteProviderCredential(name, options.server));
   },
 };

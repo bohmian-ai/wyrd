@@ -3,7 +3,10 @@
 #### begin imports ####
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, overload
+from pathlib import Path
+from typing import Any, Generic, Literal, overload
+
+from typing_extensions import Self, TypeVar
 
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef, DataLoadArgs, JsonValue
@@ -201,7 +204,7 @@ class DataInterface:
         ...
 
     @classmethod
-    def from_metadata(cls, metadata: DataCardMetadata) -> DataInterface:
+    def from_metadata(cls, metadata: DataCardMetadata) -> Self:
         """Build an interface instance from a stored card's metadata.
 
         Card retrieval calls this when given an interface class, as in
@@ -230,7 +233,7 @@ class DataInterface:
         """
         ...
 
-    def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> DataStats:
+    def save(self, path: Path, save_kwargs: dict[str, Any] | None = ...) -> DataStats:
         """Write this interface's data under a local card directory.
 
         Built-in interfaces write to a fixed path under ``path``, such as
@@ -252,7 +255,7 @@ class DataInterface:
         """
         ...
 
-    def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
+    def load(self, path: Path, load_kwargs: dict[str, Any] | None = ...) -> None:
         """Read this interface's data from a local card directory and hold it.
 
         The artifact location is derived from ``path`` and the interface
@@ -670,7 +673,10 @@ class DataCardMetadata:
         """Return this metadata as a JSON-compatible dictionary for inspection."""
         ...
 
-class DataCard:
+_GivenDataInterfaceT = TypeVar("_GivenDataInterfaceT", bound=DataInterface)
+_DataInterfaceT = TypeVar("_DataInterfaceT", bound=DataInterface | None, default=DataInterface)
+
+class DataCard(Generic[_DataInterfaceT]):
     """Local DataCard holder and spec builder.
 
     A DataCard holds identity, labels, annotations, metadata, and an optional
@@ -697,7 +703,7 @@ class DataCard:
     labels: dict[str, str]
     annotations: dict[str, str]
     metadata: DataCardMetadata
-    interface: DataInterface | None
+    interface: _DataInterfaceT
     schema: DataSchema
     stats: DataStats
 
@@ -711,10 +717,21 @@ class DataCard:
         """Supervised target column names recorded on the DataCard spec."""
         ...
 
+    @overload
     @staticmethod
     def from_path(
         path: PathLike,
-        interface: DataInterface | type[DataInterface] | CardRefLike | None = ...,
+        interface: _GivenDataInterfaceT | type[_GivenDataInterfaceT],
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> DataCard[_GivenDataInterfaceT]:
+        """As the untyped overload; the card's ``interface`` has the given interface type."""
+        ...
+
+    @overload
+    @staticmethod
+    def from_path(
+        path: PathLike,
+        interface: CardRefLike | None = ...,
         load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> DataCard:
         """Load a DataCard from a saved Card directory or a Card YAML/JSON file.
@@ -732,7 +749,7 @@ class DataCard:
     @overload
     def __init__(
         self,
-        data: DataInterface,
+        data: _DataInterfaceT,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -771,7 +788,7 @@ class DataCard:
 
     @overload
     def __init__(
-        self,
+        self: DataCard[DataInterface],
         data: PathLike | Mapping[str, Any],
         space: str | None = ...,
         name: str | None = ...,
@@ -809,7 +826,7 @@ class DataCard:
 
     @overload
     def __init__(
-        self,
+        self: DataCard[None],
         data: CardRef,
         space: str | None = ...,
         name: str | None = ...,
@@ -853,7 +870,7 @@ class DataCard:
 
     @overload
     def __init__(
-        self,
+        self: DataCard[DataInterface],
         data: object,
         space: str | None = ...,
         name: str | None = ...,
@@ -890,7 +907,7 @@ class DataCard:
         ...
 
     @property
-    def data(self) -> object:
+    def data(self) -> Any:
         """The live data held by the interface.
 
         For a custom interface this is its ``data`` attribute.
@@ -971,10 +988,20 @@ class DataCard:
         """
         ...
 
+    @overload
     @staticmethod
     def model_validate_json(
         json_string: str,
-        interface: DataInterface | type[DataInterface] | CardRefLike | None = ...,
+        interface: _GivenDataInterfaceT | type[_GivenDataInterfaceT],
+    ) -> DataCard[_GivenDataInterfaceT]:
+        """As the untyped overload; the card's ``interface`` has the given interface type."""
+        ...
+
+    @overload
+    @staticmethod
+    def model_validate_json(
+        json_string: str,
+        interface: CardRefLike | None = ...,
     ) -> DataCard:
         """Rebuild a DataCard from serialized card JSON.
 

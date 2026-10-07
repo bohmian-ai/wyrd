@@ -118,7 +118,9 @@ def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bi
     writer = Bifrost(TableConfig(Item, "vala.datasets.journey"))
     assert writer.register() == "created"
     assert writer.register() == "already_exists"
-    resolved = writer.table.resolved
+    table = writer.table
+    assert table is not None
+    resolved = table.resolved
     assert resolved is not None and resolved["table_uid"] and resolved["fingerprint"]
     writer.insert(Item(id=4, value="fourth"))
     writer.insert(Item(id=5, value="fifth"))
@@ -209,7 +211,9 @@ def test_registering_a_different_schema_on_one_name_conflicts(wyrd_server: WyrdT
     with pytest.raises(WyrdError) as raised:
         conflicting.register()
     assert raised.value.code == "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
-    assert conflicting.table.resolved is None
+    table = conflicting.table
+    assert table is not None
+    assert table.resolved is None
 
 
 @pytest.mark.integration

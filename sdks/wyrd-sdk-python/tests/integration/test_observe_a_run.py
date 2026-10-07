@@ -246,7 +246,7 @@ def test_eval_carries_trace_session_and_media(
         (EXPLICIT_TRACE[:30], EXPLICIT_SPAN, None),
         (EXPLICIT_TRACE, "zz" * 8, None),
         (EXPLICIT_TRACE, EXPLICIT_SPAN + "00", None),
-        (None, None, MediaRef(id="shot", kind="hologram", uri="s3://bucket/shot.png")),  # type: ignore[arg-type]
+        (None, None, MediaRef(id="shot", kind="hologram", uri="s3://bucket/shot.png")),  # ty: ignore[invalid-argument-type]
     ],
 )
 def test_malformed_eval_identity_is_refused(

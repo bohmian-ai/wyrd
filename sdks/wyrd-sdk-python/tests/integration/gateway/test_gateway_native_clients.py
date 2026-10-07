@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import anthropic
 import pytest
+from anthropic.types import MessageParam, TextBlock
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
@@ -18,7 +19,7 @@ from wyrd.testing import WyrdTestServer
 
 from .support import Received, access_token, assert_upstream_credentials, calls, deploy, usage
 
-MESSAGES = [{"role": "user", "content": "hi"}]
+MESSAGES: list[MessageParam] = [{"role": "user", "content": "hi"}]
 
 
 @pytest.fixture
@@ -43,9 +44,13 @@ def gemini_gateway(
     return server, received
 
 
-def anthropic_client(server: WyrdTestServer, token: str, **options: object) -> anthropic.Anthropic:
+def anthropic_client(
+    server: WyrdTestServer, token: str, default_headers: dict[str, str] | None = None
+) -> anthropic.Anthropic:
     """The official Anthropic client pointed at the gateway with ``token`` as its API key."""
-    return anthropic.Anthropic(base_url=server.base_url, api_key=token, max_retries=0, **options)
+    return anthropic.Anthropic(
+        base_url=server.base_url, api_key=token, max_retries=0, default_headers=default_headers
+    )
 
 
 def gemini_client(server: WyrdTestServer, token: str, **headers: str) -> genai.Client:
@@ -71,7 +76,9 @@ def test_anthropic_client_calls_and_streams_through_the_gateway(
         streamed = "".join(stream.text_stream)
         final = stream.get_final_message()
 
-    assert message.content[0].text == "hi"
+    (block,) = message.content
+    assert isinstance(block, TextBlock)
+    assert block.text == "hi"
     assert (message.usage.input_tokens, message.usage.output_tokens) == (5, 3)
     assert (streamed, final.stop_reason, final.usage.output_tokens) == ("hi", "end_turn", 3)
     assert len(received) == 2
@@ -96,8 +103,8 @@ def test_anthropic_refusals_never_reach_the_provider(
     with pytest.raises(anthropic.BadRequestError) as ambiguous:
         ambiguous_client.messages.create(model="claude-sonnet-5", max_tokens=16, messages=MESSAGES)
 
-    assert denied.value.body["error"]["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
-    assert ambiguous.value.body["error"]["code"] == "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
+    assert denied.value.response.json()["error"]["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert ambiguous.value.response.json()["error"]["code"] == "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
     assert received == []
 
 
@@ -140,7 +147,9 @@ def test_gemini_client_calls_and_streams_through_the_gateway(
     assert answer.usage_metadata is not None
     assert answer.usage_metadata.prompt_token_count == 7
     assert "".join(chunk.text or "" for chunk in chunks) == "hi"
-    assert chunks[-1].candidates[0].finish_reason == genai_types.FinishReason.STOP
+    final_candidates = chunks[-1].candidates
+    assert final_candidates is not None
+    assert final_candidates[0].finish_reason == genai_types.FinishReason.STOP
     assert [path for path, _ in received] == [
         "/v1beta/models/gemini-2.5-flash:generateContent",
         "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",

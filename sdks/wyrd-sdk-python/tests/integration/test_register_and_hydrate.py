@@ -58,14 +58,23 @@ def test_cards_get_returns_every_kind_typed(cards: Cards, support_desk: dict[str
     trigger = cards.get(support_desk["every-batch"])
     operator = cards.get(support_desk["notify-support"])
 
+    # `get` returns a union of typed envelopes; checking `kind` narrows each
+    # one to its kind-specific `spec`.
+    assert data["kind"] == "Data"
     assert [column["name"] for column in data["spec"]["schema"]["columns"]] == ["latency", "tier"]
     assert model["kind"] == "Model"
     assert model["metadata"]["artifact_hash"]
+    assert prompt["kind"] == "Prompt"
     assert prompt["spec"]["model"] == "gpt-4o"
+    assert agent["kind"] == "Agent"
     assert agent["spec"]["run_config"]["max_iterations"] == 2
+    assert verifier["kind"] == "Verifier"
     assert verifier["spec"]["implementation"]["kind"] == "eval"
+    assert service["kind"] == "Service"
     assert service["spec"]["service_type"] == "agent"
+    assert trigger["kind"] == "Trigger"
     assert trigger["spec"]["kind"] == "observations_ready"
+    assert operator["kind"] == "Operator"
     assert operator["spec"]["kind"] == "http"
 
 

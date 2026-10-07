@@ -18,7 +18,11 @@ const ON_CALL_TOKEN = "on-call-hook-token";
  * The latency watch Service, registered after its baseline and after the
  * `on-call-hooks` connection that gives its path-only Operator an origin.
  */
-const test = serverTest({ verificationRuntime: true }).extend<{ hooks: Receiver; cards: Cards; watch: RegistrationReceipt }>({
+const test = serverTest({ verificationRuntime: true }).extend<{
+  hooks: Receiver;
+  cards: Cards;
+  watch: RegistrationReceipt;
+}>({
   hooks: [
     async ({}, use) => {
       const hooks = await Receiver.start();
@@ -71,7 +75,7 @@ test("failed schedule alerts its operator on the connection origin", async ({ se
 });
 
 test("path only operator without connection is refused", async ({ cards }) => {
-  await expect(
-    cards.registerFromPath(fixture("invalid/operator-path-without-connection.yaml")),
-  ).rejects.toMatchObject({ code: "WYRD_SPEC_400_INVALID_OPERATOR" });
+  await expect(cards.registerFromPath(fixture("invalid/operator-path-without-connection.yaml"))).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_INVALID_OPERATOR",
+  });
 });

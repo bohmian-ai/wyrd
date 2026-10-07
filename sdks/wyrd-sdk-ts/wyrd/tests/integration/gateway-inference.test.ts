@@ -84,7 +84,10 @@ test("openai client calls the gateway with an access token", async ({ server, pr
   expect(reply.choices[0]?.message.content).toBe("hi");
   expect(reply.usage?.total_tokens).toBe(15);
   const [upstream] = provider.received.slice(before);
-  expect(upstream).toMatchObject({ path: "/v1/chat/completions", headers: { authorization: `Bearer ${PROVIDER_KEY}` } });
+  expect(upstream).toMatchObject({
+    path: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${PROVIDER_KEY}` },
+  });
   expect(Object.values(upstream?.headers ?? {})).not.toContain(token);
   expect(Object.keys(upstream?.headers ?? {}).filter((name) => name.startsWith("x-wyrd"))).toEqual([]);
 });

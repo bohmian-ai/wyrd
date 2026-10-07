@@ -13,12 +13,12 @@ import base64
 import json
 import struct
 from http.server import BaseHTTPRequestHandler
-from typing import Any
+from typing import Any, Literal
 
 from wyrd import cli
 from wyrd.bifrost import Bifrost
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway import Gateway, GatewayOperation, ProviderAdapter, ProviderAuth
 from wyrd.testing import WyrdTestServer
 
 PROVIDER_KEY = "sk-native-upstream"
@@ -180,7 +180,10 @@ class Upstream(BaseHTTPRequestHandler):
             self._send("application/json", json.dumps(OPENAI_COMPLETION))
         elif self.path == "/v1/embeddings" and body.get("encoding_format") == "base64":
             packed = base64.b64encode(struct.pack("<3f", *EMBEDDING_VECTOR)).decode()
-            answer = {**EMBEDDING, "data": [{**EMBEDDING["data"][0], "embedding": packed}]}
+            answer = {
+                **EMBEDDING,
+                "data": [{"object": "embedding", "index": 0, "embedding": packed}],
+            }
             self._send("application/json", json.dumps(answer))
         elif self.path == "/v1/embeddings":
             self._send("application/json", json.dumps(EMBEDDING))
@@ -224,10 +227,10 @@ def _sse(events: list[Any]) -> str:
 
 def deploy(
     server: WyrdTestServer,
-    provider: str,
+    provider: Literal["openai", "anthropic", "gemini", "vertex"],
     model: str,
-    capabilities: list[str],
-    adapter: object | None = None,
+    capabilities: list[GatewayOperation],
+    adapter: ProviderAdapter | None = None,
 ) -> None:
     """Store a provider's ``Environment`` credential and one built-in deployment of ``model``.
 
@@ -246,16 +249,19 @@ def deploy(
         server=server.base_url,
     )
     header = {"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(provider)
-    auth = (
+    auth: ProviderAuth = (
         {"api_key_header": {"header": header, "credential": credential}}
         if header
         else {"bearer": {"credential": credential}}
     )
+    if adapter is None:
+        assert provider != "vertex", "a Vertex deployment needs its project and location adapter"
+        adapter = provider
     gateway.put_deployment(
         {
             "name": model.replace(".", "-"),
             "model": {"provider": provider, "model": model},
-            "adapter": adapter or provider,
+            "adapter": adapter,
             "auth": auth,
             "capabilities": capabilities,
             "routing_weight": 1,

@@ -20,14 +20,20 @@ import os
 import pathlib
 import subprocess
 from collections.abc import Iterator, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import anthropic
 import openai
 import pytest
 from google import genai
+from openai.types.responses import ResponseCompletedEvent
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway import (
+    Gateway,
+    GatewayOperation,
+    ProviderAuth,
+    ProviderDeployment,
+)
 from wyrd.testing import WyrdTestServer
 
 # Provider → environment variables carrying that provider's own credential,
@@ -89,7 +95,8 @@ def credential(provider: str) -> str:
         secret = os.environ.get(variable)
         if secret:
             return secret
-    pytest.skip(f"{provider} smoke skipped: none of {', '.join(variables)} is set")
+    # ty does not yet read pytest.skip's signature through its exception decorator.
+    pytest.skip(f"{provider} smoke skipped: none of {', '.join(variables)} is set")  # ty: ignore[too-many-positional-arguments]
 
 
 def model(provider: str) -> str:
@@ -180,10 +187,10 @@ def caller(server: WyrdTestServer, provider: str, models: Sequence[str]) -> str:
 
 @contextlib.contextmanager
 def live_server(
-    provider: str,
+    provider: Literal["openai", "anthropic", "gemini"],
     secret: str,
     *,
-    deployments: Sequence[tuple[str, Sequence[str]]] | None = None,
+    deployments: Sequence[tuple[str, Sequence[GatewayOperation]]] | None = None,
 ) -> Iterator[tuple[WyrdTestServer, str]]:
     """Yield a server whose built-in adapters reach real providers, plus a caller token.
 
@@ -198,15 +205,17 @@ def live_server(
     with WyrdTestServer(mutate_env=True, live_providers=True) as server:
         name = submit(server, provider, secret)
         header = API_KEY_HEADERS.get(provider)
-        auth = (
+        auth: ProviderAuth = (
             {"api_key_header": {"header": header, "credential": name}}
             if header
             else {"bearer": {"credential": name}}
         )
-        declared = list(deployments or [(model(provider), ["chat_completions"])])
+        declared: list[tuple[str, Sequence[GatewayOperation]]] = list(
+            deployments or [(model(provider), ["chat_completions"])]
+        )
         gateway = Gateway(server_url=server.base_url, credential=server.api_key)
         for index, (native, capabilities) in enumerate(declared):
-            deployment: dict[str, Any] = {
+            deployment: ProviderDeployment = {
                 "name": f"{provider}-live-{index}",
                 "model": {"provider": provider, "model": native},
                 "adapter": provider,
@@ -220,7 +229,9 @@ def live_server(
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini"])
-def test_openai_compatible_client_reaches_a_live_provider(provider: str) -> None:
+def test_openai_compatible_client_reaches_a_live_provider(
+    provider: Literal["openai", "anthropic", "gemini"],
+) -> None:
     """The unmodified OpenAI client reaches each real provider through the server."""
     secret = credential(provider)
     with live_server(provider, secret) as (server, token):
@@ -275,7 +286,7 @@ def test_google_client_reaches_live_gemini() -> None:
 
 
 @contextlib.contextmanager
-def openai_live(*deployments: tuple[str, Sequence[str]]) -> Iterator[openai.OpenAI]:
+def openai_live(*deployments: tuple[str, Sequence[GatewayOperation]]) -> Iterator[openai.OpenAI]:
     """Yield an OpenAI client aimed at a live server administering ``deployments``."""
     secret = credential("openai")
     with live_server("openai", secret, deployments=list(deployments)) as (server, token):
@@ -308,7 +319,7 @@ def test_openai_client_reaches_live_responses() -> None:
                 max_output_tokens=MAX_OUTPUT_TOKENS,
                 stream=True,
             )
-            if event.type == "response.completed"
+            if isinstance(event, ResponseCompletedEvent)
         ]
         assert completed, "the relayed stream carried no terminal event"
         assert completed[-1].response.usage is not None, "the terminal event reported no usage"

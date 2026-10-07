@@ -2840,6 +2840,38 @@ class RegisteredAgentCard(_RegisteredAgentCardRequired, total=False):
     status: Status | None
 
 
+class _RegisteredArtifactCardRequired(TypedDict):
+    """Required keys of `RegisteredArtifactCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Artifact"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredArtifactCard(_RegisteredArtifactCardRequired, total=False):
+    """Registered `Artifact` Card envelope; its spec is not typed yet."""
+
+    relationships: Relationships
+    status: Status | None
+
+
+class _RegisteredAuditCardRequired(TypedDict):
+    """Required keys of `RegisteredAuditCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Audit"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredAuditCard(_RegisteredAuditCardRequired, total=False):
+    """Registered `Audit` Card envelope; its spec is not typed yet."""
+
+    relationships: Relationships
+    status: Status | None
+
+
 # One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
 RegisteredCard: TypeAlias = "RegisteredDataCard | RegisteredModelCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard"
 
@@ -2855,6 +2887,38 @@ class _RegisteredDataCardRequired(TypedDict):
 
 class RegisteredDataCard(_RegisteredDataCardRequired, total=False):
     """Registered `Data` Card envelope."""
+
+    relationships: Relationships
+    status: Status | None
+
+
+class _RegisteredExperimentCardRequired(TypedDict):
+    """Required keys of `RegisteredExperimentCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Experiment"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredExperimentCard(_RegisteredExperimentCardRequired, total=False):
+    """Registered `Experiment` Card envelope; its spec is not typed yet."""
+
+    relationships: Relationships
+    status: Status | None
+
+
+class _RegisteredMcpCardRequired(TypedDict):
+    """Required keys of `RegisteredMcpCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Mcp"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredMcpCard(_RegisteredMcpCardRequired, total=False):
+    """Registered `Mcp` Card envelope; its spec is not typed yet."""
 
     relationships: Relationships
     status: Status | None
@@ -2892,6 +2956,22 @@ class RegisteredOperatorCard(_RegisteredOperatorCardRequired, total=False):
     status: Status | None
 
 
+class _RegisteredPolicyCardRequired(TypedDict):
+    """Required keys of `RegisteredPolicyCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Policy"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredPolicyCard(_RegisteredPolicyCardRequired, total=False):
+    """Registered `Policy` Card envelope; its spec is not typed yet."""
+
+    relationships: Relationships
+    status: Status | None
+
+
 class _RegisteredPromptCardRequired(TypedDict):
     """Required keys of `RegisteredPromptCard`."""
 
@@ -2924,6 +3004,22 @@ class RegisteredServiceCard(_RegisteredServiceCardRequired, total=False):
     status: Status | None
 
 
+class _RegisteredSourceCardRequired(TypedDict):
+    """Required keys of `RegisteredSourceCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Source"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredSourceCard(_RegisteredSourceCardRequired, total=False):
+    """Registered `Source` Card envelope; its spec is not typed yet."""
+
+    relationships: Relationships
+    status: Status | None
+
+
 class _RegisteredTriggerCardRequired(TypedDict):
     """Required keys of `RegisteredTriggerCard`."""
 
@@ -2940,20 +3036,8 @@ class RegisteredTriggerCard(_RegisteredTriggerCardRequired, total=False):
     status: Status | None
 
 
-class _RegisteredUntypedCardRequired(TypedDict):
-    """Required keys of `RegisteredUntypedCard`."""
-
-    apiVersion: ApiVersion
-    kind: Literal["Experiment", "Workflow", "Policy", "Mcp", "Audit", "Artifact", "Source"]
-    metadata: Metadata
-    spec: dict[str, JsonValue]
-
-
-class RegisteredUntypedCard(_RegisteredUntypedCardRequired, total=False):
-    """Registered Card envelope of a kind whose spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
+# Registered Card envelope of a kind whose spec is not typed yet.
+RegisteredUntypedCard: TypeAlias = "RegisteredExperimentCard | RegisteredWorkflowCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard"
 
 
 class _RegisteredVerifierCardRequired(TypedDict):
@@ -2967,6 +3051,22 @@ class _RegisteredVerifierCardRequired(TypedDict):
 
 class RegisteredVerifierCard(_RegisteredVerifierCardRequired, total=False):
     """Registered `Verifier` Card envelope."""
+
+    relationships: Relationships
+    status: Status | None
+
+
+class _RegisteredWorkflowCardRequired(TypedDict):
+    """Required keys of `RegisteredWorkflowCard`."""
+
+    apiVersion: ApiVersion
+    kind: Literal["Workflow"]
+    metadata: Metadata
+    spec: dict[str, JsonValue]
+
+
+class RegisteredWorkflowCard(_RegisteredWorkflowCardRequired, total=False):
+    """Registered `Workflow` Card envelope; its spec is not typed yet."""
 
     relationships: Relationships
     status: Status | None

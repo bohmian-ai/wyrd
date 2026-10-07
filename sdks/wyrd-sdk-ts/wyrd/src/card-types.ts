@@ -3279,6 +3279,66 @@ export interface RegisteredAgentCard {
 }
 
 /**
+ * Registered `Artifact` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredArtifactCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Artifact";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
+ * Registered `Audit` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredAuditCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Audit";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
 export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
@@ -3307,6 +3367,66 @@ export interface RegisteredDataCard {
    * Kind-specific spec payload.
    */
   readonly spec: DataSpec;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
+ * Registered `Experiment` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredExperimentCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Experiment";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
+ * Registered `Mcp` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredMcpCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Mcp";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
   /**
    * Optional server-derived status.
    */
@@ -3374,6 +3494,36 @@ export interface RegisteredOperatorCard {
 }
 
 /**
+ * Registered `Policy` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredPolicyCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Policy";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
  * Registered `Prompt` Card envelope.
  */
 export interface RegisteredPromptCard {
@@ -3434,6 +3584,36 @@ export interface RegisteredServiceCard {
 }
 
 /**
+ * Registered `Source` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredSourceCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Source";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
  * Registered `Trigger` Card envelope.
  */
 export interface RegisteredTriggerCard {
@@ -3466,32 +3646,7 @@ export interface RegisteredTriggerCard {
 /**
  * Registered Card envelope of a kind whose spec is not typed yet.
  */
-export interface RegisteredUntypedCard {
-  /**
-   * API version. Must be `wyrd/v1` for v1 Cards.
-   */
-  readonly apiVersion: ApiVersion;
-  /**
-   * Card kind discriminator.
-   */
-  readonly kind: "Experiment" | "Workflow" | "Policy" | "Mcp" | "Audit" | "Artifact" | "Source";
-  /**
-   * Card metadata.
-   */
-  readonly metadata: Metadata;
-  /**
-   * Server-derived relationship summary.
-   */
-  readonly relationships?: Relationships;
-  /**
-   * Kind-specific spec payload.
-   */
-  readonly spec: Readonly<Record<string, unknown>>;
-  /**
-   * Optional server-derived status.
-   */
-  readonly status?: Status | null;
-}
+export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredWorkflowCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard;
 
 /**
  * Registered `Verifier` Card envelope.
@@ -3517,6 +3672,36 @@ export interface RegisteredVerifierCard {
    * Kind-specific spec payload.
    */
   readonly spec: VerifierSpec;
+  /**
+   * Optional server-derived status.
+   */
+  readonly status?: Status | null;
+}
+
+/**
+ * Registered `Workflow` Card envelope; its spec is not typed yet.
+ */
+export interface RegisteredWorkflowCard {
+  /**
+   * API version. Must be `wyrd/v1` for v1 Cards.
+   */
+  readonly apiVersion: ApiVersion;
+  /**
+   * Card kind discriminator.
+   */
+  readonly kind: "Workflow";
+  /**
+   * Card metadata.
+   */
+  readonly metadata: Metadata;
+  /**
+   * Server-derived relationship summary.
+   */
+  readonly relationships?: Relationships;
+  /**
+   * Kind-specific spec payload.
+   */
+  readonly spec: Readonly<Record<string, unknown>>;
   /**
    * Optional server-derived status.
    */

@@ -21,7 +21,7 @@ def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
         version="0.1.0",
     )
     with pytest.raises(wyrd.WyrdError) as captured:
-        offline_cards.register(card)
+        offline_cards.register(card)  # ty: ignore[invalid-argument-type]
     assert captured.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 

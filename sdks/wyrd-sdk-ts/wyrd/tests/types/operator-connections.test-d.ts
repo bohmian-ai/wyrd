@@ -34,8 +34,13 @@ expectTypeOf({
   auth: { scheme: "basic", username: "u" },
 } as const).not.toExtend<CreateOperatorConnectionRequest>();
 expectTypeOf({ provider: "email", name: "e" } as const).not.toExtend<CreateOperatorConnectionRequest>();
-// @ts-expect-error PagerDuty does not take a Slack bot token.
-const pagerDuty: CreateOperatorConnectionRequest = { provider: "pager_duty", name: "p", integration_key: "x", bot_token: "x" };
+const pagerDuty: CreateOperatorConnectionRequest = {
+  provider: "pager_duty",
+  name: "p",
+  integration_key: "x",
+  // @ts-expect-error PagerDuty does not take a Slack bot token.
+  bot_token: "x",
+};
 // @ts-expect-error Updates never rename a connection.
 const renamed: UpdateOperatorConnectionRequest = { provider: "slack", name: "renamed" };
 // @ts-expect-error An HTTP origin is not a Slack update field.

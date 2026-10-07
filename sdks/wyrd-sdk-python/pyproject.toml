@@ -76,5 +76,14 @@ target-version = "py310"
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
 
+[tool.ty.src]
+# Public modules are typed by their ``__init__.pyi``; the ``stubs/`` sources are
+# assembled into those files, so neither is checked twice.
+include = ["python/wyrd", "scripts", "tests"]
+exclude = ["python/wyrd/stubs", "python/wyrd/**/__init__.py"]
+
+[tool.ty.rules]
+unused-ignore-comment = "error"
+
 [tool.uv]
 package = false

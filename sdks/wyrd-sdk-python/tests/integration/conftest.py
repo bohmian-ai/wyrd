@@ -107,7 +107,7 @@ def receiver() -> Iterator[Receiver]:
                 received.deliveries.append(Delivery(self.path, headers, body))
                 received.delivered.notify_all()
 
-        def log_message(self, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""
 
     server.RequestHandlerClass = Handler

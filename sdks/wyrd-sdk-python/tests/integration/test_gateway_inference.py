@@ -90,7 +90,7 @@ class Elsewhere(BaseHTTPRequestHandler):
         self.received.append(self.path)
         self.send_error(401)
 
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         """Keep per-request access lines out of the test output."""
 
 

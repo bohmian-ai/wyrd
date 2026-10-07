@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
@@ -37,26 +38,26 @@ class CardEnvelope:
         ...
 
     @property
-    def metadata(self) -> dict[str, object]:
+    def metadata(self) -> dict[str, Any]:
         """Return a JSON-compatible copy of Card metadata."""
         ...
 
     @property
-    def spec(self) -> dict[str, object]:
+    def spec(self) -> dict[str, Any]:
         """Return a JSON-compatible copy of the kind-specific Card spec."""
         ...
 
     @property
-    def relationships(self) -> dict[str, object]:
+    def relationships(self) -> dict[str, Any]:
         """Return a JSON-compatible copy of server-derived relationships."""
         ...
 
     @property
-    def status(self) -> dict[str, object] | None:
+    def status(self) -> dict[str, Any] | None:
         """Return server-managed status, or ``None`` when no status exists."""
         ...
 
-    def model_dump(self) -> dict[str, object]:
+    def model_dump(self) -> dict[str, Any]:
         """Return the complete Card envelope as a JSON-compatible mapping."""
         ...
 

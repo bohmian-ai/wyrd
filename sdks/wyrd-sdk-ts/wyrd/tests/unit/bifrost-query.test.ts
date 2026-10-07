@@ -136,7 +136,7 @@ test.for(["auto", "full", "small-files", "files-with-delete"] as const)("compact
 });
 
 test.for(["small_files", "files_with_delete"])("compaction type spelled %s is refused", (refused) => {
-  expect(() =>
-    TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionType: refused as CompactionType }),
-  ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
+  expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionType: refused as CompactionType })).toThrow(
+    expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }),
+  );
 });

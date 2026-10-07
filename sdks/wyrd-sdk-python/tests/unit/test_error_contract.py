@@ -7,7 +7,7 @@ from wyrd.prompt import ResponseFormat
 
 def test_wyrd_error_exposes_the_catalog_problem() -> None:
     with pytest.raises(WyrdError) as raised:
-        ResponseFormat.json_schema("bad", [])
+        ResponseFormat.json_schema("bad", [])  # ty: ignore[invalid-argument-type]
 
     error = raised.value
     assert error.code == "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA"

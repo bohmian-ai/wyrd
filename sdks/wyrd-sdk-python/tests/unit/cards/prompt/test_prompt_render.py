@@ -7,13 +7,17 @@ from wyrd.prompt import MediaRef, Prompt, WyrdError
 def test_render_substitutes_double_brace_placeholder() -> None:
     rendered = Prompt.openai_chat("gpt-4o", messages="Hello {{name}}").render(name="Ada")
 
-    assert rendered.openai().messages[-1].content.as_text() == "Hello Ada"
+    content = rendered.openai().messages[-1].content
+    assert content is not None
+    assert content.as_text() == "Hello Ada"
 
 
 def test_render_dollar_and_double_brace_placeholders() -> None:
     rendered = Prompt.openai_chat("gpt-4o", messages="${name} {name} {{name}}").render(name="Ada")
 
-    assert rendered.openai().messages[-1].content.as_text() == "Ada {name} Ada"
+    content = rendered.openai().messages[-1].content
+    assert content is not None
+    assert content.as_text() == "Ada {name} Ada"
 
 
 @pytest.mark.parametrize(
@@ -67,7 +71,9 @@ def test_bound_text_and_media_render_together() -> None:
     bound = bound.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
     bound.bind_mut(place="London")
 
-    parts = bound.render().openai().messages[-1].content.as_parts()
+    content = bound.render().openai().messages[-1].content
+    assert content is not None
+    parts = content.as_parts()
 
     assert [part.kind for part in parts] == ["text", "image_url"]
     assert parts[0].as_text() == "Hello Ada from London "

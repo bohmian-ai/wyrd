@@ -10,7 +10,7 @@ from collections.abc import Iterator
 
 import pytest
 from wyrd import WyrdError, cli
-from wyrd.gateway import Gateway
+from wyrd.gateway import Gateway, ProviderDeployment
 from wyrd.testing import WyrdTestServer
 
 BINDING = "test-provider-key"
@@ -18,7 +18,7 @@ BINDING = "test-provider-key"
 
 SOURCE = {"environment": {"binding": BINDING}}
 
-DEPLOYMENT = {
+DEPLOYMENT: ProviderDeployment = {
     "name": "py-gpt",
     "model": {"provider": "openai", "model": "gpt-4o"},
     "adapter": "openai",

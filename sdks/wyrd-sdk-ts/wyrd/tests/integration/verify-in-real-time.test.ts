@@ -79,7 +79,9 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
 
 // `tier-drift` control-charts a text column, so its baseline never fits.
 test("verify before baseline ready is refused", async ({ unfitted }) => {
-  await expect(unfitted.run("model").observe.verify("tier-drift", Array(5).fill({ tier: "gold" }))).rejects.toMatchObject({
+  await expect(
+    unfitted.run("model").observe.verify("tier-drift", Array(5).fill({ tier: "gold" })),
+  ).rejects.toMatchObject({
     code: "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
   });
 });

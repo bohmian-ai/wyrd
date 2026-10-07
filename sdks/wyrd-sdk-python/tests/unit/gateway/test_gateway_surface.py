@@ -36,13 +36,13 @@ def test_gateway_invalid_body_raises_validation_without_echoing_it():
     gateway = Gateway(server_url="http://127.0.0.1:9", credential="unused")
     with pytest.raises(WyrdError) as captured:
         gateway.put_deployment(
-            {
+            {  # ty: ignore[invalid-argument-type]
                 "name": "openai-primary",
                 "model": {"provider": "openai", "model": "gpt-4o"},
                 "adapter": "openai",
                 "auth": {"bearer": {"credential": "openai-key"}},
                 "capabilities": ["chat_completions"],
-                "routing_weight": SENTINEL,
+                "routing_weight": SENTINEL,  # ty: ignore[invalid-argument-type]
             }
         )
     error = captured.value

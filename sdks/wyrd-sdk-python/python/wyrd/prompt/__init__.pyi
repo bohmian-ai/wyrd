@@ -788,8 +788,245 @@ class OpenAiResponsesRequest:
         """The ``model`` field."""
         ...
     @property
+    def input(self) -> list[OpenAiResponseItem]:
+        """The ``input`` items; text shorthand input is shown as its one user message."""
+        ...
+    @property
     def instructions(self) -> str | None:
         """The ``instructions`` system text, or ``None`` when unset."""
+        ...
+    @property
+    def text(self) -> OpenAiResponsesText | None:
+        """The ``text`` output configuration, or ``None`` when unset."""
+        ...
+    @property
+    def tools(self) -> list[OpenAiResponsesTool]:
+        """The ``tools`` list, empty when unset."""
+        ...
+    @property
+    def tool_choice(self) -> OpenAiResponsesToolChoice | None:
+        """The ``tool_choice``, or ``None`` when unset."""
+        ...
+    @property
+    def parallel_tool_calls(self) -> bool | None:
+        """The ``parallel_tool_calls`` flag, or ``None`` when unset."""
+        ...
+    @property
+    def previous_response_id(self) -> str | None:
+        """The ``previous_response_id`` this request continues, or ``None``."""
+        ...
+    @property
+    def stream(self) -> bool | None:
+        """The ``stream`` flag, or ``None`` when unset."""
+        ...
+    @property
+    def settings(self) -> OpenAiResponsesSettings:
+        """The generation settings sent with the request."""
+        ...
+
+class OpenAiResponseItem:
+    """One OpenAI Responses ``input`` item."""
+
+    @property
+    def kind(self) -> str:
+        """``"message"``, ``"function_call"``, ``"function_call_output"``,
+        ``"reasoning"``, ``"input_file"``, or ``"input_image"``."""
+        ...
+    def as_message_role(self) -> str:
+        """Return the ``role`` of a ``"message"`` item.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for the wrong
+                ``kind``, as every ``as_*`` accessor here does.
+        """
+        ...
+    def as_function_call_name(self) -> str:
+        """Return the function ``name`` of a ``"function_call"`` item."""
+        ...
+    def as_function_call_arguments(self) -> str:
+        """Return the JSON ``arguments`` string of a ``"function_call"`` item."""
+        ...
+    def as_function_call_output(self) -> str:
+        """Return the ``output`` of a ``"function_call_output"`` item."""
+        ...
+
+class OpenAiResponsesSettings:
+    """Generation settings of an OpenAI Responses request."""
+
+    @property
+    def temperature(self) -> float | None:
+        """The sampling ``temperature``, or ``None`` when unset."""
+        ...
+    @property
+    def top_p(self) -> float | None:
+        """The nucleus sampling ``top_p``, or ``None`` when unset."""
+        ...
+    @property
+    def max_output_tokens(self) -> int | None:
+        """The ``max_output_tokens`` limit, or ``None`` when unset."""
+        ...
+    @property
+    def reasoning(self) -> OpenAiReasoning | None:
+        """The ``reasoning`` configuration, or ``None`` when unset."""
+        ...
+    @property
+    def store(self) -> bool | None:
+        """The ``store`` flag, or ``None`` when unset."""
+        ...
+    @property
+    def metadata(self) -> dict[str, Any] | None:
+        """The request ``metadata``, or ``None`` when unset."""
+        ...
+    @property
+    def extra(self) -> dict[str, Any]:
+        """Provider fields Wyrd does not model, passed through unchanged."""
+        ...
+
+class OpenAiResponsesText:
+    """The ``text`` output configuration of an OpenAI Responses request."""
+
+    @property
+    def format_kind(self) -> str | None:
+        """``"text"``, ``"json_object"``, or ``"json_schema"``; ``None`` when unset."""
+        ...
+
+class OpenAiReasoning:
+    """The ``reasoning`` configuration of an OpenAI Responses request."""
+
+    @property
+    def effort(self) -> str | None:
+        """``"none"``, ``"minimal"``, ``"low"``, ``"medium"``, ``"high"``, or ``"xhigh"``."""
+        ...
+    @property
+    def summary(self) -> str | None:
+        """``"auto"``, ``"concise"``, or ``"detailed"``; ``None`` when unset."""
+        ...
+
+class OpenAiResponsesTool:
+    """One entry of an OpenAI Responses request's ``tools``."""
+
+    @property
+    def kind(self) -> str:
+        """``"function"``, ``"web_search_preview"``, ``"file_search"``,
+        ``"code_interpreter"``, ``"image_generation"``, ``"mcp"``, or ``"custom"``."""
+        ...
+    def as_function_name(self) -> str:
+        """Return the ``name`` of a ``"function"`` tool."""
+        ...
+    def as_mcp_server_label(self) -> str:
+        """Return the ``server_label`` of an ``"mcp"`` tool."""
+        ...
+    def as_custom_name(self) -> str:
+        """Return the ``name`` of a ``"custom"`` tool."""
+        ...
+
+class OpenAiResponsesToolChoice:
+    """The ``tool_choice`` of an OpenAI Responses request."""
+
+    @property
+    def kind(self) -> str:
+        """``"mode"``, ``"allowed"``, ``"hosted"``, ``"function"``, ``"mcp"``,
+        ``"custom"``, ``"apply_patch"``, or ``"shell"``."""
+        ...
+    def as_mode(self) -> str:
+        """Return ``"none"``, ``"auto"``, or ``"required"`` for a ``"mode"`` choice."""
+        ...
+    def as_hosted(self) -> OpenAiResponsesHostedToolChoice:
+        """Return a ``"hosted"`` choice."""
+        ...
+    def as_function_choice(self) -> OpenAiResponsesFunctionToolChoice:
+        """Return a ``"function"`` choice."""
+        ...
+    def as_allowed(self) -> OpenAiResponsesAllowedToolsChoice:
+        """Return an ``"allowed"`` choice."""
+        ...
+    def as_mcp(self) -> OpenAiResponsesMcpToolChoice:
+        """Return an ``"mcp"`` choice."""
+        ...
+    def as_custom_choice(self) -> OpenAiResponsesCustomToolChoice:
+        """Return a ``"custom"`` choice."""
+        ...
+    def as_apply_patch(self) -> OpenAiResponsesApplyPatchToolChoice:
+        """Return an ``"apply_patch"`` choice."""
+        ...
+    def as_shell(self) -> OpenAiResponsesShellToolChoice:
+        """Return a ``"shell"`` choice."""
+        ...
+
+class OpenAiResponsesAllowedToolsChoice:
+    """A ``tool_choice`` that limits the model to a subset of tools."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"allowed_tools"``."""
+        ...
+    @property
+    def mode(self) -> str:
+        """``"auto"`` or ``"required"``."""
+        ...
+
+class OpenAiResponsesHostedToolChoice:
+    """A ``tool_choice`` that forces one OpenAI-hosted tool."""
+
+    @property
+    def kind(self) -> str:
+        """The hosted tool type, such as ``"file_search"`` or ``"code_interpreter"``."""
+        ...
+
+class OpenAiResponsesFunctionToolChoice:
+    """A ``tool_choice`` that forces one function tool."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"function"``."""
+        ...
+    @property
+    def name(self) -> str:
+        """The forced function ``name``."""
+        ...
+
+class OpenAiResponsesMcpToolChoice:
+    """A ``tool_choice`` that forces a tool on one MCP server."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"mcp"``."""
+        ...
+    @property
+    def server_label(self) -> str:
+        """The MCP ``server_label``."""
+        ...
+    @property
+    def name(self) -> str | None:
+        """The forced tool ``name``, or ``None`` for any tool on the server."""
+        ...
+
+class OpenAiResponsesCustomToolChoice:
+    """A ``tool_choice`` that forces one custom tool."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"custom"``."""
+        ...
+    @property
+    def name(self) -> str:
+        """The forced custom tool ``name``."""
+        ...
+
+class OpenAiResponsesApplyPatchToolChoice:
+    """A ``tool_choice`` that forces the ``apply_patch`` tool."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"apply_patch"``."""
+        ...
+
+class OpenAiResponsesShellToolChoice:
+    """A ``tool_choice`` that forces the ``shell`` tool."""
+
+    @property
+    def kind(self) -> str:
+        """Always ``"shell"``."""
         ...
 
 class OpenAiResponsesResponse:
@@ -800,12 +1037,24 @@ class OpenAiResponsesResponse:
         """The response ``id``."""
         ...
     @property
+    def object(self) -> str:
+        """The ``object`` type, ``"response"`` from OpenAI."""
+        ...
+    @property
     def model(self) -> str:
         """The ``model`` that produced the response."""
         ...
     @property
     def status(self) -> str:
         """The response ``status``, such as ``"completed"`` or ``"incomplete"``."""
+        ...
+    @property
+    def created_at(self) -> int:
+        """The ``created_at`` Unix timestamp in seconds."""
+        ...
+    @property
+    def previous_response_id(self) -> str | None:
+        """The ``previous_response_id`` this response continues, or ``None``."""
         ...
     @property
     def usage(self) -> OpenAiResponsesUsage | None:
@@ -826,6 +1075,30 @@ class OpenAiResponsesUsage:
     @property
     def total_tokens(self) -> int:
         """The ``total_tokens`` count."""
+        ...
+    @property
+    def input_tokens_details(self) -> OpenAiResponsesInputTokensDetails | None:
+        """The ``input_tokens_details``, or ``None`` when omitted."""
+        ...
+    @property
+    def output_tokens_details(self) -> OpenAiResponsesOutputTokensDetails | None:
+        """The ``output_tokens_details``, or ``None`` when omitted."""
+        ...
+
+class OpenAiResponsesInputTokensDetails:
+    """The ``input_tokens_details`` of an OpenAI Responses usage."""
+
+    @property
+    def cached_tokens(self) -> int:
+        """The ``cached_tokens`` count."""
+        ...
+
+class OpenAiResponsesOutputTokensDetails:
+    """The ``output_tokens_details`` of an OpenAI Responses usage."""
+
+    @property
+    def reasoning_tokens(self) -> int:
+        """The ``reasoning_tokens`` count."""
         ...
 
 class ResponseFormat:
@@ -1198,7 +1471,7 @@ class Prompt:
         *,
         provider: str,
         system: str | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
@@ -1269,7 +1542,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
@@ -1290,7 +1563,7 @@ class Prompt:
         *,
         instructions: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
@@ -1309,7 +1582,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
@@ -1328,7 +1601,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,
@@ -1347,7 +1620,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | JsonDict | None = ...,
+        response_format: ResponseFormat | type | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
         variables: list[str] | None = ...,

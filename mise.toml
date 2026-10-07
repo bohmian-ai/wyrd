@@ -630,7 +630,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
 tests, every integration journey (Bifrost, gateway, and story journeys), plus the shared identity journeys (see
 verify:python-sdk)."""
-depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey"]
+depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey"]
 
 [tasks."test:rust"]
 description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to
@@ -1149,9 +1149,9 @@ run = "uv run ruff check python/wyrd tests scripts"
 
 [tasks."py:typecheck"]
 hide = true
-description = "Run ty over the generated Python stub surface"
+description = "Run ty over the Wyrd Python package, its stubs, scripts, and every test (scope in pyproject.toml)"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/client/test_client.py tests/unit/cards/test_registered_card_typing.py tests/unit/runtime/test_public_api_parity.py tests/unit/runtime/workflow/test_workflow_parameter_injection.py tests/typecheck/*.py"
+run = "uv run ty check"
 
 [tasks."py:test:testing"]
 hide = true
@@ -1515,6 +1515,23 @@ run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise
 description = "Pack the compiled @wyrd/sdk and current-host napi addon, then import the installed package from a clean ESM project"
 depends = ["ts:build"]
 run = "node scripts/check_ts_package.mjs"
+
+[tasks."ts:format"]
+description = "Format the TypeScript SDK sources and tests with Biome"
+dir = "sdks/wyrd-sdk-ts"
+run = "pnpm exec biome format --write"
+
+[tasks."ts:format:check"]
+hide = true
+description = "Check TypeScript SDK formatting with Biome"
+dir = "sdks/wyrd-sdk-ts"
+run = "pnpm exec biome format"
+
+[tasks."ts:lints"]
+hide = true
+description = "Run Biome lint checks over the TypeScript SDK"
+dir = "sdks/wyrd-sdk-ts"
+run = "pnpm exec biome lint --error-on-warnings"
 
 [tasks."ts:typecheck"]
 description = "Typecheck @wyrd/sdk incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"

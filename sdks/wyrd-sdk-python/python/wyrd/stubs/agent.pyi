@@ -3,7 +3,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import (
+    Any,
+    Literal,
+    ParamSpec,
+    Protocol,
+    TypedDict,
+    TypeVar,
+    overload,
+    runtime_checkable,
+)
 
 from .cards import AgentCard
 from .error import WyrdError
@@ -11,6 +20,9 @@ from .header import JsonDict, PathLike
 from .prompt import Prompt, ProviderResponse
 
 #### end of imports ####
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 class Role:
     """Session turn role.
@@ -627,7 +639,7 @@ class Agent:
         """Append an ``after_tool_callback``, chained as ``add_before_agent()``."""
         ...
 
-    def as_tool(self, *, description: str | None = ...) -> object:
+    def as_tool(self, *, description: str | None = ...) -> Callable[[Mapping[str, Any]], Any]:
         """Return this Agent as a tool another Agent can call.
 
         The tool is named after ``Agent.id``, takes one ``input`` string,
@@ -637,15 +649,30 @@ class Agent:
         Args:
             description: the description the calling model sees. Omitted, it
                 is ``"Delegate to agent <id>"``.
+
+        Returns:
+            A callable that takes the tool arguments as one mapping, such as
+            ``{"input": "..."}``, and returns the delegate Agent's output.
         """
         ...
 
+@overload
 def tool(
-    fn: Callable[..., object] | None = ...,
+    fn: None = ...,
     *,
     name: str | None = ...,
     description: str | None = ...,
-) -> object:
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Return a decorator that registers a function as a tool; see the other overload."""
+    ...
+
+@overload
+def tool(
+    fn: Callable[_P, _R],
+    *,
+    name: str | None = ...,
+    description: str | None = ...,
+) -> Callable[_P, _R]:
     """Decorate a function as a runtime-local tool and register it.
 
     The input schema comes from the parameters' annotations (parameters without

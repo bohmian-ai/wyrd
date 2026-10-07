@@ -91,7 +91,8 @@ def test_model_round_trips_through_its_interface(
 
     restored = ModelCard.from_path(tmp_path)
 
-    assert (restored.interface.kind, restored.interface.has_model) == (kind, True)
+    assert restored.interface.kind == kind
+    assert restored.model is not None
 
 
 def test_sklearn_interface_loads_a_local_materialization(
@@ -195,6 +196,7 @@ def test_huggingface_model_round_trips_with_its_task(
 
     restored = ModelCard.from_path(tmp_path)
 
+    assert isinstance(restored.interface, HuggingfaceInterface)
     assert (restored.interface.has_model, restored.interface.hf_task) == (
         True,
         "text-classification",
@@ -270,11 +272,8 @@ def test_model_from_path_reads_card_file_without_loading_model(
 
     card = ModelCard.from_path(tmp_path / "card.json")
 
-    assert (card.uid, card.interface.kind, card.interface.has_model) == (
-        saved.uid,
-        "Sklearn",
-        False,
-    )
+    assert isinstance(card.interface, SklearnInterface)
+    assert (card.uid, card.interface.has_model) == (saved.uid, False)
 
 
 def test_model_from_path_missing_file_raises_loader_error(tmp_path: Path) -> None:

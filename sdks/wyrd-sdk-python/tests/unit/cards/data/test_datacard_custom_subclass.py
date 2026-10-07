@@ -7,7 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
-from wyrd.data import DataCard, DataInterface, DataStats, WyrdError
+from wyrd.data import DataCard, DataCardMetadata, DataInterface, DataStats, WyrdError
 
 ROWS = {"rows": [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]}
 
@@ -32,6 +32,8 @@ class JsonInterface(DataInterface):
 
 class MetadataAwareJsonInterface(JsonInterface):
     """Keeps the stored card metadata it was rebuilt from."""
+
+    rebuilt_from: DataCardMetadata | None = None
 
     @classmethod
     def from_metadata(cls, metadata):

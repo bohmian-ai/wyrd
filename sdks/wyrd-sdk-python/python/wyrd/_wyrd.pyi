@@ -51,7 +51,7 @@ class WyrdError(Exception):
             ``WYRD_CLIENT_401_NO_CREDENTIALS``.
         message: human-readable failure text.
         detail: the same text as ``message``, under its problem-document name.
-        details: structured JSON context, or ``None`` when there is none.
+        details: structured JSON context; empty when there is none.
         remediation: what the caller should change before retrying.
         status: the HTTP status the code maps to.
         title: short catalog title for the code.
@@ -61,7 +61,7 @@ class WyrdError(Exception):
     code: str
     message: str
     detail: str
-    details: dict[str, Any] | None
+    details: dict[str, Any]
     remediation: str
     status: int
     title: str
@@ -117,7 +117,7 @@ def build_wyrd_error(
             ``{"python_error_code": code}``; the given ``details`` is dropped.
         message: human-readable failure text.
         details: JSON-compatible structured context. Omitted, ``details`` is
-            ``None``.
+            empty.
 
     """
     ...

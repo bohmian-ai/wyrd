@@ -2,7 +2,14 @@ import { resolve } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { type CardRef, Cards, type RegisteredCard, type RegistrationReceipt, Workflow, type WorkflowSelector } from "@wyrd/sdk";
+import {
+  type CardRef,
+  Cards,
+  type RegisteredCard,
+  type RegistrationReceipt,
+  Workflow,
+  type WorkflowSelector,
+} from "@wyrd/sdk";
 
 import { serverTest } from "../support/server.js";
 
@@ -54,10 +61,12 @@ const test = serverTest().extend<{
   team: [
     async ({ server: _ }, use) => {
       const cards = Cards.connect();
-      await use(refs(
-        await cards.registerFromPath(workflowFixture("team/security.yaml")),
-        await cards.registerFromPath(workflowFixture("team/correctness.yaml")),
-      ));
+      await use(
+        refs(
+          await cards.registerFromPath(workflowFixture("team/security.yaml")),
+          await cards.registerFromPath(workflowFixture("team/correctness.yaml")),
+        ),
+      );
     },
     { scope: "file" },
   ],
@@ -70,7 +79,10 @@ const test = serverTest().extend<{
     },
     { scope: "file" },
   ],
-  readerKey: [async ({ server }, use) => use(server.scopedApiKey("workflow_reader", ["cards:read"])), { scope: "file" }],
+  readerKey: [
+    async ({ server }, use) => use(server.scopedApiKey("workflow_reader", ["cards:read"])),
+    { scope: "file" },
+  ],
   outsiderKey: [
     async ({ server }, use) => use(server.scopedApiKey("workflow_outsider", ["bifrost_query:read"])),
     { scope: "file" },
@@ -144,7 +156,9 @@ test("applied workflow stays pinned to its registered cards", async ({ applied, 
   const stored = await reader.get(applied["code-review"] as CardRef);
 
   expect(stored).toMatchObject({ kind: "Workflow", spec: { steps: agents.map((target) => ({ action: { target } })) } });
-  expect(outbound(stored)).toEqual([...agents].sort((left, right) => (left?.name ?? "").localeCompare(right?.name ?? "")));
+  expect(outbound(stored)).toEqual(
+    [...agents].sort((left, right) => (left?.name ?? "").localeCompare(right?.name ?? "")),
+  );
   for (const [agent, prompt] of [
     ["security-reviewer", "security-review-prompt"],
     ["correctness-reviewer", "correctness-review-prompt"],
@@ -169,7 +183,7 @@ test.for([
     outputs: { review: REGISTERED_REVIEW },
     workflow: { uid: applied["code-review"]?.uid },
   });
-  expect(run.steps["final_review"]?.text).toBe(REGISTERED_REVIEW);
+  expect(run.steps.final_review?.text).toBe(REGISTERED_REVIEW);
 });
 
 /** One Workflow selector `workflow.load` refuses, who asks, and the catalog code. */
@@ -186,12 +200,32 @@ test.for<Refusal>([
     "WYRD_WORKFLOW_400_INVALID_CARD_REF",
   ],
   ["a malformed uid", () => ({ uid: "not-a-uid" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  ["a malformed space", () => ({ ...CODE_REVIEW, space: "Not A Space" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  ["a malformed name", () => ({ ...CODE_REVIEW, name: "not a name" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
+  [
+    "a malformed space",
+    () => ({ ...CODE_REVIEW, space: "Not A Space" }),
+    "outsider",
+    "WYRD_WORKFLOW_400_INVALID_CARD_REF",
+  ],
+  [
+    "a malformed name",
+    () => ({ ...CODE_REVIEW, name: "not a name" }),
+    "outsider",
+    "WYRD_WORKFLOW_400_INVALID_CARD_REF",
+  ],
   ["a version range", () => ({ ...CODE_REVIEW, version: "^1.0.0" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
   ["a partial version", () => ({ ...CODE_REVIEW, version: "1.0" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  ["an agent uid", (applied) => ({ uid: applied["security-reviewer"]?.uid ?? "" }), "reader", "WYRD_REGISTRY_404_CARD_NOT_FOUND"],
-  ["an outsider", (applied) => ({ uid: applied["code-review"]?.uid ?? "" }), "outsider", "WYRD_PERMISSION_403_DENIED_RBAC"],
+  [
+    "an agent uid",
+    (applied) => ({ uid: applied["security-reviewer"]?.uid ?? "" }),
+    "reader",
+    "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+  ],
+  [
+    "an outsider",
+    (applied) => ({ uid: applied["code-review"]?.uid ?? "" }),
+    "outsider",
+    "WYRD_PERMISSION_403_DENIED_RBAC",
+  ],
 ])("loading %s is refused", async ([, selector, caller, code], { applied, readerKey, outsiderKey }) => {
   const cards = Cards.connect({ credential: caller === "reader" ? readerKey : outsiderKey });
 

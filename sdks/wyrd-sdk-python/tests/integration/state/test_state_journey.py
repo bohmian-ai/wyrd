@@ -80,10 +80,11 @@ def typed_service(cards: Cards) -> TypedService:
         )
     )
     service = cards.register_from_path(str(TYPED_STATE_SOURCE / "typed-service.yaml")).root
-    trusted = {
-        alias: cards.get(ref)["metadata"]["artifact_hash"]
-        for alias, ref in (("model_primary", primary), ("model_shadow", shadow))
-    }
+    trusted: dict[str, str] = {}
+    for alias, ref in (("model_primary", primary), ("model_shadow", shadow)):
+        artifact_hash = cards.get(ref)["metadata"]["artifact_hash"]
+        assert artifact_hash, f"the registry derived no artifact hash for {alias}"
+        trusted[alias] = artifact_hash
     return TypedService(service, trusted)
 
 

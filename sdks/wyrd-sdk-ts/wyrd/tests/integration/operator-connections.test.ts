@@ -61,7 +61,9 @@ test("other tenant sees nothing", async ({ server, slack }) => {
 });
 
 test("reader cannot disable a connection", async ({ server, connections, slack }) => {
-  const reader = OperatorConnections.connect({ credential: server.scopedApiKey("operator_reader", ["operators:read"]) });
+  const reader = OperatorConnections.connect({
+    credential: server.scopedApiKey("operator_reader", ["operators:read"]),
+  });
 
   expect(await reader.get(slack)).toEqual(await connections.get(slack));
   await expect(reader.disable(slack)).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });

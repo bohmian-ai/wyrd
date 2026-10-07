@@ -56,17 +56,21 @@ def test_promptcard_exposes_typed_prompt(state: WyrdState) -> None:
 
 def test_agentcard_resolves_inline_prompt(state: WyrdState) -> None:
     """Inline Agent prompt bodies hydrate into a typed prompt without a registry."""
-    assert state.agent("agent_inline").prompt.model == "gpt-4o"
+    prompt = state.agent("agent_inline").prompt
+    assert prompt is not None
+    assert prompt.model == "gpt-4o"
 
 
 def test_agentcard_resolves_registered_prompt(state: WyrdState) -> None:
     """Referenced Agent prompt bodies resolve through the local graph."""
-    assert state.agent("agent_triage").prompt.model == "gpt-4o"
+    prompt = state.agent("agent_triage").prompt
+    assert prompt is not None
+    assert prompt.model == "gpt-4o"
 
 
 def test_builtin_model_without_a_trusted_hash_is_refused_before_load(
     builtin_model_bundle: Path,
-    builtin_interfaces: dict[str, object],
+    builtin_interfaces: dict[str, TinyModelInterface | TinyDataInterface],
     joblib_loads: list[str],
 ) -> None:
     """An executable built-in Model needs an externally supplied manifest hash."""
@@ -83,7 +87,7 @@ def test_builtin_model_without_a_trusted_hash_is_refused_before_load(
 
 def test_builtin_model_with_a_wrong_trusted_hash_is_refused_before_load(
     builtin_model_bundle: Path,
-    builtin_interfaces: dict[str, object],
+    builtin_interfaces: dict[str, TinyModelInterface | TinyDataInterface],
     joblib_loads: list[str],
 ) -> None:
     """A trusted hash that does not match the manifest never reaches joblib."""
@@ -101,7 +105,7 @@ def test_builtin_model_with_a_wrong_trusted_hash_is_refused_before_load(
 
 def test_builtin_model_with_its_trusted_hash_loads_and_predicts(
     builtin_model_bundle: Path,
-    builtin_interfaces: dict[str, object],
+    builtin_interfaces: dict[str, TinyModelInterface | TinyDataInterface],
     trusted_model_hash: str,
     joblib_loads: list[str],
 ) -> None:
@@ -117,7 +121,7 @@ def test_builtin_model_with_its_trusted_hash_loads_and_predicts(
 
 def test_builtin_override_is_rejected_before_artifact_load(
     builtin_model_bundle: Path,
-    interfaces: dict[str, object],
+    interfaces: dict[str, TinyModelInterface | TinyDataInterface],
     trusted_model_hash: str,
     joblib_loads: list[str],
 ) -> None:
@@ -135,7 +139,7 @@ def test_builtin_override_is_rejected_before_artifact_load(
 
 
 def test_custom_model_exposes_model_and_preprocessor(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Custom model interfaces expose loaded model and preprocessor objects."""
     state = WyrdState.from_path(complete_bundle, interfaces=interfaces)
@@ -145,7 +149,7 @@ def test_custom_model_exposes_model_and_preprocessor(
 
 
 def test_custom_data_exposes_loaded_data(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Custom data interfaces expose their loaded local data value."""
     state = WyrdState.from_path(complete_bundle, interfaces=interfaces)
@@ -154,7 +158,7 @@ def test_custom_data_exposes_loaded_data(
 
 
 def test_model_and_data_load_kwargs_are_forwarded_by_alias(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Alias-specific loader kwargs reach each selected custom interface."""
     WyrdState.from_path(
@@ -167,7 +171,7 @@ def test_model_and_data_load_kwargs_are_forwarded_by_alias(
 
 
 def test_typed_load_args_are_forwarded_as_dicts(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Typed ModelLoadArgs and DataLoadArgs reach custom interfaces as dictionaries."""
     WyrdState.from_path(
@@ -183,7 +187,7 @@ def test_typed_load_args_are_forwarded_as_dicts(
 
 
 def test_mapping_load_kwargs_are_materialized_as_dicts(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Non-dict Mapping loader arguments are materialized before forwarding."""
     WyrdState.from_path(
@@ -232,7 +236,7 @@ def test_missing_custom_interface_names_alias_and_card_ref(complete_bundle: Path
 
 
 def test_unknown_interface_alias_is_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Unknown interface aliases fail with the stable alias error details."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -245,7 +249,7 @@ def test_unknown_interface_alias_is_rejected(
 
 
 def test_wrong_kind_interface_alias_is_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """A Model interface assigned to Data fails with hydration-stage details."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -260,7 +264,7 @@ def test_wrong_kind_interface_alias_is_rejected(
 
 
 def test_unknown_load_kwargs_alias_is_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Unknown loader-kwargs aliases fail with the stable alias details."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -271,7 +275,7 @@ def test_unknown_load_kwargs_alias_is_rejected(
 
 
 def test_non_model_data_interface_alias_is_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Interface mappings cannot target Service or Agent aliases."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -286,7 +290,7 @@ def test_non_model_data_interface_alias_is_rejected(
 
 
 def test_conflicting_loader_aliases_for_same_card_are_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Duplicate aliases for one Card reject conflicting interface objects."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -303,7 +307,7 @@ def test_conflicting_loader_aliases_for_same_card_are_rejected(
 
 
 def test_equivalent_duplicate_alias_kwargs_are_accepted(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Equivalent normalized kwargs may configure duplicate aliases together."""
     state = WyrdState.from_path(
@@ -315,7 +319,7 @@ def test_equivalent_duplicate_alias_kwargs_are_accepted(
 
 
 def test_conflicting_duplicate_alias_kwargs_are_rejected(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Different normalized kwargs for duplicate aliases fail before loading."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -351,7 +355,7 @@ class FailingDataInterface(TinyDataInterface):
 
 
 def test_interface_load_failure_maps_to_runtime_hydration_error(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Interface load failures map to the stable runtime hydration error code."""
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -368,7 +372,7 @@ def test_interface_load_failure_maps_to_runtime_hydration_error(
 
 
 def test_late_loader_failure_publishes_no_state(
-    complete_bundle: Path, interfaces: dict[str, object]
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """All Model loaders run before a later Data failure aborts publication."""
     state = None
@@ -387,7 +391,9 @@ def test_late_loader_failure_publishes_no_state(
 
 
 def test_from_path_does_not_read_registry_configuration(
-    complete_bundle: Path, interfaces: dict[str, object], monkeypatch: pytest.MonkeyPatch
+    complete_bundle: Path,
+    interfaces: dict[str, TinyModelInterface | TinyDataInterface],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Complete local hydration succeeds without a server URL or registry access."""
     monkeypatch.delenv("WYRD_SERVER_URL", raising=False)
@@ -396,7 +402,7 @@ def test_from_path_does_not_read_registry_configuration(
 
 
 def test_malformed_bundle_retains_stable_error(
-    fixtures_dir: Path, interfaces: dict[str, object]
+    fixtures_dir: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
 ) -> None:
     """Malformed complete-bundle metadata maps to one stable bundle error code."""
     with pytest.raises(wyrd.WyrdError) as caught:

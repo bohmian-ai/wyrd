@@ -156,7 +156,7 @@ def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(
         client.embeddings.create(model="anthropic/claude-sonnet-5", input="hi")
 
     refusals = [denied.value, foreign.value, unknown.value, incapable.value]
-    assert [refusal.body["code"] for refusal in refusals] == [
+    assert [refusal.code for refusal in refusals] == [
         "WYRD_PERMISSION_403_DENIED_RBAC",
         "WYRD_AUTH_400_BAD_TOKEN_FORMAT",
         "WYRD_GATEWAY_404_MODEL_UNAVAILABLE",
@@ -217,7 +217,7 @@ def test_two_users_have_distinct_model_access(backends: tuple[WyrdTestServer, Re
             openai_client(server, caller).chat.completions.create(
                 model=denied, messages=MESSAGES, max_completion_tokens=16
             )
-        assert refused.value.body["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
+        assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert [path for path, _ in received] == ["/v1/chat/completions", "/v1/messages"]
 
 
@@ -260,7 +260,7 @@ def test_revoked_user_never_dispatches(backends: tuple[WyrdTestServer, Received]
         openai_client(server, access_token(key)).chat.completions.create(
             model="openai/gpt-4o", messages=MESSAGES, max_completion_tokens=16
         )
-    assert revoked.value.body["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert revoked.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert received == []
 
 

@@ -32,24 +32,22 @@ class TinyModelInterface(ModelInterface):
         self.processor: Any = None
         self.loaded_path: Path | None = None
         self.loaded_kwargs: dict[str, Any] | None = None
+        # Lets a GC test hold a state -> interface -> state reference cycle.
+        self.state: object | None = None
 
-    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
-        """Write deterministic fixture bytes below ``path`` and report them.
+    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> None:
+        """Write deterministic fixture bytes below ``path``.
 
         Args:
             path: Artifact-root directory supplied by the hydration runtime.
             save_kwargs: Ignored test-only save options.
-        Returns:
-            Byte count and SHA-256 digest for the created payload.
         Side effects:
             Creates ``path/model/tiny.bin`` on the local filesystem.
         """
         del save_kwargs
         output = path / "model" / "tiny.bin"
         output.parent.mkdir(parents=True, exist_ok=True)
-        payload = b"tiny-model"
-        output.write_bytes(payload)
-        return DataStats(byte_count=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        output.write_bytes(b"tiny-model")
 
     def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
         """Record local load inputs and expose deterministic callable values.

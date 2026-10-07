@@ -25,7 +25,7 @@ const Value = z.object({ value: z.int() });
 
 /** One single-column batch holding `value`, shaped by the described schema. */
 function valueBatch(schema: Schema, value: bigint): RecordBatch {
-  const builder = makeBuilder({ type: schema.fields[0]!.type });
+  const builder = makeBuilder({ type: schema.fields[0].type });
   builder.append(value);
   builder.finish();
   return new RecordBatch(schema, makeData({ type: new Struct(schema.fields), length: 1, children: [builder.flush()] }));
@@ -151,7 +151,10 @@ test("aggregate sql reads the written rows", async ({ reader }) => {
     z.object({ model: z.string(), tokens: z.bigint() }),
   );
 
-  expect(rows).toEqual([{ model: "haiku", tokens: 50n }, { model: "opus", tokens: 400n }]);
+  expect(rows).toEqual([
+    { model: "haiku", tokens: 50n },
+    { model: "opus", tokens: 400n },
+  ]);
 });
 
 test("typed rows parse each row", async ({ reader }) => {

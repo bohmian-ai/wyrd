@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from typing import Any
 
 from .._schema import annotation_to_schema as _annotation_to_schema
-from .._wyrd.tool import (
+
+# The native ``_wyrd.tool`` submodule is private and has no stub.
+from .._wyrd.tool import (  # ty: ignore[unresolved-import]
     _pop_tool_registry_scope,
     _push_tool_registry_scope,
     _register_tool,
@@ -73,7 +75,9 @@ def tool(
     """
 
     def wrap(f: Callable) -> _ToolCallable:
-        tool_name = name or f.__name__
+        tool_name = name or getattr(f, "__name__", None)
+        if not tool_name:
+            raise TypeError(f"tool() needs name= for a callable without __name__: {f!r}")
         tool_description = description or (inspect.getdoc(f) or "").strip()
         input_schema = _schema_from_signature(f)
         output_schema = _schema_from_return(f)

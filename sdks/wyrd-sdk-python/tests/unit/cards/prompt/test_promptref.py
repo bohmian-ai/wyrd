@@ -12,6 +12,7 @@ def test_card_reference_round_trips_its_card_ref() -> None:
     decoded = PromptReference.model_validate_json(ref.model_dump_json())
 
     assert decoded.kind == "card"
+    assert decoded.card_ref is not None
     assert (decoded.card_ref.space, decoded.card_ref.name, decoded.card_ref.version) == (
         "prod",
         "support-prompt",
@@ -24,7 +25,9 @@ def test_inline_reference_round_trips_its_prompt() -> None:
 
     decoded = PromptReference.model_validate_json(ref.model_dump_json())
 
-    assert (decoded.kind, decoded.prompt.model) == ("inline", "gpt-4o")
+    assert decoded.kind == "inline"
+    assert decoded.prompt is not None
+    assert decoded.prompt.model == "gpt-4o"
 
 
 def test_reference_of_an_unknown_kind_is_refused(fixtures_dir: Path) -> None:

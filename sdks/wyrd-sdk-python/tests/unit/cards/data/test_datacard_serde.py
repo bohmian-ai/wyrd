@@ -86,6 +86,10 @@ def test_labels_and_annotations_survive_the_json_round_trip() -> None:
 )
 def test_invalid_user_metadata_is_refused(user_metadata: dict[str, dict[str, str]]) -> None:
     with pytest.raises(WyrdError) as exc:
-        DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})), **user_metadata)
+        DataCard(
+            PandasInterface(data=pd.DataFrame({"x": [1]})),
+            labels=user_metadata.get("labels"),
+            annotations=user_metadata.get("annotations"),
+        )
 
     assert exc.value.code == "WYRD_DATA_400_VALIDATION"

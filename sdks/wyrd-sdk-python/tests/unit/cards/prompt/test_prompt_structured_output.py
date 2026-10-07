@@ -13,7 +13,7 @@ class Recipe(BaseModel):
     ingredients: list[Ingredient]
 
 
-def provider_prompts(response_format: object) -> list[Prompt]:
+def provider_prompts(response_format: type[BaseModel]) -> list[Prompt]:
     return [
         Prompt.openai_chat("gpt-4o", messages="Recipe", response_format=response_format),
         Prompt.openai_responses("gpt-4.1", messages="Recipe", response_format=response_format),
@@ -45,6 +45,6 @@ def test_response_schema_is_none_without_structured_output() -> None:
 
 def test_response_format_json_schema_rejects_non_object_schema() -> None:
     with pytest.raises(WyrdError) as error:
-        ResponseFormat.json_schema("bad", "not-object")
+        ResponseFormat.json_schema("bad", "not-object")  # ty: ignore[invalid-argument-type]
 
     assert error.value.code == "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA"

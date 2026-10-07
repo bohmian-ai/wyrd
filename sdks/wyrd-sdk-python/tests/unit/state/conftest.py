@@ -34,7 +34,7 @@ def trusted_model_hash(builtin_model_bundle: Path) -> str:
 
 
 @pytest.fixture
-def interfaces() -> dict[str, object]:
+def interfaces() -> dict[str, TinyModelInterface | TinyDataInterface]:
     """Fresh custom interfaces for the complete bundle's Model and Data aliases."""
     return {
         "model": TinyModelInterface(),
@@ -44,6 +44,8 @@ def interfaces() -> dict[str, object]:
 
 
 @pytest.fixture
-def state(complete_bundle: Path, interfaces: dict[str, object]) -> WyrdState:
+def state(
+    complete_bundle: Path, interfaces: dict[str, TinyModelInterface | TinyDataInterface]
+) -> WyrdState:
     """The complete bundle hydrated offline with its custom interfaces."""
     return WyrdState.from_path(complete_bundle, interfaces=interfaces)

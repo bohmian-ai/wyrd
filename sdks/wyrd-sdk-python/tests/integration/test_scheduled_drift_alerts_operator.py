@@ -27,7 +27,12 @@ def test_failed_schedule_alerts_its_operator_on_the_connection_origin(
     latency_watch.flush()
     wyrd_server.flush_bifrost()
     service = cards.get(latency_watch.card_ref("root"))
-    [binding_id] = service["status"]["verification"]["binding_ids"]
+    # Status and its verification block stay empty until the server derives them.
+    status = service["status"]
+    assert status is not None
+    verification = status["verification"]
+    assert verification is not None
+    [binding_id] = verification["binding_ids"]
 
     wyrd_server.make_binding_due(binding_id)
 

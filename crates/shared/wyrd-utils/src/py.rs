@@ -396,7 +396,12 @@ fn build_wyrd_py_exception(py: Python<'_>, error: SpecWyrdError) -> PyResult<Bou
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let details = problem.get("details").cloned().unwrap_or(Value::Null);
+    // Python callers index `details` directly, so an absent or null payload
+    // becomes an empty mapping instead of `None`.
+    let details = match problem.get("details") {
+        None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
+        Some(details) => details.clone(),
+    };
 
     let exception = exception_type_for_code(py, &code).call1((message.clone(),))?;
     exception.setattr("code", code)?;

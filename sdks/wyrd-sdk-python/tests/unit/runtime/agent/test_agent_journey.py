@@ -39,7 +39,9 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
     card = agent.to_card()
 
     assert isinstance(card, AgentCard)
-    assert (card.name, card.version, card.prompt.model) == ("planner", "0.3.0", "gpt-4o-mini")
+    assert (card.name, card.version) == ("planner", "0.3.0")
+    assert card.prompt is not None
+    assert card.prompt.model == "gpt-4o-mini"
 
     agent.save(path)
     loaded = Agent.from_yaml(path)
@@ -57,7 +59,9 @@ def test_agent_card_json_round_trip() -> None:
 
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Agent"
-    assert payload["metadata"]["space"] == "research"
+    metadata = payload["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["space"] == "research"
     assert restored.uid == card.uid
     assert restored.name == card.name
     assert isinstance(restored.prompt, Prompt)

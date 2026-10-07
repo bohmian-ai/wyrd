@@ -23,7 +23,11 @@ const test = serverTest().extend<{ bifrost: Bifrost }>({
     async ({ server }, use) => {
       const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema(QUERY_ROWS, QueryRowColumns) });
       await writer.register();
-      for (const [id, value] of [[1, "one"], [2, "two"], [3, "three"]] as const) {
+      for (const [id, value] of [
+        [1, "one"],
+        [2, "two"],
+        [3, "three"],
+      ] as const) {
         writer.insert({ id, value });
       }
       await writer.flush();
@@ -40,7 +44,10 @@ const test = serverTest().extend<{ bifrost: Bifrost }>({
 test("parameterized sql returns the callers rows", async ({ bifrost }) => {
   const rows = await bifrost.sql(`SELECT id, value FROM ${QUERY_ROWS} WHERE id >= $1 ORDER BY id`, [2], QueryRow);
 
-  expect(rows).toEqual([{ id: 2n, value: "two" }, { id: 3n, value: "three" }]);
+  expect(rows).toEqual([
+    { id: 2n, value: "two" },
+    { id: 3n, value: "three" },
+  ]);
 });
 
 test("bound sql text is treated as data", async ({ bifrost }) => {

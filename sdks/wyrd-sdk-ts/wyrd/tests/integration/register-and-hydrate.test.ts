@@ -26,10 +26,7 @@ const test = serverTest().extend<{
       use(await cards.registerFromPath(fixture("cards/register_and_hydrate/support-model.yaml"))),
     { scope: "file" },
   ],
-  desk: [
-    async ({ cards, model: _ }, use) => use(await cards.registerFromPath(DESK)),
-    { scope: "file" },
-  ],
+  desk: [async ({ cards, model: _ }, use) => use(await cards.registerFromPath(DESK)), { scope: "file" }],
 });
 
 /** A fresh directory for one hydrated bundle. */
@@ -63,15 +60,20 @@ test("registering the graph again is idempotent", async ({ cards, desk }) => {
 
 test("cards get returns every kind typed", async ({ cards, model, desk }) => {
   const baseline = await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
-  const refs = [baseline, model, desk].flatMap((receipt) =>
-    receipt.outcomes.map((outcome) => outcome.card_ref),
-  );
+  const refs = [baseline, model, desk].flatMap((receipt) => receipt.outcomes.map((outcome) => outcome.card_ref));
 
   const read = await Promise.all(refs.map((ref) => cards.get(ref)));
 
-  expect(read.map((card) => card.kind).sort()).toEqual(
-    ["Agent", "Data", "Model", "Operator", "Prompt", "Service", "Trigger", "Verifier"],
-  );
+  expect(read.map((card) => card.kind).sort()).toEqual([
+    "Agent",
+    "Data",
+    "Model",
+    "Operator",
+    "Prompt",
+    "Service",
+    "Trigger",
+    "Verifier",
+  ]);
   const verifier = read.find((card) => card.kind === "Verifier");
   expect(verifier?.kind === "Verifier" && verifier.spec.implementation.kind).toBe("eval");
   const data = read.find((card) => card.kind === "Data");
@@ -108,10 +110,7 @@ test("cli apply and get round trip the graph", async ({ desk }) => {
   const applied = await cli.apply(DESK);
   const bundle = bundleDir();
 
-  const summary = await cli.get(
-    { kind: "Service", space: "default", name: "support-desk", version: "1.0.0" },
-    bundle,
-  );
+  const summary = await cli.get({ kind: "Service", space: "default", name: "support-desk", version: "1.0.0" }, bundle);
 
   expect(applied.root).toEqual(desk.root);
   expect(summary).toMatchObject({ mode: "complete", root: desk.root });

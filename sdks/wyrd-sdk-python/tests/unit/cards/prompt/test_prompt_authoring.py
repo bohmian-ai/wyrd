@@ -23,7 +23,9 @@ def test_prompt_new_builds_openai_chat_by_default() -> None:
 
     request = prompt.request.openai()
     assert (prompt.provider, request.model, prompt.variables) == ("openai", "gpt-4o", ["name"])
-    assert request.messages[0].content.as_text() == "Hello {{name}}"
+    content = request.messages[0].content
+    assert content is not None
+    assert content.as_text() == "Hello {{name}}"
 
 
 def test_prompt_new_selects_openai_responses() -> None:
@@ -53,7 +55,9 @@ def test_bind_media_replaces_native_media_placeholder() -> None:
 
     bound = prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
 
-    part = bound.request.openai().messages[0].content.as_parts()[1]
+    content = bound.request.openai().messages[0].content
+    assert content is not None
+    part = content.as_parts()[1]
     assert part.as_image_url().url == "https://example.test/logo.png"
 
 

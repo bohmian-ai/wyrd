@@ -77,6 +77,6 @@ def test_invalid_session_object_is_rejected() -> None:
     with pytest.raises(AgentError) as exc:
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
-            session=object(),
+            session=object(),  # ty: ignore[invalid-argument-type]
         )
     assert exc.value.code == "WYRD_AGENT_422_INVALID_ARGUMENT"

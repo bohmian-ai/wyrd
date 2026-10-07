@@ -25,7 +25,6 @@ def _prompt() -> PromptCard:
 
 def _reason(error: pytest.ExceptionInfo[WyrdError]) -> str:
     assert error.value.code == "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE"
-    assert error.value.details is not None
     return error.value.details["reason"]
 
 

@@ -89,7 +89,7 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
 
 def test_rejects_missing_space() -> None:
     with pytest.raises(TypeError):
-        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0")  # type: ignore[call-arg]
+        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0")  # ty: ignore[missing-argument]
 
 
 def test_rejects_empty_space() -> None:

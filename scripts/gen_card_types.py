@@ -363,8 +363,8 @@ def lower() -> dict[str, tuple]:
     """Lower the supported Card envelopes and everything they reach.
 
     Each supported kind gets `Registered<Kind>Card` with its typed spec. Every
-    other kind shares `RegisteredUntypedCard`, whose spec stays a JSON map, so
-    `RegisteredCard` covers every envelope the registry can return while
+    other kind gets an envelope whose spec stays a JSON map, grouped as
+    `RegisteredUntypedCard`, so `RegisteredCard` covers every envelope the registry can return while
     exposing typed specs only for the supported kinds.
     """
     schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -377,13 +377,24 @@ def lower() -> dict[str, tuple]:
         envelope(lowering, schema, name, ("lit", kind), spec, f"Registered `{kind}` Card envelope.")
         names.append(("ref", name))
     deferred = [kind for kind in definitions["CardKind"]["enum"] if kind not in SUPPORTED_KINDS]
-    untyped = ("union", [("lit", kind) for kind in deferred])
-    envelope(
-        lowering,
-        schema,
-        "RegisteredUntypedCard",
-        untyped,
-        ("map", ("prim", "any")),
+    # One envelope per deferred kind keeps every `kind` a single literal, so
+    # `card["kind"] == "Data"` narrows the `RegisteredCard` union in checkers
+    # that only discriminate on single-literal tags.
+    untyped = []
+    for kind in deferred:
+        name = f"Registered{kind}Card"
+        envelope(
+            lowering,
+            schema,
+            name,
+            ("lit", kind),
+            ("map", ("prim", "any")),
+            f"Registered `{kind}` Card envelope; its spec is not typed yet.",
+        )
+        untyped.append(("ref", name))
+    lowering.nodes["RegisteredUntypedCard"] = (
+        "alias",
+        ("union", untyped),
         "Registered Card envelope of a kind whose spec is not typed yet.",
     )
     names.append(("ref", "RegisteredUntypedCard"))

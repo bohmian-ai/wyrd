@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from wyrd.prompt import Prompt, PromptCard, WyrdError
+from wyrd.prompt import OpenAISettings, Prompt, PromptCard, WyrdError
 
 
 @pytest.fixture
@@ -47,6 +47,7 @@ def test_declarative_card_extracts_its_variables(lead_scoring: Path) -> None:
 def test_declarative_card_applies_its_model_settings(lead_scoring: Path) -> None:
     card = PromptCard.from_path(lead_scoring)
 
+    assert isinstance(card.prompt.model_settings, OpenAISettings)
     assert card.prompt.model_settings.to_dict()["temperature"] == pytest.approx(0.2)
 
 

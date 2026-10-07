@@ -11,7 +11,9 @@ LOGO_URL = "https://example.test/logo.png"
 def test_openai_eager_image_url_is_an_image_part() -> None:
     prompt = Prompt.openai_chat("gpt-4o").user("look").user(Prompt.openai_image_url(LOGO_URL))
 
-    assert prompt.request.openai().messages[1].content.as_parts()[0].as_image_url().url == LOGO_URL
+    content = prompt.request.openai().messages[1].content
+    assert content is not None
+    assert content.as_parts()[0].as_image_url().url == LOGO_URL
 
 
 def test_openai_eager_file_data_is_a_file_part() -> None:
@@ -19,9 +21,9 @@ def test_openai_eager_file_data_is_a_file_part() -> None:
         Prompt.openai_file_data("data:image/png;base64,QUJD", filename="logo.png")
     )
 
-    assert (
-        prompt.request.openai().messages[0].content.as_parts()[0].as_file().filename == "logo.png"
-    )
+    content = prompt.request.openai().messages[0].content
+    assert content is not None
+    assert content.as_parts()[0].as_file().filename == "logo.png"
 
 
 def test_openai_image_path_binds_as_a_data_url(tmp_path: Path) -> None:
@@ -32,7 +34,9 @@ def test_openai_image_path_binds_as_a_data_url(tmp_path: Path) -> None:
         "logo", MediaRef.image_path(image)
     )
 
-    url = prompt.request.openai().messages[0].content.as_parts()[1].as_image_url().url
+    content = prompt.request.openai().messages[0].content
+    assert content is not None
+    url = content.as_parts()[1].as_image_url().url
     assert url.startswith("data:image/png;base64,")
 
 

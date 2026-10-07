@@ -145,7 +145,7 @@ def test_manifest_ref_allows_authored_ref_without_space() -> None:
 
 
 def test_set_interface_replaces_spec_metadata_and_schema() -> None:
-    card = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
+    card: DataCard[DataInterface] = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
 
     card.interface = ArrowInterface(data=pa.table({"score": pa.array([1], type=pa.int64())}))
 

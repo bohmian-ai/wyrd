@@ -12,9 +12,9 @@ pytestmark = pytest.mark.tensorflow
 @pytest.fixture
 def keras_model() -> Any:
     """A one-layer Keras regressor over two features."""
-    import tensorflow as tf
+    import keras
 
-    return tf.keras.Sequential([tf.keras.Input(shape=(2,)), tf.keras.layers.Dense(1)])
+    return keras.Sequential([keras.Input(shape=(2,)), keras.layers.Dense(1)])
 
 
 @pytest.mark.parametrize("save_format", ["keras", "savedmodel"])
@@ -27,6 +27,7 @@ def test_keras_model_round_trips_in_its_save_format(
 
     restored = ModelCard.from_path(tmp_path)
 
+    assert isinstance(restored.interface, TensorflowInterface)
     assert (restored.interface.has_model, restored.interface.save_format) == (True, save_format)
 
 
@@ -42,7 +43,8 @@ def test_loaded_keras_model_saves_as_a_new_card(
 
     restored = ModelCard.from_path(tmp_path / "copy")
 
-    assert (restored.interface.kind, restored.interface.has_model) == ("Tensorflow", True)
+    assert isinstance(restored.interface, TensorflowInterface)
+    assert restored.interface.has_model
 
 
 def test_tensorflow_sample_input_survives_save_and_load(tmp_path: Path) -> None:

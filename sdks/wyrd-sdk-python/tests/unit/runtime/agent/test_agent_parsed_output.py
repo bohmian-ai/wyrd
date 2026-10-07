@@ -17,13 +17,15 @@ class Plan(pydantic.BaseModel):
 def mock_agent() -> Callable[..., Agent]:
     """Build an offline Agent whose model answers once with the given text."""
 
-    def build(answer: str, output: object, **kwargs: object) -> Agent:
+    def build(
+        answer: str, output: type | dict[str, type], output_type: type | None = None
+    ) -> Agent:
         return Agent(
             prompt=Prompt(
                 messages=["Plan it."], model="mock-model", provider="mock", output=output
             ),
             mock_provider=MockProvider([answer]),
-            **kwargs,
+            output_type=output_type,
         )
 
     return build

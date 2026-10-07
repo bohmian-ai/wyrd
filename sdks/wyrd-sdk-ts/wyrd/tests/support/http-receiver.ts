@@ -31,9 +31,7 @@ export class Receiver {
   ) {}
 
   /** Listen on a loopback port, answering every request with `reply`. */
-  static async start(
-    reply: (request: ReceivedRequest) => Reply = () => ({ status: 204 }),
-  ): Promise<Receiver> {
+  static async start(reply: (request: ReceivedRequest) => Reply = () => ({ status: 204 })): Promise<Receiver> {
     let receiver: Receiver | undefined;
     const server = createServer((request, response) => {
       const chunks: Buffer[] = [];

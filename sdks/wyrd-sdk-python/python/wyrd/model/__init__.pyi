@@ -3,7 +3,10 @@
 #### begin imports ####
 
 from collections.abc import Mapping, Sequence
-from typing import Any, overload
+from pathlib import Path
+from typing import Any, Generic, overload
+
+from typing_extensions import Self, TypeVar
 
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
 from ..cards import CardRef, JsonValue, ModelLoadArgs
@@ -37,7 +40,7 @@ class ModelInterface:
         ...
 
     @classmethod
-    def from_metadata(cls, metadata: ModelCardMetadata) -> ModelInterface:
+    def from_metadata(cls, metadata: ModelCardMetadata) -> Self:
         """Build an interface instance from a stored card's metadata.
 
         ``ModelCard.model_validate_json(..., interface=MyInterface)`` and
@@ -54,7 +57,7 @@ class ModelInterface:
         """
         ...
 
-    def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
+    def save(self, path: Path, save_kwargs: dict[str, Any] | None = ...) -> None:
         """Write model bytes under a local card directory.
 
         A subclass override chooses its own layout under ``path`` and must
@@ -73,7 +76,7 @@ class ModelInterface:
         """
         ...
 
-    def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
+    def load(self, path: Path, load_kwargs: dict[str, Any] | None = ...) -> None:
         """Read model bytes from a local card directory and hold them.
 
         Args:
@@ -620,7 +623,10 @@ class ModelCardMetadata:
         """Return this metadata as a JSON-compatible spec dictionary."""
         ...
 
-class ModelCard:
+_GivenModelInterfaceT = TypeVar("_GivenModelInterfaceT", bound=ModelInterface)
+_ModelInterfaceT = TypeVar("_ModelInterfaceT", bound=ModelInterface, default=ModelInterface)
+
+class ModelCard(Generic[_ModelInterfaceT]):
     """Local ModelCard holder and spec builder.
 
     A ModelCard holds identity, labels, annotations, metadata, and a live
@@ -637,7 +643,7 @@ class ModelCard:
     ``get`` returns the validated envelope without model bytes unless
     ``eager_load=True``, which downloads the artifacts and calls ``load``.
     ``model``, ``preprocessor``, and ``processor`` read through to the held
-    interface and are ``None`` when it has none. Setting ``metadata``
+    interface and are ``None`` until it holds them. Setting ``metadata``
     re-validates the spec.
     """
 
@@ -648,10 +654,10 @@ class ModelCard:
     labels: dict[str, str]
     annotations: dict[str, str]
     metadata: ModelCardMetadata
-    interface: ModelInterface | None
-    model: Any | None
-    preprocessor: Any | None
-    processor: Any | None
+    interface: _ModelInterfaceT
+    model: Any
+    preprocessor: Any
+    processor: Any
     task_type: str
     signature: ModelSignature
     sample_input: SampleInput | None
@@ -669,7 +675,7 @@ class ModelCard:
     @overload
     def __init__(
         self,
-        model_or_interface: ModelInterface,
+        model_or_interface: _ModelInterfaceT,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -711,7 +717,7 @@ class ModelCard:
 
     @overload
     def __init__(
-        self,
+        self: ModelCard[ModelInterface],
         model_or_interface: object,
         space: str | None = ...,
         name: str | None = ...,
@@ -811,10 +817,20 @@ class ModelCard:
         """
         ...
 
+    @overload
     @staticmethod
     def model_validate_json(
         json_string: str,
-        interface: ModelInterface | type[ModelInterface] | None = ...,
+        interface: _GivenModelInterfaceT | type[_GivenModelInterfaceT],
+    ) -> ModelCard[_GivenModelInterfaceT]:
+        """As the untyped overload; the card's ``interface`` has the given interface type."""
+        ...
+
+    @overload
+    @staticmethod
+    def model_validate_json(
+        json_string: str,
+        interface: None = ...,
     ) -> ModelCard:
         """Rebuild a ModelCard from serialized card JSON.
 
@@ -836,10 +852,21 @@ class ModelCard:
         """
         ...
 
+    @overload
     @staticmethod
     def from_path(
         path: PathLike,
-        interface: ModelInterface | type[ModelInterface] | None = ...,
+        interface: _GivenModelInterfaceT | type[_GivenModelInterfaceT],
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> ModelCard[_GivenModelInterfaceT]:
+        """As the untyped overload; the card's ``interface`` has the given interface type."""
+        ...
+
+    @overload
+    @staticmethod
+    def from_path(
+        path: PathLike,
+        interface: None = ...,
         load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> ModelCard:
         """Load a ModelCard from a saved Card directory or a Card YAML/JSON file.

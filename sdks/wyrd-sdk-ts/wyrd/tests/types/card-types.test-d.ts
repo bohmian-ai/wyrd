@@ -5,13 +5,19 @@ import type { DriftBaselineState, RegisteredCard, RegisteredVerifierCard, TypedC
 
 // Narrowing a registered envelope by `kind` reaches the Verifier's typed baseline state.
 expectTypeOf<
-  NonNullable<NonNullable<NonNullable<Extract<RegisteredCard, { kind: "Verifier" }>["status"]>["verification"]>["baseline"]>["state"]
+  NonNullable<
+    NonNullable<NonNullable<Extract<RegisteredCard, { kind: "Verifier" }>["status"]>["verification"]>["baseline"]
+  >["state"]
 >().toEqualTypeOf<DriftBaselineState>();
 
 // Deferred kinds keep an untyped spec until the kind is typed.
 expectTypeOf<"Workflow">().not.toExtend<TypedCardKind>();
-expectTypeOf({ apiVersion: "wyrd/v1", kind: "Workflow", metadata: { name: "flow" }, spec: { steps: [] } } as const)
-  .toExtend<RegisteredCard>();
+expectTypeOf({
+  apiVersion: "wyrd/v1",
+  kind: "Workflow",
+  metadata: { name: "flow" },
+  spec: { steps: [] },
+} as const).toExtend<RegisteredCard>();
 
 const undeclared: RegisteredVerifierCard = {
   apiVersion: "wyrd/v1",

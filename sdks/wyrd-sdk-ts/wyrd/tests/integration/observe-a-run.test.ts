@@ -123,12 +123,7 @@ test("card scoped key cannot write another cards observations", async ({ state }
   await expect(state.shutdown()).rejects.toMatchObject({ code: "WYRD_VALA_403_BIFROST_CARD_SCOPE" });
 });
 
-test("eval observation carries its session, media, and active span", async ({
-  server,
-  serviceKey,
-  reader,
-  state,
-}) => {
+test("eval observation carries its session, media, and active span", async ({ server, serviceKey, reader, state }) => {
   vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", server.grpcUrl);
   vi.stubEnv("OTEL_EXPORTER_OTLP_HEADERS", `x-wyrd-api-key=${server.apiKey}`);
   const tracing = new BasicTracerProvider({ spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())] });
@@ -147,30 +142,27 @@ test("eval observation carries its session, media, and active span", async ({
   server.flushBifrost();
 
   const rows = await reader.sql(
-      `SELECT e.context, e.session_id, e.media, e.trace_id, e.span_id, e.card_uid, s.name AS span_name
+    `SELECT e.context, e.session_id, e.media, e.trace_id, e.span_id, e.card_uid, s.name AS span_name
          FROM vala.eval.observations e
          JOIN vala.traces.spans s ON e.trace_id = s.trace_id AND e.span_id = s.span_id
          WHERE e.run_id = $1`,
     [agent.runId],
     SpannedEvalRow,
   );
-  expect(rows).toEqual([{
-    context: '{"answer":"yes"}',
-    session_id: SESSION,
-    media: '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]',
-    trace_id: span.spanContext().traceId,
-    span_id: span.spanContext().spanId,
-    card_uid: state.cardRef("agent").uid,
-    span_name: "answer",
-  }]);
+  expect(rows).toEqual([
+    {
+      context: '{"answer":"yes"}',
+      session_id: SESSION,
+      media: '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]',
+      trace_id: span.spanContext().traceId,
+      span_id: span.spanContext().spanId,
+      card_uid: state.cardRef("agent").uid,
+      span_name: "answer",
+    },
+  ]);
 });
 
-test("records land in their tables under the view that wrote them", async ({
-  server,
-  serviceKey,
-  reader,
-  state,
-}) => {
+test("records land in their tables under the view that wrote them", async ({ server, serviceKey, reader, state }) => {
   for (const table of [ANSWERS, SCORES]) {
     const registrar = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, VALUE_ROW) });
     await registrar.register();
@@ -207,10 +199,9 @@ test.for<Refusal>([
   [
     "malformed trace id",
     (state) =>
-      state.run("agent").observe.eval(
-        { answer: "yes" },
-        { traceId: "zzf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" },
-      ),
+      state
+        .run("agent")
+        .observe.eval({ answer: "yes" }, { traceId: "zzf92f3577b34da6a3ce929d0e0e4736", spanId: "00f067aa0ba902b7" }),
     "WYRD_SPEC_400_VALIDATION",
   ],
   [

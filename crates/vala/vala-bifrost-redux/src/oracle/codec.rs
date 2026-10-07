@@ -104,6 +104,10 @@ pub(crate) struct RemoteScanPayload {
     /// Output partitions the placeholder advertises. Zero is normalized to one.
     #[prost(uint32, tag = "5")]
     pub(crate) partitions: u32,
+    /// JSON-encoded [`super::leaf_paths::LeafPaths`] the follower's
+    /// source reads; empty when every column is read whole.
+    #[prost(bytes, tag = "6")]
+    pub(crate) leaf_paths_json: Vec<u8>,
 }
 
 /// The one pinned source occurrence a placeholder was planned against.
@@ -167,6 +171,9 @@ pub struct RemoteSourcePlaceholderExec {
     /// keeps receiving one variant per stage task. It never crosses the wire:
     /// encoding emits the follower assignment instead.
     local: Option<Arc<dyn ExecutionPlan>>,
+    /// Literal paths the query reads from each trimmed Struct or Variant column,
+    /// carried to the follower and applied to the local leaf.
+    leaf_paths: super::leaf_paths::LeafPaths,
     /// This variant's ordinal within its stage's final task count.
     task_index: usize,
     /// Final task count of the stage this variant belongs to, at least one.
@@ -192,6 +199,7 @@ impl RemoteSourcePlaceholderExec {
             assignment: None,
             source: None,
             local: None,
+            leaf_paths: super::leaf_paths::LeafPaths::default(),
             task_index: 0,
             task_count: 1,
         }
@@ -215,6 +223,22 @@ impl RemoteSourcePlaceholderExec {
             .with_partitions(local.properties().partitioning.partition_count());
         self.local = Some(local);
         self
+    }
+
+    /// Reads each Variant column `paths` names through only those paths'
+    /// leaves, here on the local leaf and on the follower that decodes this
+    /// placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error raised while applying the paths to the
+    /// local leaf.
+    pub(super) fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Result<Self> {
+        if let Some(local) = self.local.take() {
+            self.local = Some(super::leaf_paths::LeafPathPushdown::assign(local, &paths)?);
+        }
+        self.leaf_paths = paths;
+        Ok(self)
     }
 
     /// Freezes the pinned cut, tier, and participant this occurrence reads.
@@ -709,6 +733,13 @@ fn remote_scan_payload(
     scan: &RemoteSourcePlaceholderExec,
     bindings: Option<&super::bindings::OracleExecutionLock>,
 ) -> Result<RemoteScanPayload> {
+    let leaf_paths_json = if scan.leaf_paths.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::to_vec(&scan.leaf_paths).map_err(|error| {
+            DataFusionError::Plan(format!("Variant path encoding failed: {error}"))
+        })?
+    };
     let bound = scan
         .source_key()
         .zip(bindings.and_then(std::sync::OnceLock::get))
@@ -722,6 +753,7 @@ fn remote_scan_payload(
             assignment_json: Vec::new(),
             closure_schema: Vec::new(),
             partitions: 0,
+            leaf_paths_json,
         });
     };
     // One narrowing site for both paths: the leader's bound assignment and the
@@ -742,6 +774,7 @@ fn remote_scan_payload(
         assignment_json,
         closure_schema: schema.encode_to_vec(),
         partitions: u32::try_from(scan.partitions()).unwrap_or(u32::MAX),
+        leaf_paths_json,
     })
 }
 
@@ -820,8 +853,15 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&payload.scan_id);
+                let leaf_paths = if payload.leaf_paths_json.is_empty() {
+                    super::leaf_paths::LeafPaths::default()
+                } else {
+                    serde_json::from_slice(&payload.leaf_paths_json).map_err(|error| {
+                        DataFusionError::Plan(format!("invalid leaf paths: {error}"))
+                    })?
+                };
                 if let Some(provider) = pre_resolved {
-                    return Ok(provider);
+                    return super::leaf_paths::LeafPathPushdown::assign(provider, &leaf_paths);
                 }
                 // An Interactive follower has already registered every provider
                 // it was authorized to read, so an absent entry is a refusal.
@@ -835,13 +875,16 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                     )));
                 };
                 let (assignment, schema, partitions) = analytical_leaf_parts(&payload)?;
-                Ok(Arc::new(super::analytical_scan::AnalyticalScanExec::new(
-                    assignment,
-                    binding.role,
-                    Arc::clone(&binding.resolver),
-                    schema,
-                    partitions,
-                )))
+                Ok(Arc::new(
+                    super::analytical_scan::AnalyticalScanExec::new(
+                        assignment,
+                        binding.role,
+                        Arc::clone(&binding.resolver),
+                        schema,
+                        partitions,
+                    )
+                    .with_leaf_paths(leaf_paths),
+                ))
             }
             _ => Err(DataFusionError::Plan(
                 "unsupported Oracle physical extension type".to_owned(),

@@ -25,6 +25,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderBuilder, ArrowReaderMetadata, RowS
 use parquet::file::metadata::ParquetMetaData;
 
 use super::exec::RowGroupSelection;
+use super::leaf_paths::LeafPaths;
 use super::variant_sql::OracleVariantSql;
 
 /// One Parquet file's read plan from `DataFusion`'s shared per-file planner.
@@ -204,28 +205,34 @@ impl FileReadPlan {
 pub(super) struct PublishedFileReadPlanner {
     /// The scan closure the filter was compiled against.
     schema: SchemaRef,
-    /// Conjunction of the scan's closed predicates over `schema`.
-    filter: Arc<dyn PhysicalExpr>,
+    /// Conjunction of the scan's closed predicates over `schema`, if any.
+    filter: Option<Arc<dyn PhysicalExpr>>,
+    /// Literal paths read from each trimmed Struct or Variant column.
+    leaf_paths: LeafPaths,
     /// The session's bound on `IN`-list literals used for pruning.
     max_in_list_size: usize,
 }
 
 impl PublishedFileReadPlanner {
-    /// Plans every published file of one scan against `filter` over `schema`.
+    /// Plans every published file of one scan against `filter` over `schema`,
+    /// trimming the columns `leaf_paths` names.
     pub(super) fn new(
         schema: SchemaRef,
-        filter: Arc<dyn PhysicalExpr>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+        leaf_paths: LeafPaths,
         max_in_list_size: usize,
     ) -> Self {
         Self {
             schema,
             filter,
+            leaf_paths,
             max_in_list_size,
         }
     }
 
-    /// Builds one file's [`FileReadPlan`] and applies its statistics and page
-    /// pruning to `row_groups`.
+    /// Builds one file's [`FileReadPlan`], applies its statistics and page
+    /// pruning to `row_groups`, and returns the leaf mask of its trimmed
+    /// columns.
     ///
     /// # Errors
     ///
@@ -237,20 +244,24 @@ impl PublishedFileReadPlanner {
         metadata: &ArrowReaderMetadata,
         row_groups: Vec<usize>,
     ) -> DataFusionResult<iceberg::arrow::ParquetFileReadNarrowing> {
-        let columns = (0..self.schema.fields().len()).collect::<Vec<_>>();
         let mut read_plan = FileReadPlan::new(
             metadata,
             &self.schema,
-            ProjectionExprs::from_indices(&columns, &self.schema),
-            Some(Arc::clone(&self.filter)),
+            self.leaf_paths.projection(&self.schema),
+            self.filter.clone(),
             self.max_in_list_size,
         )?;
         let selection = read_plan.select_row_groups(row_groups);
         let (row_groups, row_selection, _) = read_plan.select_pages(selection.retained)?;
+        let projection = (!self.leaf_paths.is_empty()).then(|| {
+            self.leaf_paths
+                .leaf_mask(&read_plan.plan.projection_mask, metadata.parquet_schema())
+        });
         Ok(iceberg::arrow::ParquetFileReadNarrowing {
             row_groups,
             row_selection,
             row_filter: read_plan.plan.row_filter.take(),
+            projection,
         })
     }
 }
@@ -278,7 +289,7 @@ impl iceberg::arrow::ParquetFileReadPlanner for PublishedFileReadPlanner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use arrow::array::{
         Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, StructArray,
     };
@@ -309,7 +320,7 @@ mod tests {
 
     /// The table schema every fixture file is read against: an id, a
     /// nullable Struct `s{a, b}`, and a canonical unshredded Variant `v`.
-    fn logical_schema() -> SchemaRef {
+    pub(in crate::oracle) fn logical_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -329,12 +340,15 @@ mod tests {
 
     /// Writes one file holding [`DOCUMENTS`] with `v` shredded on `a: Int64`
     /// and `b: Utf8` when `shredded`, else stored unshredded. Row 2's struct
-    /// is null over a placeholder child.
+    /// is null over a placeholder child. The footer proves the fixture tenant,
+    /// so a hot leaf can read the file too, and fields carry the Iceberg field
+    /// ids `id` 1, `s` 2, `s.a` 3, `s.b` 4, and `v` 5, and `v` the Variant
+    /// extension, as published files do.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot be shredded or encoded.
-    fn write_file(shredded: bool) -> Bytes {
+    pub(in crate::oracle) fn write_file(shredded: bool) -> Bytes {
         let text: ArrayRef = Arc::new(StringArray::from(DOCUMENTS.to_vec()));
         let variant = json_to_variant(&text).expect("JSON documents encode");
         let variant = if shredded {
@@ -348,10 +362,18 @@ mod tests {
             variant
         };
         let variant: ArrayRef = variant.into();
+        let id = |field: Field, id: i32| {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_owned(),
+                id.to_string(),
+            );
+            field.with_metadata(metadata)
+        };
         let structs = StructArray::new(
             vec![
-                Field::new("a", DataType::Int64, false),
-                Field::new("b", DataType::Utf8, true),
+                id(Field::new("a", DataType::Int64, false), 3),
+                id(Field::new("b", DataType::Utf8, true), 4),
             ]
             .into(),
             vec![
@@ -366,9 +388,13 @@ mod tests {
             Some(vec![true, true, false, true].into()),
         );
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("s", structs.data_type().clone(), true),
-            Field::new("v", variant.data_type().clone(), true),
+            id(Field::new("id", DataType::Int64, false), 1),
+            id(Field::new("s", structs.data_type().clone(), true), 2),
+            id(
+                Field::new("v", variant.data_type().clone(), true)
+                    .with_metadata(variant_field("v", true).metadata().clone()),
+                5,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -380,7 +406,12 @@ mod tests {
         )
         .expect("fixture batch");
         let mut sink = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut sink, schema, None).expect("writer");
+        let mut writer = ArrowWriter::try_new(
+            &mut sink,
+            schema,
+            Some(super::super::exec::tests::fixture_writer_properties(&[])),
+        )
+        .expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
         Bytes::from(sink)
@@ -426,7 +457,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the file does not decode under the plan.
-    fn read(published: &Bytes, plan: FileReadPlan) -> RecordBatch {
+    pub(in crate::oracle) fn read(published: &Bytes, plan: FileReadPlan) -> RecordBatch {
         let builder = ParquetRecordBatchReaderBuilder::try_new(published.clone()).expect("reader");
         let groups = (0..builder.metadata().num_row_groups()).collect();
         let (builder, projector) = plan.apply(builder, groups, None).expect("applied plan");
@@ -443,7 +474,7 @@ mod tests {
     }
 
     /// Returns the dotted paths of the Parquet leaves `plan` decodes.
-    fn decoded_leaves(published: &Bytes, plan: &FileReadPlan) -> Vec<String> {
+    pub(in crate::oracle) fn decoded_leaves(published: &Bytes, plan: &FileReadPlan) -> Vec<String> {
         let reader =
             ArrowReaderMetadata::load(published, ArrowReaderOptions::new()).expect("valid footer");
         let descriptor = reader.metadata().file_metadata().schema_descr();
@@ -532,6 +563,101 @@ mod tests {
             decoded_leaves(&unshredded, &root_plan),
             ["v.metadata", "v.value"]
         );
+    }
+
+    /// Reads `published` with `v` projected through
+    /// [`OracleVariantSql::trimmed`] for `paths`, returning the decoded leaves
+    /// and each path's `->>` text.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan does not build, decode, or evaluate.
+    fn read_trimmed(
+        published: &Bytes,
+        paths: &[Vec<String>],
+    ) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        let schema = logical_schema();
+        let column = Arc::new(datafusion::physical_expr::expressions::Column::new("v", 2));
+        let projection = ProjectionExprs::new([ProjectionExpr::new(
+            OracleVariantSql::shared().trimmed(column, paths),
+            "v",
+        )]);
+        let reader =
+            ArrowReaderMetadata::load(published, ArrowReaderOptions::new()).expect("valid footer");
+        let read_plan =
+            FileReadPlan::new(&reader, &schema, projection, None, 20).expect("per-file plan");
+        let leaves = decoded_leaves(published, &read_plan);
+        (leaves, path_texts(&read(published, read_plan), paths))
+    }
+
+    /// Evaluates `v ->> path` for each of `paths` over `batch`'s `v` column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an expression does not plan or evaluate.
+    fn path_texts(batch: &RecordBatch, paths: &[Vec<String>]) -> Vec<Vec<Option<String>>> {
+        let df_schema = DFSchema::try_from(batch.schema()).expect("df schema");
+        paths
+            .iter()
+            .map(|keys| {
+                let expr = datafusion::physical_expr::create_physical_expr(
+                    &OracleVariantSql::shared().text_at(col("v"), keys),
+                    &df_schema,
+                    &datafusion::execution::context::ExecutionProps::new(),
+                    &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+                )
+                .expect("physical path");
+                let text = expr
+                    .evaluate(batch)
+                    .and_then(|value| value.into_array(batch.num_rows()))
+                    .expect("evaluated path");
+                text.as_string::<i32>()
+                    .iter()
+                    .map(|cell| cell.map(ToOwned::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A Variant read for only some paths decodes just their leaves (a
+    /// shredded key's subtree, or the root residual for a key the file did
+    /// not shred, plus `metadata`) and never a sibling shredded child, yet
+    /// every path reads exactly what an all-residual file returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a read decodes other leaves or any value differs.
+    #[test]
+    fn trimmed_variant_reads_only_its_paths_leaves() {
+        let shredded = write_file(true);
+        let unshredded = write_file(false);
+        let path = |key: &str| vec![key.to_owned()];
+        for (paths, leaves) in [
+            (
+                vec![path("a")],
+                vec![
+                    "v.metadata",
+                    "v.typed_value.a.value",
+                    "v.typed_value.a.typed_value",
+                ],
+            ),
+            (vec![path("c")], vec!["v.metadata", "v.value"]),
+            (
+                vec![path("a"), path("c")],
+                vec![
+                    "v.metadata",
+                    "v.value",
+                    "v.typed_value.a.value",
+                    "v.typed_value.a.typed_value",
+                ],
+            ),
+        ] {
+            let (decoded, texts) = read_trimmed(&shredded, &paths);
+            assert_eq!(decoded, leaves, "{paths:?}");
+            let (whole, expected) = read_trimmed(&unshredded, &paths);
+            assert_eq!(whole, ["v.metadata", "v.value"]);
+            assert_eq!(texts, expected, "{paths:?}");
+        }
     }
 
     /// A key the file did not shred reads as null even when every row's
@@ -875,8 +1001,12 @@ mod tests {
             Box::new(OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()])),
             DataType::Int64,
         ));
-        let planner =
-            PublishedFileReadPlanner::new(logical_schema(), physical(&number.eq(lit(2_i64))), 20);
+        let planner = PublishedFileReadPlanner::new(
+            logical_schema(),
+            Some(physical(&number.eq(lit(2_i64)))),
+            LeafPaths::default(),
+            20,
+        );
         let reader = iceberg::arrow::ArrowReaderBuilder::new(
             iceberg::io::FileIO::new_with_fs(),
             iceberg::Runtime::current(),

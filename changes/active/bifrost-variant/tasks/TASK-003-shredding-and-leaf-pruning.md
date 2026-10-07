@@ -373,6 +373,61 @@ Commands:
 `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration --run-ignored all'`;
 fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core --lib`.
 
+#### Output leaf projection evidence (spec revision 22)
+
+One physical rule, `LeafPathPushdown` (`oracle/leaf_paths.rs`), walks the plan
+top-down and records, per scan column, the literal paths the query reads. A
+Variant path (`variant_get` with literal keys) decodes its `typed_value`
+subtree, its path-local `value` and the top-level `metadata`. A Struct path
+(`get_field` literal chain) decodes only that field. Any other use reads the
+column whole. Hot reads trim through `HotParquetExec.leaf_paths`; published
+reads pass the same `LeafPaths::leaf_mask` to the iceberg fork as
+`ParquetFileReadNarrowing.projection`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-007 hot projection-only decodes only the path's leaves | `LeafPaths::projection` (`OracleVariantSql::trimmed` / `StructTrim`), `HotParquetExec::with_leaf_paths` | `oracle::leaf_paths::tests::trimmed_struct_reads_only_its_paths_leaves` (decoded `id`, `s.b`, `v.metadata`, `v.typed_value.a.{value,typed_value}`) | PASS |
+| AC-007 published projection-only decodes only the path's leaves | `PublishedFileReadPlanner.leaf_paths` → `LeafPaths::leaf_mask`; fork `ParquetFileReadNarrowing.projection`, `RecordBatchTransformer::promote` | `oracle::leaf_paths::tests::published_reads_decode_only_struct_and_variant_paths`; fork `struct_missing_children_are_rebuilt_by_name` | PASS |
+| AC-007 trimmed result equals the all-residual/whole read (Variant and Struct) | same | both tests above compare values with a whole read | PASS |
+| No regression to stock DataFusion results | `Demand` (schema-aware path recognition), `keeps_columns`, `VariantGet::placement` | `oracle::leaf_paths::tests::literal_key_reads_trim_the_scan_and_match_stock_datafusion` (10 queries: filter, ORDER BY, LIMIT/TopK, GROUP BY, nested Struct, mixed Struct+Variant); `other_uses_read_the_column_whole` (9 queries: whole column, IS NOT NULL, CASE key, integer index, window) | PASS |
+| Distributed peers carry the paths | codec `leaf_paths_json` (tag 6) | redux integration (see Neighbors) | PASS |
+| Neighbors and journeys | — | redux lib (Postgres) 872/872; redux `integration --run-ignored all` 73/73; `wyrd-testing --test oracle -P journey --run-ignored all` 53/53; fork iceberg lib 1798/1798; compaction core lib 153/153; `check:workspace-hack` clean | PASS |
+| Lints | — | nightly fmt; clippy `-D warnings` on `vala-bifrost-redux --all-features --all-targets` and fork `iceberg --all-targets`; `git diff --check` | PASS |
+
+Pins: iceberg-rust `9ec4f03d9130bc44fc4a05a713e7b66b304c060b`, iceberg-compaction `5919997444dd8ee4626648e51083a8a4cd4fd987` (both pushed).
+
+Limit: DataFusion does not move field lookups below a window, so a window query
+reads the column whole (pinned by `other_uses_read_the_column_whole`).
+
+Diagnoses:
+
+- **TopK harness.** Symptom: trimmed `LIMIT 3` returned 2 rows. Evidence:
+  `SortExec TopK filter=[id@1 < 3]` survived into the second run. Cause: the
+  test re-executed one plan instance, whose dynamic filter keeps state. Fix
+  site: the test plans freshly per run; no production change.
+- **Adapter cast.** Symptom: `s.a` still decoded for `SELECT s['b']`.
+  Evidence: the schema adapter casts `s` (field-id metadata differs), and the
+  planner keeps every leaf the cast consumes. Cause: trimming applied after
+  the cast. Fix site: `StructTrim` takes `get_field` arguments, which
+  DataFusion narrows through the cast.
+- **Iceberg Struct promote.** Symptom: published read failed "Incorrect number
+  of arrays for StructArray fields, expected 2 got 1". Evidence: Arrow `cast`
+  of a pruned Struct. Cause: the transformer cast by position. Fix site: fork
+  `RecordBatchTransformer::promote` rebuilds by name.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `oracle::leaf_paths::{LeafPaths, LeafPathPushdown, Demand}` (renamed from the Variant-only rule) | DataFusion `ProjectionPushdown`, `get_field` simplification, `variant_sql` | DataFusion pushes whole columns only; one rule now serves Struct and Variant |
+| `oracle::leaf_paths::StructTrim` | DataFusion `get_field`, `named_struct`, Arrow `cast` | rebuilds the full Struct type from the read children so downstream types stay unchanged; `named_struct` cannot keep unread required children |
+| `VariantGet::placement` | DataFusion `get_field` placement | lets DataFusion move Variant lookups below aggregates, as it does for `get_field` |
+| fork `ParquetFileReadNarrowing.projection`, `RecordBatchTransformer::promote` | fork reader pipeline, Arrow `cast` | the reader had no way to accept a leaf mask; `cast` cannot rebuild a Struct with missing children |
+
+Commands:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib'`;
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::leaf_paths::/)'`;
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration --run-ignored all && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored all'`;
+fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core`.
+
 ### Hot-reader fix: a key the file did not shred
 
 Diagnosis:

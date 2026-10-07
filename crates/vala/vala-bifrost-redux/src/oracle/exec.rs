@@ -79,7 +79,6 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use super::live::LiveScribeExec;
 use super::nested_pushdown::FileReadPlan;
 use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry, QueryCatalogError};
-use datafusion::physical_expr::projection::ProjectionExprs;
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -1002,6 +1001,8 @@ pub(crate) struct OracleIcebergScanExec {
     /// Scan closure and closed predicates every data file is planned against
     /// through the shared read core; `None` leaves pruning to Iceberg alone.
     read_plan: Option<(SchemaRef, Vec<ScanPredicate>)>,
+    /// Literal paths the query reads from each trimmed Struct or Variant column.
+    leaf_paths: super::leaf_paths::LeafPaths,
 }
 
 /// What a pinned Iceberg scan needs to load data-file footers through the
@@ -1332,7 +1333,18 @@ impl OracleIcebergScanExec {
             planned: Arc::default(),
             reader: Arc::default(),
             read_plan: None,
+            leaf_paths: super::leaf_paths::LeafPaths::default(),
         })
+    }
+
+    /// Reads each Variant column `paths` names through only those paths'
+    /// leaves; see [`super::leaf_paths`].
+    ///
+    /// The cached reader is dropped because it embeds the per-file planner.
+    pub(super) fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Self {
+        self.leaf_paths = paths;
+        self.reader = Arc::default();
+        self
     }
 
     /// Reads this scan across `partitions` byte-range partitions.
@@ -1371,8 +1383,9 @@ impl OracleIcebergScanExec {
 
     /// Resolves the per-file planner one execution installs in the reader.
     ///
-    /// Returns `None` when the scan has no read plan or no closed predicate,
-    /// because the shared core then has nothing to prune or filter.
+    /// Returns `None` when the scan has no read plan, or has neither a closed
+    /// predicate nor a trimmed column, because the shared core then
+    /// has nothing to prune, filter, or trim.
     ///
     /// # Errors
     ///
@@ -1391,15 +1404,18 @@ impl OracleIcebergScanExec {
             .execution
             .parquet
             .max_in_list_size;
-        Ok(
-            scan_predicate_conjunction(predicates, schema)?.map(|filter| {
-                Arc::new(super::nested_pushdown::PublishedFileReadPlanner::new(
-                    Arc::clone(schema),
-                    filter,
-                    max_in_list_size,
-                ))
-            }),
-        )
+        let filter = scan_predicate_conjunction(predicates, schema)?;
+        if filter.is_none() && self.leaf_paths.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            super::nested_pushdown::PublishedFileReadPlanner::new(
+                Arc::clone(schema),
+                filter,
+                self.leaf_paths.clone(),
+                max_in_list_size,
+            ),
+        )))
     }
 
     /// Restricts this pinned scan to one exact authenticated follower assignment.
@@ -2801,6 +2817,7 @@ impl AsyncFileReader for IcebergParquetReader {
 /// through [`HotParquetGovernance`], which owns where every reserved byte is
 /// charged. Visible to sibling `oracle` submodules so the follower resolver can
 /// build the follower mode and [`OracleQueryScanStats`] can fold its counters.
+#[derive(Clone)]
 pub(super) struct HotParquetExec {
     /// Validated immutable manifest entries.
     files: Vec<HotFileSource>,
@@ -2823,6 +2840,8 @@ pub(super) struct HotParquetExec {
     /// stream holds a clone, so the lease is released once the plan and every
     /// stream it produced are dropped.
     staged_lease: Option<Arc<StagedSourceLease>>,
+    /// Literal paths the query reads from each trimmed Struct or Variant column.
+    pub(super) leaf_paths: super::leaf_paths::LeafPaths,
     /// Deterministic reader injected only by focused unit tests.
     #[cfg(test)]
     reader_override: Option<HotReadOverride>,
@@ -2867,6 +2886,7 @@ impl HotParquetExec {
             metrics,
             predicates,
             staged_lease: None,
+            leaf_paths: super::leaf_paths::LeafPaths::default(),
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
@@ -2890,6 +2910,13 @@ impl HotParquetExec {
     /// lease is what keeps publication from deleting a run mid-read.
     pub(super) fn with_staged_lease(mut self, lease: StagedSourceLease) -> Self {
         self.staged_lease = Some(Arc::new(lease));
+        self
+    }
+
+    /// Reads each Variant column `paths` names through only those paths'
+    /// leaves; see [`super::leaf_paths`].
+    pub(super) fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Self {
+        self.leaf_paths = paths;
         self
     }
 
@@ -3090,8 +3117,7 @@ fn hot_stream(
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     let filter = scan_predicate_conjunction(&predicates, &schema);
-    let projection =
-        ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema);
+    let projection = exec.leaf_paths.projection(&schema);
     let staged_lease = exec.staged_lease.clone();
     // Cancelling the query drops this stream, which drops the guard and
     // cancels any metadata decode this stream still has outstanding. Owner
@@ -4210,7 +4236,7 @@ fn plan_properties_with_partitions(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -4267,7 +4293,9 @@ mod tests {
 
     /// Builds the production writer recipe with a footer proving
     /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
-    fn fixture_writer_properties(bloom_columns: &[String]) -> WriterProperties {
+    pub(in crate::oracle) fn fixture_writer_properties(
+        bloom_columns: &[String],
+    ) -> WriterProperties {
         crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
             vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
             bloom_columns,
@@ -4967,11 +4995,10 @@ mod tests {
         )
         .expect("valid Parquet footer");
         let filter = scan_predicate_conjunction(predicates, schema).expect("compiled predicates");
-        let columns = (0..schema.fields().len()).collect::<Vec<_>>();
         FileReadPlan::new(
             &reader,
             schema,
-            ProjectionExprs::from_indices(&columns, schema),
+            super::super::leaf_paths::LeafPaths::default().projection(schema),
             filter,
             20,
         )
@@ -5796,15 +5823,15 @@ mod tests {
     }
 
     /// Owns deterministic Parquet bytes used by the terminal-owner hot test.
-    struct HotCausalFixture {
+    pub(in crate::oracle) struct HotCausalFixture {
         /// Temporary directory retaining the source file for the fixture lifetime.
-        _directory: tempfile::TempDir,
+        pub(in crate::oracle) _directory: tempfile::TempDir,
         /// Source location supplied to the production hot execution plan.
-        path: std::path::PathBuf,
-        /// One-column Arrow schema used to write and decode the source.
-        schema: SchemaRef,
+        pub(in crate::oracle) path: std::path::PathBuf,
+        /// Arrow schema used to write and decode the source.
+        pub(in crate::oracle) schema: SchemaRef,
         /// Serialized Parquet bytes returned by deterministic reader overrides.
-        bytes: bytes::Bytes,
+        pub(in crate::oracle) bytes: bytes::Bytes,
     }
 
     /// Builds one small Parquet source for terminal-owner hot attempts.
@@ -6897,7 +6924,7 @@ mod tests {
     ///
     /// `size_bytes` is the manifest size the leaf trusts, so a caller can
     /// deliberately mis-state it to drive the storage-failure branch.
-    fn hot_exec_for(
+    pub(in crate::oracle) fn hot_exec_for(
         fixture: &HotCausalFixture,
         governance: HotParquetPlan,
         metrics: &Arc<OracleScanMetricsHandle>,

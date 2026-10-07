@@ -62,6 +62,8 @@ impl AnalyticalScanSource {
 pub struct AnalyticalScanExec {
     /// Closed source identity this leaf resolves at execution time.
     source: AnalyticalScanSource,
+    /// Literal paths applied to the resolved provider's Struct and Variant columns.
+    leaf_paths: super::leaf_paths::LeafPaths,
     /// Advertised physical properties derived from the leader's closure.
     properties: Arc<PlanProperties>,
     /// Provider resolved on first execution and shared by every partition.
@@ -108,9 +110,18 @@ impl AnalyticalScanExec {
         ));
         Self {
             source,
+            leaf_paths: super::leaf_paths::LeafPaths::default(),
             properties,
             resolved: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Applies the leader's Variant `paths` to the provider this leaf
+    /// resolves, so its readers decode only those paths' leaves.
+    #[must_use]
+    pub fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Self {
+        self.leaf_paths = paths;
+        self
     }
 
     /// Resolves, validates, and reshapes the provider backing this leaf.
@@ -125,6 +136,7 @@ impl AnalyticalScanExec {
     /// precisely the closure derived from that schema and the signed column
     /// names. Deriving the closure from the provider's own schema would make
     /// the check circular, so it is derived from the authenticated full schema.
+    /// The leader's leaf paths are then applied to the provider's readers.
     /// The provider is finally reshaped to the advertised partition count,
     /// because the leader planned against that count and an operator above this
     /// leaf depends on it.
@@ -132,7 +144,8 @@ impl AnalyticalScanExec {
     /// # Errors
     ///
     /// Returns [`DataFusionError::Plan`] when resolution fails, when either
-    /// schema check fails, or when the provider cannot be repartitioned.
+    /// schema check fails, or when the leaf paths or repartitioning cannot
+    /// be applied to the provider.
     async fn resolve(&self, task: &Arc<TaskContext>) -> Result<ResolvedAnalyticalSource> {
         let resolved = {
             let AnalyticalScanSource {
@@ -167,7 +180,7 @@ impl AnalyticalScanExec {
                         .to_owned(),
                 ));
             }
-            resolved.plan
+            super::leaf_paths::LeafPathPushdown::assign(resolved.plan, &self.leaf_paths)?
         };
         if resolved.schema() != self.schema() {
             return Err(DataFusionError::Plan(

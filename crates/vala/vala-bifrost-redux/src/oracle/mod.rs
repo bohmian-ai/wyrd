@@ -103,6 +103,7 @@ pub(super) type DegradedSourceAccumulator = Arc<std::sync::Mutex<Vec<DegradedPar
 pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::QueryLifecycleObserver> {
     query_stream::query_lifecycle_observer_for_test()
 }
+mod leaf_paths;
 mod tail_discovery;
 pub mod telemetry;
 pub mod variant_sql;

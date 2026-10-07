@@ -247,8 +247,11 @@ impl QueryClient {
     ///
     /// # Errors
     ///
-    /// Returns a contract error before IO when the request is invalid, or a
-    /// transport error when authentication or the HTTP request fails.
+    /// Returns a contract error before IO when the request is invalid —
+    /// `WYRD_SPEC_400_VALIDATION` for an out-of-range deadline and
+    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL or a non-finite bind
+    /// value — or a transport error when authentication or the HTTP request
+    /// fails.
     ///
     /// # Cancellation
     ///
@@ -258,13 +261,9 @@ impl QueryClient {
         &self,
         request: &BifrostQueryRequest,
     ) -> Result<QueryResultStream, BifrostClientError> {
-        request.validate().map_err(|error| {
-            BifrostClientError::Transport(WyrdError::Vala {
-                error: BifrostError::QueryInvalidSql {
-                    detail: error.to_string(),
-                },
-            })
-        })?;
+        request
+            .validate()
+            .map_err(|error| BifrostClientError::Transport(error.into()))?;
         let request_id = RequestId::now_v7();
         let response = self
             .client

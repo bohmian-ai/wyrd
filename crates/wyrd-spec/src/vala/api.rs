@@ -485,6 +485,32 @@ pub enum QueryContractError {
         /// Zero-based position of the rejected bind value.
         index: usize,
     },
+    /// The caller deadline is not an integer in `1..=u32::MAX` milliseconds.
+    #[error("deadline_ms must be an integer between 1 and 4294967295")]
+    InvalidDeadline,
+}
+
+/// Projects a query request refusal onto the public catalog.
+///
+/// A deadline outside its range is a request-field fault, not a SQL fault, so
+/// it is the shared `WYRD_SPEC_400_VALIDATION` naming `deadline_ms`; every
+/// other contract refusal concerns the SQL text or its bind values and stays
+/// `WYRD_VALA_400_QUERY_INVALID_SQL`. Client surfaces that validate a request
+/// before IO route through this one projection.
+impl From<QueryContractError> for crate::error::WyrdError {
+    fn from(error: QueryContractError) -> Self {
+        match error {
+            QueryContractError::InvalidDeadline => Self::Validation {
+                message: error.to_string(),
+                details: serde_json::json!({ "field": "deadline_ms" }),
+            },
+            other => Self::Vala {
+                error: crate::vala::error::BifrostError::QueryInvalidSql {
+                    detail: other.to_string(),
+                },
+            },
+        }
+    }
 }
 
 /// One typed scalar bind value for a positional SQL placeholder.
@@ -562,9 +588,7 @@ impl BifrostQueryRequest {
             .deadline_ms
             .is_some_and(|deadline| !(1..=i64::from(u32::MAX)).contains(&deadline))
         {
-            return Err(QueryContractError::InvalidTerminal {
-                reason: "deadline_ms must be between 1 and 4294967295",
-            });
+            return Err(QueryContractError::InvalidDeadline);
         }
         Ok(())
     }
@@ -1242,6 +1266,34 @@ mod query_terminal_tests {
         assert_eq!(
             schema["additionalProperties"],
             serde_json::Value::Bool(false)
+        );
+    }
+
+    /// An out-of-range deadline projects onto the shared request-validation
+    /// code, while an empty statement stays the SQL refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either request validates or projects onto another code.
+    #[test]
+    fn query_request_refusals_project_onto_their_catalog_codes() {
+        let request = |sql: &str, deadline_ms| BifrostQueryRequest {
+            params: Vec::new(),
+            sql: sql.into(),
+            deadline_ms,
+        };
+        let refusal = |request: BifrostQueryRequest| {
+            crate::error::WyrdError::from(request.validate().expect_err("request is refused"))
+                .code()
+        };
+
+        assert_eq!(
+            refusal(request("SELECT 1", Some(0))),
+            "WYRD_SPEC_400_VALIDATION"
+        );
+        assert_eq!(
+            refusal(request(" ", None)),
+            "WYRD_VALA_400_QUERY_INVALID_SQL"
         );
     }
 }

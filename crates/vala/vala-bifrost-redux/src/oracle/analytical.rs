@@ -11,7 +11,7 @@
 //! # Why the upstream crate rather than a Wyrd scheduler
 //!
 //! `datafusion-distributed` is pinned into the same native `DataFusion` 55 /
-//! Arrow 59.2 cone Bifrost already uses (proved by
+//! Arrow 60 cone Bifrost already uses (proved by
 //! `tests/integration/distributed_compat.rs`). It supplies the distributed
 //! physical planner, stage graph, network boundaries, and worker task cache.
 //! Wyrd supplies exactly the three things the upstream crate deliberately

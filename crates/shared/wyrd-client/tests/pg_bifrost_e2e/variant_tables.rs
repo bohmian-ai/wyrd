@@ -561,7 +561,9 @@ mod pg_tests {
             (
                 with_column(
                     &valid,
-                    payload_field.clone().with_metadata(Default::default()),
+                    payload_field
+                        .clone()
+                        .with_metadata(std::collections::HashMap::new()),
                     Arc::clone(valid.column(payload)),
                 ),
                 unsupported,

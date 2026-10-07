@@ -2214,7 +2214,7 @@ impl TableProvider for OracleTableProvider {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -3631,7 +3631,7 @@ fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority
 /// scan may quietly drop.
 fn scan_output_names(
     schema: &Schema,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&[usize]>,
 ) -> DataFusionResult<Vec<String>> {
     let Some(projection) = projection else {
         return Ok(schema
@@ -3763,7 +3763,7 @@ impl OracleScanProjection {
     /// name is absent from it.
     fn try_new(
         physical_schema: &Schema,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> DataFusionResult<Self> {
         let output_names = scan_output_names(physical_schema, projection)?;
@@ -7158,14 +7158,14 @@ mod tests {
         let left = provider
             .scan(
                 &session.state(),
-                Some(&vec![1_usize]),
+                Some(&[1_usize]),
                 &[col("status_code").eq(lit("STATUS_CODE_ERROR"))],
                 None,
             )
             .await
             .expect("the first occurrence plans");
         let right = provider
-            .scan(&session.state(), Some(&vec![0_usize]), &[], None)
+            .scan(&session.state(), Some(&[0_usize]), &[], None)
             .await
             .expect("the second occurrence plans");
         (

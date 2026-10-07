@@ -454,7 +454,7 @@ pub fn spec_to_field(spec: &FieldSpec, carry_metadata: bool) -> Field {
         spec.nullable,
     );
     let field = if carry_metadata {
-        field.with_metadata(spec.metadata.clone().into_iter().collect())
+        field.with_metadata(spec.metadata.clone())
     } else {
         field
     };

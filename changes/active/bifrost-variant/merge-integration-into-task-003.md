@@ -3,7 +3,8 @@
 - Source: `wyrd/bifrost-variant/integration` @ `66859d22f` (spec revision 17).
 - Target: `wyrd/bifrost-variant/TASK-003` (spec revision 11; working tree uncommitted).
 - Merge base: `535367c94`.
-- Status: **executed through step 6; step 7 verification next; not committed.** Deviations are listed under "Execution notes".
+- Status: **executed and committed** (merge `796fd3f72`, dedup `3d673d597`). Deviations are listed under "Execution notes".
+- Step 7 results: fmt, lints and codegen clean; `integration:redux`, `journey:mcp`, `journey:sdk` and `journey:python` exit 0. `journey:typescript` failed one test (a map column reading back as a plain object), was fixed, and re-ran green (12/12 files). `journey:server` failed `builtin_variant_columns_are_refused_before_ack` and `typed_builtin_payloads_are_queryable`; both were fixed and passed a focused re-run (2/2). The whole server lane re-runs inside the later `verify:bifrost`.
 
 ## Evidence
 

@@ -48,7 +48,7 @@ impl WorkerResolver for NoWorkerCluster {
 /// distributed planner extension consumes that same builder, and the resulting
 /// state must still carry Bifrost's fixed Parquet pushdown and indexing options
 /// and still execute a plan over Arrow batches Bifrost built itself. That is only
-/// possible if both crates resolve to one native `DataFusion` 55 / Arrow 59.2 graph.
+/// possible if both crates resolve to one native `DataFusion` 55 / Arrow 60 graph.
 ///
 /// Oracle's own `PhysicalExtensionCodec` registers through the distributed crate's
 /// public codec API as part of the same call chain, which additionally pins that

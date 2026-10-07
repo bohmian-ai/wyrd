@@ -76,16 +76,16 @@ const FIXED_TABLES: [&str; 2] = ["vala.drift.observations", "vala.eval.observati
 /// The rows the Eval read-back selects.
 #[derive(Debug, Deserialize)]
 struct EvalRow {
-    /// The JSON context text the caller emitted.
-    context: String,
+    /// The Variant context the caller emitted, read back as its JSON value.
+    context: serde_json::Value,
     /// The authored session, as its UUID text.
     session_id: Option<String>,
     /// The persisted `FixedSizeBinary(16)` trace id, rendered as hex by Arrow.
     trace_id: Option<String>,
     /// The persisted `FixedSizeBinary(8)` span id, rendered as hex by Arrow.
     span_id: Option<String>,
-    /// The authored media descriptors as canonical JSON text.
-    media: Option<String>,
+    /// The authored Variant media descriptors, read back as their JSON value.
+    media: Option<serde_json::Value>,
     /// The managed subject Card UID stamped from the authorized scope.
     card_uid: Option<String>,
     /// The managed invocation id every row of one run shares.
@@ -98,8 +98,8 @@ const EXPLICIT_SPAN_NAME: &str = "observe-judge-call";
 /// One Eval row joined to its span by typed trace and span identity.
 #[derive(Debug, Deserialize)]
 struct EvalSpanRow {
-    /// The JSON context text of the joined Eval row.
-    context: String,
+    /// The Variant context of the joined Eval row, read back as its JSON value.
+    context: serde_json::Value,
     /// The name of the span sharing the row's trace and span identity.
     span_name: String,
 }
@@ -311,11 +311,14 @@ async fn assert_read_back(
         1,
         "the refused pair and media added no row: {evals:?}"
     );
-    assert_eq!(evals[0].context, r#"{"answer":"yes"}"#);
+    assert_eq!(evals[0].context, serde_json::json!({ "answer": "yes" }));
     assert_eq!(evals[0].session_id.as_deref(), Some(SESSION));
     assert_eq!(evals[0].trace_id.as_deref(), Some(EXPLICIT_TRACE));
     assert_eq!(evals[0].span_id.as_deref(), Some(EXPLICIT_SPAN));
-    assert_eq!(evals[0].media.as_deref(), Some(MEDIA));
+    assert_eq!(
+        evals[0].media,
+        Some(serde_json::from_str(MEDIA).expect("MEDIA is JSON"))
+    );
     assert_eq!(evals[0].run_id.as_deref(), Some(run_id));
     assert_eq!(
         evals[0].card_uid.as_deref(),
@@ -423,7 +426,7 @@ async fn assert_eval_joins_span(client: &WyrdClient, run_id: &str) {
         .await
         .expect("eval rows join spans");
     assert_eq!(joined.len(), 1, "one Eval row joins its span: {joined:?}");
-    assert_eq!(joined[0].context, r#"{"answer":"yes"}"#);
+    assert_eq!(joined[0].context, serde_json::json!({ "answer": "yes" }));
     assert_eq!(joined[0].span_name, EXPLICIT_SPAN_NAME);
 }
 

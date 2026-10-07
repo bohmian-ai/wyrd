@@ -3960,13 +3960,11 @@ impl SealedObject {
     /// Returns an error when the object carries no offset index.
     fn page_count(&self, column: &str) -> Result<usize, JourneyError> {
         let index = self.column_index(column)?;
-        self.metadata
-            .offset_index()
-            .ok_or_else(|| format!("{}: no offset index", self.path))?
-            .iter()
-            .map(|columns| {
-                columns
-                    .get(index)
+        (0..self.metadata.num_row_groups())
+            .map(|group| {
+                self.metadata
+                    .page_index_for_row_group(group)
+                    .offset_index(index)
                     .map(|column| column.page_locations().len())
                     .ok_or_else(|| format!("{}: no offset index for {column}", self.path))
             })
@@ -4008,9 +4006,8 @@ impl SealedObject {
         let index = self.column_index("key_id")?;
         let pages = self
             .metadata
-            .offset_index()
-            .and_then(|groups| groups.get(group))
-            .and_then(|columns| columns.get(index))
+            .page_index_for_row_group(group)
+            .offset_index(index)
             .ok_or_else(|| format!("{}: no key offset index", self.path))?
             .page_locations()
             .len();

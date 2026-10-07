@@ -157,6 +157,29 @@ Each status was found by searching the tree for that scenario's named tests.
 
 After the merge, resume shredding at Scenario 1.
 
+### Arrow 60 upgrade (user decision, before Scenario 1)
+
+Arrow 59.3 `shred_variant` silently converts values that do not fit the typed
+column (for an Int64 column, `true` becomes 1 and `1.5` becomes 1; for a
+Boolean column, every number becomes `true`). arrow-rs #10157 fixed this in
+60.0.0: values that don't fit stay in the residual `value` column. The user
+chose to move the whole stack to Arrow 60.
+
+| Repository | Branch | Tested revision | Proof |
+|---|---|---|---|
+| `bohmian-ai/datafusion` | `wyrd-arrow60-variant-read-plan` | `202c5e101c8edac0f391d22fb0b29993fc19dcce` | apache main `b631f2c7d9` (arrow 60, still v55.1.0) plus the fork's seven commits, cherry-picked with `-x`. common 691, expr 323, functions 386, physical-expr 1667, physical-expr-adapter 45, pruning 108, datasource-parquet 281, core `parquet_integration` 244, all passing; sqllogictest `projection_pushdown` exit 0 |
+| `bohmian-ai/iceberg-rust` | `wyrd/bifrost-variant` | `e12773876e9a1974f7e1d0fc57eef1bea6489e5c` | parquet 60 page-index port from apache/iceberg-rust#3257. `iceberg` + `iceberg-datafusion` 1968 passed, 0 failed; nightly clippy `-D warnings` clean |
+| `bohmian-ai/iceberg-compaction` | `wyrd/bifrost-variant` | `15949359922a6ef7d2145db0622df1ad6da1c0a5` | core 152 passed, 0 failed; clippy clean. Its docker integration tests cannot start here: Docker Hub no longer serves `minio/mc` |
+| `bohmian-ai/datafusion-distributed` (new fork, user-approved) | `wyrd-arrow60` | `22a395f89e1e49c3a47c04736ea43a0df3e617ef` | upstream is still on Arrow 59. 388 passed, 0 failed; clippy `-D warnings` clean |
+
+Wyrd: arrow, parquet and parquet-variant move to 60.0; the four pins above
+replace the old revisions; the workspace-hack is regenerated; the
+`object_store` single-version check now expects 0.14.* (the whole stack
+resolves 0.14.2). Code changes: `Field::with_metadata` takes the map
+directly; `TableProvider::scan` takes `Option<&[usize]>`; two test helpers
+read offset indexes through `page_index_for_row_group`.
+`verify:bifrost`: exit 0 on the Arrow 60 tree (2026-10-07), after fixing five stale tests; diagnoses in `../diagnostics/README.md`.
+
 Open follow-up (recorded at the merge, not done): JSON-row → Arrow value
 conversion (`build_list`, `build_map`, timestamp parsing run by
 `RowPreflight`) still lives in `wyrd-queue/src/batch_builder.rs`. Type

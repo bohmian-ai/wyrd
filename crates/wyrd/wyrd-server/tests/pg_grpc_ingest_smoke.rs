@@ -25,6 +25,7 @@ use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
 use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
+use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
@@ -776,65 +777,44 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
 
 /// Encodes one complete `vala.verification.results` row with `card_ref`.
 ///
-/// Carries every authored column of the built-in result table. `card_ref`
-/// shapes the correlation column: `None` omits it, `Some(None)` declares it
-/// with a null row, and `Some(Some(value))` carries `value`, so an in-scope
-/// value lets Scribe resolve and stamp the signed Verifier UID rather than
-/// trusting a client-supplied one.
+/// Carries every authored column of the built-in result table, taken from
+/// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
+/// a completed passing drift result with both implementation summaries null.
+/// `card_ref` shapes the correlation column: `None` omits it, `Some(None)`
+/// declares it with a null row, and `Some(Some(value))` carries `value`, so an
+/// in-scope value lets Scribe resolve and stamp the signed Verifier UID rather
+/// than trusting a client-supplied one.
 ///
 /// # Panics
 ///
 /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
 fn verification_result_ipc(card_ref: Option<Option<&str>>) -> Vec<u8> {
-    let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let text = |name: &str, nullable: bool| Field::new(name, DataType::Utf8, nullable);
-    let mut fields = vec![
-        text("result_id", false),
-        text("implementation", false),
-        text("execution_status", false),
-        text("verdict", false),
-        text("verifier_version", false),
-        text("owner_card_uid", true),
-        text("subject_card_uid", false),
-        text("binding_id", true),
-        text("trigger_identity", true),
-        text("source_record_id", true),
-        Field::new("window_start", utc(), true),
-        Field::new("window_end", utc(), true),
-        Field::new("started_at", utc(), false),
-        Field::new("ended_at", utc(), false),
-        text("details", true),
-    ];
+    let mut fields = ResultsTable::arrow_fields();
     if card_ref.is_some() {
-        fields.push(text("card_ref", true));
+        fields.push(Field::new("card_ref", DataType::Utf8, true));
     }
-    let schema = Arc::new(Schema::new(fields));
     let now = Utc::now().timestamp_micros();
-    let value = |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![Some(value)])) };
-    let null = || -> ArrayRef { Arc::new(StringArray::from(vec![None::<&str>])) };
-    let at = |micros: Option<i64>| -> ArrayRef {
-        Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))
-    };
-    let mut columns = vec![
-        value(&uuid::Uuid::now_v7().to_string()),
-        value("drift"),
-        value("completed"),
-        value("pass"),
-        value("1.0.0"),
-        null(),
-        value(&uuid::Uuid::now_v7().to_string()),
-        null(),
-        null(),
-        null(),
-        at(None),
-        at(None),
-        at(Some(now)),
-        at(Some(now)),
-        null(),
-    ];
+    let mut columns: Vec<ArrayRef> = fields
+        .iter()
+        .map(|field| match (field.name().as_str(), field.data_type()) {
+            ("result_id" | "subject_card_uid", _) => {
+                Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])) as ArrayRef
+            }
+            ("implementation", _) => Arc::new(StringArray::from(vec!["drift"])),
+            ("execution_status", _) => Arc::new(StringArray::from(vec!["completed"])),
+            ("verdict", _) => Arc::new(StringArray::from(vec!["pass"])),
+            ("verifier_version", _) => Arc::new(StringArray::from(vec!["1.0.0"])),
+            ("started_at" | "ended_at", data_type) => Arc::new(
+                TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
+            ),
+            (_, data_type) => arrow::array::new_null_array(data_type, 1),
+        })
+        .collect();
     if let Some(card_ref) = card_ref {
+        columns.pop();
         columns.push(Arc::new(StringArray::from(vec![card_ref])));
     }
+    let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
         .expect("valid verification result batch");
     let mut bytes = Vec::new();

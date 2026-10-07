@@ -324,8 +324,14 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])),
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
-            Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_000_000_i64])
+                    .with_data_type(schema.field(7).data_type().clone()),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![1_000_001_i64])
+                    .with_data_type(schema.field(8).data_type().clone()),
+            ),
         ],
     )?;
     let mut parquet = Vec::new();

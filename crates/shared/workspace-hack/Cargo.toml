@@ -17,11 +17,11 @@ publish = false
 ### BEGIN HAKARI SECTION
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
-arrow = { version = "59", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
-arrow-array = { version = "59", default-features = false, features = ["chrono-tz"] }
-arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
-arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
-arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types"] }
+arrow = { version = "60", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
+arrow-array = { version = "60", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { version = "60", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { version = "60", features = ["lz4", "zstd"] }
+arrow-schema = { version = "60", default-features = false, features = ["canonical_extension_types"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-runtime = { version = "1", default-features = false, features = ["event-stream", "http-02x", "sigv4a"] }
@@ -34,7 +34,6 @@ base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 bigdecimal = { version = "0.4", features = ["serde"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
-blake2 = { version = "0.10" }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -147,17 +146,15 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1", features = ["derive"] }
-zstd = { version = "0.13" }
-zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [build-dependencies]
 ahash = { version = "0.8", features = ["serde"] }
-arrow = { version = "59", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
-arrow-array = { version = "59", default-features = false, features = ["chrono-tz"] }
-arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
-arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
-arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types"] }
+arrow = { version = "60", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
+arrow-array = { version = "60", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { version = "60", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { version = "60", features = ["lz4", "zstd"] }
+arrow-schema = { version = "60", default-features = false, features = ["canonical_extension_types"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-runtime = { version = "1", default-features = false, features = ["event-stream", "http-02x", "sigv4a"] }
@@ -170,7 +167,6 @@ base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 bigdecimal = { version = "0.4", features = ["serde"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
-blake2 = { version = "0.10" }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
@@ -289,8 +285,6 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zeroize = { version = "1", features = ["derive"] }
-zstd = { version = "0.13" }
-zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
@@ -298,52 +292,60 @@ async-compression = { version = "0.4", default-features = false, features = ["br
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
 compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "xz", "zstd"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-apple-darwin.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -351,13 +353,15 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -365,13 +369,15 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.aarch64-apple-darwin.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -379,13 +385,15 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -393,13 +401,15 @@ compression-codecs = { version = "0.4", default-features = false, features = ["b
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-libc = { version = "0.2" }
+libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -412,6 +422,8 @@ rustix = { version = "1", features = ["fs", "net"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 async-compression = { version = "0.4", default-features = false, features = ["brotli", "bzip2", "gzip", "tokio", "xz", "zstd"] }
@@ -424,5 +436,7 @@ rustix = { version = "1", features = ["fs", "net"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+zstd = { version = "0.13" }
+zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 
 ### END HAKARI SECTION

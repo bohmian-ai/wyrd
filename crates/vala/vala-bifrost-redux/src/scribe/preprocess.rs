@@ -1065,7 +1065,7 @@ mod tests {
 
     /// Decimal precision beyond Decimal128's width never reaches WAL.
     ///
-    /// Arrow 59 decodes the widened declaration, so the refusal comes from the
+    /// Arrow decodes the widened declaration, so the refusal comes from the
     /// registered-schema fingerprint the producer checks on every batch.
     #[test]
     fn native_producer_refuses_decimal_precision_overflow() {

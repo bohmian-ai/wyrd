@@ -43,7 +43,7 @@ mistake unrepresentable.
 | `scribe` | `write_read`, `telemetry`, `lifecycle`, `event_time_window`, `source_boundary`, `source_boundary_recovery`, `describe`, `ambiguous_retry` | write, ack, seal, WAL replay, exactly-once restart, admission window, OTLP source-boundary durability, described physical schema, ambiguous-deadline dedup | Postgres + server |
 | `oracle` | `published`, `distributed`, `convergence`, `spill`, `capacity`, `grpc_surface`, `observability`, `recovery`, `layout`, `peer` | query execution, distributed follower dispatch, peer security, tail fencing, cancellation, telemetry | Postgres + server |
 | `otlp` | `logs_export`, `metrics_export`, `trace_export`, `trace_export_http`, `mixed_batch`, `negative` | OTLP logs, metrics, traces, mixed batch, negative protocol surface | Postgres + server |
-| `server` | `grpc_mount`, `smoke`, `owner_inspection`, `query_lifecycle` | gRPC mount, boot, owner lifecycle and inspection, audited running-query controls and describe refusal | Postgres + server |
+| `server` | `grpc_mount`, `smoke`, `owner_inspection`, `query_lifecycle`, `observe_ingest` | gRPC mount, boot, owner lifecycle and inspection, audited running-query controls and describe refusal, observation emit time and exactly-once drift ingest | Postgres + server |
 
 MCP journeys live in a sibling crate under the same rule:
 `wyrd-mcp/tests/bifrost/mcp/` aggregates `layout` and `rbac`.

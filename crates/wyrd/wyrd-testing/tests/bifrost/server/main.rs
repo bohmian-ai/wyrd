@@ -1,5 +1,6 @@
 mod audit_publication;
 mod eval_verification;
+mod observe_ingest;
 mod owner_inspection;
 mod query;
 mod query_lifecycle;

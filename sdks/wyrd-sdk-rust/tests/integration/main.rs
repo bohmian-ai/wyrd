@@ -8,7 +8,6 @@
 mod drift_verification;
 mod gateway_admin;
 mod observe_a_run;
-mod observe_run;
 mod operator_connections;
 mod query_bifrost;
 mod register_and_hydrate;

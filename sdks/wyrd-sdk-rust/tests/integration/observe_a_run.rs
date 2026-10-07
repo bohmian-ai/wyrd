@@ -71,9 +71,7 @@ fn state(dir: &TempDir) -> WyrdState {
 async fn run_observations_read_back_by_run_id() {
     let (deployment, dir) = observed().await;
     let state = state(&dir);
-    let service = deployment
-        .service_key(state.root_ref(), &[])
-        .await;
+    let service = deployment.service_key(state.root_ref(), &[]).await;
     state
         .start_bifrost_with(&deployment.client(&service), None)
         .await
@@ -124,7 +122,10 @@ async fn run_observations_read_back_by_run_id() {
     };
     assert_eq!(
         rows,
-        [row("latency", Some(12.5), "12.5"), row("tier", None, "gold")]
+        [
+            row("latency", Some(12.5), "12.5"),
+            row("tier", None, "gold")
+        ]
     );
     deployment.shutdown().await;
 }

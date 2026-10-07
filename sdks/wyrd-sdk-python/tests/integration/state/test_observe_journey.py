@@ -289,7 +289,7 @@ def assert_read_back(
     drift = query.sql(
         "SELECT series, num_value, str_value, card_uid, run_id "
         f"FROM vala.drift.observations WHERE run_id = '{run_id}' ORDER BY series",
-        DriftRow,
+        model=DriftRow,
     )
     assert [row.series for row in drift] == ["latency_ms", "tier"]
     assert drift[0].num_value == 12.5
@@ -302,7 +302,7 @@ def assert_read_back(
     evals = query.sql(
         "SELECT context, session_id, trace_id, span_id, media, card_uid, run_id "
         f"FROM vala.eval.observations WHERE run_id = '{run_id}'",
-        EvalRow,
+        model=EvalRow,
     )
     by_answer = {json.loads(row.context)["answer"]: row for row in evals}
     assert set(by_answer) == {"yes", "traced", "explicit"}
@@ -325,7 +325,7 @@ def assert_read_back(
     ):
         rows = query.sql(
             f"SELECT value, run_id, card_uid FROM {table} WHERE run_id = '{run_id}' ORDER BY value",
-            CorrelatedDatasetRow,
+            model=CorrelatedDatasetRow,
         )
         assert [row.value for row in rows] == values
         assert {row.run_id for row in rows} == {run_id}

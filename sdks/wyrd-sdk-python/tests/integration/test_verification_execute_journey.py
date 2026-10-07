@@ -68,6 +68,7 @@ VERIFIERS = (
     "py-exec-trace",
     "py-exec-judge",
 )
+EVAL_VERIFIERS = frozenset({"py-exec-assert", "py-exec-trace", "py-exec-judge"})
 
 
 @contextmanager
@@ -134,12 +135,17 @@ def register_judge(cards: Cards, root: Path) -> CardRef:
 def bound_subject(cards: Cards, root: Path, name: str, verifiers: Sequence[str]) -> CardRef:
     """Register a Service named ``name`` whose root binds each of ``verifiers``.
 
-    Each binding runs on a daily schedule with no Operator, so the journey's
-    direct judgments are the only executions it observes.
+    Drift bindings run on a daily schedule and Eval bindings on observations
+    the journey never writes, with no Operator, so the journey's direct
+    judgments are the only executions it observes.
     """
     bindings = "".join(
         f"    - verifier: {{kind: Verifier, name: {verifier}, version: 1.0.0, space: default}}\n"
-        '      runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+        + (
+            "      runs_on: {kind: observations_ready}\n"
+            if verifier in EVAL_VERIFIERS
+            else '      runs_on: {kind: schedule, cron: "0 0 * * *"}\n'
+        )
         for verifier in verifiers
     )
     return register(

@@ -183,7 +183,10 @@ interface Journey {
   readonly close: () => Promise<void>;
 }
 
-/** The subject Service binding every journey Verifier at its root on a daily schedule. */
+/**
+ * The subject Service binding every journey Verifier at its root: Drift on a
+ * daily schedule and Eval on observations the journey never writes.
+ */
 const serviceYaml = (names: readonly string[]) => `apiVersion: wyrd/v1
 kind: Service
 metadata: {name: ts-exec-service, version: 1.0.0, space: default}
@@ -192,7 +195,7 @@ spec:
 ${names
   .map(
     (name) => `    - verifier: {kind: Verifier, name: ${name}, version: 1.0.0, space: default}
-      runs_on: {kind: schedule, cron: "0 0 * * *"}
+      runs_on: ${name in EVAL ? "{kind: observations_ready}" : '{kind: schedule, cron: "0 0 * * *"}'}
 `,
   )
   .join("")}`;

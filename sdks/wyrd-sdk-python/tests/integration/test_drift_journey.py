@@ -286,7 +286,7 @@ def test_parquet_baselines_fit_and_score_drift_server_side(
             ), name
             features = judgment.detail["drift"]["features"]
             assert {feature: report["verdict"] for feature, report in features.items()} == {
-                "latency": "drift"
+                "latency": "Drift"
             }, name
             if name == "py-drift-spc":
                 assert_spc_evidence(json.dumps(judgment.detail["drift"]), 24, 24)

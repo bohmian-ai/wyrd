@@ -863,9 +863,10 @@ mod tests {
 
     use super::{Metrics, Role, operator};
 
-    /// A serving replica in peer mode derives its peer listener and address;
-    /// a Forge worker given the same TLS directory only dials, so it gets
-    /// its target and neither peer setting.
+    /// A joined serving replica in peer mode derives its peer listener and
+    /// address from the joined-replica peer range; a Forge worker given the
+    /// same TLS directory only dials, so it gets its target and neither peer
+    /// setting.
     ///
     /// # Panics
     ///
@@ -895,7 +896,10 @@ mod tests {
                 value("WYRD_BIFROST_PEER_BIND_ADDR"),
             )
         };
-        let peer = Some("127.0.0.1:50072".to_owned());
+        let peer = Some(format!(
+            "127.0.0.1:{}",
+            super::replica_port(super::JOINED_PEER_PORT, 2)
+        ));
         assert_eq!(read(Role::Serving), (None, peer.clone(), peer));
         assert_eq!(
             read(Role::ForgeWorker),

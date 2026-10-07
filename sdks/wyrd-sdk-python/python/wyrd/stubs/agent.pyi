@@ -389,9 +389,9 @@ class Agent:
     ) -> None:
         """Create an Agent.
 
-        Every callback receives a ``ctx`` mapping with ``agent_id``,
-        ``session_id``, ``iteration``, and ``conversation`` as its first
-        argument. Returning ``None`` keeps the value unchanged. A callback
+        Every callback receives a read-only ``CallbackContext`` with
+        ``agent_id``, ``session_id``, ``iteration``, and ``conversation``
+        attributes as its first argument. Returning ``None`` keeps the value unchanged. A callback
         that returns a value of the wrong type is treated as raising, with
         ``WYRD_AGENT_422_CALLBACK_RETURN_TYPE`` as the error. A raised
         ``WyrdError``, or any exception whose ``args`` start with a catalog

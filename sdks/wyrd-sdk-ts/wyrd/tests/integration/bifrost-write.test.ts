@@ -277,7 +277,7 @@ describe("Bifrost write journey", () => {
       const register = async (compactionType?: CompactionType) => {
         const bifrost = await connect(
           server,
-          TableConfig.fromJsonSchema(fqn, SCHEMA, undefined, undefined, compactionType),
+          TableConfig.fromJsonSchema(fqn, SCHEMA, { compactionType }),
         );
         try {
           return await bifrost.register();

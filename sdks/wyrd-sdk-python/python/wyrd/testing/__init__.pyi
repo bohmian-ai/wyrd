@@ -169,26 +169,6 @@ class WyrdTestServer:
         """
         ...
 
-    def verification_runs(self) -> list[str]:
-        """Return every verification run ID of the fixture tenant, oldest first."""
-        ...
-
-    def retire_fitted_format(self, verifier_uid: str) -> None:
-        """Strip ``format`` from a Drift Verifier's ready fitted profile.
-
-        Simulates a profile fitted under earlier semantics, which the engine
-        must refuse rather than rescore.
-
-        Args:
-            verifier_uid: the Verifier Card's UID.
-
-        Raises:
-            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid UID or
-                when the Verifier has no ready fitted profile.
-
-        """
-        ...
-
     def wait_for_baseline(self, verifier: str, timeout: float) -> None:
         """Return once Drift Verifier ``verifier``'s fitted baseline is ready.
 
@@ -197,14 +177,6 @@ class WyrdTestServer:
         when ``timeout`` elapses first; its ``details["baseline"]`` is the last
         observed baseline status, the same value ``card.status.verification``
         serves.
-        """
-        ...
-
-    def make_binding_due(self, binding_id: str) -> None:
-        """Make binding ``binding_id``'s schedule due now.
-
-        The server's own scheduler then claims, runs, and settles the
-        occurrence.
         """
         ...
 
@@ -265,115 +237,6 @@ class WyrdTestServer:
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when ``tenant_id``
                 does not parse.
-
-        """
-        ...
-
-    def ensure_builtin_table(self, namespace: str, name: str) -> None:
-        """Create the built-in signal table ``namespace.name`` if it is absent.
-
-        OTLP ingest provisions these tables itself; a journey that writes one
-        through the public Arrow batch door calls this first.
-
-        Raises:
-            WyrdError: when no built-in table has that name or the catalog
-                cannot create it.
-
-        """
-        ...
-
-    def prepare_oracle_query_fixture(self, fused: bool = False) -> tuple[str, str]:
-        """Ingest a real Oracle query fixture and return ``(table, access_token)``.
-
-        Rows go through the public gRPC ingest path and the token comes from
-        the real auth route.
-
-        Args:
-            fused: true leaves the rows in Scribe's live tier; false (the
-                default) flushes them to sealed storage first.
-
-        """
-        ...
-
-    def fail_next_query_after_schema(self) -> None:
-        """Make the server cut the next query's stream after its schema frame."""
-        ...
-
-    def fail_next_query_after_batch(self) -> None:
-        """Make the server cut the next query's stream after its first batch frame."""
-        ...
-
-    def stall_next_query_after_schema(self) -> None:
-        """Make the server hold the next query's stream after its schema frame.
-
-        Pair with ``wait_query_schema_stall()`` to cancel a query at a known
-        point.
-        """
-        ...
-
-    def wait_query_schema_stall(self) -> str:
-        """Block until the stalled query reaches its stall; return its query id.
-
-        Raises:
-            WyrdError: when no stall is scheduled or the server drain deadline
-                passes first.
-
-        """
-        ...
-
-    def bifrost_query_resource_snapshot(self, query_id: str) -> dict[str, int]:
-        """Return query ``query_id``'s held admission, memory, peer-slot, and tail-fence counts.
-
-        Raises:
-            WyrdError: when the server cannot take an exact snapshot.
-
-        """
-        ...
-
-    def wait_bifrost_query_resources_released(
-        self, query_id: str, baseline: dict[str, int]
-    ) -> dict[str, int]:
-        """Block until query ``query_id``'s resources return to ``baseline``.
-
-        Args:
-            query_id: the query to watch.
-            baseline: a ``bifrost_query_resource_snapshot()`` taken before the
-                query ran.
-
-        Returns:
-            The final snapshot, equal to ``baseline``.
-
-        Raises:
-            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for a malformed
-                baseline, or an error when release takes longer than the
-                server drain deadline.
-
-        """
-        ...
-
-    def query_denied_token(self) -> str:
-        """Return an access token whose principal lacks ``bifrost_query:read``."""
-        ...
-
-    def bifrost_read_decision_count(self) -> int:
-        """Return the fixture tenant's staged Oracle read-decision audit count.
-
-        Call ``wait_oracle_audit_staged()`` first; Oracle stages decisions in
-        the background.
-        """
-        ...
-
-    def wait_oracle_audit_staged(self, budget_ms: int = 5000) -> int:
-        """Block until Oracle's in-flight audit commits finish.
-
-        Args:
-            budget_ms: the most milliseconds to wait.
-
-        Returns:
-            The decisions still pending; ``0`` once every one is staged.
-
-        Raises:
-            WyrdError: when this server hosts no Oracle role.
 
         """
         ...

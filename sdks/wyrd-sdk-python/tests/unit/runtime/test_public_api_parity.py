@@ -115,7 +115,7 @@ def test_after_tool_raise_reports_failed_tool_call_and_continues() -> None:
         return input
 
     def after_model(ctx, response):
-        if ctx["iteration"] > 0:
+        if ctx.iteration > 0:
             return None
         return {
             "id": "tool-call",

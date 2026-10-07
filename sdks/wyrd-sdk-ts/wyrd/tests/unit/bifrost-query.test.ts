@@ -236,13 +236,13 @@ describe("TableConfig compaction type", () => {
   it("defaults to small-files by declaring nothing and carries an explicit type", () => {
     expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA).compactionType).toBeUndefined();
     expect(
-      TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, undefined, "small-files").compactionType,
+      TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionType: "small-files" }).compactionType,
     ).toBe("small-files");
   });
 
   it("carries every hyphenated wire compaction type", () => {
     for (const kind of ["auto", "full", "small-files", "files-with-delete"] as const) {
-      expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, undefined, kind).compactionType).toBe(kind);
+      expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA, { compactionType: kind }).compactionType).toBe(kind);
     }
   });
 
@@ -252,9 +252,7 @@ describe("TableConfig compaction type", () => {
         TableConfig.fromJsonSchema(
           "unit.rows",
           SCHEMA,
-          undefined,
-          undefined,
-          refused as unknown as CompactionType,
+          { compactionType: refused as unknown as CompactionType },
         ),
       ).toThrow(/compaction type/);
     }

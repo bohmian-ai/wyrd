@@ -307,7 +307,7 @@ def test_typed_registry_rejects_a_card_of_the_wrong_kind(cards: Cards) -> None:
 
     with pytest.raises(WyrdError) as raised:
         cards.data.register(card)
-    assert raised.value.code == "WYRD_DATA_400_VALIDATION"
+    assert raised.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
 @pytest.mark.integration

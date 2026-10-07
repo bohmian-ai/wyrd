@@ -2753,8 +2753,10 @@ struct PythonCardEnvelope {
 /// version bump; omitted bumps use the server-compatible Patch default.
 ///
 /// # Errors
-/// Returns holder validation, local save, manifest, transport, or server
-/// completion errors. The holder is stamped only after a successful receipt.
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the holder is not a
+/// registrable kind or does not match a typed registry's kind, plus local
+/// save, manifest, transport, or server completion errors. The holder is
+/// stamped only after a successful receipt.
 fn register_python_card(
     py: Python<'_>,
     registry: &Cards,
@@ -2767,11 +2769,17 @@ fn register_python_card(
     if let Some(expected) = expected_kind
         && expected != &kind
     {
-        return Err(WyrdPyError::validation(format!(
-            "typed registry expects {}, got {}",
-            expected.wire_name(),
-            kind.wire_name()
-        )));
+        return Err(WyrdPyError::from(WyrdError::RegistryInvalidCardSpec {
+            message: format!(
+                "typed registry expects {}, got {}",
+                expected.wire_name(),
+                kind.wire_name()
+            ),
+            details: serde_json::json!({
+                "expected_kind": expected.wire_name(),
+                "actual_kind": kind.wire_name(),
+            }),
+        }));
     }
     let bump_supplied = version_bump.is_some();
     let bump = version_bump
@@ -2795,8 +2803,11 @@ fn register_python_card(
 /// Run the Python holder callback and normalize its server-native envelope.
 ///
 /// # Errors
-/// Returns Python extraction, local save, envelope validation, version-intent,
-/// or serialization errors. No hashing or remote operation is started here.
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the envelope's kind or
+/// `apiVersion` disagrees with the holder, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK`
+/// when the authored version is malformed or an exact pin is combined with an
+/// explicit bump, and Python extraction, local save, or serialization errors.
+/// No hashing or remote operation is started here.
 fn save_python_card(
     py: Python<'_>,
     card: &Bound<'_, PyAny>,
@@ -2872,18 +2883,18 @@ fn save_python_card(
             }
         }
         _ => {
-            return Err(WyrdPyError::validation(
+            return Err(WyrdPyError::from(WyrdError::registry_invalid_card_spec(
                 "Cards.register supports DataCard, ModelCard, and PromptCard",
-            ));
+            )));
         }
     };
 
     let mut envelope: PythonCardEnvelope = serde_json::from_str(&saved_envelope.json)?;
     envelope.metadata.version = saved_envelope.version;
     if envelope.api_version.as_str() != ApiVersion::V1 || &envelope.kind != kind {
-        return Err(WyrdPyError::validation(
+        return Err(WyrdPyError::from(WyrdError::registry_invalid_card_spec(
             "card envelope kind or apiVersion does not match the native holder",
-        ));
+        )));
     }
     let exact_pin = envelope
         .metadata
@@ -2891,9 +2902,10 @@ fn save_python_card(
         .as_ref()
         .is_some_and(VersionSpec::is_pin);
     if bump_supplied && exact_pin {
-        return Err(WyrdPyError::validation(
-            "version_bump cannot be combined with an exact metadata.version pin; use a scope or omit version",
-        ));
+        return Err(WyrdPyError::from(WyrdError::RegistryInvalidVersionBlock {
+            message: "version_bump cannot be combined with an exact metadata.version pin; use a scope or omit version".to_owned(),
+            details: serde_json::json!({ "field": "version_bump" }),
+        }));
     }
     envelope.metadata.uid = None;
     envelope.metadata.spec_hash = None;
@@ -2909,15 +2921,18 @@ fn save_python_card(
 /// one- and two-component values remain registration scopes.
 ///
 /// # Errors
-/// Returns a validation error when `value` is not a supported registration
-/// version shape.
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when `value` is not a
+/// supported registration version shape.
 fn registration_version(value: &str) -> CardPyResult<Option<VersionSpec>> {
     if value.is_empty() {
         return Ok(None);
     }
-    VersionSpec::parse(value)
-        .map(Some)
-        .map_err(|error| WyrdPyError::validation(format!("invalid card version: {error}")))
+    VersionSpec::parse(value).map(Some).map_err(|error| {
+        WyrdPyError::from(WyrdError::RegistryInvalidVersionBlock {
+            message: format!("invalid card version: {error}"),
+            details: serde_json::json!({ "field": "metadata.version" }),
+        })
+    })
 }
 
 /// Return an exact placeholder accepted by local Card serialization.
@@ -3018,7 +3033,8 @@ fn stamp_python_holder(card: &Bound<'_, PyAny>, card_ref: &CardRef) -> CardPyRes
 ///
 /// # Errors
 ///
-/// Returns a validation error for any other object.
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for any other object,
+/// including an Agent holder, which this registry cannot register.
 fn holder_kind(card: &Bound<'_, PyAny>) -> CardPyResult<CardKind> {
     if card.is_instance_of::<DataCard>() {
         Ok(CardKind::Data)
@@ -3027,9 +3043,9 @@ fn holder_kind(card: &Bound<'_, PyAny>) -> CardPyResult<CardKind> {
     } else if card.is_instance_of::<PromptCard>() {
         Ok(CardKind::Prompt)
     } else {
-        Err(WyrdPyError::validation(
+        Err(WyrdPyError::from(WyrdError::registry_invalid_card_spec(
             "Cards.register requires a wyrd DataCard, ModelCard, or PromptCard",
-        ))
+        )))
     }
 }
 

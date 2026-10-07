@@ -22,7 +22,7 @@ def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
     )
     with pytest.raises(wyrd.WyrdError) as captured:
         offline_cards.register(card)
-    assert captured.value.code == "WYRD_DATA_400_VALIDATION"
+    assert captured.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
 
 
 def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: Cards) -> None:
@@ -35,7 +35,7 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: 
     )
     with pytest.raises(wyrd.WyrdError) as captured:
         offline_cards.prompt.register(card, version_bump=VersionBump.Minor)
-    assert captured.value.code == "WYRD_DATA_400_VALIDATION"
+    assert captured.value.code == "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK"
 
 
 @pytest.mark.usefixtures("no_credentials")

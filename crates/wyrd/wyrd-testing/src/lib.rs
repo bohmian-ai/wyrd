@@ -2,6 +2,7 @@
 
 pub mod bifrost;
 pub mod capacity;
+pub mod gateway_capture;
 pub mod interleaving;
 pub mod keys;
 pub mod load;

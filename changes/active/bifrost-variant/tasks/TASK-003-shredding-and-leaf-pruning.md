@@ -152,7 +152,7 @@ Each status was found by searching the tree for that scenario's named tests.
 | 1. Only final output files infer a bounded standard layout | **Committed locally (`509f972c6`), not pushed; Forge memory part superseded by spec revision 19** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70`, iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`. `reserve_variant_prefixes` (a fixed `RUNNER_MAX_PARALLELISM` × 64 MiB task reservation) contradicts revision 19 REQ-030, REQ-031, INV-009 and AC-012/AC-013, which require charging live retained prefix bytes to the attempt's DataFusion pool and a `max(1, effective_cpu * 4)` planning maximum. TASK-004 owns that rework after TASK-003 integrates |
 | 2. Recovery and compaction preserve standard logical values | **Implemented, not pushed** | iceberg-rust `fdc02e0a0847f3219e234f81ee6b7a2ff0d67418` (reader unshreds), iceberg-compaction `28f35fc9fd39b1e4879e7652f074f1630ca417cb` (test) and `a52462a2114e6912b0c7fdf903abcbb31b7d7136` (repin). Evidence below |
 | 3. Distinct logical semantics share physical pushdown | **Partly done** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`. The DataFusion fork per-file read plan (`per_file_plan_covers_projection_filter_and_pruning` in the fork) and `oracle::nested_pushdown::tests::both_readers_use_shared_per_file_plan` exist. The journey `published::struct_and_variant_share_physical_pushdown` is absent. |
-| 4. Unsigned distributed predicates preserve authority | **Partly done** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). The journeys `distributed::unsigned_leaf_predicates_round_trip_and_execute` and MCP `sensitive_variant_leaf_is_denied_before_io` are absent. |
+| 4. Unsigned distributed predicates preserve authority | **Partly done** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). MCP `query::pg_tests::sensitive_variant_leaf_is_denied_before_io` implemented (evidence below). The journey `distributed::unsigned_leaf_predicates_round_trip_and_execute` is absent. |
 | Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
 
 After the merge, resume shredding at Scenario 1.
@@ -205,6 +205,41 @@ with a 30 s deadline. No existing assertion changed.
 | `PromotedRewriteFixture::object_batches` | `object_row_values` | extracted; `object_row_values` now uses it |
 | `variant_batch`, `logical_rows`, `shredded_fields`, `document_keys`, `assert_per_file_layouts`, `published_rows`, `expected_rows` (journey) | `flat_builtin_batch` (fixed one-key shape per field, cannot vary layout by day), `LineageTable` (reused for the rewrite loop) | the scenario needs different document shapes per day |
 | `unshred_variant_columns` (iceberg-rust) | Arrow `unshred_variant` (used), reader projection | applies Arrow's unshred to each Variant column of a batch |
+
+#### Scenario 3 finding (blocked on a decision)
+
+REQ-023 and INV-008 require both Oracle readers to use the one per-file read
+plan. Only the hot reader does (`oracle/exec.rs` `FileReadPlan::new` in
+`hot_stream`). The published reader runs the iceberg fork's `ArrowReader`
+(`oracle/exec.rs` `start_stream`), which keeps its own projection, row filter,
+pruning, delete application, and lineage. The `nested_pushdown.rs` module doc
+claims both readers use the plan. Full-path matching (fork
+`row_group_filter.rs` `statistics_converter_for_path`) and Bloom `IN` (upstream
+`test_row_group_bloom_filter_pruning_predicate_sql_in`) already exist for the
+hot reader. Decoder row-filter use is not observable: `FileReadPlan` writes its
+`ParquetFileMetrics` into a throwaway `ExecutionPlanMetricsSet`. The
+`published::struct_and_variant_share_physical_pushdown` journey waits on the
+human choice of how the published reader adopts the plan.
+
+#### Scenario 4 evidence (MCP)
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A sensitive Variant leaf (`->>`, `->` chain, predicate only, `to_json`) is refused without payload authority, with no rows and no scan | `authorize_payload_columns` (unchanged); journey `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs` | `query::pg_tests::sensitive_variant_leaf_is_denied_before_io`: 1 passed (exit 0). Permitted reads scan files and bytes > 0; each refusal is `WYRD_VALA_403_QUERY_FORBIDDEN` with 0 files and 0 bytes scanned | PASS |
+| Shared gateway capture fixture does not change the journeys it came from | `wyrd_testing::gateway_capture::GatewayCapture` | `verification_runtime::typed_builtin_payloads_are_queryable`, `builtin_variant_columns_are_refused_before_ack`: 2 passed; all MCP journeys 16 passed | PASS |
+| Lints | — | `cargo fmt`; clippy `-D warnings` on `wyrd-mcp --test mcp` and `wyrd-testing --lib --test server`: 0 | PASS |
+
+Diagnosis (first run): the permitted read returned rows but scanned 0 files.
+The trace shows `listed active Scribe tail partitions ... active_partition_count=1`:
+gateway capture reaches Scribe asynchronously, so `flush_bifrost` ran before
+the rows arrived and the read came from the live tail. The journey now waits,
+with a 30 s deadline, for `wyrd_gateway_capture_total{outcome="delivered"}`
+to reach 2 before sealing.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `wyrd_testing::gateway_capture::{GatewayCapture, CapturedCall}` | `verification_runtime.rs` `TypedPayloadJourney` (moved from there), `WyrdTestServer` gateway builders | `vala.gateway.calls` accepts only the capture principal; the mock-upstream setup is now shared instead of copied |
+| `oracle_scans` (MCP journey) | `oracle/support.rs` `sum_metric` (test-local to another binary) | sums two scan families in the MCP binary |
 
 ### Arrow 60 upgrade (user decision, before Scenario 1)
 

@@ -19,11 +19,15 @@ mod pg_tests {
     use rmcp::service::PeerRequestOptions;
     use rmcp::service::ServiceError;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_runtime::Permission;
     use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::seed_query_fixture;
+    use wyrd_testing::bifrost::shared_process_telemetry_for_test;
+    use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
+    use wyrd_testing::gateway_capture::GatewayCapture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
 
     /// Build one `bifrost.query` call from its closed arguments.
@@ -799,6 +803,171 @@ mod pg_tests {
 
         client.cancel().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Sums the Oracle scan counters one telemetry window recorded.
+    ///
+    /// Returns the files and bytes the Oracle readers scanned, which stay zero
+    /// for a query refused before any provider reads storage.
+    fn oracle_scans(delta: &BifrostTelemetryDelta) -> (f64, f64) {
+        let sum = |family: &str| -> f64 {
+            delta
+                .metrics
+                .iter()
+                .filter(|sample| sample.family == family)
+                .map(|sample| sample.value)
+                .sum()
+        };
+        (
+            sum("oracle_query_files_scanned_total"),
+            sum("oracle_query_bytes_scanned_total"),
+        )
+    }
+
+    /// An agent without gateway payload authority cannot read any leaf of a
+    /// sensitive Variant column, and the refusal happens before any read.
+    ///
+    /// A real gateway call is captured into `vala.gateway.calls`. An agent
+    /// holding payload-read authority reads `request_payload ->> 'model'`, and
+    /// an agent holding only query read reads `call_id`; both scan storage.
+    /// The query-only agent is then refused every shape that reaches a
+    /// payload leaf: a `->>` projection, a `->` chain, a predicate-only use,
+    /// and `to_json` of the response payload. Each refusal is
+    /// `WYRD_VALA_403_QUERY_FORBIDDEN` with no rows, and its telemetry window
+    /// records no scanned file or byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns server, capture, MCP transport, telemetry, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a permitted read fails or scans nothing, or a payload read
+    /// without authority is not refused before any scan.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn sensitive_variant_leaf_is_denied_before_io() -> Result<(), McpJourneyError> {
+        let (_telemetry_guard, telemetry) = shared_process_telemetry_for_test()?;
+        let gateway = GatewayCapture::start().await?;
+        gateway.capture_call().await?;
+        // Capture is delivered to Scribe asynchronously; seal only once both
+        // calls (the answered one and the refused one) have arrived, so the
+        // permitted reads below come from storage rather than the live tail.
+        // Each test is its own process, so the absolute count is this test's.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while telemetry
+            .snapshot()?
+            .iter()
+            .filter(|sample| {
+                sample.family == "wyrd_gateway_capture_total"
+                    && sample.labels.get("outcome").map(String::as_str) == Some("delivered")
+            })
+            .map(|sample| sample.value)
+            .sum::<f64>()
+            < 2.0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both gateway calls are captured within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        gateway.server.flush_bifrost().await?;
+        let server = &gateway.server;
+        let payload_reader = agent_with_permissions(
+            server,
+            "payload_reader",
+            &[
+                Permission::bifrost_query_read(),
+                Permission::gateway_payload_read(),
+            ],
+        )
+        .await?;
+        let metadata_reader = agent_with_permissions(
+            server,
+            "metadata_reader",
+            &[Permission::bifrost_query_read()],
+        )
+        .await?;
+
+        for (case, agent, sql) in [
+            (
+                "payload leaf with authority",
+                &payload_reader,
+                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls \
+                 WHERE request_payload ->> 'model' IS NOT NULL",
+            ),
+            (
+                "metadata without payload authority",
+                &metadata_reader,
+                "SELECT call_id FROM vala.gateway.calls",
+            ),
+        ] {
+            let window = telemetry.checkpoint()?;
+            let result = structured(
+                agent
+                    .call_tool(query(serde_json::json!({"sql": sql})))
+                    .await?,
+            )?;
+            let (files, bytes) = oracle_scans(&telemetry.delta_since(&window)?);
+            assert!(
+                result["rows"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty()),
+                "{case} returns the captured call: {result}"
+            );
+            assert!(
+                files > 0.0 && bytes > 0.0,
+                "{case} reads storage: {files} files, {bytes} bytes"
+            );
+        }
+
+        for (case, sql) in [
+            (
+                "->> projection",
+                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls",
+            ),
+            (
+                "-> chain",
+                "SELECT to_json(request_payload -> 'messages' -> 0) AS first FROM vala.gateway.calls",
+            ),
+            (
+                "predicate only",
+                "SELECT call_id FROM vala.gateway.calls \
+                 WHERE request_payload ->> 'model' = 'openai/gpt-4o'",
+            ),
+            (
+                "to_json of the response",
+                "SELECT to_json(response_payload) AS body FROM vala.gateway.calls",
+            ),
+        ] {
+            let window = telemetry.checkpoint()?;
+            let refusal = problem(
+                metadata_reader
+                    .call_tool(query(serde_json::json!({"sql": sql})))
+                    .await?,
+            )?;
+            let (files, bytes) = oracle_scans(&telemetry.delta_since(&window)?);
+            assert_eq!(
+                refusal["code"],
+                serde_json::json!("WYRD_VALA_403_QUERY_FORBIDDEN"),
+                "{case}: {refusal}"
+            );
+            assert!(
+                refusal.get("rows").is_none(),
+                "{case} returns no rows: {refusal}"
+            );
+            assert_eq!(
+                (files, bytes),
+                (0.0, 0.0),
+                "{case} is refused before any read"
+            );
+        }
+
+        payload_reader.cancel().await?;
+        metadata_reader.cancel().await?;
+        gateway.server.shutdown().await?;
         Ok(())
     }
 

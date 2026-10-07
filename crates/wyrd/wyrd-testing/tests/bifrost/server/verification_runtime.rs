@@ -33,13 +33,10 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::tables::{AgentTracesTable, DomainTable};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use vala_sql::queries::audit_staging::{append_audit, entry_hash};
-use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderFactory};
@@ -52,7 +49,7 @@ use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GatewayAccess, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
 use wyrd_spec::reference::CardRef;
@@ -71,6 +68,7 @@ use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
+use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_types::variant::{variant_field, variant_storage_type};
@@ -1071,7 +1069,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let journey = TypedPayloadJourney::start().await?;
 
     let results = journey.publish_results().await?;
-    let call = journey.capture_gateway_call().await?;
+    let call = journey.gateway.capture_call().await?;
     let trace = journey.write_agent_trace().await?;
     let decision = journey.append_audit_decision().await?;
     let children_sql = format!(
@@ -1164,8 +1162,12 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     expect_eq("hot gateway model children", &hot_models, &expected_models)?;
-    journey.server.flush_bifrost().await?;
-    journey.server.await_audit_published(journey.tenant).await?;
+    journey.gateway.server.flush_bifrost().await?;
+    journey
+        .gateway
+        .server
+        .await_audit_published(journey.gateway.tenant)
+        .await?;
     expect_eq(
         "published summary Struct children",
         &journey.rows(children_sql).await?,
@@ -1293,7 +1295,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
         stored_hash,
     )?;
 
-    journey.server.shutdown().await?;
+    journey.gateway.server.shutdown().await?;
     Ok(())
 }
 
@@ -1783,7 +1785,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     admission
         .accept(POINTS, &admission.points_frame(&accepted, false)?)
         .await?;
-    admission.journey.server.flush_bifrost().await?;
+    admission.journey.gateway.server.flush_bifrost().await?;
 
     let suffix = &admission.run;
     expect_eq(
@@ -1831,7 +1833,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &vec![vec![json!(accepted), json!(2)]],
     )?;
 
-    admission.journey.server.shutdown().await?;
+    admission.journey.gateway.server.shutdown().await?;
     Ok(())
 }
 
@@ -1917,11 +1919,13 @@ impl VariantAdmissionJourney {
             ("metrics", "points"),
         ] {
             journey
+                .gateway
                 .server
-                .ensure_builtin_table_for_test(journey.tenant, namespace, name)
+                .ensure_builtin_table_for_test(journey.gateway.tenant, namespace, name)
                 .await?;
         }
         let Bootstrap::Machine { api_key, .. } = journey
+            .gateway
             .server
             .bootstrap_service("variant_admission_writer", &["admin"])
             .await?
@@ -1929,9 +1933,9 @@ impl VariantAdmissionJourney {
             return Err("a service bootstrap returned a user".into());
         };
         let client = wyrd_client::bifrost::client_from_options(
-            journey.server.base_url(),
+            journey.gateway.server.base_url(),
             Some(api_key.expose_secret()),
-            journey.server.grpc_url().as_deref(),
+            journey.gateway.server.grpc_url().as_deref(),
         )?;
         let spans = Arc::clone(TableConfig::describe(&client, SPANS).await?.user_schema());
         let points = Arc::clone(TableConfig::describe(&client, POINTS).await?.user_schema());
@@ -2432,19 +2436,6 @@ struct PublishedResults {
     item: Vec<Value>,
 }
 
-/// The captured gateway calls and the JSON the resolved one sent and received.
-struct CapturedCall {
-    /// Request id the gateway answered with, which the captured row carries.
-    request_id: String,
-    /// Request id of a second call the upstream refused, so its captured row
-    /// has no resolved model.
-    unresolved_request_id: String,
-    /// Body the caller sent.
-    request: Value,
-    /// Body the upstream provider answered with.
-    response: Value,
-}
-
 /// The written agent trace and its native payloads.
 struct WrittenTrace {
     /// Session id identifying the one written row.
@@ -2463,63 +2454,20 @@ struct AppendedDecision {
     detail: Value,
 }
 
-/// One bound server with a mock gateway upstream, and the tenant whose
-/// built-in payloads the typed-payload journey writes and reads.
+/// The typed-payload journey's server, mock upstream, and tenant.
 struct TypedPayloadJourney {
-    /// Bound server whose gateway adapters target `upstream`.
-    server: WyrdTestServer,
-    /// Mock `OpenAI` provider answering the captured call.
-    upstream: MockServer,
-    /// Tenant every row belongs to.
-    tenant: DataTenantId,
+    /// Bound server with a capturing gateway.
+    gateway: GatewayCapture,
 }
 
 impl TypedPayloadJourney {
-    /// Buffered Chat Completions answer the mock upstream returns.
-    fn completion() -> Value {
-        json!({
-            "id": "chatcmpl-typed",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gpt-4o",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null}],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15},
-        })
-    }
-
-    /// Start a bound server whose gateway providers resolve to a mock
-    /// upstream that answers every chat completion, except that one asking
-    /// for a single completion token is refused, so no model resolves it.
+    /// Start a bound server whose gateway captures calls to a mock upstream.
     ///
     /// # Errors
     /// Returns a mock URL or server start error.
     async fn start() -> Result<Self, ServerJourneyError> {
-        let upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_partial_json(json!({"max_completion_tokens": 1})))
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {"message": "refused", "type": "invalid_request_error"},
-            })))
-            .with_priority(1)
-            .mount(&upstream)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(Self::completion()))
-            .mount(&upstream)
-            .await;
-        let server = Box::pin(
-            WyrdTestServer::builder()
-                .with_gateway_provider_root_for_test(Url::parse(&upstream.uri())?)
-                .start_bound(),
-        )
-        .await?;
-        let tenant = server.data_tenant_id();
         Ok(Self {
-            server,
-            upstream,
-            tenant,
+            gateway: GatewayCapture::start().await?,
         })
     }
 
@@ -2532,8 +2480,11 @@ impl TypedPayloadJourney {
     /// # Errors
     /// Returns a seeding, minting, payload, or write error.
     async fn publish_results(&self) -> Result<PublishedResults, ServerJourneyError> {
-        let seed = VerificationFixture::provision(self.server.state().postgres.wyrd(), self.tenant)
-            .await?;
+        let seed = VerificationFixture::provision(
+            self.gateway.server.state().postgres.wyrd(),
+            self.gateway.tenant,
+        )
+        .await?;
         let (subject, _) = seed.service("typed-subject").await?;
         let uid = seed.drift_verifier("typed-drift").await?;
         let verifier: CardRef = format!("default/Verifier/typed-drift@1.0.0#{uid}").parse()?;
@@ -2542,29 +2493,32 @@ impl TypedPayloadJourney {
             ("drift", "result_features"),
             ("eval", "result_items"),
         ] {
-            self.server
-                .ensure_builtin_table_for_test(self.tenant, namespace, name)
+            self.gateway
+                .server
+                .ensure_builtin_table_for_test(self.gateway.tenant, namespace, name)
                 .await?;
         }
         let issuer = self
+            .gateway
             .server
             .state()
             .auth
             .tenant_issuer()
             .ok_or("the server has no tenant issuer")?;
         let mut conn = self
+            .gateway
             .server
             .state()
             .postgres
             .wyrd()
-            .tenant_conn(self.tenant)
+            .tenant_conn(self.gateway.tenant)
             .await?;
         let token = issuer.issue_system_token(&mut conn, &verifier).await?;
         drop(conn);
         let bifrost = Bifrost::connect(&wyrd_client::bifrost::client_from_options(
-            self.server.base_url(),
+            self.gateway.server.base_url(),
             Some(token.access_token.expose_secret()),
-            self.server.grpc_url().as_deref(),
+            self.gateway.server.grpc_url().as_deref(),
         )?)
         .await?;
         let verifier_ref = CardRef {
@@ -2699,138 +2653,6 @@ impl TypedPayloadJourney {
         }
     }
 
-    /// Configure a provider and a request-and-response payload capture
-    /// policy, then invoke one chat completion as an ordinary caller.
-    ///
-    /// # Errors
-    /// Returns a seeding, exchange, administration, or call error.
-    async fn capture_gateway_call(&self) -> Result<CapturedCall, ServerJourneyError> {
-        self.server
-            .seed_role(
-                "typed_invoker",
-                &[Permission::gateway_invoke(GatewayAccess::Provider {
-                    provider: "openai".parse()?,
-                })],
-            )
-            .await?;
-        let admin = self.exchange("typed_gateway_admin", &["admin"]).await?;
-        let caller = self
-            .exchange("typed_gateway_caller", &["typed_invoker"])
-            .await?;
-        let http = reqwest::Client::new();
-        let base = self.server.base_url().ok_or("the server is not bound")?;
-        for (route, body) in [
-            (
-                "provider-credentials/openai-key",
-                json!({
-                    "name": "openai-key",
-                    "provider": "openai",
-                    "source": {"managed_secret": {"secret": "sk-typed-upstream"}},
-                }),
-            ),
-            (
-                "provider-deployments/gpt-4o",
-                json!({
-                    "name": "gpt-4o",
-                    "model": {"provider": "openai", "model": "gpt-4o"},
-                    "adapter": "openai",
-                    "auth": {"bearer": {"credential": "openai-key"}},
-                    "capabilities": ["chat_completions"],
-                    "routing_weight": 1,
-                }),
-            ),
-            (
-                "capture-policy",
-                json!({"mode": "payload", "payload_fields": ["request", "response"]}),
-            ),
-        ] {
-            let response = http
-                .put(format!("{base}/v1/admin/gateway/{route}"))
-                .header("x-wyrd-access-token", format!("Bearer {admin}"))
-                .json(&body)
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                return Err(
-                    format!("{route}: {} {}", response.status(), response.text().await?).into(),
-                );
-            }
-        }
-        let request = json!({
-            "model": "openai/gpt-4o",
-            "max_completion_tokens": 16,
-            "messages": [
-                {"role": "system", "content": "be brief"},
-                {"role": "user", "content": "hi"},
-            ],
-        });
-        let answer = http
-            .post(format!("{base}/v1/chat/completions"))
-            .header("authorization", format!("Bearer {caller}"))
-            .json(&request)
-            .send()
-            .await?;
-        if answer.status().as_u16() != 200 {
-            return Err(format!(
-                "the call failed: {} {}",
-                answer.status(),
-                answer.text().await?
-            )
-            .into());
-        }
-        let request_id = answer
-            .headers()
-            .get("wyrd-request-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or("the answer carries no request id")?
-            .to_owned();
-        if self
-            .upstream
-            .received_requests()
-            .await
-            .is_none_or(|calls| calls.is_empty())
-        {
-            return Err("the call never reached the mock upstream".into());
-        }
-        let refused = http
-            .post(format!("{base}/v1/chat/completions"))
-            .header("authorization", format!("Bearer {caller}"))
-            .json(&json!({
-                "model": "openai/gpt-4o",
-                "max_completion_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}],
-            }))
-            .send()
-            .await?;
-        if refused.status().is_success() {
-            return Err("the upstream refusal reached the caller as a success".into());
-        }
-        let unresolved_request_id = refused
-            .headers()
-            .get("wyrd-request-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or("the refused answer carries no request id")?
-            .to_owned();
-        Ok(CapturedCall {
-            request_id,
-            unresolved_request_id,
-            request,
-            response: Self::completion(),
-        })
-    }
-
-    /// Bootstrap a service holding `roles` and exchange its key for a token.
-    ///
-    /// # Errors
-    /// Returns the bootstrap or exchange error, or a user bootstrap.
-    async fn exchange(&self, name: &str, roles: &[&str]) -> Result<String, ServerJourneyError> {
-        let Bootstrap::Machine { api_key, .. } = self.server.bootstrap_service(name, roles).await?
-        else {
-            return Err("a service bootstrap returned a user".into());
-        };
-        Ok(self.server.exchange_api_key(&api_key).await?)
-    }
-
     /// Write one agent trace with nested message and tool payloads through
     /// the public Bifrost facade as a tenant administrator.
     ///
@@ -2840,14 +2662,16 @@ impl TypedPayloadJourney {
         let Bootstrap::Machine {
             api_key, card_ref, ..
         } = self
+            .gateway
             .server
             .bootstrap_service("typed_trace_writer", &["admin"])
             .await?
         else {
             return Err("a service bootstrap returned a user".into());
         };
-        self.server
-            .ensure_builtin_table_for_test(self.tenant, "dev", "agent_traces")
+        self.gateway
+            .server
+            .ensure_builtin_table_for_test(self.gateway.tenant, "dev", "agent_traces")
             .await?;
         let session = format!("typed-{}", uuid::Uuid::now_v7());
         let messages = json!([
@@ -2898,9 +2722,9 @@ impl TypedPayloadJourney {
             ],
         )?;
         let writer = wyrd_client::bifrost::client_from_options(
-            self.server.base_url(),
+            self.gateway.server.base_url(),
             Some(api_key.expose_secret()),
-            self.server.grpc_url().as_deref(),
+            self.gateway.server.grpc_url().as_deref(),
         )?;
         Bifrost::connect(&writer)
             .await?
@@ -2939,7 +2763,11 @@ impl TypedPayloadJourney {
             AuditOutcome::Allowed,
         )
         .with_detail(detail.clone());
-        let mut conn = self.server.tenant_conn_for(self.tenant).await?;
+        let mut conn = self
+            .gateway
+            .server
+            .tenant_conn_for(self.gateway.tenant)
+            .await?;
         append_audit(&mut conn, &event).await?;
         conn.commit().await?;
         Ok(AppendedDecision {
@@ -2961,11 +2789,11 @@ impl TypedPayloadJourney {
             Principal::new(
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
-                self.tenant,
+                self.gateway.tenant,
                 Vec::new(),
                 PermissionSet::from_iter([permission.clone(), Permission::gateway_payload_read()]),
             ),
-            self.tenant,
+            self.gateway.tenant,
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
@@ -2973,7 +2801,7 @@ impl TypedPayloadJourney {
         )?;
         let mut batches = Vec::new();
         ScheduledQueryCaller::new(
-            self.server.state().clone(),
+            self.gateway.server.state().clone(),
             context,
             CancellationToken::new(),
         )

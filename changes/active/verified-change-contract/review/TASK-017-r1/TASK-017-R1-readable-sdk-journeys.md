@@ -109,7 +109,7 @@ lane pass.
 
 ### FIND-TASK-017-04 — `test_workflow_loading_journey` is one huge test
 
-**Consequence.** A single function proves thirteen behaviours. A failure
+**Consequence.** A single function proves thirteen behaviours, one of which is not a server journey at all. A failure
 doesn't say which behaviour broke, and nobody can learn one behaviour from it
 in isolation.
 
@@ -118,12 +118,18 @@ in isolation.
 | Story | Tests |
 |---|---|
 | workflow_loading | `local_workflow_runs_without_credentials`, `gateway_workflow_without_credentials_is_refused_before_any_step`, `registry_refs_resolve_through_the_registry`, `registry_refs_without_read_access_are_refused`, `local_sibling_never_satisfies_a_registry_ref`, `deleted_registry_card_is_refused`, `applied_workflow_stays_pinned_to_its_registered_cards`, `loaded_workflow_runs_its_pinned_cards`, `loading_a_bad_selector_is_refused` |
-| gateway_inference (moved here) | `example_workflow_runs_through_the_wyrd_gateway`, `example_workflow_runs_through_an_external_gateway_binding`, `applying_a_workflow_calls_no_model`, `registered_example_runs_through_the_gateway` |
+| gateway_inference (moved here) | `example_workflow_runs_through_the_wyrd_gateway`, `applying_a_workflow_calls_no_model`, `registered_example_runs_through_the_gateway` |
 
-Move the story's Card YAML to `fixtures/cards/workflow_loading/`. If a Gateway
-fixture needs the server's dynamic port, first check whether the existing
-client configuration can supply it from the environment. Only when it can't,
-stop and report it; don't generate YAML.
+Move the story's Card YAML to `fixtures/cards/workflow_loading/`.
+
+Delete the external-gateway-binding journey (`test_cards_crud.py:654-678` and
+its counterparts in the other SDKs) rather than moving it. An `ext_gateway`
+route runs entirely on the client side and never reaches the Wyrd server, and
+its fake gateway's random port forces the test to build YAML in code.
+`selected_local_dependencies_use_shared_config` in
+`crates/shared/wyrd-client/src/workflow/mod.rs` already owns that behaviour
+against a mock gateway: the binding is selected from shared configuration, the
+secret header is sent, and bad bindings are refused before dispatch.
 
 **Focused acceptance proof.** Each named test runs by its exact selector in
 each SDK's journey lane.

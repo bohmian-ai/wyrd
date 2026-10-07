@@ -7,8 +7,12 @@ class WyrdTestServer:
 
     Journeys steer the server through exactly three test controls, each backed
     by the production code path: ``flush_bifrost``, ``wait_for_baseline``, and
-    ``make_binding_due``. The remaining members start, address, or credential
-    the server.
+    ``make_binding_due``. Keys that need Roles come from the credential
+    fixtures, which stand in for the operator who grants Roles in a
+    deployment: ``bootstrap_service``, ``bootstrap_service_in_tenant``, and
+    ``credential_registered_service``. A Card key without added Roles comes
+    from ``wyrd.cli.issue_key``. The remaining members start or address the
+    server.
 
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
     embedded Postgres fixture. Use as a context manager; ``bootstrap_service``

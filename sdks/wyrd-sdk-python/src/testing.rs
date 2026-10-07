@@ -362,6 +362,10 @@ impl WyrdTestServer {
 
     /// Issue an API key for the principal projected by a registered Service Card.
     ///
+    /// A credential fixture: `roles` are granted to the Service's existing
+    /// principal, standing in for the operator who grants Roles in a
+    /// deployment. A key without added Roles comes from `wyrd.cli.issue_key`.
+    ///
     /// # Errors
     /// Raises a harness error for an invalid Card identity or a missing principal.
     fn credential_registered_service(

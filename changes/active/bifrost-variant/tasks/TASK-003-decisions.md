@@ -105,10 +105,25 @@ following standard practice.
 - Seeded and reproducible. A re-run claim must write the same objects, so the
   seed derives from the claim or object identity, never from time or a global
   RNG.
-- Stratified. System tables (traces, logs, and other tenant-owned system
-  tables written by many services) stratify by `service_name`. User tables are
-  the single-stratum case, which is plain seeded random sampling. One code
-  path for both.
+- Stratified by the system-injected `principal_id` (`tables/managed_columns.rs`
+  `MANAGED_COLUMNS`). It is the only injected column that is server-set, never
+  null, and present on every table that carries injected columns: user tables,
+  spans, logs, metrics, gateway, verification, and `dev.agent_traces`. It is
+  already a managed Bloom column. A table without it (`audit_log`, written only
+  by the `AuditPublisher`) is one stratum. A table with one writer is also one
+  stratum, which is plain seeded random sampling. One rule, no per-table
+  configuration.
+  - Rejected: partition columns (every signal table partitions by hour of
+    `wyrd_event_time`, so rows in one file barely differ there);
+    `service_name` (caller-supplied, nullable, only on the signal tables);
+    `card_uid` alone (nullable, and one stratum per Card version).
+  - A principal is created per registered service and is not shared across
+    Card versions, but one principal can write for many Cards. Their rows form
+    one stratum. A key is still shredded when it is common within that
+    stratum; only a key rare across the principal but common within one of its
+    Cards is missed. Upgrade path if that shows up: stratify by
+    `(principal_id, card_uid)`, falling back to `principal_id` when `card_uid`
+    is null, with a stratum-count cap.
 - Sample size follows the algorithm (it scales with the input row count),
   bounded only by a memory cap. The fixed `max_bytes: 64 MiB` and
   `max_rows: 4096` in `BIFROST_VARIANT_SHREDDING`
@@ -119,18 +134,18 @@ following standard practice.
   sample before the writer opens. Cost: one extra read of those columns.
 
 Constraint: a Parquet file has one schema, so each Variant column has one
-layout per file. Per-service layouts inside one file are impossible. The
+layout per file. Per-writer layouts inside one file are impossible. The
 stratified result is one combined layout: a key is shredded when it is common
 (at or above the frequency threshold) in any stratum, and keys compete for the
-emitted-children cap by frequency. Other services' rows hold nulls in those
+emitted-children cap by frequency. Other writers' rows hold nulls in those
 columns, which cost almost nothing in Parquet.
 
-Deferred: sorting system-table files by `service_name`, so each file is mostly
-one service and files or row groups prune by service. Add it only if the
+Deferred: sorting system-table files by `principal_id`, so each file is mostly
+one writer and files or row groups prune by writer. Add it only if the
 combined layout proves too wide.
 
 Open, to settle in the spec revision: the sample-size formula, the
-stratum allocation (proportional versus a per-stratum floor so small services
+stratum allocation (proportional versus a per-stratum floor so small writers
 are seen), and the frequency threshold.
 
 ## 3. Nested shredding

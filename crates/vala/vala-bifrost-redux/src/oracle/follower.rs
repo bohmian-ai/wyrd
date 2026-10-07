@@ -549,7 +549,9 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         )?;
         // Footers load through the node's one governed cache, charged to the
         // request-local pool the retained worker lease backs, like hot ranges.
-        let plan = super::exec::route_published_footers(
+        // Every file is planned through the shared read core against the
+        // signed closure, exactly as on the leader.
+        let plan = super::exec::route_published_reads(
             plan,
             &super::exec::PublishedFooters::new(
                 Arc::clone(self.catalog.storage()),
@@ -559,6 +561,8 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                     memory_pool: session.runtime_env().memory_pool.clone(),
                 },
             ),
+            &required_schema,
+            &assignment.predicates,
         )
         .map_err(|_| "authenticated Oracle footer routing failed".to_owned())?;
         let plan = super::exec::project_plan_by_name(plan, &assignment.required_columns)

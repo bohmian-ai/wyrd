@@ -6,7 +6,9 @@
 //! decoder row filter, and row-group and page pruning predicates, through the
 //! Oracle Variant file adapter, so a Struct field (`get_field`) and a Variant
 //! path (`variant_get`) select the same physical leaves on every reader while
-//! keeping their distinct logical semantics.
+//! keeping their distinct logical semantics. Hot objects apply the plan
+//! directly; published files reach it through [`PublishedFileReadPlanner`],
+//! which the Iceberg reader calls per file inside its own task semantics.
 
 use std::sync::Arc;
 
@@ -22,7 +24,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use parquet::arrow::arrow_reader::{ArrowReaderBuilder, ArrowReaderMetadata, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 
-use super::exec::{OracleScanMetricsHandle, RowGroupSelection};
+use super::exec::RowGroupSelection;
 use super::variant_sql::OracleVariantSql;
 
 /// One Parquet file's read plan from `DataFusion`'s shared per-file planner.
@@ -115,10 +117,11 @@ impl FileReadPlan {
     }
 
     /// Narrows `row_groups` to the pages whose page index may satisfy the
-    /// filter, recording the rows skipped in `metrics`.
+    /// filter.
     ///
-    /// Returns the row groups still read and, when any page inside them was
-    /// skipped, the row selection over exactly those groups.
+    /// Returns the row groups still read, the row selection over exactly those
+    /// groups when any page inside them was skipped, and the number of rows of
+    /// `row_groups` no longer read.
     ///
     /// # Errors
     ///
@@ -127,10 +130,9 @@ impl FileReadPlan {
     pub(super) fn select_pages(
         &self,
         row_groups: Vec<usize>,
-        metrics: &OracleScanMetricsHandle,
-    ) -> DataFusionResult<(Vec<usize>, Option<RowSelection>)> {
+    ) -> DataFusionResult<(Vec<usize>, Option<RowSelection>, usize)> {
         let Some(pages) = self.plan.page_predicate.as_deref() else {
-            return Ok((row_groups, None));
+            return Ok((row_groups, None, 0));
         };
         let rows = |groups: &[usize]| {
             groups
@@ -152,8 +154,8 @@ impl FileReadPlan {
         let kept_rows = selection
             .as_ref()
             .map_or_else(|| rows(&kept_groups), RowSelection::row_count);
-        metrics.record_page_pruned_rows(rows(&row_groups).saturating_sub(kept_rows));
-        Ok((kept_groups, selection))
+        let skipped = rows(&row_groups).saturating_sub(kept_rows);
+        Ok((kept_groups, selection, skipped))
     }
 
     /// Applies this plan's decoder half to `builder`: the `row_groups` and
@@ -185,6 +187,93 @@ impl FileReadPlan {
             builder = builder.with_row_filter(row_filter);
         }
         Ok((builder, projector))
+    }
+}
+
+/// The published source adapter's entry into the shared read core.
+///
+/// The Iceberg reader opens each planned data file and applies its own byte
+/// range and Iceberg-predicate pruning, then calls this planner with the
+/// file's footer-derived metadata. The planner builds the same
+/// [`FileReadPlan`] a hot object gets and hands back its row-group and page
+/// pruning and its decoder row filter, so a Struct field or shredded Variant
+/// path prunes and filters published files exactly as it does hot ones.
+/// Iceberg keeps projection by field id, deletes, schema transformation,
+/// partition constants, and row lineage, and counts this planner's pruning in
+/// its own scan metrics.
+pub(super) struct PublishedFileReadPlanner {
+    /// The scan closure the filter was compiled against.
+    schema: SchemaRef,
+    /// Conjunction of the scan's closed predicates over `schema`.
+    filter: Arc<dyn PhysicalExpr>,
+    /// The session's bound on `IN`-list literals used for pruning.
+    max_in_list_size: usize,
+}
+
+impl PublishedFileReadPlanner {
+    /// Plans every published file of one scan against `filter` over `schema`.
+    pub(super) fn new(
+        schema: SchemaRef,
+        filter: Arc<dyn PhysicalExpr>,
+        max_in_list_size: usize,
+    ) -> Self {
+        Self {
+            schema,
+            filter,
+            max_in_list_size,
+        }
+    }
+
+    /// Builds one file's [`FileReadPlan`] and applies its statistics and page
+    /// pruning to `row_groups`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error raised when the filter cannot be adapted
+    /// to the file schema or the pruned access plan cannot become a row
+    /// selection.
+    fn narrow(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        row_groups: Vec<usize>,
+    ) -> DataFusionResult<iceberg::arrow::ParquetFileReadNarrowing> {
+        let columns = (0..self.schema.fields().len()).collect::<Vec<_>>();
+        let mut read_plan = FileReadPlan::new(
+            metadata,
+            &self.schema,
+            ProjectionExprs::from_indices(&columns, &self.schema),
+            Some(Arc::clone(&self.filter)),
+            self.max_in_list_size,
+        )?;
+        let selection = read_plan.select_row_groups(row_groups);
+        let (row_groups, row_selection, _) = read_plan.select_pages(selection.retained)?;
+        Ok(iceberg::arrow::ParquetFileReadNarrowing {
+            row_groups,
+            row_selection,
+            row_filter: read_plan.plan.row_filter.take(),
+        })
+    }
+}
+
+impl iceberg::arrow::ParquetFileReadPlanner for PublishedFileReadPlanner {
+    /// Narrows one published data file through the shared read core.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Iceberg error carrying the `DataFusion` cause when the file
+    /// cannot be planned; the reader then fails the task.
+    fn plan(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        row_groups: Vec<usize>,
+    ) -> iceberg::Result<iceberg::arrow::ParquetFileReadNarrowing> {
+        self.narrow(metadata, row_groups).map_err(|error| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "published per-file read plan failed",
+            )
+            .with_source(error)
+        })
     }
 }
 
@@ -297,6 +386,23 @@ mod tests {
         Bytes::from(sink)
     }
 
+    /// Plans the logical `expr` over [`logical_schema`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the expression does not plan.
+    fn physical(expr: &Expr) -> Arc<dyn PhysicalExpr> {
+        let df_schema = DFSchema::try_from(logical_schema()).expect("df schema");
+        datafusion::physical_expr::create_physical_expr(
+            expr,
+            &df_schema,
+            &datafusion::execution::context::ExecutionProps::new(),
+            &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(
+            ),
+        )
+        .expect("physical expression")
+    }
+
     /// Plans `exprs` as aliased outputs over `published`, filtered by `filter`.
     ///
     /// # Panics
@@ -304,16 +410,6 @@ mod tests {
     /// Panics when the footer does not decode or an expression does not plan.
     fn plan(published: &Bytes, exprs: &[(&str, Expr)], filter: Option<&Expr>) -> FileReadPlan {
         let schema = logical_schema();
-        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("df schema");
-        let physical = |expr: &Expr| {
-            datafusion::physical_expr::create_physical_expr(
-                expr,
-                &df_schema,
-                &datafusion::execution::context::ExecutionProps::new(),
-                &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
-            )
-            .expect("physical expression")
-        };
         let projection = ProjectionExprs::new(
             exprs
                 .iter()
@@ -502,6 +598,86 @@ mod tests {
         }
     }
 
+    /// A key shredded in one file and residual in another reads identically:
+    /// for top-level and nested keys, typed and type-mismatched values, and
+    /// keys no file shredded, every filter and projection over the shredded
+    /// file returns exactly what the all-residual file returns, and an absent
+    /// key reads null and matches nothing instead of failing. The shredded
+    /// file filters while decoding; the all-residual file decodes every row,
+    /// and the filter above the scan keeps the same ones.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan fails or the shredded and residual reads differ.
+    #[test]
+    fn shredded_and_residual_files_read_identically() {
+        let documents: &[&str] = &[
+            r#"{"a":1,"o":{"x":1,"y":"p"}}"#,
+            r#"{"a":2,"o":{"x":2}}"#,
+            r#"{"a":"2","o":{"x":"2","y":"q"}}"#,
+            r#"{"b":true}"#,
+        ];
+        let shredded = write_groups(&[documents]);
+        let residual = write_groups_with_a(&[documents], None);
+        let at = |keys: &[&str]| {
+            OracleVariantSql::shared().text_at(
+                col("v"),
+                &keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        let number = |keys: &[&str]| {
+            Expr::Cast(datafusion::logical_expr::expr::Cast::new(
+                Box::new(at(keys)),
+                DataType::Int64,
+            ))
+        };
+        let projection = [
+            ("a", at(&["a"])),
+            ("o_x", at(&["o", "x"])),
+            ("o_y", at(&["o", "y"])),
+            ("zz", at(&["zz"])),
+            ("o_z", at(&["o", "z"])),
+        ];
+        let projected = read(&residual, plan(&residual, &projection, None));
+        assert_eq!(
+            read(&shredded, plan(&shredded, &projection, None)),
+            projected
+        );
+        assert_eq!(
+            projected.column(3).as_string::<i32>(),
+            &StringArray::from(vec![None::<&str>; 4])
+        );
+        for (filter, ids) in [
+            (number(&["a"]).eq(lit(2_i64)), vec![2_i64, 3]),
+            (at(&["a"]).eq(lit("2")), vec![2, 3]),
+            (number(&["o", "x"]).eq(lit(2_i64)), vec![2, 3]),
+            (at(&["o", "y"]).eq(lit("q")), vec![3]),
+            (at(&["zz"]).eq(lit("x")), vec![]),
+            (number(&["o", "z"]).eq(lit(1_i64)), vec![]),
+        ] {
+            for published in [&shredded, &residual] {
+                // The decoder filter is best effort, so the filter is also
+                // evaluated over the decoded rows, as the `FilterExec` above
+                // every Oracle scan does.
+                let batch = read(
+                    published,
+                    plan(
+                        published,
+                        &[("id", col("id")), ("keep", filter.clone())],
+                        Some(&filter),
+                    ),
+                );
+                let kept = arrow::compute::filter(batch.column(0), batch.column(1).as_boolean())
+                    .expect("filtered ids");
+                assert_eq!(
+                    kept.as_primitive::<Int64Type>(),
+                    &Int64Array::from(ids.clone()),
+                    "{filter}"
+                );
+            }
+        }
+    }
+
     /// Writes `groups` of JSON documents as one row group each, with `v`
     /// shredded on `a: Int64` and `o.x: Int64` and ids numbered from 1
     /// across groups.
@@ -510,21 +686,35 @@ mod tests {
     ///
     /// Panics when the fixture cannot be shredded or encoded.
     fn write_groups(groups: &[&[&str]]) -> Bytes {
-        let layout = ShreddedSchemaBuilder::new()
-            .with_path("a", &DataType::Int64)
-            .expect("layout")
-            .with_path("o.x", &DataType::Int64)
-            .expect("layout")
-            .build();
+        write_groups_with_a(groups, Some(&DataType::Int64))
+    }
+
+    /// [`write_groups`] with `a` shredded as `a_type` instead of `Int64`, or
+    /// every document stored unshredded when `a_type` is `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be shredded or encoded.
+    fn write_groups_with_a(groups: &[&[&str]], a_type: Option<&DataType>) -> Bytes {
+        let layout = a_type.map(|a_type| {
+            ShreddedSchemaBuilder::new()
+                .with_path("a", a_type)
+                .expect("layout")
+                .with_path("o.x", &DataType::Int64)
+                .expect("layout")
+                .build()
+        });
         let mut id = 0_i64;
         let batches = groups
             .iter()
             .map(|documents| {
                 let text: ArrayRef = Arc::new(StringArray::from(documents.to_vec()));
-                let variant: ArrayRef =
-                    shred_variant(&json_to_variant(&text).expect("encode"), &layout)
-                        .expect("shred")
-                        .into();
+                let variant = json_to_variant(&text).expect("encode");
+                let variant: ArrayRef = match &layout {
+                    Some(layout) => shred_variant(&variant, layout).expect("shred"),
+                    None => variant,
+                }
+                .into();
                 let ids = (id + 1
                     ..=id + i64::try_from(documents.len()).expect("group length fits i64"))
                     .collect::<Vec<_>>();
@@ -549,11 +739,13 @@ mod tests {
     }
 
     /// Typed Variant statistics prune a row group only when its residual is
-    /// all null and the comparison's type is exactly the shredded type: the
-    /// group holding a residual `"10"` is always read and its row still
-    /// matches, an all-typed group outside the literal is skipped, a `Utf8`
-    /// comparison against the `Int64` shredding prunes nothing, and pruned
-    /// and unpruned reads return identical rows.
+    /// all null and the comparison fits the shredded type: the group holding
+    /// a residual `"10"` is always read and its row still matches, an
+    /// all-typed group outside the literal is skipped whether `a` is shredded
+    /// as `Int64` or narrowed to `Int16` or `Int8`, a `Utf8` comparison
+    /// against an integer shredding prunes nothing, a `BIGINT` literal
+    /// outside an `Int8` leaf's range prunes nothing and matches nothing, and
+    /// pruned and unpruned reads return identical rows.
     ///
     /// # Panics
     ///
@@ -561,11 +753,28 @@ mod tests {
     /// pruned and unpruned reads differ.
     #[test]
     fn typed_variant_statistics_prune_only_with_all_null_residuals() {
-        let published = write_groups(&[
-            &[r#"{"a":1}"#, r#"{"a":2}"#],
-            &[r#"{"a":10}"#, r#"{"a":"10"}"#],
-            &[r#"{"a":20}"#, r#"{"a":21}"#],
-        ]);
+        for a_type in [DataType::Int64, DataType::Int16, DataType::Int8] {
+            typed_statistics_prune_at(&a_type);
+        }
+    }
+
+    /// Runs the typed-statistics cases of
+    /// [`typed_variant_statistics_prune_only_with_all_null_residuals`] with
+    /// `a` shredded as `a_type`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a group is pruned or kept against that test's rule, or
+    /// when pruned and unpruned reads differ.
+    fn typed_statistics_prune_at(a_type: &DataType) {
+        let published = write_groups_with_a(
+            &[
+                &[r#"{"a":1}"#, r#"{"a":2}"#],
+                &[r#"{"a":10}"#, r#"{"a":"10"}"#],
+                &[r#"{"a":20}"#, r#"{"a":21}"#],
+            ],
+            Some(a_type),
+        );
         let text = || OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()]);
         let number = || {
             Expr::Cast(datafusion::logical_expr::expr::Cast::new(
@@ -577,12 +786,21 @@ mod tests {
             (number().eq(lit(2_i64)), vec![0, 1], vec![2]),
             (number().eq(lit(10_i64)), vec![1], vec![3, 4]),
             (text().eq(lit("2")), vec![0, 1, 2], vec![2]),
+            (
+                number().eq(lit(1_000_i64)),
+                if a_type == &DataType::Int8 {
+                    vec![0, 1, 2]
+                } else {
+                    vec![1]
+                },
+                vec![],
+            ),
         ] {
             let read_plan = || plan(&published, &[("id", col("id"))], Some(&filter));
             assert_eq!(
                 read_plan().select_row_groups(vec![0, 1, 2]).retained,
                 retained,
-                "{filter}"
+                "{filter} at {a_type}"
             );
             for groups in [retained.clone(), vec![0, 1, 2]] {
                 let builder =
@@ -603,8 +821,88 @@ mod tests {
                             .to_vec()
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(read, ids, "{filter}");
+                assert_eq!(read, ids, "{filter} at {a_type}");
             }
         }
+    }
+
+    /// A published file reaches the same per-file plan through the Iceberg
+    /// reader: inside Iceberg's own task handling, the shredded leaf's
+    /// statistics skip the all-typed group outside the literal, the decoder
+    /// filter keeps only the matching row, and Iceberg counts the skipped
+    /// group in its scan metrics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader fails, returns other rows, or reports other
+    /// pruning.
+    #[tokio::test]
+    async fn published_files_prune_and_filter_through_the_shared_plan() {
+        use futures_util::TryStreamExt as _;
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("published.parquet");
+        std::fs::write(
+            &path,
+            write_groups(&[
+                &[r#"{"a":1}"#, r#"{"a":2}"#],
+                &[r#"{"a":10}"#, r#"{"a":"10"}"#],
+                &[r#"{"a":20}"#, r#"{"a":21}"#],
+            ]),
+        )
+        .expect("fixture file");
+        let task = iceberg::scan::FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).expect("fixture size").len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path.to_string_lossy().into_owned())
+            .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+            .with_schema(Arc::new(
+                iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    ))])
+                    .build()
+                    .expect("task schema"),
+            ))
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .build();
+        let number = Expr::Cast(datafusion::logical_expr::expr::Cast::new(
+            Box::new(OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()])),
+            DataType::Int64,
+        ));
+        let planner =
+            PublishedFileReadPlanner::new(logical_schema(), physical(&number.eq(lit(2_i64))), 20);
+        let reader = iceberg::arrow::ArrowReaderBuilder::new(
+            iceberg::io::FileIO::new_with_fs(),
+            iceberg::Runtime::current(),
+        )
+        .with_parquet_file_read_planner(Arc::new(planner))
+        .build();
+        let result = reader
+            .read(Box::pin(futures_util::stream::iter(vec![Ok(task)])))
+            .expect("published reader");
+        let metrics = result.metrics().clone();
+        let ids = result
+            .stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("published rows")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2]);
+        assert_eq!(metrics.row_groups_considered(), 3);
+        assert_eq!(metrics.row_groups_pruned_by_statistics(), 1);
     }
 }

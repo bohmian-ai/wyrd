@@ -151,7 +151,7 @@ Each status was found by searching the tree for that scenario's named tests.
 |---|---|---|
 | 1. Only final output files infer a bounded standard layout | **Committed locally (`509f972c6`), not pushed; Forge memory part superseded by spec revision 19** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70`, iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`. `reserve_variant_prefixes` (a fixed `RUNNER_MAX_PARALLELISM` × 64 MiB task reservation) contradicts revision 19 REQ-030, REQ-031, INV-009 and AC-012/AC-013, which require charging live retained prefix bytes to the attempt's DataFusion pool and a `max(1, effective_cpu * 4)` planning maximum. TASK-004 owns that rework after TASK-003 integrates |
 | 2. Recovery and compaction preserve standard logical values | **Implemented, not pushed** | iceberg-rust `fdc02e0a0847f3219e234f81ee6b7a2ff0d67418` (reader unshreds), iceberg-compaction `28f35fc9fd39b1e4879e7652f074f1630ca417cb` (test) and `a52462a2114e6912b0c7fdf903abcbb31b7d7136` (repin). Evidence below |
-| 3. Distinct logical semantics share physical pushdown | **Partly done** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`. The DataFusion fork per-file read plan (`per_file_plan_covers_projection_filter_and_pruning` in the fork) and `oracle::nested_pushdown::tests::both_readers_use_shared_per_file_plan` exist. The journey `published::struct_and_variant_share_physical_pushdown` is absent. |
+| 3. Distinct logical semantics share physical pushdown | **Implemented (spec revision 20)** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`, plus the revision-20 read-core commit. Published files go through `FileReadPlan` via the iceberg fork's per-file hook (iceberg-rust `b0a88c310`). Journey `published::struct_and_variant_share_physical_pushdown` passes. Output leaf projection is still open (see the evidence below). |
 | 4. Unsigned distributed predicates preserve authority | **Implemented** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). MCP `query::pg_tests::sensitive_variant_leaf_is_denied_before_io` and peer `peer_network::security::unsigned_leaf_predicates_round_trip_and_execute` implemented (evidence below). |
 | Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
 
@@ -206,20 +206,65 @@ with a 30 s deadline. No existing assertion changed.
 | `variant_batch`, `logical_rows`, `shredded_fields`, `document_keys`, `assert_per_file_layouts`, `published_rows`, `expected_rows` (journey) | `flat_builtin_batch` (fixed one-key shape per field, cannot vary layout by day), `LineageTable` (reused for the rewrite loop) | the scenario needs different document shapes per day |
 | `unshred_variant_columns` (iceberg-rust) | Arrow `unshred_variant` (used), reader projection | applies Arrow's unshred to each Variant column of a batch |
 
-#### Scenario 3 finding (blocked on a decision)
+#### Scenario 3 evidence (spec revision 20: one per-file read core)
 
-REQ-023 and INV-008 require both Oracle readers to use the one per-file read
-plan. Only the hot reader does (`oracle/exec.rs` `FileReadPlan::new` in
-`hot_stream`). The published reader runs the iceberg fork's `ArrowReader`
-(`oracle/exec.rs` `start_stream`), which keeps its own projection, row filter,
-pruning, delete application, and lineage. The `nested_pushdown.rs` module doc
-claims both readers use the plan. Full-path matching (fork
-`row_group_filter.rs` `statistics_converter_for_path`) and Bloom `IN` (upstream
-`test_row_group_bloom_filter_pruning_predicate_sql_in`) already exist for the
-hot reader. Decoder row-filter use is not observable: `FileReadPlan` writes its
-`ParquetFileMetrics` into a throwaway `ExecutionPlanMetricsSet`. The
-`published::struct_and_variant_share_physical_pushdown` journey waits on the
-human choice of how the published reader adopts the plan.
+Published files now go through the same per-file read core as hot files.
+Iceberg still plans the scan and applies deletes, field IDs, defaults,
+partition constants and lineage. For each data file it opens, the iceberg
+fork calls a `ParquetFileReadPlanner` hook. Oracle implements that hook with
+`PublishedFileReadPlanner`, which builds a `FileReadPlan` and hands back
+row-group pruning, a page selection and a decoder `RowFilter`. The leader
+installs the planner in `OracleIcebergScanExec::start_stream`; followers get
+it through `route_published_reads`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-014.1: a key shredded in some files and residual in others, at any depth, reads like an all-residual read; a key no file shredded reads null and never errors | `PublishedFileReadPlanner` (`oracle/nested_pushdown.rs`); integer width fix in `VariantFileAdapter::typed_comparison` (`oracle/variant_sql.rs`) | `oracle::nested_pushdown::tests::shredded_and_residual_files_read_identically`, `typed_variant_statistics_prune_only_with_all_null_residuals` (Int64/Int16/Int8); `nested_pushdown` 6 passed | PASS |
+| AC-014.2: Forge/Scribe compatibility test is committed | Scribe-shredded files rewritten by Forge read through the shared core | `forge::managed_rewrite::standard_variant_layouts_round_trip_per_file`; journey below (rewritten cut) | PASS |
+| AC-014.3: `published::struct_and_variant_share_physical_pushdown` | `published.rs` journey: `PushdownCut`, `prove_pushdown_cut` | 1 passed. Files read / row groups pruned: hot 3/2, promoted 3/2, rewritten 1/5. Struct and Variant are identical in each state; the unshredded key returns 0 rows; contents are identical across all three | PASS |
+| AC-014.4: Oracle position-delete and Forge position/equality-delete journeys stay green | unchanged Iceberg delete application around the core | redux lib 861 passed; `managed_rewrite::` and `publication::` journeys: `managed_rewrite::` 11 passed (including `managed_rewrite_applies_position_and_equality_deletes_to_output_rows`); `publication::` 4 passed | PASS |
+| AC-014.5: tenant footer, byte range, LIMIT and follower assignment stay green | `PublishedFooterLoader` and `assigned ⊆ planned` unchanged | whole `wyrd-testing --test oracle` journey binary 53 tests: 50 passed in the first run; the other 3 passed on re-run (see the span diagnosis below), including `iceberg_filtering_mechanisms_cover_all_table_kinds`, `limit_stops_unneeded_live_fragment_without_footer`, `remote_staged_footer_refusal_fails_closed`, and the distributed and follower journeys | PASS |
+| AC-014.6: Variant values and v3 lineage survive repeated Forge rewrites | `LineageTable` checks `_row_id` and sequence across two rewrites | `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite` and `standard_variant_layouts_round_trip_per_file` passed | PASS |
+| Pins | iceberg-rust `b0a88c310afaee98d31fcd7a66e17036c8bf6a7c` (hook); iceberg-compaction `30e805a63a24d2b969cb9adb751ed584fab44d74` (repin) | `Cargo.lock` holds one `iceberg` | PASS |
+| Lints | — | `cargo +nightly-2026-03-05 fmt` touched only changed files; clippy `--all-features --all-targets -D warnings` on `vala-bifrost-redux` 0, and on `wyrd-testing --test oracle` 0; `git diff --check` 0 | PASS |
+
+Diagnosis: hot Variant filter did not prune.
+- **Symptom:** in the journey's hot cut, the Struct filter pruned 2 row groups and the Variant filter pruned 0.
+- **Evidence:** the iceberg fork's `variant_shredding.rs` narrows integers to the widest width the file holds, so Scribe wrote `typed_value: Int16`. `typed_comparison` required the leaf type to equal the cast type (`Int64`) exactly.
+- **Cause:** the typed half was never formed, so no statistics predicate existed.
+- **Fix site:** `VariantFileAdapter::typed_comparison`, the one place both readers rewrite Variant comparisons. An integer literal is now cast to the leaf's width when that cast is lossless. If it is not lossless, the comparison falls back to residual-only (unit case `1000` against Int8).
+
+Diagnosis: the rewrite never ran in the journey.
+- **Symptom:** `await_rewrite` timed out with no `/data/forge/` file.
+- **Evidence:** the Forge leader creates a compaction track only from a commit notice that carries table settings (`forge/leader.rs` `notify_commit`).
+- **Cause:** compaction was disabled at promotion. Setting the property later through the catalog sends no notice.
+- **Fix site:** test only. After enabling compaction, the journey writes and promotes one more file, so a commit carries the setting. Forge is unchanged.
+
+Diagnosis: span assertions failed in the regression run.
+- **Symptom:** six tests failed with "spans … never finished" or "no Analytical attempt span": three `forge::publication` tests, `analytical_lifecycle::pg_analytical_production_telemetry_covers_every_hot_path`, `published::published_cache_pruning_and_shutdown_are_production_governed`, and `peer_network::analytical::remote_live_scribe_drop_releases_query`.
+- **Evidence:** test span capture (`wyrd-telemetry` `init_test_capture`) honours the ambient `WYRD_LOG`. That run used `WYRD_LOG=warn`, which drops info spans.
+- **Cause:** the run's environment, not the code.
+- **Fix site:** none. Re-run without `WYRD_LOG` on the pushed pins: all six passed, and so did `published::struct_and_variant_share_physical_pushdown`.
+
+Known gap: neither reader yet projects only the shredded leaves an output
+needs. Both pass every column's whole projection to `FileReadPlan`
+(`exec.rs` hot stream; `PublishedFileReadPlanner`), so leaf masks are used
+for filters only. REQ-023's output leaf projection is still open.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `ParquetFileReadPlanner`, `ParquetFileReadNarrowing`, `ArrowReaderBuilder::with_parquet_file_read_planner` (iceberg-rust) | `ArrowReader` pruning, `ParquetMetadataLoader` hook | Iceberg had no per-file hook for an embedder to narrow the decode; it follows the existing loader hook |
+| `PublishedFileReadPlanner` | `FileReadPlan`, hot `HotParquetExec` | adapts the one `FileReadPlan` to the Iceberg hook; it adds no second planner |
+| `OracleIcebergScanExec::with_read_plan`, `file_read_planner`; `route_published_footers` renamed to `route_published_reads` | `with_footers`, follower routing | carries the closure predicates into the published scan on the leader and followers |
+| `write_groups_with_a`, `typed_statistics_prune_at` (tests) | `write_groups` | `write_groups` now delegates; this parametrizes the shredded integer width |
+| `PushdownCut`, `prove_pushdown_cut` (journey) | `FilterCase`, `run_case`, `expect_measure` (reused) | runs the same three cases at each of the three file states |
+| `await_rewrite`, `planned_paths`, `set_table_property`, `FORGE_DATA_SEGMENT` moved to `oracle/support.rs` | `distributed.rs` copies | moved, not copied; `distributed.rs` uses them |
+
+Commands:
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support'`
+- `mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=published::struct_and_variant_share_physical_pushdown)'` (under the Postgres wrapper)
+- `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E 'test(/managed_rewrite::/) | test(/publication::/)'` (under the Postgres wrapper)
+- the whole `wyrd-testing --test oracle -P journey --run-ignored=all` binary (under the Postgres wrapper)
 
 #### Scenario 4 evidence (MCP)
 

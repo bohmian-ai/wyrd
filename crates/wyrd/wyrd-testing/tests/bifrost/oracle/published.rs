@@ -16,9 +16,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::ForgeConfig;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::storage::{
     BifrostStorage, BifrostStorageError, StorageInspection, StorageLifecycle, StorageOperation,
     StorageOperationBarrier, StorageRequestOutcome,
@@ -39,6 +42,7 @@ use wyrd_testing::bifrost::{
 use crate::analytical_activation::{
     COORDINATOR, PEER_FOLLOWERS, PEER_SCRIBE, RemoteWork, sdk_code,
 };
+use crate::distributed::{FilterCase, expect_measure, run_case};
 use crate::peer_cluster::PeerCluster;
 use crate::support::*;
 
@@ -1508,4 +1512,266 @@ fn render_rows(batch: &RecordBatch) -> Result<Vec<Vec<String>>, JourneyError> {
                 .collect()
         })
         .collect()
+}
+
+/// Rows each sealed file of the pushdown journey holds.
+const PUSHDOWN_ROWS_PER_FILE: i64 = 2_000;
+
+/// The key every pushdown filter looks up; it lives in the second file.
+const PUSHDOWN_PROBE: i64 = PUSHDOWN_ROWS_PER_FILE + 500;
+
+/// Forge row-group target for the pushdown table, small enough that the
+/// rewrite of its three files closes several row groups.
+const PUSHDOWN_ROW_GROUP_BYTES: u64 = 16 * 1024;
+
+/// A Struct field and a shredded Variant path share one physical pushdown on
+/// hot, promoted, and rewritten files.
+///
+/// One table carries the same key `a` twice: as Struct field `s.a` and as
+/// Variant path `doc.a`, which Scribe shreds into a typed integer leaf. Three
+/// files hold disjoint key ranges. In each cut a Struct filter and a Variant
+/// filter on that key return the same exact row and the same physical
+/// evidence, an unshredded Variant key reads null and matches nothing, and the
+/// full content, Variant values included, equals what the hot objects return,
+/// so Forge's promoted and rewritten files read identically to Scribe's:
+///
+/// - **hot** — the hot reader's per-file plan prunes the other files' row
+///   groups by footer statistics;
+/// - **promoted** — the same files, now read by the Iceberg reader, are
+///   pruned identically through the published per-file plan;
+/// - **rewritten** — one Forge output holds several row groups, and both
+///   filters prune the same ones.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, catalog, Forge, telemetry, or query
+/// errors, or a description of the first expectation that does not hold.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn struct_and_variant_share_physical_pushdown() -> Result<(), JourneyError> {
+    // Promotion is parked at the commit seam before any write so the first
+    // cut stays hot; see `prove_published_governance`.
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the pod wraps its Forge catalog in the commit seam")?;
+    promotion.pause_before_commit();
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_pushdown");
+    let fqn = format!("vala.bifrost.{table}");
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)])),
+            true,
+        ),
+        wyrd_types::variant::variant_field("doc", true),
+    ]));
+    register_table_with(
+        server,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    // Compaction stays off until the rewritten cut, so the promoted cut is
+    // measured exactly as Scribe sealed it.
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("Scribe composition retains the shared catalog")?
+        .iceberg_catalog();
+    let binding =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &table)))?;
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
+    set_table_property(
+        &catalog,
+        &binding,
+        iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+        &PUSHDOWN_ROW_GROUP_BYTES.to_string(),
+    )
+    .await?;
+    let rows = writer(server, "pushdown-writer").await?;
+    for file in 0..3 {
+        let ids = file * PUSHDOWN_ROWS_PER_FILE..(file + 1) * PUSHDOWN_ROWS_PER_FILE;
+        rows.write(
+            &fqn,
+            &schema,
+            ids.map(|id| {
+                serde_json::json!({"id": id, "s": {"a": id}, "doc": {"a": id}})
+                    .to_string()
+                    .into_bytes()
+            }),
+        )
+        .await?;
+        server.flush_bifrost().await?;
+    }
+    let reader = client(server, "pushdown-reader").await?;
+
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the first promotion never reached the parked commit")?;
+    cluster.refresh_oracle_snapshots().await?;
+    if file_tier_counts(&cluster, tenant, &table).await? != (0, 3) {
+        return Err("the hot cut must hold three unpromoted files".into());
+    }
+    prove_pushdown_cut(&cluster, &reader, &fqn, PushdownCut::Hot).await?;
+    // Every later cut must return exactly the content Scribe's hot objects
+    // return, Variant values included.
+    let contents = format!(
+        "SELECT id, s['a'], variant_as_text(doc) FROM {fqn} WHERE id < {} ORDER BY id",
+        3 * PUSHDOWN_ROWS_PER_FILE
+    );
+    let (_, hot_rows) = run_rows(&reader, &contents).await?;
+    if hot_rows.len() != usize::try_from(3 * PUSHDOWN_ROWS_PER_FILE)? {
+        return Err(format!("the hot cut returned {} rows", hot_rows.len()).into());
+    }
+
+    promotion.release_paused_before_commit();
+    compact_sealed_batch(&cluster, tenant, &table, 3).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let promoted = planned_paths(server, tenant, BifrostNamespace::Bifrost, &table).await?;
+    if promoted.len() != 3
+        || promoted
+            .iter()
+            .any(|path| path.contains(FORGE_DATA_SEGMENT))
+    {
+        return Err(
+            format!("the promoted cut must plan the three Scribe files: {promoted:?}").into(),
+        );
+    }
+    prove_pushdown_cut(&cluster, &reader, &fqn, PushdownCut::Promoted).await?;
+    if run_rows(&reader, &contents).await?.1 != hot_rows {
+        return Err("the promoted cut's content differs from the hot cut's".into());
+    }
+
+    // Forge learns a table's settings from its own commits, so compaction is
+    // re-enabled and one more file, outside the probe's range, is promoted
+    // to carry that setting into the schedule.
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "true").await?;
+    let extra = 3 * PUSHDOWN_ROWS_PER_FILE;
+    rows.write(
+        &fqn,
+        &schema,
+        [
+            serde_json::json!({"id": extra, "s": {"a": extra}, "doc": {"a": extra}})
+                .to_string()
+                .into_bytes(),
+        ],
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    compact_sealed_batch(&cluster, tenant, &table, 4).await?;
+    await_rewrite(
+        &cluster,
+        server,
+        &[(BifrostNamespace::Bifrost, table.as_str())],
+    )
+    .await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let rewritten = planned_paths(server, tenant, BifrostNamespace::Bifrost, &table).await?;
+    if rewritten.len() != 1 {
+        return Err(format!("the rewrite must publish one output: {rewritten:?}").into());
+    }
+    prove_pushdown_cut(&cluster, &reader, &fqn, PushdownCut::Rewritten).await?;
+    if run_rows(&reader, &contents).await?.1 != hot_rows {
+        return Err("the rewritten cut's content differs from the hot cut's".into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// The physical cut one pushdown phase reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushdownCut {
+    /// Three Scribe hot objects.
+    Hot,
+    /// The same three objects promoted into Iceberg unchanged.
+    Promoted,
+    /// One Forge output replacing them.
+    Rewritten,
+}
+
+/// Runs the Struct, Variant, and unshredded-key filters against one cut and
+/// asserts their rows and pruning evidence.
+///
+/// # Errors
+///
+/// Returns query or telemetry errors, and an error naming the first case whose
+/// rows or evidence differ from the cut's expectation.
+async fn prove_pushdown_cut(
+    cluster: &WyrdTestCluster,
+    reader: &WyrdClient,
+    fqn: &str,
+    cut: PushdownCut,
+) -> Result<(), JourneyError> {
+    let case = |name: &str, filter: &str, expected: Vec<i64>| FilterCase {
+        name: format!("{cut:?} {name}"),
+        sql: format!("SELECT id FROM {fqn} WHERE {filter} ORDER BY id"),
+        expected,
+    };
+    let structs = run_case(
+        cluster,
+        reader,
+        case(
+            "struct",
+            &format!("s['a'] = {PUSHDOWN_PROBE}"),
+            vec![PUSHDOWN_PROBE],
+        ),
+    )
+    .await?;
+    let variant = run_case(
+        cluster,
+        reader,
+        case(
+            "variant",
+            &format!("CAST(doc->>'a' AS BIGINT) = {PUSHDOWN_PROBE}"),
+            vec![PUSHDOWN_PROBE],
+        ),
+    )
+    .await?;
+    run_case(
+        cluster,
+        reader,
+        case(
+            "unshredded key",
+            "CAST(doc->>'zz' AS BIGINT) = 1",
+            Vec::new(),
+        ),
+    )
+    .await?;
+    // Hot and promoted: all three files open and the per-file plan drops the
+    // other two files' row groups. Rewritten: one output whose row groups
+    // outside the probe are dropped.
+    let files = match cut {
+        PushdownCut::Hot | PushdownCut::Promoted => 3.0,
+        PushdownCut::Rewritten => 1.0,
+    };
+    if structs.row_groups_pruned < 2.0 {
+        return Err(format!("{cut:?}: the Struct filter pruned too little: {structs:?}").into());
+    }
+    for (name, evidence) in [("struct", structs), ("variant", variant)] {
+        expect_measure(name, "files", evidence.files, files)?;
+        expect_measure(
+            name,
+            "pruned",
+            evidence.row_groups_pruned,
+            structs.row_groups_pruned,
+        )?;
+    }
+    Ok(())
 }

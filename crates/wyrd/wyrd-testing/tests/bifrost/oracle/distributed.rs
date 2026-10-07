@@ -671,20 +671,9 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .bifrost_catalog()
         .ok_or("Scribe composition retains the shared catalog")?
         .iceberg_catalog();
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
-    ))?;
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    let tx = iceberg::transaction::Transaction::new(&loaded);
-    let tx = iceberg::transaction::ApplyTransactionAction::apply(
-        tx.update_table_properties().set(
-            "wyrd.forge.enable-compaction".to_owned(),
-            "false".to_owned(),
-        ),
-        tx,
-    )?;
-    tx.commit_once(catalog.as_ref()).await?;
+    let binding =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &table)))?;
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     let rows = writer(ingest_server, "two-tier-writer").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
@@ -2588,7 +2577,24 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
     let fixture = {
         let scribe = cluster.server(0).ok_or("missing Scribe node")?;
         let fixture = FilteringFixture::write(scribe).await?;
-        fixture.declare_rewrite_row_groups(scribe).await?;
+        let catalog = scribe
+            .state()
+            .bifrost_catalog()
+            .ok_or("Scribe composition retains the shared catalog")?
+            .iceberg_catalog();
+        let binding = TenantTableBinding::resolve((
+            scribe.data_tenant_id(),
+            TableRef::new(BifrostNamespace::Datasets, &fixture.custom),
+        ))?;
+        // Scribe's sealed files ignore this property; Forge reads it when it
+        // plans the rewrite.
+        set_table_property(
+            &catalog,
+            &binding,
+            iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+            &REWRITE_ROW_GROUP_BYTES.to_string(),
+        )
+        .await?;
         fixture
     };
     cluster.refresh_oracle_snapshots().await?;
@@ -2610,7 +2616,7 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .prove_cut(&cluster, scribe, &reader, FilterCut::Promoted)
         .await?;
 
-    fixture.await_rewrite(&cluster, scribe).await?;
+    await_rewrite(&cluster, scribe, &fixture.tables()).await?;
     cluster.refresh_oracle_snapshots().await?;
     fixture
         .prove_cut(&cluster, scribe, &reader, FilterCut::Rewritten)
@@ -2634,26 +2640,26 @@ struct FilteringFixture {
 }
 
 /// One query of the filtering matrix and its exact expected row identities.
-struct FilterCase {
+pub(crate) struct FilterCase {
     /// Name reported with every failure and evidence line.
-    name: String,
+    pub(crate) name: String,
     /// The SQL, projecting the row identity as an `Int64` `id`, ordered by it.
-    sql: String,
+    pub(crate) sql: String,
     /// Ascending row identities the query must return.
-    expected: Vec<i64>,
+    pub(crate) expected: Vec<i64>,
 }
 
 /// Physical scan evidence one query's Oracle telemetry delta records.
 #[derive(Debug, Clone, Copy)]
-struct ScanEvidence {
+pub(crate) struct ScanEvidence {
     /// Hot files opened, or Iceberg data files the manifest pruning kept.
-    files: f64,
+    pub(crate) files: f64,
     /// Row groups excluded by statistics or Bloom filters.
-    row_groups_pruned: f64,
+    pub(crate) row_groups_pruned: f64,
     /// Row groups of those excluded by a Bloom filter alone.
-    bloom_pruned: f64,
+    pub(crate) bloom_pruned: f64,
     /// Rows the page index skipped inside retained row groups.
-    page_rows_pruned: f64,
+    pub(crate) page_rows_pruned: f64,
 }
 
 impl FilteringFixture {
@@ -2979,41 +2985,6 @@ impl FilteringFixture {
         ]
     }
 
-    /// Declares [`REWRITE_ROW_GROUP_BYTES`] as the custom table's Forge
-    /// row-group target.
-    ///
-    /// A test-scoped Iceberg table property: Scribe's sealed files ignore it,
-    /// and Forge reads it when it plans the rewrite.
-    ///
-    /// # Errors
-    ///
-    /// Returns catalog, binding, or commit errors.
-    async fn declare_rewrite_row_groups(
-        &self,
-        server: &WyrdTestServer,
-    ) -> Result<(), JourneyError> {
-        let catalog = server
-            .state()
-            .bifrost_catalog()
-            .ok_or("Scribe composition retains the shared catalog")?
-            .iceberg_catalog();
-        let binding = TenantTableBinding::resolve((
-            server.data_tenant_id(),
-            vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &self.custom),
-        ))?;
-        let loaded = catalog.load_table(&binding.table_ident()).await?;
-        let tx = iceberg::transaction::Transaction::new(&loaded);
-        let tx = iceberg::transaction::ApplyTransactionAction::apply(
-            tx.update_table_properties().set(
-                iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_owned(),
-                REWRITE_ROW_GROUP_BYTES.to_string(),
-            ),
-            tx,
-        )?;
-        tx.commit_once(catalog.as_ref()).await?;
-        Ok(())
-    }
-
     /// Waits, bounded, until the freshly started coordinator has promoted every
     /// table's sealed files.
     ///
@@ -3036,13 +3007,13 @@ impl FilteringFixture {
             .server_by_node(coordinator)
             .ok_or("the delayed coordinator is running")?;
         tokio::time::timeout(
-            FORGE_PASS_WAIT,
+            COMPACTION_PASS_WAIT,
             server.wait_for_forge_scheduler_passes_for_test(1),
         )
         .await
         .map_err(|_| "the coordinator never completed its boot pass")?;
         let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
+        let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
         loop {
             let mut hot_tables = Vec::new();
             for (_, table) in self.tables() {
@@ -3060,63 +3031,11 @@ impl FilteringFixture {
             let before = server.completed_forge_scheduler_passes_for_test();
             server.request_forge_scheduler_pass_for_test();
             tokio::time::timeout(
-                FORGE_PASS_WAIT,
+                COMPACTION_PASS_WAIT,
                 server.wait_for_forge_scheduler_passes_for_test(before + 1),
             )
             .await
             .map_err(|_| "a requested scheduler pass did not complete")?;
-        }
-    }
-
-    /// Advances every Forge clock past the compaction interval and waits,
-    /// bounded, until each table's current snapshot plans only Forge outputs.
-    ///
-    /// Each iteration releases retry backoff, requests a scheduler pass, and
-    /// waits for a worker completion; the exit condition is the planned data
-    /// files themselves, never a pass or completion count.
-    ///
-    /// # Errors
-    ///
-    /// Returns clock, catalog, scan-planning, or Postgres errors, or an error
-    /// naming the tables still planning Scribe objects when the budget
-    /// elapses.
-    async fn await_rewrite(
-        &self,
-        cluster: &WyrdTestCluster,
-        server: &WyrdTestServer,
-    ) -> Result<(), JourneyError> {
-        let observer = cluster
-            .forge_completion_observer()
-            .ok_or("cluster was started without a Forge completion observer")?;
-        for node in cluster.servers() {
-            node.forge_clock()
-                .advance(chrono::Duration::days(1))
-                .map_err(|error| format!("elapse the compaction interval: {error}"))?;
-        }
-        let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
-        loop {
-            let mut pending = Vec::new();
-            for (namespace, table) in self.tables() {
-                let paths = planned_paths(server, tenant, namespace, table).await?;
-                if paths.is_empty() || !paths.iter().all(|path| path.contains(FORGE_DATA_SEGMENT)) {
-                    pending.push(format!("{table}: {paths:?}"));
-                }
-            }
-            if pending.is_empty() {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!("the rewrite did not publish: {pending:?}").into());
-            }
-            for (_, table) in self.tables() {
-                release_forge_retries(cluster, tenant, table).await?;
-            }
-            let target = observer.completed().saturating_add(1);
-            cluster.request_forge_scheduler_pass_for_test();
-            // A lapsed wait is not a verdict: the planned files checked at the
-            // top of the next iteration are.
-            let _ = tokio::time::timeout(FORGE_PASS_WAIT, observer.wait_for_at_least(target)).await;
         }
     }
 
@@ -3746,7 +3665,6 @@ struct FilterProbes {
     custom_groups: usize,
 }
 
-/// Path segment every Forge rewrite output carries beneath its table root.
 const FORGE_DATA_SEGMENT: &str = "/data/forge/";
 
 /// The physical cut one filtering phase proves.
@@ -3786,44 +3704,6 @@ enum PhysicalTier {
     Hot,
     /// Data files of the table's current Iceberg snapshot.
     Iceberg,
-}
-
-/// Bound on one requested Forge scheduler pass or worker completion.
-const FORGE_PASS_WAIT: Duration = Duration::from_secs(30);
-
-/// Bound on one whole Forge phase of the filtering journey.
-const FORGE_PHASE_BUDGET: Duration = Duration::from_secs(180);
-
-/// The data-file paths one table's current Iceberg snapshot plans.
-///
-/// # Errors
-///
-/// Returns catalog, binding, or scan-planning errors.
-async fn planned_paths(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    namespace: BifrostNamespace,
-    table: &str,
-) -> Result<Vec<String>, JourneyError> {
-    let catalog = server
-        .state()
-        .bifrost_catalog()
-        .ok_or("Scribe composition retains the shared catalog")?
-        .iceberg_catalog();
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(namespace, table),
-    ))?;
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    if loaded.metadata().current_snapshot().is_none() {
-        return Ok(Vec::new());
-    }
-    let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
-    let mut paths = Vec::new();
-    while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
-        paths.push(task.data_file_path);
-    }
-    Ok(paths)
 }
 
 /// One sealed object read back from storage, with its decoded rows and its
@@ -4154,7 +4034,7 @@ impl SealedObject {
 ///
 /// Returns telemetry or query errors, and an error when the returned ids are
 /// not exactly the expected ids.
-async fn run_case(
+pub(crate) async fn run_case(
     cluster: &WyrdTestCluster,
     reader: &WyrdClient,
     case: FilterCase,
@@ -4199,7 +4079,7 @@ async fn run_case(
 /// # Errors
 ///
 /// Returns an error naming the case, the measure, and both values.
-fn expect_measure(
+pub(crate) fn expect_measure(
     case: &str,
     measure: &str,
     actual: f64,
@@ -4938,27 +4818,6 @@ async fn held_query_live_files(
     Ok((Some(current.snapshot_id()), snapshots, files))
 }
 
-/// Commits one table property through the shared catalog, outside Forge.
-///
-/// # Errors
-/// Returns the catalog load, transaction, or commit error.
-async fn held_query_set_property(
-    catalog: &Arc<dyn Catalog>,
-    binding: &TenantTableBinding,
-    key: &str,
-    value: &str,
-) -> Result<(), JourneyError> {
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    let tx = iceberg::transaction::Transaction::new(&loaded);
-    let tx = iceberg::transaction::ApplyTransactionAction::apply(
-        tx.update_table_properties()
-            .set(key.to_owned(), value.to_owned()),
-        tx,
-    )?;
-    tx.commit_once(catalog.as_ref()).await?;
-    Ok(())
-}
-
 /// Reads one `file_list` row's `(compacted, committed)` state, if it exists.
 ///
 /// # Errors
@@ -5093,7 +4952,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         .iceberg_catalog();
     // One promotion commit makes the table due, so the rewrite needs no
     // elapsed interval and no clock advance.
-    held_query_set_property(
+    set_table_property(
         &catalog,
         &binding,
         "wyrd.forge.compaction.trigger-snapshot-count",
@@ -5259,7 +5118,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     // the originals reachable until an ordinary append moves the head. With
     // compaction off, a third object promotes without rewriting the
     // replacement, so the replacement stays live in the new head.
-    held_query_set_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     rows.write(
         &format!("vala.bifrost.{table}"),
         &journey_schema(),

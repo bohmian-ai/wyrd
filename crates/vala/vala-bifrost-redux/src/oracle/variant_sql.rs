@@ -715,8 +715,9 @@ impl PhysicalExprAdapterFactory for VariantFileAdapterFactory {
 /// A literal-key `variant_get` over a shredded root reads the root as stored,
 /// so it decodes only the leaves it declares; any other use of that root is
 /// wrapped in [`VariantUnshred`] and sees the canonical value. A comparison of
-/// a Variant leaf with a literal of exactly its shredded type also gains the
-/// typed form statistics can prune; see [`Self::typed_comparison`].
+/// a Variant leaf with a literal of its shredded type, or an integer literal
+/// that fits its shredded integer width, also gains the typed form statistics
+/// can prune; see [`Self::typed_comparison`].
 #[derive(Debug)]
 struct VariantFileAdapter {
     /// `DataFusion`'s adapter over the file schema with shredded columns
@@ -786,8 +787,10 @@ impl VariantFileAdapter {
     ///
     /// The leaf is `variant_as_text(variant_get(v, keys))` with a `Utf8`
     /// literal, or that text cast `AS T` with a `T` literal, and
-    /// the file must shred the last key with a `typed_value` of exactly the
-    /// literal's type next to its residual `value`. The result is
+    /// the file must shred the last key with a `typed_value` next to its
+    /// residual `value`. The `typed_value` is the literal's type, or an
+    /// integer type the integer literal casts into losslessly; an integer
+    /// literal outside the leaf's width forms no typed half. The result is
     /// `(typed op literal AND residual IS NULL) OR (residual IS NOT NULL AND
     /// original)`: a row's value lives in exactly one of the two, so the
     /// rewrite is three-valued identical to the original, and a row group
@@ -858,11 +861,18 @@ impl VariantFileAdapter {
         let DataType::Struct(children) = &leaf else {
             return None;
         };
-        if children.find("typed_value")?.1.data_type() != &wanted
-            || children.find("value").is_none()
-        {
+        children.find("value")?;
+        let typed_type = children.find("typed_value")?.1.data_type();
+        // Shredding narrows integers to each file's widest observed width, so
+        // an integer literal is compared at the leaf's width when it casts
+        // there losslessly; otherwise the typed half cannot be formed.
+        let typed_literal: Arc<dyn PhysicalExpr> = if typed_type == &wanted {
+            Arc::clone(binary.right())
+        } else if typed_type.is_integer() && wanted.is_integer() {
+            Arc::new(Literal::new(literal.cast_to(typed_type).ok()?))
+        } else {
             return None;
-        }
+        };
         let at = |last: &str| -> Result<Arc<dyn PhysicalExpr>> {
             let mut args = path.clone();
             args.push(Arc::new(Literal::new(ScalarValue::from(last))));
@@ -877,7 +887,7 @@ impl VariantFileAdapter {
             let typed: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
                 at("typed_value")?,
                 *binary.op(),
-                Arc::clone(binary.right()),
+                typed_literal,
             ));
             let residual = at("value")?;
             let typed_only: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(

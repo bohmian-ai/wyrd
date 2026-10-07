@@ -999,6 +999,9 @@ pub(crate) struct OracleIcebergScanExec {
     /// Iceberg reader built once and cloned by every partition, because
     /// building one probes the host's CPU limits.
     reader: Arc<tokio::sync::OnceCell<iceberg::arrow::ArrowReader>>,
+    /// Scan closure and closed predicates every data file is planned against
+    /// through the shared read core; `None` leaves pruning to Iceberg alone.
+    read_plan: Option<(SchemaRef, Vec<ScanPredicate>)>,
 }
 
 /// What a pinned Iceberg scan needs to load data-file footers through the
@@ -1171,17 +1174,20 @@ impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
     }
 }
 
-/// Routes every pinned Iceberg scan in `plan` through `footers`.
+/// Routes every pinned Iceberg scan in `plan` through `footers` and plans its
+/// files through the shared read core against `predicates` over `schema`.
 ///
 /// Used where a plan's Iceberg leaves were built by code that cannot see the
-/// storage owner, such as a follower's catalog scan.
+/// storage owner or the signed closure, such as a follower's catalog scan.
 ///
 /// # Errors
 ///
 /// Returns the `DataFusion` error of a failed plan rewrite.
-pub(super) fn route_published_footers(
+pub(super) fn route_published_reads(
     plan: Arc<dyn ExecutionPlan>,
     footers: &PublishedFooters,
+    schema: &SchemaRef,
+    predicates: &[ScanPredicate],
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     use datafusion::common::tree_node::{Transformed, TreeNode as _};
     plan.transform_up(|node| {
@@ -1189,7 +1195,9 @@ pub(super) fn route_published_footers(
             return Ok(Transformed::no(node));
         };
         Ok(Transformed::yes(Arc::new(
-            exec.clone().with_footers(footers.clone()),
+            exec.clone()
+                .with_footers(footers.clone())
+                .with_read_plan(Arc::clone(schema), predicates.to_vec()),
         )))
     })
     .map(|transformed| transformed.data)
@@ -1323,6 +1331,7 @@ impl OracleIcebergScanExec {
             footers: None,
             planned: Arc::default(),
             reader: Arc::default(),
+            read_plan: None,
         })
     }
 
@@ -1344,6 +1353,53 @@ impl OracleIcebergScanExec {
     pub(super) fn with_footers(mut self, footers: PublishedFooters) -> Self {
         self.footers = Some(footers);
         self
+    }
+
+    /// Plans every data file this scan reads through the shared read core,
+    /// filtering by `predicates` over the scan closure `schema`.
+    ///
+    /// This is what lets a Struct field or shredded Variant path prune and
+    /// filter published files: Iceberg's own predicate cannot express them.
+    pub(super) fn with_read_plan(
+        mut self,
+        schema: SchemaRef,
+        predicates: Vec<ScanPredicate>,
+    ) -> Self {
+        self.read_plan = Some((schema, predicates));
+        self
+    }
+
+    /// Resolves the per-file planner one execution installs in the reader.
+    ///
+    /// Returns `None` when the scan has no read plan or no closed predicate,
+    /// because the shared core then has nothing to prune or filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error raised when a closed predicate does not
+    /// compile against the scan closure.
+    fn file_read_planner(
+        &self,
+        task: &TaskContext,
+    ) -> DataFusionResult<Option<Arc<super::nested_pushdown::PublishedFileReadPlanner>>> {
+        let Some((schema, predicates)) = &self.read_plan else {
+            return Ok(None);
+        };
+        let max_in_list_size = task
+            .session_config()
+            .options()
+            .execution
+            .parquet
+            .max_in_list_size;
+        Ok(
+            scan_predicate_conjunction(predicates, schema)?.map(|filter| {
+                Arc::new(super::nested_pushdown::PublishedFileReadPlanner::new(
+                    Arc::clone(schema),
+                    filter,
+                    max_in_list_size,
+                ))
+            }),
+        )
     }
 
     /// Restricts this pinned scan to one exact authenticated follower assignment.
@@ -1516,7 +1572,9 @@ impl OracleIcebergScanExec {
     /// every data file's metadata through. The first partition to start
     /// builds the one reader every partition clones, so its loader serves the
     /// whole query; every partition of one execution resolves the same
-    /// admitted governance, so any partition's loader is equivalent.
+    /// admitted governance, so any partition's loader is equivalent. `file_planner`
+    /// narrows each opened file through the shared read core after Iceberg's
+    /// own pruning; every partition resolves the same one.
     ///
     /// # Errors
     ///
@@ -1528,6 +1586,7 @@ impl OracleIcebergScanExec {
         &self,
         partition: usize,
         footers: Arc<PublishedFooterLoader>,
+        file_planner: Option<Arc<super::nested_pushdown::PublishedFileReadPlanner>>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let planned = self.planned.get_or_try_init(|| self.plan_tasks()).await?;
         // Bifrost writes no encrypted data file. One that claims key metadata
@@ -1557,11 +1616,16 @@ impl OracleIcebergScanExec {
         let reader = self
             .reader
             .get_or_init(|| async {
-                self.table
+                let builder = self
+                    .table
                     .reader_builder()
                     .with_row_selection_enabled(true)
-                    .with_parquet_metadata_loader(footers)
-                    .build()
+                    .with_parquet_metadata_loader(footers);
+                match file_planner {
+                    Some(file_planner) => builder.with_parquet_file_read_planner(file_planner),
+                    None => builder,
+                }
+                .build()
             })
             .await
             .clone();
@@ -1683,8 +1747,9 @@ impl ExecutionPlan for OracleIcebergScanExec {
             .as_ref()
             .ok_or_else(|| QueryCatalogError::external(BifrostError::QueryTenantInvariant))?
             .loader(self.table.file_io().clone(), context.as_ref())?;
+        let planner = self.file_read_planner(context.as_ref())?;
         let source = self.clone();
-        let future = async move { source.start_stream(partition, footers).await };
+        let future = async move { source.start_stream(partition, footers, planner).await };
         let stream = futures_util::stream::once(future).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -2012,7 +2077,8 @@ impl OracleTableProvider {
                         self.context.data_tenant_id,
                         self.table.clone(),
                         HotParquetPlan::Leader,
-                    )),
+                    ))
+                    .with_read_plan(Arc::clone(&required_schema), supported_predicates.to_vec()),
             );
             // The dependency may return the projected columns in its own
             // physical order. The signed closure is authoritative, so the plan
@@ -3100,7 +3166,8 @@ fn hot_stream(
             if bloom.excludes_file() {
                 continue;
             }
-            let (row_groups, pages) = read_plan.select_pages(bloom.retained, &metrics)?;
+            let (row_groups, pages, skipped) = read_plan.select_pages(bloom.retained)?;
+            metrics.record_page_pruned_rows(skipped);
             // The shared plan's projection turns decoded leaves back into the
             // closure's logical columns; `project_batch` below only pins the
             // exact output schema.
@@ -4704,9 +4771,8 @@ mod tests {
             ScanLiteral::I64(TARGET),
         )];
 
-        let metrics = OracleScanMetricsHandle::default();
-        let (groups, selection) = hot_file_plan(&published, &schema, &predicates)
-            .select_pages(vec![0], &metrics)
+        let (groups, selection, skipped) = hot_file_plan(&published, &schema, &predicates)
+            .select_pages(vec![0])
             .expect("page selection");
         assert_eq!(groups, vec![0]);
         let selection = selection.expect("the sorted column's page index excludes pages");
@@ -4738,17 +4804,17 @@ mod tests {
         })
         .sum();
         assert_eq!(matching, 1, "the selection must keep the matching row");
-        let (groups, unchanged) = hot_file_plan(&published, &schema, &[])
-            .select_pages(vec![0], &metrics)
+        let (groups, unchanged, none_skipped) = hot_file_plan(&published, &schema, &[])
+            .select_pages(vec![0])
             .expect("page selection");
         assert!(
-            groups == vec![0] && unchanged.is_none(),
+            groups == vec![0] && unchanged.is_none() && none_skipped == 0,
             "an empty conjunction leaves the reader unchanged"
         );
-        assert_eq!(metrics.rows_pruned_page_index.load(Ordering::Relaxed), {
-            u64::try_from(ROWS).expect("fixture rows fit u64")
-                - u64::try_from(kept).expect("kept fits u64")
-        });
+        assert_eq!(
+            skipped,
+            usize::try_from(ROWS).expect("fixture rows fit usize") - kept
+        );
     }
 
     /// Row-group min/max pruning measured on a real two-row-group file written

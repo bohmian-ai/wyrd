@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
 use iceberg::spec::{
     DataFile, DataFileFormat, PartitionKey, Schema as IcebergSchema, TableProperties,
 };
@@ -512,26 +513,7 @@ impl PromotedRewriteFixture {
     pub(crate) async fn object_row_values(&self, paths: &[String]) -> Vec<i64> {
         let mut values = Vec::new();
         for path in paths {
-            let key = path
-                .split_once(&format!("{}/", self.fixture.binding.object_prefix))
-                .map_or_else(
-                    || path.clone(),
-                    |(_, suffix)| format!("{}/{suffix}", self.fixture.binding.object_prefix),
-                );
-            let bytes = self
-                .fixture
-                .staging
-                .read(&key)
-                .await
-                .expect("produced object read")
-                .to_bytes();
-            let reader =
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-                    .expect("produced object is Parquet")
-                    .build()
-                    .expect("produced object reader");
-            for batch in reader {
-                let batch = batch.expect("produced object batch");
+            for batch in self.object_batches(path).await {
                 let column = batch
                     .column_by_name("value")
                     .expect("produced object carries the user column");
@@ -543,6 +525,36 @@ impl PromotedRewriteFixture {
             }
         }
         values
+    }
+
+    /// Reads one object's stored batches exactly as the Parquet file holds them.
+    ///
+    /// `path` may be a full table location or a key relative to the staging
+    /// root; both resolve to the same staging key. Nothing is unshredded or
+    /// projected, so a caller sees the physical layout the writer chose.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object cannot be read or is not Parquet.
+    pub(crate) async fn object_batches(&self, path: &str) -> Vec<RecordBatch> {
+        let prefix = &self.fixture.binding.object_prefix;
+        let key = path.split_once(&format!("{prefix}/")).map_or_else(
+            || path.to_owned(),
+            |(_, suffix)| format!("{prefix}/{suffix}"),
+        );
+        let bytes = self
+            .fixture
+            .staging
+            .read(&key)
+            .await
+            .expect("produced object read")
+            .to_bytes();
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("produced object is Parquet")
+            .build()
+            .expect("produced object reader")
+            .collect::<Result<_, _>>()
+            .expect("produced object batches")
     }
 
     /// Snapshots every object under the table prefix with its content hash.

@@ -6,6 +6,7 @@ mod horizontal_ingest;
 mod ingest_bounds;
 mod lifecycle;
 mod qualification;
+mod recovery;
 mod source_boundary;
 mod source_boundary_recovery;
 mod support;

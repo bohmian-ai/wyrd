@@ -1048,12 +1048,39 @@ impl PromotionIntegrationFixture {
 
     /// Start Postgres, compose the production graph, and seal two hot objects.
     ///
+    /// The table carries one `value` column and each object lands in its own
+    /// closed day; see [`Self::start_with`].
+    ///
     /// # Panics
     ///
     /// Panics when any fixture dependency cannot start, when the table cannot
     /// be registered, or when a real Scribe seal publishes fewer than the two
     /// `vala.file_list` rows a promotion group needs.
     pub(crate) async fn start(table_name: &str) -> Self {
+        let schema = ingress_schema();
+        Self::start_with(
+            table_name,
+            value_fields(),
+            &[ingress_batch(&schema, 0), ingress_batch(&schema, 1)],
+        )
+        .await
+    }
+
+    /// Start Postgres, compose the production graph, register `user_fields`,
+    /// and seal one hot object per batch.
+    ///
+    /// Each batch carries its own `wyrd_event_time`, so the caller decides
+    /// which closed day, and therefore which Forge plan, every object joins.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any fixture dependency cannot start, when the table cannot
+    /// be registered, or when a seal publishes no `vala.file_list` row.
+    pub(crate) async fn start_with(
+        table_name: &str,
+        user_fields: Vec<Field>,
+        batches: &[RecordBatch],
+    ) -> Self {
         ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
@@ -1090,24 +1117,8 @@ impl PromotionIntegrationFixture {
         )
         .await;
 
-        let binding = create_table(&catalog, tenant, table_name).await;
+        let binding = create_table(&catalog, tenant, table_name, user_fields).await;
         let operator_pool = database.operator_pool().clone();
-        let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
-            .fetch_one(operator_pool.pool())
-            .await
-            .expect("fixture seed marker");
-        let ingress_schema = ingress_schema();
-        for file_number in 0..2_i64 {
-            append_and_seal(
-                &scribe,
-                &catalog,
-                tenant,
-                &binding,
-                &ingress_batch(&ingress_schema, file_number),
-            )
-            .await;
-        }
-        age_files(&operator_pool, tenant, &binding, seeded_at).await;
 
         let fixture = Self {
             catalog,
@@ -1125,12 +1136,7 @@ impl PromotionIntegrationFixture {
             _wal_root: wal_root,
             _scratch_root: scratch_root,
         };
-        let sealed = fixture.file_rows().await;
-        assert_eq!(
-            sealed.len(),
-            2,
-            "a real Scribe seal must publish two hot objects, saw {sealed:?}"
-        );
+        fixture.seal(batches).await;
         fixture
     }
 
@@ -1318,28 +1324,45 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when a seal publishes no new `vala.file_list` row.
     pub(crate) async fn seal_more(&self, count: usize) {
+        let first = i64::try_from(self.file_rows().await.len())
+            .expect("fixture row counts stay representable");
+        let count = i64::try_from(count).expect("fixture seal counts stay representable");
+        let schema = ingress_schema();
+        let batches: Vec<RecordBatch> = (first..first + count)
+            .map(|file_number| ingress_batch(&schema, file_number))
+            .collect();
+        self.seal(&batches).await;
+    }
+
+    /// Seals one hot object per batch into the fixture table and ages them.
+    ///
+    /// Each batch is appended and sealed through the real Scribe on its own,
+    /// so every batch becomes exactly one `vala.file_list` row. The new rows
+    /// are then backdated past Forge's settle floor so the next pass sees them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seal publishes no new `vala.file_list` row.
+    pub(crate) async fn seal(&self, batches: &[RecordBatch]) {
         let before = self.file_rows().await.len();
-        let first = i64::try_from(before).expect("fixture row counts stay representable");
         let seeded_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
             .fetch_one(self.operator_pool.pool())
             .await
             .expect("fixture seed marker");
-        let schema = ingress_schema();
-        for file_number in 0..i64::try_from(count).expect("fixture seal counts stay representable")
-        {
+        for batch in batches {
             append_and_seal(
                 &self.scribe,
                 &self.catalog,
                 self.tenant,
                 &self.binding,
-                &ingress_batch(&schema, first + file_number),
+                batch,
             )
             .await;
         }
         age_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
         assert_eq!(
             self.file_rows().await.len(),
-            before + count,
+            before + batches.len(),
             "a real Scribe seal publishes one row per batch"
         );
     }
@@ -1446,7 +1469,7 @@ impl PromotionIntegrationFixture {
         name: &str,
         count: usize,
     ) {
-        let binding = create_table(&self.catalog, tenant, name).await;
+        let binding = create_table(&self.catalog, tenant, name, value_fields()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -1470,7 +1493,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
-        let binding = create_table(&self.catalog, self.tenant, name).await;
+        let binding = create_table(&self.catalog, self.tenant, name, value_fields()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -2813,14 +2836,18 @@ pub(crate) fn fixture_day() -> chrono::NaiveDate {
 /// `wyrd_event_time` is carried explicitly so the fixture selects its own event
 /// day; Scribe lifts that column into the managed slot verbatim.
 fn ingress_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![
-        Field::new("value", DataType::Int64, false),
-        Field::new(
-            WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-    ]))
+    let mut fields = value_fields();
+    fields.push(Field::new(
+        WYRD_EVENT_TIME,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    ));
+    Arc::new(ArrowSchema::new(fields))
+}
+
+/// User fields of the default fixture table: one non-null `value` column.
+fn value_fields() -> Vec<Field> {
+    vec![Field::new("value", DataType::Int64, false)]
 }
 
 /// Builds one two-row ingress batch whose event times land in its own closed day.
@@ -2962,7 +2989,8 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     bytes::Bytes::from(ipc)
 }
 
-/// Registers the fixture table through the real catalog and returns its binding.
+/// Registers the fixture table with `user_fields` through the real catalog and
+/// returns its binding.
 ///
 /// # Panics
 ///
@@ -2971,6 +2999,7 @@ async fn create_table(
     catalog: &BifrostCatalog,
     tenant: DataTenantId,
     table_name: &str,
+    user_fields: Vec<Field>,
 ) -> TenantTableBinding {
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
@@ -2978,7 +3007,7 @@ async fn create_table(
     catalog
         .create_table(CreateTableRequest {
             table: binding.table_ref.clone(),
-            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            user_fields,
             tenant,
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
                 partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,

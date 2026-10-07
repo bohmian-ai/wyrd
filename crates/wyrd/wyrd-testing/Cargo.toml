@@ -125,6 +125,8 @@ datafusion-proto = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }
+# The Variant recovery journey builds Variant ingest batches from JSON.
+parquet-variant-compute = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

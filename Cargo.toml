@@ -233,20 +233,20 @@ parquet = "60.0"
 parquet-variant = "60.0"
 parquet-variant-compute = "60.0"
 parquet-variant-json = "60.0"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "c41cbd0ca8a2e4ca34ffc994c553682206908f70" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "fdc02e0a0847f3219e234f81ee6b7a2ff0d67418" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "c41cbd0ca8a2e4ca34ffc994c553682206908f70" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "c41cbd0ca8a2e4ca34ffc994c553682206908f70" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "fdc02e0a0847f3219e234f81ee6b7a2ff0d67418" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "fdc02e0a0847f3219e234f81ee6b7a2ff0d67418" }
 # Non-blocking local-filesystem Iceberg storage for Scribe staged-run reads;
 # already in the graph through the managed compaction core.
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "c41cbd0ca8a2e4ca34ffc994c553682206908f70", default-features = false, features = ["opendal-fs"] }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "fdc02e0a0847f3219e234f81ee6b7a2ff0d67418", default-features = false, features = ["opendal-fs"] }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 60 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "c04c45f89e335c82d6f447c01f9ceb9292943969" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "a52462a2114e6912b0c7fdf903abcbb31b7d7136" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

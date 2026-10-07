@@ -149,8 +149,8 @@ Each status was found by searching the tree for that scenario's named tests.
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| 1. Only final output files infer a bounded standard layout | **Implemented, not pushed** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70` (Variant writer on top of `bee81f957`), iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`; Wyrd changes uncommitted. Evidence and new items below |
-| 2. Recovery and compaction preserve standard logical values | **Not started** | `variant_staging_restores_and_publishes_once`, `rolled_outputs_infer_independent_variant_layouts` and `standard_variant_layouts_round_trip_per_file` absent |
+| 1. Only final output files infer a bounded standard layout | **Committed locally (`509f972c6`), not pushed; Forge memory part superseded by spec revision 19** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70`, iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`. `reserve_variant_prefixes` (a fixed `RUNNER_MAX_PARALLELISM` × 64 MiB task reservation) contradicts revision 19 REQ-030, REQ-031, INV-009 and AC-012/AC-013, which require charging live retained prefix bytes to the attempt's DataFusion pool and a `max(1, effective_cpu * 4)` planning maximum. TASK-004 owns that rework after TASK-003 integrates |
+| 2. Recovery and compaction preserve standard logical values | **Implemented, not pushed** | iceberg-rust `fdc02e0a0847f3219e234f81ee6b7a2ff0d67418` (reader unshreds), iceberg-compaction `28f35fc9fd39b1e4879e7652f074f1630ca417cb` (test) and `a52462a2114e6912b0c7fdf903abcbb31b7d7136` (repin). Evidence below |
 | 3. Distinct logical semantics share physical pushdown | **Partly done** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`. The DataFusion fork per-file read plan (`per_file_plan_covers_projection_filter_and_pruning` in the fork) and `oracle::nested_pushdown::tests::both_readers_use_shared_per_file_plan` exist. The journey `published::struct_and_variant_share_physical_pushdown` is absent. |
 | 4. Unsigned distributed predicates preserve authority | **Partly done** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). The journeys `distributed::unsigned_leaf_predicates_round_trip_and_execute` and MCP `sensitive_variant_leaf_is_denied_before_io` are absent. |
 | Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
@@ -181,6 +181,30 @@ shared buffers in full, so a per-row cut cannot be measured.
 | `BIFROST_VARIANT_SHREDDING` | `parquet/writer_properties.rs` | the one Bifrost policy value |
 | `RUNNER_MAX_PARALLELISM` | `forge/managed/policy.rs` | was an inline literal; now shared with the reservation |
 | `reserve_variant_prefixes`, `open_inferred`, `write_open`, `roll_if_due`, `variant_error` | `RollingArtifactWriter`, Forge executor | split of the existing write/roll path so replay rolls once |
+
+#### Scenario 2 evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Staged runs restore after restart and publish once with logical values | Scribe recovery unchanged; journey `crates/wyrd/wyrd-testing/tests/bifrost/scribe/recovery.rs` | `recovery::variant_staging_restores_and_publishes_once`: 1 passed (exit 0) | PASS |
+| Each rolled compaction output infers its own layout | iceberg-compaction `executor::datafusion::tests::rolled_outputs_infer_independent_variant_layouts` | passed; compaction core 153 passed | PASS |
+| Iceberg reader returns logical Variant from shredded files | iceberg-rust `projection::unshred_variant_columns`, called in `pipeline.rs`; the old shredded-layout rejection is removed | 363 arrow/writer/scan tests passed; pinned nightly clippy 0 | PASS |
+| Hot, published, rewrite and twice-compacted reads equal input; one layout per file; no union; output `DataFile` counts its object; handoffs name the base snapshot | journey `forge::managed_rewrite::standard_variant_layouts_round_trip_per_file`; fixture `PromotionIntegrationFixture::start_with` and `seal` (shared by `start` and `seal_more`), `PromotedRewriteFixture::object_batches` (shared by `object_row_values`) | focused journey: 1 passed (exit 0); whole redux integration binary: 72 passed (exit 0) | PASS |
+| Lints | — | `mise run fmt` 0; redux integration clippy `-D warnings` 0; `git diff --check` 0 | PASS |
+
+WAL diagnosis (recovery journey): the first run asserted the WAL segment was
+gone immediately after drain and failed (`shard-00/0.wal` present). Cause:
+only closed segments are deleted, by `retire_committed` on the shard age tick
+(`ShardCommand::FlushExpired`); see `wal.rs`
+`retirement_deletes_only_closed_segments`. The new test waits for retirement
+with a 30 s deadline. No existing assertion changed.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `PromotionIntegrationFixture::start_with`, `seal`, `value_fields` | `start`, `seal_more`, `seal_builtin_table` | `start` and `seal_more` now delegate; one seal path |
+| `PromotedRewriteFixture::object_batches` | `object_row_values` | extracted; `object_row_values` now uses it |
+| `variant_batch`, `logical_rows`, `shredded_fields`, `document_keys`, `assert_per_file_layouts`, `published_rows`, `expected_rows` (journey) | `flat_builtin_batch` (fixed one-key shape per field, cannot vary layout by day), `LineageTable` (reused for the rewrite loop) | the scenario needs different document shapes per day |
+| `unshred_variant_columns` (iceberg-rust) | Arrow `unshred_variant` (used), reader projection | applies Arrow's unshred to each Variant column of a batch |
 
 ### Arrow 60 upgrade (user decision, before Scenario 1)
 

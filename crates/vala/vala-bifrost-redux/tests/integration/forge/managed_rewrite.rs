@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow::array::{Array as _, AsArray as _, RecordBatch};
+use arrow::array::{Array as _, AsArray as _, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Int64Type};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
 use arrow::util::display::array_value_to_string;
 use futures_util::TryStreamExt as _;
 use iceberg::metadata_columns::{
@@ -25,6 +25,7 @@ use iceberg::metadata_columns::{
 };
 use iceberg::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType, Operation};
 use iceberg::table::Table;
+use parquet_variant_compute::{VariantArray, unshred_variant, variant_to_json};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
@@ -33,11 +34,14 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::builtin_tables;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_types::variant::variant_field;
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
-    remove_table_properties, set_table_properties,
+    fixture_day, remove_table_properties, set_table_properties,
 };
 
 /// Runs one whole attempt over the promoted snapshot with no plan budget.
@@ -1559,4 +1563,293 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
         "the fresh rows are promoted"
     );
     supervisor.shutdown().await;
+}
+
+/// One logical row of the Variant scenario: its key and its JSON document.
+type VariantRow = (i64, serde_json::Value);
+
+/// Builds one ingress batch of `docs` whose event times land `day` days before
+/// the fixture day, so each batch is its own closed partition and Forge plan.
+///
+/// # Panics
+///
+/// Panics when a document cannot be encoded or the batch cannot be assembled.
+fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
+    let noon = (fixture_day() - chrono::Duration::days(day))
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let mut variants = VariantColumnBuilder::with_capacity(docs.len());
+    for (_, doc) in docs {
+        variants.append(&EncodedVariant::from_json(doc).expect("fixture Variant encodes"));
+    }
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+            Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                docs.iter().map(|(key, _)| *key),
+            )),
+            variants.finish(),
+            Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    (0..i64::try_from(docs.len()).expect("bounded fixture rows"))
+                        .map(|row| noon + row),
+                )
+                .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .expect("fixture Variant batch")
+}
+
+/// Reads every row of `batches` as its key and its logical JSON document.
+///
+/// The Variant column is unshredded first, so a shredded object and an
+/// unshredded scan of the same rows read back identically.
+///
+/// # Panics
+///
+/// Panics when a batch lacks either column or a value cannot be rendered.
+fn logical_rows(batches: &[RecordBatch]) -> BTreeSet<(i64, String)> {
+    let mut rows = BTreeSet::new();
+    for batch in batches {
+        let keys = batch
+            .column_by_name("value")
+            .expect("the key column")
+            .as_primitive::<Int64Type>();
+        let variant = VariantArray::try_new(batch.column_by_name("v").expect("the Variant column"))
+            .expect("Variant storage");
+        let logical: arrow::array::ArrayRef = unshred_variant(&variant).expect("unshred").into();
+        let json = variant_to_json(&logical).expect("Variant JSON");
+        for row in 0..batch.num_rows() {
+            let doc: serde_json::Value =
+                serde_json::from_str(json.value(row)).expect("Variant JSON parses");
+            rows.insert((keys.value(row), doc.to_string()));
+        }
+    }
+    rows
+}
+
+/// Renders the scenario's input rows the way [`logical_rows`] reads them.
+fn expected_rows(docs: &[VariantRow]) -> BTreeSet<(i64, String)> {
+    docs.iter()
+        .map(|(key, doc)| (*key, doc.to_string()))
+        .collect()
+}
+
+/// Returns the shredded field names of column `v` in one stored object.
+///
+/// An unshredded object returns no names.
+///
+/// # Panics
+///
+/// Panics when the object has no batch or no Variant column.
+fn shredded_fields(batches: &[RecordBatch]) -> Vec<String> {
+    let column = batches[0].column_by_name("v").expect("the Variant column");
+    match VariantArray::try_new(column)
+        .expect("Variant storage")
+        .typed_value_column()
+        .map(arrow::array::Array::data_type)
+    {
+        Some(DataType::Struct(fields)) => fields.iter().map(|field| field.name().clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Returns the top-level keys of every document an object holds, sorted.
+fn document_keys(rows: &BTreeSet<(i64, String)>) -> Vec<String> {
+    let keys: BTreeSet<String> = rows
+        .iter()
+        .flat_map(|(_, doc)| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(doc)
+                .expect("an object document")
+                .into_iter()
+                .map(|(key, _)| key)
+        })
+        .collect();
+    keys.into_iter().collect()
+}
+
+/// Asserts every object infers exactly its own layout and keeps its rows.
+///
+/// Each object's shredded fields must equal the keys of the documents it
+/// holds: a table-wide union would add keys another object's documents carry.
+/// The union of every object's logical rows must equal `expected`.
+///
+/// # Panics
+///
+/// Panics when an object's layout or the combined rows differ.
+async fn assert_per_file_layouts(
+    promoted: &PromotedRewriteFixture,
+    paths: &[String],
+    expected: &BTreeSet<(i64, String)>,
+    read: &str,
+) {
+    let mut rows = BTreeSet::new();
+    for path in paths {
+        let batches = promoted.object_batches(path).await;
+        let object_rows = logical_rows(&batches);
+        assert_eq!(
+            shredded_fields(&batches),
+            document_keys(&object_rows),
+            "{read} object {path} shreds exactly its own documents' fields"
+        );
+        rows.extend(object_rows);
+    }
+    assert_eq!(&rows, expected, "{read} objects keep every logical row");
+}
+
+/// Reads every live row of the table through the Iceberg reader.
+///
+/// # Panics
+///
+/// Panics when the scan fails.
+async fn published_rows(promoted: &PromotedRewriteFixture) -> BTreeSet<(i64, String)> {
+    let batches: Vec<RecordBatch> = promoted
+        .load_table()
+        .await
+        .scan()
+        .select(["value", "v"])
+        .build()
+        .expect("published scan builds")
+        .to_arrow()
+        .await
+        .expect("published scan starts")
+        .try_collect()
+        .await
+        .expect("published scan reads");
+    logical_rows(&batches)
+}
+
+/// Standard Variant layouts round-trip through Scribe, promotion, and Forge
+/// with one inferred layout per file.
+///
+/// Two closed days hold documents of different shapes (`a` integers, `b`
+/// strings), so each sealed object, each rewrite plan, and each rewrite output
+/// infers its own layout. Logical rows are compared on the hot objects, the
+/// published table, one non-committing rewrite's outputs, and after every
+/// original row has been rewritten twice by the production scheduler. Each
+/// handoff's outputs must describe the objects written (row count, size) and
+/// name the evidence's base snapshot, and no object may shred another day's
+/// fields. Rolled outputs may close in any order, so outputs are compared as
+/// a set.
+///
+/// # Panics
+///
+/// Panics when any read differs from the input rows, a layout is a union, or
+/// a handoff does not describe its outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn standard_variant_layouts_round_trip_per_file() {
+    let mut docs: Vec<VariantRow> = vec![
+        (1, serde_json::json!({"a": 1})),
+        (2, serde_json::json!({"a": 2})),
+        (3, serde_json::json!({"b": "x"})),
+        (4, serde_json::json!({"b": "y"})),
+    ];
+    let fixture = PromotionIntegrationFixture::start_with(
+        "variant_layouts",
+        vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+        ],
+        &[variant_batch(0, &docs[..2]), variant_batch(1, &docs[2..])],
+    )
+    .await;
+    let promoted = PromotedRewriteFixture { fixture };
+    let fixture = &promoted.fixture;
+
+    let hot: Vec<String> = fixture
+        .file_rows()
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect();
+    assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
+
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+    let mut tables = [LineageTable::new(fixture.binding.clone(), "value")];
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(tables[0].rows.len(), 4, "the Variant rows are promoted");
+    tables[0].freeze_original();
+    assert_eq!(
+        published_rows(&promoted).await,
+        expected_rows(&docs),
+        "the published read returns the logical rows"
+    );
+
+    let run = rewrite_whole_attempt(&promoted).await;
+    assert_eq!(run.handoffs.len(), 2, "one plan per closed day");
+    for handoff in &run.handoffs {
+        assert_eq!(
+            handoff.base_snapshot_id,
+            run.evidence().base_snapshot_id,
+            "each handoff names the snapshot the evidence was derived from"
+        );
+        for output in &handoff.output_data_files {
+            let batches = promoted.object_batches(output.file_path()).await;
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(
+                output.record_count(),
+                u64::try_from(rows).expect("bounded fixture rows"),
+                "the output DataFile counts the rows its object holds"
+            );
+        }
+    }
+    assert_per_file_layouts(
+        &promoted,
+        &run.output_paths(),
+        &expected_rows(&docs),
+        "rewrite",
+    )
+    .await;
+
+    let mut day = 2;
+    for _ in 0..LINEAGE_STEPS {
+        if tables[0].rewritten_twice() {
+            break;
+        }
+        if !tables[0].owes_compaction(fixture, &supervisor) {
+            let first = docs.len();
+            let key = i64::try_from(first).expect("bounded fixture rows") + 1;
+            docs.push((key, serde_json::json!({ format!("d{day}"): key })));
+            fixture.seal(&[variant_batch(day, &docs[first..])]).await;
+            day += 1;
+        }
+        advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    }
+    assert!(
+        tables[0].rewritten_twice(),
+        "every original Variant row was rewritten twice"
+    );
+    supervisor.shutdown().await;
+
+    let live: Vec<String> = promoted
+        .live_data_files()
+        .await
+        .iter()
+        .map(|file| file.file_path().to_owned())
+        .collect();
+    assert_per_file_layouts(&promoted, &live, &expected_rows(&docs), "twice-compacted").await;
+    assert_eq!(
+        published_rows(&promoted).await,
+        expected_rows(&docs),
+        "the twice-compacted read returns the logical rows"
+    );
 }

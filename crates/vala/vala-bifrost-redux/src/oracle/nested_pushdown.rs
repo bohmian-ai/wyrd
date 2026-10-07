@@ -465,8 +465,46 @@ mod tests {
         );
     }
 
+    /// A nested key reads through whichever leaf holds it: the shredded
+    /// `o.x`, the residual of `o` for the unshredded `o.y`, and null for `o.z`
+    /// when no row keeps a residual under `o`, so Arrow reports it missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan fails to decode or a nested filter returns other
+    /// than its exact rows.
+    #[test]
+    fn nested_variant_keys_filter_through_shredded_and_residual_leaves() {
+        let nested = |key: &str| {
+            OracleVariantSql::shared().text_at(col("v"), &["o".to_owned(), key.to_owned()])
+        };
+        let mixed = write_groups(&[&[
+            r#"{"o":{"x":1,"y":"p"}}"#,
+            r#"{"o":{"x":2}}"#,
+            r#"{"o":{"x":3,"y":"q"}}"#,
+        ]]);
+        let typed_only = write_groups(&[&[r#"{"o":{"x":1}}"#, r#"{"o":{"x":2}}"#]]);
+        for (published, key, text, ids) in [
+            (&mixed, "x", "2", vec![2_i64]),
+            (&mixed, "y", "q", vec![3]),
+            (&typed_only, "z", "q", vec![]),
+        ] {
+            let filter = nested(key).eq(lit(text));
+            let batch = read(
+                published,
+                plan(published, &[("id", col("id"))], Some(&filter)),
+            );
+            assert_eq!(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::from(ids),
+                "{filter}"
+            );
+        }
+    }
+
     /// Writes `groups` of JSON documents as one row group each, with `v`
-    /// shredded on `a: Int64` and ids numbered from 1 across groups.
+    /// shredded on `a: Int64` and `o.x: Int64` and ids numbered from 1
+    /// across groups.
     ///
     /// # Panics
     ///
@@ -474,6 +512,8 @@ mod tests {
     fn write_groups(groups: &[&[&str]]) -> Bytes {
         let layout = ShreddedSchemaBuilder::new()
             .with_path("a", &DataType::Int64)
+            .expect("layout")
+            .with_path("o.x", &DataType::Int64)
             .expect("layout")
             .build();
         let mut id = 0_i64;

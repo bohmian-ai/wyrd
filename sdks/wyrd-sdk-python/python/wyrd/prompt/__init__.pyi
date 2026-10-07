@@ -221,6 +221,17 @@ class ProviderRequest:
 class ProviderResponse:
     """A provider-native response with typed per-provider views."""
 
+    @staticmethod
+    def text(text: str) -> ProviderResponse:
+        """Build a finished OpenAI Chat response whose one assistant message is ``text``.
+
+        Return it from an ``after_model_callback`` to replace the model's
+        answer. It is the deterministic shape the ``mock`` provider returns:
+        id ``mock_response``, model ``mock-model``, finish reason ``stop``,
+        and zero token usage.
+        """
+        ...
+
     @property
     def provider(self) -> str:
         """The response dialect's default provider, such as ``"google"`` for a Vertex body.

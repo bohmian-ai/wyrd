@@ -6,9 +6,6 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use skald_spec::wire::openai_chat::{
-    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiUsage,
-};
 use skald_spec::{ProviderName, ProviderResponse};
 
 use crate::{MockProvider, ProviderRegistry};
@@ -86,7 +83,7 @@ impl PyMockProvider {
 
     /// Queue one more canned assistant response.
     fn push(&self, text: &str) {
-        self.inner.push_response(openai_text_response(text));
+        self.inner.push_response(ProviderResponse::text(text));
     }
 
     /// Return how many canned responses are still queued.
@@ -120,37 +117,4 @@ fn provider_name_label(name: &ProviderName) -> String {
         ProviderName::Vertex => "vertex".to_owned(),
         ProviderName::Custom(value) => value.clone(),
     }
-}
-
-fn openai_text_response(text: &str) -> ProviderResponse {
-    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
-        id: "mock_response".to_owned(),
-        object: "chat.completion".to_owned(),
-        created: 0,
-        model: "mock-model".to_owned(),
-        choices: vec![OpenAiChatChoice {
-            index: 0,
-            message: OpenAiChatMessage {
-                role: "assistant".to_owned(),
-                content: Some(OpenAiMessageContent::Text(text.to_owned())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                refusal: None,
-                annotations: Vec::new(),
-                audio: None,
-            },
-            finish_reason: Some("stop".to_owned()),
-            logprobs: None,
-        }],
-        usage: Some(OpenAiUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        }),
-        system_fingerprint: None,
-        service_tier: None,
-    })
 }

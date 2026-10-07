@@ -289,18 +289,22 @@ def query_table(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture
-def gateway_server(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[tuple[WyrdTestServer, Received]]:
-    """Server whose built-in adapters reach a recording mock upstream."""
-    monkeypatch.setenv("WYRD_TEST_GATEWAY_PROVIDER_KEY", PROVIDER_KEY)
+def gateway_server(wyrd_server: WyrdTestServer) -> Iterator[tuple[WyrdTestServer, Received]]:
+    """Server whose built-in adapters reach a recording mock upstream.
+
+    Starts after the session server and owns its own environment patch, so a
+    test's ``monkeypatch`` unwinds before this server restores the session
+    endpoints.
+    """
     received: Received = []
     handler = type("RecordingUpstream", (Upstream,), {"received": received})
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     try:
         base = f"http://127.0.0.1:{upstream.server_address[1]}"
-        with WyrdTestServer(provider_base_url=base) as server:
-            yield server, received
+        with pytest.MonkeyPatch.context() as env:
+            env.setenv("WYRD_TEST_GATEWAY_PROVIDER_KEY", PROVIDER_KEY)
+            with WyrdTestServer(provider_base_url=base) as server:
+                yield server, received
     finally:
         upstream.shutdown()

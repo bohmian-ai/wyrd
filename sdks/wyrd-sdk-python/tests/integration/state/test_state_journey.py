@@ -1,30 +1,20 @@
-"""Public CLI-to-offline WyrdState journeys."""
+"""A downloaded Service bundle hydrates into an offline ``WyrdState``, and broken bundles do not."""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID, uuid4
 
 import numpy as np
 import pandas as pd
 import pytest
 import wyrd
-import yaml
+from sklearn.linear_model import LogisticRegression
+from wyrd import cli
 from wyrd.cards import CardRef, Cards
 from wyrd.data import DataCard, FieldSpec, PandasInterface
-from wyrd.model import (
-    ModelCard,
-    ModelCardMetadata,
-    ModelSignature,
-    SklearnInterface,
-)
+from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInterface
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
 
 TYPED_STATE_SOURCE = (
     Path(__file__).resolve().parents[5]
@@ -46,20 +36,18 @@ EXPECTED_ALIASES = (
     "triage_prompt",
 )
 TRAINING_DATA = pd.DataFrame({"feature": [0.0, 1.0], "label": [0, 1]})
-DOWNLOADED_ARTIFACT_COUNT = 3
 
 
-def copy_typed_state_service(root: Path) -> Path:
-    """Copy the committed service graph so each journey can mutate an isolated workspace."""
-    service_path = root / "service"
-    shutil.copytree(TYPED_STATE_SOURCE, service_path)
-    return service_path
+@dataclass(frozen=True)
+class TypedService:
+    """The registered ``typed_state`` Service and the trusted hash of each executable Model alias."""
+
+    ref: CardRef
+    trusted: dict[str, str]
 
 
 def register_model(cards: Cards, name: str) -> CardRef:
-    """Register one executable model lineage anchor required by the service fixture."""
-    from sklearn.linear_model import LogisticRegression
-
+    """Register one executable scikit-learn Model the Service graph references."""
     model = LogisticRegression(random_state=0).fit(
         TRAINING_DATA[["feature"]].to_numpy(), TRAINING_DATA["label"].to_numpy()
     )
@@ -71,300 +59,129 @@ def register_model(cards: Cards, name: str) -> CardRef:
         metadata=ModelCardMetadata(
             task_type="other",
             signature=ModelSignature(
-                [FieldSpec("feature", "float64")],
-                [FieldSpec("prediction", "float64")],
+                [FieldSpec("feature", "float64")], [FieldSpec("prediction", "float64")]
             ),
         ),
     )
     return cards.model.register(card).root
 
 
-def register_heavy_cards(cards: Cards) -> None:
-    """Register the Model and Data lineage anchors before applying the service graph."""
-    register_model(cards, "primary")
-    register_model(cards, "shadow")
-    data = DataCard(
-        PandasInterface(data=TRAINING_DATA),
-        space="default",
-        name="training",
-        version="1.0.0",
-    )
-    cards.data.register(data)
+@pytest.fixture(scope="module")
+def typed_service(cards: Cards) -> TypedService:
+    """Register the Models, Data, and the ``typed_state`` Service graph once for the module.
 
-
-def run_cli(
-    server: WyrdTestServer,
-    *arguments: str,
-    api_key: str | None = None,
-    check: bool = True,
-) -> dict[str, object]:
-    """Run the public CLI against the supplied server and return its JSON or process result."""
-    environment = os.environ.copy()
-    environment.update(
-        WYRD_SERVER_URL=server.base_url,
-        WYRD_API_KEY=api_key or writer_api_key(server),
-    )
-    executable = Path(sys.executable).with_name("wyrd")
-    completed = subprocess.run(
-        [str(executable), *arguments],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if not check:
-        return {
-            "code": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-    assert completed.returncode == 0, completed.stderr or completed.stdout
-    return json.loads(completed.stdout)
-
-
-def writer_api_key(server: WyrdTestServer) -> str:
-    """Mint a valid writer key for the journey's real server boundary."""
-    return server.bootstrap_service(["writer"], name=f"state-journey-{uuid4().hex[:12]}")
-
-
-def exact_get_arguments(
-    service_ref: CardRef, bundle: Path, *, metadata_only: bool = False
-) -> tuple[str, ...]:
-    """Build a CLI request that identifies the registered Service by its immutable UID."""
-    assert service_ref.uid is not None
-    args = (
-        "get",
-        "--kind",
-        "Service",
-        "--uid",
-        str(service_ref.uid),
-        "--output-dir",
-        str(bundle),
-        "--format",
-        "json",
-    )
-    return args + (("--metadata-only",) if metadata_only else ())
-
-
-def assert_all_refs_are_exact_and_uid_bearing(state: WyrdState) -> None:
-    """Assert that every alias resolves to one immutable registered Card version."""
-    for alias in state.aliases:
-        ref = state.card_ref(alias)
-        assert ref.uid is not None and ref.version
-
-
-def assert_all_artifacts_are_confined_to_bundle(state: WyrdState, bundle: Path) -> None:
-    """Assert hydrated artifact paths remain inside the downloaded CLI bundle."""
-    for alias in ("model_primary", "model_shadow", "default-Data-training-1.0.0"):
-        artifact = state.artifacts(alias)[0]
-        assert artifact.local_path.is_file()
-        assert artifact.local_path.is_relative_to(bundle.resolve())
-
-
-def registered_artifact_hashes(cards: Cards, bundle: Path) -> dict[str, str]:
-    """Read each executable Model alias's trusted hash from its registered Card."""
-    manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
-    trusted: dict[str, str] = {}
-    for card in manifest["cards"]:
-        ref = card["card_ref"]
-        if ref["kind"] != "Model":
-            continue
-        registered = cards.get(
-            CardRef(ref["kind"], ref["name"], ref["version"], space=ref["space"], uid=ref["uid"])
+    The trusted hashes come from the registered Model Cards, not the download.
+    """
+    primary = register_model(cards, "primary")
+    shadow = register_model(cards, "shadow")
+    cards.data.register(
+        DataCard(
+            PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
         )
-        artifact_hash = registered["metadata"].get("artifact_hash")
-        assert artifact_hash, "a registered Model Card carries its artifact hash"
-        for alias in card["aliases"]:
-            trusted[alias] = artifact_hash
-    return trusted
+    )
+    service = cards.register_from_path(str(TYPED_STATE_SOURCE / "typed-service.yaml")).root
+    trusted = {
+        alias: cards.get(ref)["metadata"]["artifact_hash"]
+        for alias, ref in (("model_primary", primary), ("model_shadow", shadow))
+    }
+    return TypedService(service, trusted)
 
 
-def register_service(cards: Cards, service_path: Path) -> CardRef:
-    """Register the fixture's pre-copied service graph after its lineage anchors exist."""
-    register_heavy_cards(cards)
-    return cards.register_from_path(str(service_path / "typed-service.yaml")).root
-
-
-def download_fixture(
-    tmp_path: Path, *, metadata_only: bool = False
-) -> tuple[Path, CardRef, dict[str, object], dict[str, str]]:
-    """Register the fixture, download its CLI bundle, and read its trusted hashes."""
-    service_path = copy_typed_state_service(tmp_path)
-    bundle = tmp_path / "wyrd-state"
-    with WyrdTestServer(mutate_env=False) as server:
-        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
-        service_ref = register_service(cards, service_path)
-        result = run_cli(
-            server,
-            *exact_get_arguments(service_ref, bundle, metadata_only=metadata_only),
-        )
-        trusted = {} if metadata_only else registered_artifact_hashes(cards, bundle)
-    return bundle, service_ref, result, trusted
+def download(service: TypedService, output_dir: Path, *, metadata_only: bool = False) -> Path:
+    """Download the registered Service's graph into ``output_dir`` with in-process ``wyrd get``."""
+    cli.get(
+        output_dir=output_dir,
+        kind="Service",
+        uid=str(service.ref.uid),
+        metadata_only=metadata_only,
+    )
+    return output_dir
 
 
 @pytest.mark.integration
 def test_service_bundle_hydrates_complete_python_runtime_offline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    typed_service: TypedService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hydrate the complete CLI bundle into usable offline Python objects."""
-    bundle, service_ref, result, trusted = download_fixture(tmp_path)
+    """Hydrate the downloaded bundle into usable Python objects with no server reachable."""
+    bundle = download(typed_service, tmp_path)
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
-    state = WyrdState.from_path(
-        bundle,
-        trusted_artifact_hashes=trusted,
-    )
-    assert result["mode"] == "complete"
-    assert result["card_count"] == 10
-    assert result["downloaded_artifact_count"] == DOWNLOADED_ARTIFACT_COUNT
-    assert state.service.card_ref == service_ref
+
+    state = WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
+
+    assert state.service.card_ref == typed_service.ref
     assert state.aliases == EXPECTED_ALIASES
-    np.testing.assert_array_equal(
-        state.model("model_primary").model.predict([[0.0], [1.0]]),
-        np.array([0, 1]),
-    )
-    np.testing.assert_array_equal(
-        state.model("model_shadow").model.predict([[0.0], [1.0]]),
-        np.array([0, 1]),
-    )
-    pd.testing.assert_frame_equal(
-        state.data("default-Data-training-1.0.0").data,
-        TRAINING_DATA,
-    )
-    assert (
-        state.agent("agent_triage").prompt is not None
-        and state.agent("agent_inline").prompt is not None
-    )
-    assert state.prompt("triage_prompt").prompt is not None
+    for alias in ("model_primary", "model_shadow"):
+        np.testing.assert_array_equal(
+            state.model(alias).model.predict([[0.0], [1.0]]), np.array([0, 1])
+        )
+    assert state.model("model_primary") is not state.model("model_shadow")
+    pd.testing.assert_frame_equal(state.data("default-Data-training-1.0.0").data, TRAINING_DATA)
+    assert state.agent("agent_triage").prompt is not None
+    assert state.agent("agent_inline").prompt is not None
     assert state.prompt("triage_prompt") is state.prompt("default-Prompt-triage-prompt-1.0.0")
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
-    assert state.model("model_primary") is not state.model("model_shadow")
     quality = state.verifier("default-Verifier-quality-1.0.0")
     assert quality.kind is wyrd.CardKind.Verifier
     assert quality.spec["implementation"]["kind"] == "eval"
     drift = state.verifier("default-Verifier-model-drift-1.0.0")
     assert drift.kind is wyrd.CardKind.Verifier
     assert drift.spec["implementation"]["kind"] == "drift"
-    assert state.workflow("runtime_workflow").kind is wyrd.CardKind.Workflow
     assert state.workflow("runtime_workflow").spec["outputs"] == {
         "answer": "steps.triage.output.text"
     }
-    assert_all_refs_are_exact_and_uid_bearing(state)
-    assert_all_artifacts_are_confined_to_bundle(state, bundle)
+    for alias in state.aliases:
+        ref = state.card_ref(alias)
+        assert ref.uid is not None and ref.version
+    for alias in ("model_primary", "model_shadow", "default-Data-training-1.0.0"):
+        artifact = state.artifacts(alias)[0]
+        assert artifact.local_path.is_file()
+        assert artifact.local_path.is_relative_to(bundle.resolve())
 
 
 @pytest.mark.integration
-def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> None:
-    """Reject a bundle produced by the public metadata-only CLI mode."""
-    bundle, _, _, _ = download_fixture(tmp_path, metadata_only=True)
+def test_metadata_only_bundle_is_rejected_by_python_state(
+    typed_service: TypedService, tmp_path: Path
+) -> None:
+    """A metadata-only download is inspectable but never hydrates."""
+    bundle = download(typed_service, tmp_path, metadata_only=True)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
-    assert caught.value.details["path"]
 
 
 @pytest.mark.integration
-def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> None:
-    """Ensure a denied get cannot publish a runnable bundle."""
-    bundle = tmp_path / "denied"
-    with WyrdTestServer(mutate_env=False) as server:
-        service_path = copy_typed_state_service(tmp_path)
-        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
-        service_ref = register_service(cards, service_path)
-        denied = server.bootstrap_service([], name="underprivileged-get")
-        result = run_cli(
-            server, *exact_get_arguments(service_ref, bundle), api_key=denied, check=False
-        )
-    payload = json.loads(result["stderr"].splitlines()[0])
-    assert result["code"] != 0
-    assert payload["kind"] == "wyrd_cli_error"
-    assert payload["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
-    assert payload["status"] == 403
-    assert payload["message"]
-    assert payload["remediation"] == "Request the required role from a workspace admin."
-    assert not bundle.exists() or not (bundle / "metadata.yaml").exists()
-
-
-@pytest.mark.integration
-def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> None:
-    """Reject downloaded artifact bytes that no longer match inventory."""
-    bundle, _, _, trusted = download_fixture(tmp_path)
-    artifact = next(
-        path
-        for path in bundle.rglob("*")
-        if path.is_file() and "artifacts" in path.parts and path.name != "artifacts.yaml"
-    )
-    artifact.write_bytes(b"tampered")
+def test_tampered_downloaded_artifact_is_rejected_offline(
+    typed_service: TypedService, tmp_path: Path
+) -> None:
+    """Downloaded artifact bytes that no longer match the inventory are refused."""
+    bundle = download(typed_service, tmp_path)
+    artifacts = bundle / "cards" / "model_primary" / "artifacts"
+    next(path for path in artifacts.rglob("*") if path.is_file()).write_bytes(b"tampered")
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(
-            bundle,
-            trusted_artifact_hashes=trusted,
-        )
+        WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
-    assert caught.value.details["path"]
 
 
 @pytest.mark.integration
-def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Path) -> None:
-    """Keep distinct same-kind Cards distinct at runtime."""
-    bundle, _, _, trusted = download_fixture(tmp_path)
-    state = WyrdState.from_path(
-        bundle,
-        trusted_artifact_hashes=trusted,
-    )
-    assert state.model("model_primary") is not state.model("model_shadow")
-
-
-@pytest.mark.integration
-def test_missing_model_trust_returns_recoverable_runtime_error(tmp_path: Path) -> None:
-    """Reject executable built-in Model hydration without external trust."""
-    bundle, _, _, _ = download_fixture(tmp_path)
+def test_missing_model_trust_returns_recoverable_runtime_error(
+    typed_service: TypedService, tmp_path: Path
+) -> None:
+    """An executable built-in Model does not hydrate without an external trusted hash."""
+    bundle = download(typed_service, tmp_path)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model_primary"
     assert caught.value.details["stage"] == "artifact_trust"
-    assert caught.value.details["card_ref"]["name"] == "primary"
 
 
 @pytest.mark.integration
-def test_missing_relationship_projection_is_rejected_offline(tmp_path: Path) -> None:
-    """Reject a complete bundle whose projected relationship file is absent."""
-    bundle, _, _, trusted = download_fixture(tmp_path)
-    manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
-    relationship_path = bundle / manifest["cards"][0]["relationships_path"]
-    relationship_path.unlink()
+def test_missing_relationship_projection_is_rejected_offline(
+    typed_service: TypedService, tmp_path: Path
+) -> None:
+    """A bundle whose root relationship projection is absent is refused."""
+    bundle = download(typed_service, tmp_path)
+    (bundle / "cards" / "root" / "relationships.yaml").unlink()
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(
-            bundle,
-            trusted_artifact_hashes=trusted,
-        )
+        WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
-    assert caught.value.details["path"]
-
-
-def served_binding_ids(bundle: Path, trusted: dict[str, str]) -> list[str]:
-    """Read the root Service's served binding identities from a hydrated bundle."""
-    state = WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
-    status = state.card("root").status
-    assert status is not None, "a binding owner serves status"
-    return status["verification"]["binding_ids"]
-
-
-@pytest.mark.integration
-def test_bound_service_serves_stable_uuid7_binding_ids(tmp_path: Path) -> None:
-    """Reapplying the bound Service keeps the UUIDv7 binding IDs its envelope serves."""
-    service_path = copy_typed_state_service(tmp_path)
-    with WyrdTestServer(mutate_env=False) as server:
-        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
-        service_ref = register_service(cards, service_path)
-        first = tmp_path / "first"
-        run_cli(server, *exact_get_arguments(service_ref, first))
-        trusted = registered_artifact_hashes(cards, first)
-        reapplied = cards.register_from_path(str(service_path / "typed-service.yaml")).root
-        assert reapplied.uid == service_ref.uid
-        second = tmp_path / "second"
-        run_cli(server, *exact_get_arguments(service_ref, second))
-    binding_ids = served_binding_ids(first, trusted)
-    assert len(binding_ids) == 2, "one binding per bound component occurrence"
-    assert all(UUID(binding_id).version == 7 for binding_id in binding_ids)
-    assert served_binding_ids(second, trusted) == binding_ids

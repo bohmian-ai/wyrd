@@ -9,8 +9,6 @@ use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
-use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionState;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
@@ -309,7 +307,7 @@ impl OracleCatalogResolver {
     /// governance: its reservations are charged to the request-local pool
     /// backed by the retained worker lease. It is built at the closure schema,
     /// so its Parquet column mask decodes only the signed columns, and split
-    /// across the session's target partitions by byte range.
+    /// by byte range under the shared scan rule.
     ///
     /// # Errors
     /// Returns a scrubbed message when an assigned descriptor is not a hot
@@ -341,7 +339,7 @@ impl OracleCatalogResolver {
                     Arc::new(super::exec::OracleScanMetricsHandle::default()),
                     assignment.predicates.clone(),
                 )
-                .with_partitions(session.config().target_partitions()),
+                .with_partitions(session.config().options()),
             ),
             full_schema,
         })
@@ -542,11 +540,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 )
             })
             .collect::<Vec<_>>();
-        let plan = restrict_plan_to_assigned_files(
-            plan,
-            &restriction,
-            session.config().target_partitions(),
-        )?;
+        let plan = restrict_plan_to_assigned_files(plan, &restriction, session.config().options())?;
         // Footers load through the node's one governed cache, charged to the
         // request-local pool the retained worker lease backs, like hot ranges.
         // Every file is planned through the shared read core against the
@@ -679,8 +673,9 @@ fn live_open_error(error: &ScribeError) -> FollowerResolutionError {
 ///
 /// It turns the opened live read into one `DataFusion` leaf: the memtable cut
 /// as an in-memory source and the unserved staged runs through Oracle's own
-/// hot-Parquet scan, both split across the session's target partitions and
-/// filtered by the signed predicates.
+/// hot-Parquet scan, the memtable split across the session's target
+/// partitions and the staged runs by the shared scan rule, both filtered by
+/// the signed predicates.
 pub struct ScribeTailResolver<T = FetchLiveTailService> {
     /// Existing Scribe snapshot service; this owner calls it once per assignment.
     tail: Arc<T>,
@@ -758,7 +753,7 @@ impl<T> ScribeTailResolver<T> {
     /// across exactly the session's target partitions of one in-memory source,
     /// leaving unused partitions empty, so a sparse cut keeps the session
     /// shape. The unserved staged runs are read by
-    /// [`super::exec::HotParquetExec`] at the same partition count, so they
+    /// [`super::exec::HotParquetExec`], split by the shared scan rule, so they
     /// get the row-group and page pruning, node metadata cache, and grant
     /// charging every Oracle hot read gets; the scan holds the staged lease
     /// until its last stream drops. A signed predicate
@@ -834,7 +829,7 @@ impl<T> ScribeTailResolver<T> {
                 Arc::new(super::exec::OracleScanMetricsHandle::default()),
                 assignment.predicates.clone(),
             )
-            .with_partitions(partitions);
+            .with_partitions(session.config().options());
             let scan = match lease {
                 Some(lease) => scan.with_staged_lease(lease),
                 None => scan,
@@ -1035,20 +1030,22 @@ fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
     .ok_or_else(|| "assignment table binding is not canonical".to_owned())
 }
 
-/// Restricts every file-backed leaf to the exact authenticated assignment.
+/// Restricts every Iceberg leaf to the exact authenticated assignment.
 ///
-/// The Iceberg provider remains responsible for schema, pruning, and tenant
-/// filtering. This final projection removes every unassigned manifest file and
-/// rejects assignments that do not correspond to a planned file. Each Iceberg
-/// leaf reads across `partitions`, the follower session's target partitions.
+/// The catalog's `IcebergStaticTableProvider` plans one `IcebergTableScan`;
+/// each becomes an [`super::exec::OracleIcebergScanExec`] pinned to the
+/// assigned files, which refuses at execute any assigned file the pinned
+/// snapshot did not plan and drops every unassigned one. Each leaf reads across
+/// the partitions the shared scan rule chooses under the follower session's
+/// `options`.
 ///
 /// # Errors
-/// Returns an error when the provider is not file-backed, an assigned location
-/// is absent, or a non-file leaf prevents proving exact file-set equality.
+/// Returns an error when the assignment names a file twice or names an empty
+/// location, or when the plan has no Iceberg leaf to restrict.
 fn restrict_plan_to_assigned_files(
     plan: Arc<dyn ExecutionPlan>,
     assigned_files: &[(String, String, String)],
-    partitions: usize,
+    options: &datafusion::config::ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>, String> {
     let assigned = assigned_files
         .iter()
@@ -1067,19 +1064,9 @@ fn restrict_plan_to_assigned_files(
     {
         return Err("authenticated Oracle assignment contains duplicate or empty files".to_owned());
     }
-    let mut observed = std::collections::BTreeSet::new();
     let mut file_leaves = 0usize;
     let transformed = plan
         .transform_up(|node| {
-            if let Some(exec) = node.downcast_ref::<super::exec::OracleIcebergScanExec>() {
-                file_leaves = file_leaves.saturating_add(1);
-                observed.extend(assigned.iter().cloned());
-                return Ok(Transformed::yes(Arc::new(
-                    exec.clone()
-                        .with_assigned_files(assigned.clone(), relative_assignments.clone())
-                        .with_partitions(partitions),
-                )));
-            }
             if node.is::<IcebergTableScan>() {
                 let restricted = super::exec::OracleIcebergScanExec::from_plan(node.as_ref())
                     .map_err(|_| {
@@ -1088,83 +1075,18 @@ fn restrict_plan_to_assigned_files(
                         )
                     })?
                     .with_assigned_files(assigned.clone(), relative_assignments.clone())
-                    .with_partitions(partitions);
+                    .with_partitions(options);
                 file_leaves = file_leaves.saturating_add(1);
-                observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(restricted)));
             }
-            let Some(exec) = node.downcast_ref::<DataSourceExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() else {
-                return Err(datafusion::common::DataFusionError::Plan(
-                    "Oracle assignment encountered a non-file data source".to_owned(),
-                ));
-            };
-            file_leaves = file_leaves.saturating_add(1);
-            let groups = config
-                .file_groups
-                .iter()
-                .filter_map(|group| {
-                    let files = group
-                        .iter()
-                        .filter(|file| {
-                            let object_path = file.object_meta.location.to_string();
-                            let location = relative_assignments
-                                .get(&object_path)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    physical_file_location(
-                                        config.object_store_url.as_str(),
-                                        &object_path,
-                                    )
-                                });
-                            if assigned.contains(&location) {
-                                observed.insert(location);
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    (!files.is_empty()).then(|| FileGroup::new(files))
-                })
-                .collect();
-            let restricted = FileScanConfigBuilder::from(config.clone())
-                .with_file_groups(groups)
-                .build();
-            Ok(Transformed::yes(Arc::new(
-                exec.clone().with_data_source(Arc::new(restricted)),
-            )))
+            Ok(Transformed::no(node))
         })
         .map_err(|_| "authenticated Oracle file projection failed".to_owned())?
         .data;
-    if file_leaves == 0 || observed != assigned {
-        // Counts only: which files a tenant owns is not safe to name in an
-        // error that crosses the dispatch boundary, but the shape of the
-        // mismatch is what a maintainer needs to tell "no file leaf in this
-        // plan" apart from "the leaf lost files the leader signed for".
-        return Err(format!(
-            "authenticated Oracle assignment differs from planned files: \
-             file_leaves={file_leaves} observed={} assigned={}",
-            observed.len(),
-            assigned.len()
-        ));
+    if file_leaves == 0 {
+        return Err("authenticated Oracle assignment found no Iceberg file leaf".to_owned());
     }
     Ok(transformed)
-}
-
-/// Joins `DataFusion`'s authenticated object-store authority and relative object key.
-fn physical_file_location(store: &str, path: &str) -> String {
-    if store == "file://" {
-        return format!("file:///{}", path.trim_start_matches('/'));
-    }
-    if store.ends_with('/') || path.starts_with('/') {
-        format!("{store}{path}")
-    } else {
-        format!("{store}/{path}")
-    }
 }
 
 /// Concrete owner of preflight, provider resolution, and `DataFusion` decode.
@@ -1669,10 +1591,7 @@ pub(crate) mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::ParquetSource;
     use datafusion::execution::context::SessionContext;
-    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::physical_plan::{ExecutionPlanProperties, collect};
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
@@ -1682,125 +1601,29 @@ pub(crate) mod tests {
     use super::*;
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
 
-    /// Builds a file-backed physical source with the exact supplied catalog paths.
-    fn file_plan(schema: SchemaRef, files: &[&str]) -> Arc<dyn ExecutionPlan> {
-        let source = Arc::new(ParquetSource::new(schema));
-        let groups = vec![FileGroup::new(
-            files
-                .iter()
-                .map(|file| PartitionedFile::new((*file).to_owned(), 1))
-                .collect(),
-        )];
-        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
-            .with_file_groups(groups)
-            .build();
-        DataSourceExec::from_data_source(config)
-    }
-
-    /// Returns every file location still reachable from a restricted source.
+    /// An assignment naming one file twice is refused before the plan is read.
+    ///
+    /// Which assigned files the pinned snapshot planned is checked at execute
+    /// by `OracleIcebergScanExec`; the distributed journeys cover it.
     ///
     /// # Panics
-    /// Panics if the supplied plan is not the file-backed source constructed by
-    /// [`file_plan`] or if that source does not contain a [`FileScanConfig`].
-    fn plan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
-        let exec = plan.downcast_ref::<DataSourceExec>().expect("file source");
-        let config = exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .expect("file scan config");
-        config
-            .file_groups
-            .iter()
-            .flat_map(datafusion::datasource::physical_plan::FileGroup::iter)
-            .map(|file| file.object_meta.location.to_string())
-            .collect()
-    }
-
-    /// Exact Oracle projection excludes unassigned catalog files and fails closed.
-    ///
-    /// # Panics
-    /// Panics if the valid fixture cannot be projected or its file-backed plan
-    /// violates the test construction invariant.
+    /// Panics if the duplicate assignment is accepted.
     #[test]
-    fn oracle_projection_is_exactly_the_authenticated_assignment() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
-        let catalog = file_plan(
-            Arc::clone(&schema),
-            &["assigned.parquet", "unassigned.parquet"],
+    fn duplicate_assigned_files_are_refused() {
+        let location = "file:///assigned.parquet".to_owned();
+        let assigned = (
+            "assigned.parquet".to_owned(),
+            "assigned.parquet".to_owned(),
+            location,
         );
-        let assigned = physical_file_location(
-            ObjectStoreUrl::local_filesystem().as_str(),
-            "assigned.parquet",
-        );
-        let restricted = restrict_plan_to_assigned_files(
-            catalog,
-            &[(
-                ("assigned.parquet").to_owned(),
-                "assigned.parquet".to_owned(),
-                assigned.clone(),
-            )],
-            1,
-        )
-        .expect("exact assigned file remains executable");
-        assert_eq!(plan_files(&restricted), vec!["assigned.parquet"]);
-
-        assert!(
-            restrict_plan_to_assigned_files(
-                file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &[(
-                    "missing.parquet".to_owned(),
-                    "missing.parquet".to_owned(),
-                    physical_file_location(
-                        ObjectStoreUrl::local_filesystem().as_str(),
-                        "missing.parquet",
-                    ),
-                )],
-                1
-            )
-            .is_err()
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(Arc::new(Schema::empty())),
         );
         assert!(
             restrict_plan_to_assigned_files(
-                file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &[
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned.clone(),
-                    ),
-                    (
-                        "extra.parquet".to_owned(),
-                        "extra.parquet".to_owned(),
-                        physical_file_location(
-                            ObjectStoreUrl::local_filesystem().as_str(),
-                            "extra.parquet",
-                        ),
-                    ),
-                ],
-                1
-            )
-            .is_err()
-        );
-        assert!(
-            restrict_plan_to_assigned_files(
-                file_plan(schema, &["assigned.parquet"]),
-                &[
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned.clone(),
-                    ),
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned,
-                    ),
-                ],
-                1
+                plan,
+                &[assigned.clone(), assigned],
+                &datafusion::config::ConfigOptions::default()
             )
             .is_err()
         );
@@ -2155,7 +1978,6 @@ pub(crate) mod tests {
 
     /// Exercises one complete role-local provider resolution and execution.
     async fn prove_role_local_providers_are_isolated_and_consumed_once() {
-        oracle_projection_is_exactly_the_authenticated_assignment();
         let (request, binding) = oracle_request().expect("valid Oracle request");
         let calls = Arc::new(AtomicUsize::new(0));
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -3087,19 +2909,19 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Every live source keeps the session's partition count, however sparse.
+    /// Each live source reads at its own partition count and every row once.
     ///
-    /// At four target partitions, an empty snapshot, a one-batch memtable cut
-    /// (fewer batches than partitions) and a mixed memtable-plus-staged cut
-    /// must each give every source four partitions, with unused groups left
-    /// empty. Draining every partition returns each row exactly once, after
-    /// the signed predicate where one applies.
+    /// At four target partitions, an empty snapshot and a one-batch memtable
+    /// cut (fewer batches than partitions) give the memtable four partitions,
+    /// with unused groups left empty, while a small staged run reads as one
+    /// partition by the shared scan rule. Draining every partition returns
+    /// each row exactly once, after the signed predicate where one applies.
     ///
     /// # Panics
     /// Panics when resolution or execution fails, a source advertises a
     /// different partition count, or the drained rows are not exactly once.
     #[tokio::test]
-    async fn scribe_live_sources_keep_the_session_partition_count() {
+    async fn scribe_live_sources_read_every_row_once_at_their_partition_count() {
         let session = SessionContext::new_with_config(
             datafusion::prelude::SessionConfig::new().with_target_partitions(4),
         )
@@ -3186,7 +3008,7 @@ pub(crate) mod tests {
             .expect("the newer batch inserts");
         let service = Arc::clone(&fixture.service);
         let plan = resolve_staged_fixture(&fixture, service, Vec::new(), &session).await;
-        assert_eq!(live_source_partitions(&plan), vec![4, 4]);
+        assert_eq!(live_source_partitions(&plan), vec![4, 1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the mixed cut executes");

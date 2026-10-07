@@ -55,7 +55,7 @@ pub mod analytical;
 pub mod analytical_scan;
 pub mod analytical_supervisor;
 pub mod analytical_transport;
-mod bindings;
+pub(crate) mod bindings;
 pub mod codec;
 pub mod dispatcher;
 pub(crate) mod exec;

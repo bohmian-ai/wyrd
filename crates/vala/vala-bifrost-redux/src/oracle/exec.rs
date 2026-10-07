@@ -25,6 +25,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -291,6 +292,25 @@ impl PruningEvidence {
 fn retain_iceberg_task(task: FileScanTask, metrics: &Arc<OracleScanMetricsHandle>) -> FileScanTask {
     metrics.record_iceberg_task(&task);
     task
+}
+
+/// Returns how many partitions a scan of `files` files holding `bytes` bytes
+/// reads across, by `DataFusion`'s own listing-scan rule.
+///
+/// A scan reaching `optimizer.repartition_file_min_size` with
+/// `optimizer.repartition_file_scans` on splits across
+/// `execution.target_partitions`; a smaller one reads one partition per file,
+/// as an unsplit listing scan does. Every partition costs a task, a stream,
+/// and its metrics, so a small scan never pays for the session's full width.
+/// The result is at least one and at most the target.
+fn scan_partitions(files: usize, bytes: u64, options: &ConfigOptions) -> usize {
+    let target = options.execution.target_partitions.max(1);
+    let min_size = u64::try_from(options.optimizer.repartition_file_min_size).unwrap_or(u64::MAX);
+    if options.optimizer.repartition_file_scans && bytes >= min_size {
+        target
+    } else {
+        files.clamp(1, target)
+    }
 }
 
 /// Returns the byte ranges one partition reads when `sizes` are laid end to end.
@@ -1347,16 +1367,44 @@ impl OracleIcebergScanExec {
         self
     }
 
-    /// Reads this scan across `partitions` byte-range partitions.
+    /// Reads this scan across the byte-range partitions [`scan_partitions`]
+    /// chooses under the session's `options`; see [`partition_byte_ranges`].
     ///
-    /// Callers pass their session's target partitions, the way a `DataFusion`
-    /// listing scan splits its file groups. See [`partition_byte_ranges`].
-    pub(crate) fn with_partitions(mut self, partitions: usize) -> Self {
+    /// File tasks are planned only at execution, so the file count and bytes
+    /// come from the pinned snapshot's summary: an assignment's file count
+    /// when one is set, and the snapshot's total size, which can only
+    /// overstate what a pruned scan reads. A table with no snapshot reads one
+    /// empty partition; a summary without a size splits to the full target.
+    pub(crate) fn with_partitions(mut self, options: &ConfigOptions) -> Self {
+        let snapshot = match self.snapshot_id {
+            Some(id) => self.table.metadata().snapshot_by_id(id),
+            None => self.table.metadata().current_snapshot(),
+        };
+        let (files, bytes) = snapshot.map_or((0, 0), |snapshot| {
+            let total = |key: &str| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get(key)
+                    .and_then(|value| value.parse::<u64>().ok())
+            };
+            (
+                total("total-data-files").map_or(usize::MAX, |files| {
+                    usize::try_from(files).unwrap_or(usize::MAX)
+                }),
+                total("total-files-size").unwrap_or(u64::MAX),
+            )
+        });
+        let files = self
+            .assigned_files
+            .as_ref()
+            .map_or(files, std::collections::BTreeSet::len);
+        let partitions = scan_partitions(files, bytes, options);
         self.properties = Arc::new(
             self.properties
                 .as_ref()
                 .clone()
-                .with_partitioning(Partitioning::UnknownPartitioning(partitions.max(1))),
+                .with_partitioning(Partitioning::UnknownPartitioning(partitions)),
         );
         self
     }
@@ -2066,9 +2114,9 @@ impl OracleTableProvider {
         occurrence: u64,
     ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
         let required_schema = Arc::clone(&scan_projection.required_schema);
-        // Like a `DataFusion` listing scan, each persisted leaf reads across
-        // the session's target partitions.
-        let partitions = state.config_options().execution.target_partitions;
+        // Like a `DataFusion` listing scan, each persisted leaf splits across
+        // the session's target partitions only when it is large enough.
+        let options = state.config_options();
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let published_index = inputs.len();
         {
@@ -2087,7 +2135,7 @@ impl OracleTableProvider {
                 .await?;
             let published: Arc<dyn ExecutionPlan> = Arc::new(
                 OracleIcebergScanExec::from_plan(published.as_ref())?
-                    .with_partitions(partitions)
+                    .with_partitions(options)
                     .with_footers(PublishedFooters::new(
                         Arc::clone(&self.storage),
                         self.context.data_tenant_id,
@@ -2116,7 +2164,7 @@ impl OracleTableProvider {
                     Arc::new(OracleScanMetricsHandle::default()),
                     supported_predicates.to_vec(),
                 )
-                .with_partitions(partitions),
+                .with_partitions(options),
             ));
         }
         let Some(remote) = self.remote.as_ref() else {
@@ -2818,7 +2866,7 @@ impl AsyncFileReader for IcebergParquetReader {
 /// charged. Visible to sibling `oracle` submodules so the follower resolver can
 /// build the follower mode and [`OracleQueryScanStats`] can fold its counters.
 #[derive(Clone)]
-pub(super) struct HotParquetExec {
+pub(crate) struct HotParquetExec {
     /// Validated immutable manifest entries.
     files: Vec<HotFileSource>,
     /// The node's one storage owner, asked to decode each object's metadata.
@@ -2894,13 +2942,15 @@ impl HotParquetExec {
         }
     }
 
-    /// Reads this leaf across `partitions` byte-range partitions.
-    ///
-    /// Callers pass their session's target partitions; see
+    /// Reads this leaf across the byte-range partitions [`scan_partitions`]
+    /// chooses for its files under the session's `options`; see
     /// [`partition_byte_ranges`].
-    pub(super) fn with_partitions(mut self, partitions: usize) -> Self {
-        self.properties =
-            plan_properties_with_partitions(Arc::clone(&self.schema), partitions.max(1));
+    pub(super) fn with_partitions(mut self, options: &ConfigOptions) -> Self {
+        let bytes = self.files.iter().fold(0_u64, |total, file| {
+            total.saturating_add(u64::try_from(file.size_bytes).unwrap_or(u64::MAX))
+        });
+        let partitions = scan_partitions(self.files.len(), bytes, options);
+        self.properties = plan_properties_with_partitions(Arc::clone(&self.schema), partitions);
         self
     }
 
@@ -2918,6 +2968,14 @@ impl HotParquetExec {
     pub(super) fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Self {
         self.leaf_paths = paths;
         self
+    }
+
+    /// The literal paths this scan trims each column to; empty reads every
+    /// column whole. Benchmarks assert it as the scan's physical field
+    /// requirement.
+    #[cfg(all(feature = "test-support", feature = "bench-support"))]
+    pub(crate) fn leaf_paths(&self) -> &super::leaf_paths::LeafPaths {
+        &self.leaf_paths
     }
 
     /// Returns the files and byte ranges `partition` owns, in file order.
@@ -5513,6 +5571,9 @@ pub(super) mod tests {
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
         let telemetry = Arc::new(OracleTelemetry::new());
         for partitions in [1, 2, 3, 4, 16] {
+            let mut options = ConfigOptions::default();
+            options.execution.target_partitions = partitions;
+            options.optimizer.repartition_file_min_size = 0;
             let metrics = Arc::new(OracleScanMetricsHandle::default());
             let exec = HotParquetExec::new(
                 files.clone(),
@@ -5523,7 +5584,7 @@ pub(super) mod tests {
                 Arc::clone(&metrics),
                 Vec::new(),
             )
-            .with_partitions(partitions);
+            .with_partitions(&options);
             assert_eq!(exec.properties().partitioning.partition_count(), partitions);
             let context = bound_leader_task(
                 oracle_memory_resources(&governor, 1024 * 1024),

@@ -322,6 +322,27 @@ pub(super) fn bind_test_session(
     memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     grant: OracleExecutionGrant,
 ) -> Arc<datafusion::execution::TaskContext> {
+    let runtime = Arc::new(
+        datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(memory_pool)
+            .build()
+            .expect("a runtime environment builds from a memory pool"),
+    );
+    datafusion::prelude::SessionContext::new_with_config_rt(with_test_grant(config, grant), runtime)
+        .task_ctx()
+}
+
+/// Returns `config` bound with `grant` as an admitted query whose plan
+/// delegated no source, the way admission binds a leader-local plan.
+///
+/// # Panics
+///
+/// Panics when the fresh lock refuses its first binding, which cannot happen.
+#[cfg(any(test, all(feature = "test-support", feature = "bench-support")))]
+fn with_test_grant(
+    config: datafusion::prelude::SessionConfig,
+    grant: OracleExecutionGrant,
+) -> datafusion::prelude::SessionConfig {
     let lock = Arc::new(OracleExecutionLock::new());
     assert!(
         lock.set(OracleExecutionBindings {
@@ -333,17 +354,27 @@ pub(super) fn bind_test_session(
         .is_ok(),
         "a fresh execution lock binds exactly once"
     );
-    let runtime = Arc::new(
-        datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-            .with_memory_pool(memory_pool)
-            .build()
-            .expect("a runtime environment builds from a memory pool"),
-    );
-    datafusion::prelude::SessionContext::new_with_config_rt(config.with_extension(lock), runtime)
-        .task_ctx()
+    config.with_extension(lock)
 }
 
-#[cfg(test)]
+/// Returns `config` bound with a live Interactive grant over `memory`, so a
+/// benchmark session executes leader-local Oracle leaves without admission.
+#[cfg(all(feature = "test-support", feature = "bench-support"))]
+pub(crate) fn bench_session_config(
+    config: datafusion::prelude::SessionConfig,
+    memory: OracleMemoryResources,
+) -> datafusion::prelude::SessionConfig {
+    with_test_grant(
+        config,
+        OracleExecutionGrant::for_test(
+            QueryClass::Interactive,
+            memory,
+            Arc::new(OracleTelemetry::new()),
+        ),
+    )
+}
+
+#[cfg(any(test, all(feature = "test-support", feature = "bench-support")))]
 impl OracleExecutionGrant {
     /// Builds one live grant for a leaf-level test.
     ///

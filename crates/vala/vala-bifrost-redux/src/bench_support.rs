@@ -214,3 +214,214 @@ impl WalBenchSupport {
         })
     }
 }
+
+/// One tenant's Oracle tables over local hot Parquet files, for the
+/// nested-field benchmark.
+///
+/// Each table is the production [`OracleTableProvider`] over a snapshot-free
+/// Iceberg table and one hot file, so a query plans and reads exactly as a
+/// leader-local Oracle read does: the Variant SQL surface, the leaf path
+/// rule, and the hot per-file reader. Files must be written with
+/// [`Self::writer_properties`], whose footer proves this owner's tenant.
+///
+/// [`OracleTableProvider`]: crate::oracle::exec::OracleTableProvider
+#[cfg(feature = "test-support")]
+pub struct OracleHotTables {
+    /// The tenant every footer proves and every query reads as.
+    tenant: DataTenantId,
+    /// The storage owner that decodes each hot file's footer.
+    storage: std::sync::Arc<crate::storage::BifrostStorage>,
+}
+
+#[cfg(feature = "test-support")]
+impl OracleHotTables {
+    /// Creates an owner for a fresh tenant whose test storage lives under the
+    /// existing directory `root`.
+    #[must_use]
+    pub fn new(root: &Path) -> Self {
+        Self {
+            tenant: DataTenantId::new_v7(),
+            storage: crate::storage::BifrostStorage::for_test(root, true),
+        }
+    }
+
+    /// The Bifrost writer recipe, with a footer proving this owner's tenant and
+    /// `row_group_rows` rows per row group.
+    #[must_use]
+    pub fn writer_properties(
+        &self,
+        row_group_rows: usize,
+    ) -> parquet::file::properties::WriterProperties {
+        crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
+            vec![crate::parquet::footer::tenant_key_value(self.tenant)],
+            &[],
+        )
+        .into_builder()
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .build()
+    }
+
+    /// Returns an Oracle session with each `(name, logical schema, file)`
+    /// registered as a table, bound with a live Interactive grant over a
+    /// 1 GiB test Oracle composition so its leaves execute without admission.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed test composition has no Oracle capability.
+    ///
+    /// The logical schema carries every field's Iceberg field id; a file may
+    /// shred its Variants, as hot files do.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when a schema has no Iceberg form, a file
+    /// cannot be stat'ed, or a provider cannot be built or registered.
+    pub async fn session(
+        &self,
+        tables: &[(&str, arrow::datatypes::SchemaRef, &Path)],
+    ) -> datafusion::error::Result<datafusion::prelude::SessionContext> {
+        let memory = crate::oracle::OracleMemoryResources {
+            resources: crate::resources::BifrostRuntimeResources::composed_for_test(
+                1 << 30,
+                1 << 30,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("the composed test roles include Oracle"),
+            reconciliation_limit_bytes: 64 << 20,
+        };
+        let config = crate::oracle::bindings::bench_session_config(
+            datafusion::prelude::SessionConfig::new(),
+            memory,
+        );
+        let state = crate::oracle::variant_sql::OracleVariantSql::shared()
+            .install(
+                datafusion::execution::SessionStateBuilder::new()
+                    .with_default_features()
+                    .with_config(config),
+            )
+            .build();
+        let context = datafusion::prelude::SessionContext::new_with_state(state);
+        for (name, schema, path) in tables {
+            let provider = self.provider(name, schema, path).await?;
+            context.register_table(*name, std::sync::Arc::new(provider))?;
+        }
+        Ok(context)
+    }
+
+    /// Builds the production provider for one table holding the hot file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when the schema has no Iceberg form, the
+    /// file cannot be stat'ed, or the table or provider cannot be built.
+    async fn provider(
+        &self,
+        name: &str,
+        schema: &arrow::datatypes::Schema,
+        path: &Path,
+    ) -> datafusion::error::Result<crate::oracle::exec::OracleTableProvider> {
+        use datafusion::error::DataFusionError;
+        use iceberg::spec::{FormatVersion, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
+
+        let external = |error: iceberg::Error| DataFusionError::External(Box::new(error));
+        let metadata = TableMetadataBuilder::new(
+            iceberg::arrow::arrow_schema_to_schema(schema).map_err(external)?,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            format!("file://{}", path.parent().unwrap_or(path).display()),
+            FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .and_then(TableMetadataBuilder::build)
+        .map_err(external)?
+        .metadata;
+        let table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::from_strs(["bench", name]).map_err(external)?)
+            .runtime(iceberg::Runtime::current())
+            .build()
+            .map_err(external)?;
+        let size = std::fs::metadata(path)?.len();
+        let location = path.to_string_lossy().into_owned();
+        let identity = uuid::Uuid::now_v7();
+        let mut checksum = [0_u8; 32];
+        checksum[..16].copy_from_slice(identity.as_bytes());
+        let hot = crate::oracle::exec::HotFileSource {
+            metadata_key: crate::storage::ObjectMetadataKey::new(
+                self.tenant,
+                name.to_owned(),
+                location.clone(),
+                identity,
+                checksum,
+                size,
+            ),
+            location,
+            size_bytes: usize::try_from(size).unwrap_or(usize::MAX),
+            event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
+                crate::catalog::event_time::EventTimeBoundsDefect::Missing,
+            ),
+        };
+        let principal = wyrd_runtime::Principal {
+            id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: self.tenant,
+            roles: Vec::new(),
+            effective_permissions: wyrd_runtime::permission::PermissionSet::default(),
+            credential_id: None,
+        };
+        let context = crate::oracle::AuthorizedQueryContext::try_new(
+            principal,
+            self.tenant,
+            wyrd_spec::request_id::RequestId::now_v7(),
+            None,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            wyrd_runtime::Permission::bifrost_query_read(),
+        )
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        crate::oracle::exec::OracleTableProvider::try_new(crate::oracle::exec::OracleTableInputs {
+            table,
+            storage: std::sync::Arc::clone(&self.storage),
+            hot_files: vec![hot],
+            context,
+            table_name: name.to_owned(),
+            remote: None,
+            live: None,
+        })
+        .await
+    }
+}
+
+/// The leaf paths each hot scan in `plan` trims its columns to, as JSON
+/// (`{"column": [["key", ...], ...]}`), in plan order.
+///
+/// # Errors
+///
+/// Returns the JSON error raised when a path set does not serialize.
+#[cfg(feature = "test-support")]
+pub fn hot_leaf_paths(
+    plan: &std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> serde_json::Result<Vec<serde_json::Value>> {
+    use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
+
+    let mut paths = Vec::new();
+    let _ = plan.apply(|node| {
+        if let Some(hot) = node.downcast_ref::<crate::oracle::exec::HotParquetExec>() {
+            paths.push(hot.leaf_paths().clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    paths.iter().map(serde_json::to_value).collect()
+}
+
+/// Physical Parquet bytes `plan` read, once it has executed to completion,
+/// through the production Oracle scan statistics; `None` when no scan
+/// reported bytes.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn bytes_scanned(plan: &dyn datafusion::physical_plan::ExecutionPlan) -> Option<u64> {
+    let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(plan);
+    stats.finalize();
+    stats.physical_bytes_scanned
+}

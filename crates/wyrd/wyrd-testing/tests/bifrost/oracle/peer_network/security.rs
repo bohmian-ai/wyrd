@@ -18,13 +18,15 @@ use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
     PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut, TenantTableBinding,
 };
+use wyrd_spec::vala::assignment_authority::ScanPredicate;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::support::{
-    PeerDial, PeerJourneyError, ReservationPlane, proto_with_context, reserve, stamped,
+    DialIdentity, PeerDial, PeerJourneyError, ReservationPlane, proto_with_context, reserve,
+    stamped,
 };
 use crate::peer_cluster::{PeerCluster, PeerProbeFraming, PeerProbePlan, PeerProbeService};
 
@@ -408,6 +410,210 @@ async fn a_foreign_tenant_context_reads_no_scribe_rows(
     Ok(())
 }
 
+/// Struct and Variant leaf predicates, including `IN`, cross the unsigned
+/// peer plane and execute on the Scribe that receives them, and any change
+/// to what the leader bound is refused before the fragment executes.
+///
+/// # Panics
+///
+/// Panics when any claim in the journey fails, naming the claim.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn unsigned_leaf_predicates_round_trip_and_execute() {
+    prove_leaf_predicates_round_trip_and_execute()
+        .await
+        .expect("leaf predicate journey");
+}
+
+/// Drives the leaf predicate journey against one live topology.
+///
+/// The leader's predicates travel as domain values, through the protobuf
+/// conversion and the v8 assignment-authority digest, over the real mTLS peer
+/// listener; the Scribe decodes them, recomputes the digest, and filters its
+/// live rows with them. Exact ids prove both leaves decoded to the predicate
+/// the leader built. A one-byte literal change, an incompatible protocol
+/// version, and a dial without a client certificate each leave the Scribe's
+/// fragment-execution counter where it was.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_leaf_predicates_round_trip_and_execute() -> Result<(), PeerJourneyError> {
+    use arrow::datatypes::{DataType, Field, Fields};
+    use wyrd_spec::vala::assignment_authority::{ScanLeaf, ScanLiteral};
+
+    let cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
+    .await?;
+    let plane = ReservationPlane::observe(&cluster).await?;
+    let table = "peer_leaf_predicates";
+    let attrs = Fields::from(vec![Field::new("kind", DataType::Utf8, false)]);
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("attrs", DataType::Struct(attrs.clone()), false),
+        wyrd_types::variant::variant_field("doc", false),
+    ]));
+    cluster
+        .register_table_with(
+            SCRIBE_POD,
+            table,
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+        )
+        .await?;
+    let kinds = ["a", "a", "b", "c", "c"];
+    let docs: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+        r#"{"n":1}"#,
+        r#"{"n":2}"#,
+        r#"{"n":2}"#,
+        r#"{"n":2}"#,
+        r#"{"n":3}"#,
+    ]));
+    let docs: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&docs)?.into();
+    let rows = arrow::record_batch::RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![0_i64, 1, 2, 3, 4])),
+            Arc::new(arrow::array::StructArray::try_new(
+                attrs,
+                vec![Arc::new(arrow::array::StringArray::from(kinds.to_vec()))],
+                None,
+            )?),
+            arrow::compute::cast(&docs, &wyrd_types::variant::variant_storage_type())?,
+        ],
+    )?;
+    cluster.ingest_live_batch(SCRIBE_POD, table, &rows).await?;
+
+    // attrs.kind IN ('a', 'c') AND doc.n = 2 selects ids 1 and 3 alone.
+    let fragment = ScribeFragment::over(
+        &cluster,
+        &plane,
+        table,
+        &["id", "attrs", "doc"],
+        vec![
+            ScanPredicate::In(
+                ScanLeaf::StructField {
+                    column: "attrs".to_owned(),
+                    fields: vec!["kind".to_owned()],
+                },
+                vec![
+                    ScanLiteral::Utf8("a".to_owned()),
+                    ScanLiteral::Utf8("c".to_owned()),
+                ],
+            ),
+            ScanPredicate::Eq(
+                ScanLeaf::Variant {
+                    column: "doc".to_owned(),
+                    keys: vec!["n".to_owned()],
+                },
+                ScanLiteral::I64(2),
+            ),
+        ],
+    )
+    .await?;
+    let tenant = cluster.tenant().as_uuid();
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
+            .connect()
+            .await?,
+    );
+
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    let mut stream = client
+        .execute_fragment(fragment.request(tenant)?)
+        .await
+        .map_err(|status| format!("a correct leaf fragment was refused with {status}"))?
+        .into_inner();
+    // Each batch frame is one self-contained Arrow IPC stream.
+    let mut ids = Vec::new();
+    while let Some(frame) = stream.message().await? {
+        let Some(proto::worker_attempt_frame::Frame::ArrowIpcBatch(bytes)) = frame.frame else {
+            continue;
+        };
+        for batch in arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)? {
+            let batch = batch?;
+            let column = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<arrow::array::Int64Array>())
+                .ok_or("the worker batch carries no Int64 id column")?;
+            ids.extend(column.values().iter().copied());
+        }
+    }
+    ids.sort_unstable();
+    if ids != [1, 3] {
+        return Err(format!("the worker filtered its live rows to {ids:?}, not [1, 3]").into());
+    }
+    if cluster.scribe_fragments(SCRIBE_POD)? != before + 1 {
+        return Err("the correct leaf fragment did not execute exactly once".into());
+    }
+
+    // One byte of one signed literal: 'a' becomes 'b' after the leader signed.
+    let mut tampered = fragment.request(tenant)?;
+    tampered
+        .assignments
+        .first_mut()
+        .and_then(|assignment| assignment.predicates.first_mut())
+        .and_then(|predicate| predicate.literals.first_mut())
+        .ok_or("the encoded fragment carries no literal to tamper with")?
+        .value = Some(proto::scan_literal::Value::Utf8Value("b".to_owned()));
+    let refusals = [
+        (
+            "a fragment whose signed literal changed by one byte",
+            tampered,
+        ),
+        (
+            "a fragment from an incompatible protocol version",
+            fragment.request_with(tenant, |claims| {
+                claims.protocol_version = claims.protocol_version.wrapping_add(1);
+            })?,
+        ),
+    ];
+    for (description, request) in refusals {
+        let before = cluster.scribe_fragments(SCRIBE_POD)?;
+        match client.execute_fragment(request).await {
+            Err(status) if status.code() == tonic::Code::PermissionDenied => {}
+            Err(status) => return Err(format!("{description} failed with {status}").into()),
+            Ok(_) => return Err(format!("{description} opened a row stream").into()),
+        }
+        if cluster.scribe_fragments(SCRIBE_POD)? != before {
+            return Err(format!("{description} executed on the Scribe").into());
+        }
+    }
+
+    // No client certificate: the peer plane must never read the body.
+    let before = (
+        cluster.scribe_fragments(SCRIBE_POD)?,
+        cluster.peer_body_polls(),
+    );
+    if let Ok(channel) = PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
+        .with_identity(DialIdentity::Anonymous)
+        .connect()
+        .await
+        && OraclePeerServiceClient::new(channel)
+            .execute_fragment(fragment.request(tenant)?)
+            .await
+            .is_ok()
+    {
+        return Err("an anonymous origin opened a row stream".into());
+    }
+    if (
+        cluster.scribe_fragments(SCRIBE_POD)?,
+        cluster.peer_body_polls(),
+    ) != before
+    {
+        return Err("an anonymous origin reached the fragment body".into());
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// One live Scribe fragment built exactly as an Oracle leader builds it.
 struct ScribeFragment {
     /// The fragment's single hot-provider assignment, owned by the real tenant.
@@ -437,6 +643,26 @@ impl ScribeFragment {
     ) -> Result<Self, PeerJourneyError> {
         cluster.register_table(SCRIBE_POD, table).await?;
         cluster.ingest_live_rows(SCRIBE_POD, table, 0, 8, 2).await?;
+        Self::over(cluster, plane, table, &["id"], Vec::new()).await
+    }
+
+    /// Builds the fragment for the one live partition of an already written
+    /// `table`, reading `columns` under the closed `predicates`.
+    ///
+    /// `columns` is the signed projection closure, so it must name every
+    /// predicate root; the encoded placeholder exposes exactly those columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the Scribe reports no live partition, a column
+    /// is absent from the table, or the plan cannot be encoded.
+    async fn over(
+        cluster: &PeerCluster,
+        plane: &ReservationPlane,
+        table: &str,
+        columns: &[&str],
+        predicates: Vec<ScanPredicate>,
+    ) -> Result<Self, PeerJourneyError> {
         let state = cluster.server(SCRIBE_POD)?.state();
         let catalog = state
             .bifrost_catalog()
@@ -459,7 +685,11 @@ impl ScribeFragment {
             .ok_or("the Scribe reports no live partition")?;
         let schema = catalog.assignment_schema(&table_ref, tenant).await?;
         let schema_fingerprint = assignment_schema_fingerprint(&schema);
-        let projected = Arc::new(schema.project(&[schema.index_of("id")?])?);
+        let indices = columns
+            .iter()
+            .map(|column| schema.index_of(column))
+            .collect::<Result<Vec<_>, _>>()?;
+        let projected = Arc::new(schema.project(&indices)?);
         let scan_id = format!(
             "oracle:bifrost.{table}:scribe:{}:{}:live",
             stream.node_id.as_uuid(),
@@ -487,8 +717,8 @@ impl ScribeFragment {
                     end_partition: partition,
                 }),
                 schema_fingerprint,
-                required_columns: vec!["id".to_owned()],
-                predicates: Vec::new(),
+                required_columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+                predicates,
             },
             leader: OracleRoleFence {
                 node_id: NodeId::new(plane.leader_node_id),
@@ -515,9 +745,23 @@ impl ScribeFragment {
         &self,
         context_tenant: uuid::Uuid,
     ) -> Result<proto::ExecuteFragmentRequest, PeerJourneyError> {
+        self.request_with(context_tenant, |_| {})
+    }
+
+    /// Encodes the fragment as [`Self::request`] does, then applies `deviate`
+    /// to the leader's claims before they are serialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns the assignment-authority digest failure unchanged.
+    fn request_with(
+        &self,
+        context_tenant: uuid::Uuid,
+        deviate: fn(&mut PeerTicketClaims),
+    ) -> Result<proto::ExecuteFragmentRequest, PeerJourneyError> {
         let assignments = vec![self.assignment.clone()];
         let deadline = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis();
-        let claims = PeerTicketClaims {
+        let mut claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
             audience: self.target.node_id.as_uuid().as_bytes().to_vec(),
             worker_fence: self.target.fencing_token,
@@ -538,6 +782,7 @@ impl ScribeFragment {
             assignment_authority_digest: assignment_authority_digest_for(&assignments)
                 .map_err(|error| format!("assignment-authority digest: {error:?}"))?,
         };
+        deviate(&mut claims);
         Ok(ExecuteFragmentRequest {
             context: PeerContext {
                 claims_bytes: claims.encode_to_vec(),

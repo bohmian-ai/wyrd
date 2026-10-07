@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from wyrd.model import ModelCard
 from wyrd.state import WyrdState
 
 from .support import TinyDataInterface, TinyModelInterface
@@ -25,9 +26,11 @@ def builtin_model_bundle(fixtures_dir: Path) -> Path:
 
 
 @pytest.fixture
-def trusted_model_hash() -> str:
-    """The canonical artifact-manifest hash of ``builtin-model``'s ``model`` Card."""
-    return "6df95bdf5f1a6ec1b59fe52d2974e222ec5e7094d877a3a16858aa89d66aaca5"
+def trusted_model_hash(builtin_model_bundle: Path) -> str:
+    """The ``model`` Card's registered artifact hash, read from its envelope."""
+    card = ModelCard.from_path(builtin_model_bundle / "cards" / "model" / "card.yaml")
+    assert card.artifact_hash is not None
+    return card.artifact_hash
 
 
 @pytest.fixture

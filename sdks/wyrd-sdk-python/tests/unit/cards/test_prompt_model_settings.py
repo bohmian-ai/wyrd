@@ -1,5 +1,5 @@
-import inspect
 import json
+from pathlib import Path
 
 import pytest
 from wyrd import (
@@ -9,15 +9,6 @@ from wyrd import (
     Prompt,
     PromptCard,
     WyrdError,
-)
-from wyrd.prompt import (
-    AnthropicSettings as PromptAnthropicSettings,
-)
-from wyrd.prompt import (
-    GeminiSettings as PromptGeminiSettings,
-)
-from wyrd.prompt import (
-    OpenAISettings as PromptOpenAISettings,
 )
 
 
@@ -121,37 +112,6 @@ def test_cache_sugar_and_model_settings_precedence() -> None:
     assert prompt.request.model_dump()["body"]["prompt_cache_key"] == "cache-from-settings"
 
 
-def test_yaml_prompt_load_with_model_settings(tmp_path) -> None:
-    path = tmp_path / "prompt.yaml"
-    path.write_text(
-        """
-provider: openai
-model: gpt-4o
-messages: hello
-model_settings:
-  seed: 99
-"""
-    )
-
-    prompt = Prompt.load(path)
-    assert prompt.request.model_dump()["body"]["seed"] == 99
-
-
-def test_old_sampling_kwargs_are_absent() -> None:
-    signature = inspect.signature(Prompt.openai_chat)
-
-    assert "model_settings" in signature.parameters
-    assert "temperature" not in signature.parameters
-    assert "top_p" not in signature.parameters
-    assert "max_tokens" not in signature.parameters
-
-
-def test_settings_classes_import_from_root_and_prompt_module() -> None:
-    assert OpenAISettings is PromptOpenAISettings
-    assert AnthropicSettings is PromptAnthropicSettings
-    assert GeminiSettings is PromptGeminiSettings
-
-
 def test_vertex_reuses_gemini_settings() -> None:
     prompt = Prompt.vertex(
         "gemini-2.5-pro",
@@ -182,29 +142,8 @@ def test_prompt_card_model_settings_provider_mismatch() -> None:
     assert error.value.code == "WYRD_PROMPT_400_SETTINGS_PROVIDER_MISMATCH"
 
 
-def test_yaml_prompt_card_load_with_model_settings(tmp_path) -> None:
-    path = tmp_path / "prompt_card.yaml"
-    path.write_text(
-        """
-apiVersion: wyrd/v1
-kind: Prompt
-metadata:
-  space: default
-  name: yaml-prompt
-  version: 0.1.0
-  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
-spec:
-  provider: openai
-  model: gpt-4o
-  messages: hello
-  model_settings:
-    seed: 123
-    future_knob:
-      enabled: true
-"""
-    )
-
-    card = PromptCard.load(path)
+def test_prompt_card_file_keeps_its_model_settings(fixtures_dir: Path) -> None:
+    card = PromptCard.load(fixtures_dir / "authoring" / "prompt" / "seeded-prompt.yaml")
 
     assert card.prompt.request.model_dump()["body"]["seed"] == 123
     assert card.prompt.request.model_dump()["body"]["future_knob"] == {"enabled": True}

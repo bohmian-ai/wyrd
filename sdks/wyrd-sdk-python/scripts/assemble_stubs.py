@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -38,6 +39,68 @@ def validate_source_stub(filename: str, raw_text: str) -> None:
             f"{STUB_DIR / filename}: public stubs must document constructors as "
             "__init__, not __new__"
         )
+    missing = undocumented_public_members(ast.parse(raw_text))
+    if missing:
+        raise SystemExit(f"{STUB_DIR / filename}: missing docstrings: {', '.join(missing)}")
+
+
+def undocumented_public_members(tree: ast.Module) -> list[str]:
+    """Return public classes and methods without a docstring.
+
+    Stubs are the help text editors show, so every public class, ``__init__``,
+    and public method needs one. ``@overload`` variants share the docstring of
+    their documented sibling.
+    """
+    missing: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
+            continue
+        if ast.get_docstring(node) is None:
+            missing.append(node.name)
+        for child in node.body:
+            if not isinstance(child, ast.FunctionDef):
+                continue
+            if child.name != "__init__" and child.name.startswith("_"):
+                continue
+            if any(getattr(d, "id", None) == "overload" for d in child.decorator_list):
+                continue
+            if ast.get_docstring(child) is None:
+                missing.append(f"{node.name}.{child.name}")
+    return missing
+
+
+def literal_all(tree: ast.Module) -> set[str]:
+    """Return the names a module's literal ``__all__`` assignment lists."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+        ):
+            return set(ast.literal_eval(node.value))
+    raise SystemExit("__all__ must be a literal list")
+
+
+def validate_package_exports(stub_text: str) -> None:
+    """Fail when the package stub and runtime ``__init__.py`` export different names."""
+    runtime = literal_all(ast.parse((PACKAGE_DIR / "__init__.py").read_text(encoding="utf-8")))
+    stub = literal_all(ast.parse(stub_text))
+    if runtime != stub:
+        raise SystemExit(
+            f"{STUB_DIR / PACKAGE_STUB_FILE}: __all__ differs from {PACKAGE_DIR / '__init__.py'}: "
+            f"only in stub {sorted(stub - runtime)}, only at runtime {sorted(runtime - stub)}"
+        )
+
+
+def validate_package_layout() -> None:
+    """Fail when a stray root module or stub would shadow a public module package."""
+    expected = {ROOT_OUTPUT_FILE.name, "__init__.pyi"}
+    stray = sorted(path.name for path in PACKAGE_DIR.glob("*.pyi") if path.name not in expected)
+    stray += sorted(
+        f"{output.parent.name}.py"
+        for output in PUBLIC_MODULE_STUBS.values()
+        if (PACKAGE_DIR / f"{output.parent.name}.py").exists()
+    )
+    if stray:
+        raise SystemExit(f"{PACKAGE_DIR}: unexpected root stubs {stray}")
 
 
 def strip_imports_section(content: str) -> str:
@@ -209,6 +272,7 @@ def assemble_public_module_stubs() -> None:
 def assemble_package_stub() -> None:
     """Write the root public package stub."""
     raw_text = source_text(PACKAGE_STUB_FILE)
+    validate_package_exports(raw_text)
     lines = [
         "# AUTO-GENERATED STUB FILE. DO NOT EDIT.",
         "# pylint: disable=redefined-builtin, invalid-name, dangerous-default-value",
@@ -224,6 +288,7 @@ def assemble() -> None:
     assemble_root_stub()
     assemble_package_stub()
     assemble_public_module_stubs()
+    validate_package_layout()
 
 
 if __name__ == "__main__":

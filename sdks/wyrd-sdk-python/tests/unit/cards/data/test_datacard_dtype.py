@@ -1,3 +1,5 @@
+"""Column dtypes a DataCard records for each supported framework."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -9,6 +11,7 @@ import torch
 from wyrd.data import (
     ArrowInterface,
     DataCard,
+    DataInterface,
     NumpyInterface,
     PandasInterface,
     PolarsInterface,
@@ -17,45 +20,32 @@ from wyrd.data import (
 )
 
 
-def test_pandas_dtype_table() -> None:
-    assert (
-        DataCard(PandasInterface(data=pd.DataFrame({"i": pd.Series([1], dtype="int64")})))
-        .schema.columns[0]
-        .dtype
-        == "int64"
-    )
-
-
-def test_polars_dtype_table() -> None:
-    assert (
-        DataCard(PolarsInterface(data=pl.DataFrame({"i": pl.Series([1], dtype=pl.Int64)})))
-        .schema.columns[0]
-        .dtype
-        == "int64"
-    )
-
-
-def test_pyarrow_dtype_table() -> None:
-    assert (
-        DataCard(ArrowInterface(data=pa.table({"i": pa.array([1], type=pa.int64())})))
-        .schema.columns[0]
-        .dtype
-        == "int64"
-    )
-
-
-def test_numpy_dtype_table() -> None:
-    assert (
-        DataCard(NumpyInterface(data=np.array([True], dtype=bool))).schema.columns[0].dtype
-        == "bool"
-    )
-
-
-def test_torch_dtype_table_when_installed() -> None:
-    assert (
-        DataCard(TorchInterface(data=torch.tensor([1], dtype=torch.int64))).schema.columns[0].dtype
-        == "int64"
-    )
+@pytest.mark.parametrize(
+    ("interface", "dtype"),
+    [
+        pytest.param(
+            PandasInterface(data=pd.DataFrame({"i": pd.Series([1], dtype="int64")})),
+            "int64",
+            id="pandas",
+        ),
+        pytest.param(
+            PolarsInterface(data=pl.DataFrame({"i": pl.Series([1], dtype=pl.Int64)})),
+            "int64",
+            id="polars",
+        ),
+        pytest.param(
+            ArrowInterface(data=pa.table({"i": pa.array([1], type=pa.int64())})),
+            "int64",
+            id="arrow",
+        ),
+        pytest.param(NumpyInterface(data=np.array([True], dtype=bool)), "bool", id="numpy"),
+        pytest.param(
+            TorchInterface(data=torch.tensor([1], dtype=torch.int64)), "int64", id="torch"
+        ),
+    ],
+)
+def test_datacard_records_the_framework_dtype(interface: DataInterface, dtype: str) -> None:
+    assert DataCard(interface).schema.columns[0].dtype == dtype
 
 
 def test_unknown_dtype_raises_unknown_data_type() -> None:

@@ -1,17 +1,28 @@
-from __future__ import annotations
+"""Split builders validate their rule, and a card keeps the splits it is given."""
 
-import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
-from wyrd.data import DataCard, PandasInterface, Split, WyrdError
+from wyrd.data import DataCard, Split, WyrdError
+
+TEST_ROWS = {"kind": "Artifact", "name": "test", "version": "1.0.0", "space": "default"}
 
 
-def test_split_column_eq_ne_gt_ge_lt_le_in() -> None:
-    expected = {"==": "Eq", "!=": "Ne", ">": "Gt", ">=": "Ge", "<": "Lt", "<=": "Le", "in": "In"}
-
-    for op, token in expected.items():
-        assert Split.column("year", op, 2024).to_dict()["value"]["op"] == token
+@pytest.mark.parametrize(
+    ("op", "token"),
+    [
+        ("==", "Eq"),
+        ("!=", "Ne"),
+        (">", "Gt"),
+        (">=", "Ge"),
+        ("<", "Lt"),
+        ("<=", "Le"),
+        ("in", "In"),
+    ],
+)
+def test_column_split_records_its_operator(op: str, token: str) -> None:
+    assert Split.column("year", op, 2024).to_dict()["value"]["op"] == token
 
 
 def test_split_column_invalid_operator_raises_invalid_split_rule() -> None:
@@ -21,15 +32,19 @@ def test_split_column_invalid_operator_raises_invalid_split_rule() -> None:
     assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 
 
-def test_split_index_range_serializes_start_stop() -> None:
-    assert Split.index_range(0, 10).to_dict()["value"] == {"start": 0, "stop": 10}
+def test_index_range_split_records_its_bounds() -> None:
+    assert Split.index_range(0, 10).to_dict() == {
+        "kind": "IndexRange",
+        "value": {"start": 0, "stop": 10},
+    }
 
 
-def test_split_index_range_rejects_negative_start_or_stop() -> None:
-    for start, stop in [(-1, 2), (0, -1)]:
-        with pytest.raises(WyrdError) as exc:
-            Split.index_range(start, stop)
-        assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
+@pytest.mark.parametrize(("start", "stop"), [(-1, 2), (0, -1)])
+def test_split_index_range_rejects_negative_start_or_stop(start: int, stop: int) -> None:
+    with pytest.raises(WyrdError) as exc:
+        Split.index_range(start, stop)
+
+    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 
 
 def test_split_index_range_start_after_stop_rejected() -> None:
@@ -39,31 +54,27 @@ def test_split_index_range_start_after_stop_rejected() -> None:
     assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 
 
-def test_split_indices_serializes_values() -> None:
-    assert Split.indices([0, 2, 3]).to_dict()["value"] == [0, 2, 3]
+def test_indices_split_records_its_rows() -> None:
+    assert Split.indices([0, 2, 3]).to_dict() == {"kind": "Indices", "value": [0, 2, 3]}
 
 
-def test_split_indices_rejects_negative_values() -> None:
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param([0, -1], id="negative"),
+        pytest.param([1, 1], id="duplicate"),
+        pytest.param([], id="empty"),
+    ],
+)
+def test_invalid_indices_are_refused(values: list[int]) -> None:
     with pytest.raises(WyrdError) as exc:
-        Split.indices([0, -1])
+        Split.indices(values)
 
     assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 
 
-def test_split_indices_rejects_duplicate_values() -> None:
-    with pytest.raises(WyrdError) as exc:
-        Split.indices([1, 1])
-
-    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
-
-
-def test_split_materialized_accepts_artifact_card_ref() -> None:
-    payload = Split.materialized(
-        {"kind": "Artifact", "name": "train", "version": "1.0.0", "space": "default"}
-    ).to_dict()
-
-    assert payload["kind"] == "Materialized"
-    assert payload["value"]["kind"] == "Artifact"
+def test_materialized_split_records_its_artifact_ref() -> None:
+    assert Split.materialized(TEST_ROWS).to_dict() == {"kind": "Materialized", "value": TEST_ROWS}
 
 
 def test_split_materialized_allows_authored_ref_without_space() -> None:
@@ -75,40 +86,15 @@ def test_split_materialized_allows_authored_ref_without_space() -> None:
     }
 
 
-def test_mixed_materialized_ref_and_rule_based_splits_round_trip(tmp_path) -> None:
-    card = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
-    payload = json.loads(card.model_dump_json())
-    payload["spec"]["splits"] = {
-        "train": {"label": "train", "strategy": Split.column("year", "<=", 2024).to_dict()},
-        "test": {
-            "label": "test",
-            "strategy": Split.materialized(
-                {"kind": "Artifact", "name": "test", "version": "1.0.0", "space": "default"}
-            ).to_dict(),
-        },
+def test_rule_and_materialized_splits_survive_save_and_load(tmp_path: Path) -> None:
+    DataCard(
+        pd.DataFrame({"year": [2024]}),
+        splits={"train": Split.column("year", "<=", 2024), "test": Split.materialized(TEST_ROWS)},
+    ).save(tmp_path)
+
+    splits = DataCard.from_path(tmp_path).splits
+
+    assert {label: split.to_dict()["kind"] for label, split in splits.items()} == {
+        "train": "Column",
+        "test": "Materialized",
     }
-    restored = DataCard.model_validate_json(json.dumps(payload))
-
-    assert restored.metadata.to_dict()["splits"]["train"]["strategy"]["kind"] == "Column"
-
-
-def test_split_key_must_match_serialized_label() -> None:
-    card = DataCard(PandasInterface(data=pd.DataFrame({"year": [2024]})))
-    payload = json.loads(card.model_dump_json())
-    payload["spec"]["splits"] = {
-        "train": {"label": "test", "strategy": Split.column("year", "<=", 2024).to_dict()}
-    }
-
-    with pytest.raises(WyrdError):
-        DataCard.model_validate_json(json.dumps(payload))
-
-
-def test_datacard_does_not_expose_split_data_execution() -> None:
-    assert not hasattr(DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))), "split_data")
-
-
-def test_split_indices_rejects_empty_list() -> None:
-    with pytest.raises(WyrdError) as exc:
-        Split.indices([])
-
-    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"

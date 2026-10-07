@@ -1,0 +1,11 @@
+apiVersion: wyrd/hydrated-bundle/v1
+hydration: metadata
+root:
+  kind: Data
+  name: dataset
+  version: 1.0.0
+  space: default
+cards: []
+card_count: 0
+artifact_count: 0
+downloaded_artifact_count: 0

@@ -1,0 +1,31 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: default
+  name: training
+  version: 1.0.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
+  labels: {}
+  annotations: {}
+spec:
+  interface:
+    kind: Custom
+    meta:
+      loader_module: fixture
+      loader_class: TinyData
+      extra: {}
+  schema:
+    columns: []
+  card_refs: []
+  splits: {}
+  target_columns: []
+  stats:
+    row_count: null
+    col_count: null
+    byte_count: 0
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+relationships:
+  outbound: []
+  outbound_refs: []
+  inbound: []
+  inbound_refs: []

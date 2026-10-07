@@ -1,0 +1,5 @@
+- relative_path: model.joblib
+  sha256: CrK8HjrLsv4aKu4epTZ6CUnh6dnitORC4pPxkMxsD+Y=
+  size_bytes: 863
+  content_type: application/octet-stream
+  local_path: cards/model/artifacts/model.joblib

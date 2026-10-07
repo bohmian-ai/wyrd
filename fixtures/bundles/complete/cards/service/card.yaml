@@ -1,0 +1,108 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  space: default
+  name: service
+  version: 1.0.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01
+  labels: {}
+  annotations: {}
+spec:
+  components:
+  - alias: model
+    ref:
+      kind: Model
+      name: model
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
+  - alias: backup
+    ref:
+      kind: Model
+      name: backup
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03
+  - alias: training_data
+    ref:
+      kind: Data
+      name: training
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
+  - alias: agent_triage
+    ref:
+      kind: Agent
+      name: triage
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b06
+  - alias: agent_inline
+    ref:
+      kind: Agent
+      name: inline
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
+  verified_by:
+  - verifier:
+      kind: Verifier
+      name: ok-check
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
+    runs_on:
+      kind: observations_ready
+relationships:
+  outbound:
+  - default/Agent/inline@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
+  - default/Agent/triage@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b06
+  - default/Data/training@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
+  - default/Model/backup@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03
+  - default/Model/model@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
+  - default/Verifier/ok-check@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
+  outbound_refs:
+  - ref:
+      kind: Agent
+      name: inline
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
+    alias: agent_inline
+  - ref:
+      kind: Agent
+      name: triage
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b06
+    alias: agent_triage
+  - ref:
+      kind: Data
+      name: training
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
+    alias: training_data
+  - ref:
+      kind: Model
+      name: backup
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03
+    alias: backup
+  - ref:
+      kind: Model
+      name: model
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
+    alias: model
+  - ref:
+      kind: Verifier
+      name: ok-check
+      version: 1.0.0
+      space: default
+      uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
+    alias: null
+  inbound: []
+  inbound_refs: []

@@ -1,0 +1,18 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: default
+  name: triage
+  version: 1.0.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+  labels: {}
+  annotations: {}
+spec:
+  provider: openai
+  model: gpt-4o
+  messages: hello
+relationships:
+  outbound: []
+  outbound_refs: []
+  inbound: []
+  inbound_refs: []

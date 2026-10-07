@@ -209,7 +209,7 @@ Commits: `4d17b274b`, `ea13a8824`, `eaf24f690`, `fabe5005e`, `82972f9f9`, `91db2
 
 Commit range: `4d17b274b^..71fe71c35` (the commits above plus the evidence record `0676b763d`).
 
-Post-merge fixes on TASK-016 surfaces after the Forge merge: `41065b39b` drops testing hooks the merge resurrected (S11), reads `CallbackContext` as attributes (S5), and passes the TypeScript compaction type through `TableConfigOptions` (S4).
+Post-merge fixes on TASK-016 surfaces after the Forge merge: `41065b39b` drops testing hooks the merge resurrected (S11), reads `CallbackContext` as attributes (S5), and passes the TypeScript compaction type through `TableConfigOptions` (S4); `bd9f0b2c3` passes the Python row model by keyword (S8), expects `Drift` in a judgment's detail, and binds Eval Verifiers on `observations_ready` in the direct verification journeys (S1).
 
 Approved on user direction without a task review; review pending.
 

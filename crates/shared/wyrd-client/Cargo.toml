@@ -72,7 +72,6 @@ rustix = { workspace = true, features = ["process"] }
 [dev-dependencies]
 workspace-hack.workspace = true
 secrecy = { workspace = true }
-sqlx = { workspace = true, features = ["postgres"] }
 vala-bifrost-redux = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 wiremock = { workspace = true }

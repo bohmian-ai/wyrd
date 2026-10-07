@@ -11358,7 +11358,6 @@ dependencies = [
  "skald-spec",
  "skald-tool",
  "skald-workflow",
- "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

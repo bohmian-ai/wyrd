@@ -10319,6 +10319,7 @@ dependencies = [
  "wyrd-storage",
  "wyrd-telemetry",
  "wyrd-tonic",
+ "wyrd-types",
 ]
 
 [[package]]
@@ -11337,6 +11338,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-types",
  "wyrd-utils",
 ]
 
@@ -11511,6 +11513,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-types",
 ]
 
 [[package]]
@@ -11586,6 +11589,7 @@ dependencies = [
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-testing",
+ "wyrd-types",
  "wyrd-utils",
 ]
 
@@ -11631,6 +11635,7 @@ dependencies = [
  "wyrd-client",
  "wyrd-queue",
  "wyrd-spec",
+ "wyrd-types",
 ]
 
 [[package]]
@@ -11747,6 +11752,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-types",
  "wyrd-vault",
  "zeroize",
 ]
@@ -11957,6 +11963,7 @@ dependencies = [
  "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-types",
 ]
 
 [[package]]
@@ -11993,6 +12000,20 @@ dependencies = [
  "wyrd-spec",
  "wyrd-tls",
  "wyrd-tonic",
+]
+
+[[package]]
+name = "wyrd-types"
+version = "0.0.1"
+dependencies = [
+ "arrow-schema",
+ "chrono",
+ "parquet-variant-compute",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+ "wyrd-spec",
 ]
 
 [[package]]

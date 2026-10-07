@@ -50,7 +50,10 @@ impl ManagedColumn {
         Self {
             field: CanonicalField::meta(
                 name,
-                CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+                CanonicalType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE),
+                ),
                 false,
             ),
             scope: ManagedScope::Time,

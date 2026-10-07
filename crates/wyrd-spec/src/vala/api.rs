@@ -274,8 +274,8 @@ pub enum DataTypeSpec {
     ///
     /// Key and value are full [`FieldSpec`]s for the same reason as
     /// [`Self::List`]'s element: each keeps its name, nullability, metadata,
-    /// and stable field id. The key must be non-nullable; register refuses a
-    /// nullable key with `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`.
+    /// and stable field id. An Iceberg map key is always required, so register
+    /// stores a key declared nullable as non-nullable.
     #[cfg_attr(feature = "server", schema(no_recursion))]
     Map {
         /// Declaration of every entry's key.
@@ -333,6 +333,15 @@ pub struct FieldSpec {
 /// This is the same key Parquet and Iceberg read a field id from, so a
 /// description round-trips through Arrow without a second id convention.
 pub const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
+
+/// The [`DataTypeSpec::Timestamp`] zone of every stored zoned timestamp.
+///
+/// A zoned timestamp is one UTC instant; its zone only labels how to display
+/// it. Iceberg stores it as `timestamptz` and reads it back with this label,
+/// so a table description, a built-in declaration, and a read all spell it
+/// this way. A writer may send any zone label: Bifrost converts it to this one
+/// on ingest without changing the instant.
+pub const UTC_TIME_ZONE: &str = "+00:00";
 
 /// Metadata key marking a declaration as a write-time input class.
 pub const INPUT_CLASS_KEY: &str = "wyrd:input_class";

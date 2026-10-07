@@ -8,7 +8,6 @@ pub mod claim_publication;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
-mod fixed_ipc;
 pub mod geometry;
 pub mod hot_source;
 pub mod hot_stage;

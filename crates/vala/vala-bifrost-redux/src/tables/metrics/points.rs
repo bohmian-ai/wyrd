@@ -22,13 +22,15 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Element declaration of an explicit-bucket count collection.
-pub static BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static BUCKET_COUNT_ELEMENT: F = F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Element declaration of an explicit-bound collection.
-pub static EXPLICIT_BOUND_ELEMENT: F = F::payload("item", T::Float64, false);
+pub static EXPLICIT_BOUND_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Float64, false);
 
 /// Element declaration of the positive exponential bucket counts.
-pub static POSITIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static POSITIVE_BUCKET_COUNT_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the positive exponential bucket collection.
 pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
@@ -41,7 +43,8 @@ pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
 ];
 
 /// Element declaration of the negative exponential bucket counts.
-pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the negative exponential bucket collection.
 pub static NEGATIVE_BUCKET_FIELDS: [F; 2] = [
@@ -60,8 +63,11 @@ pub static QUANTILE_VALUE_FIELDS: [F; 2] = [
 ];
 
 /// Element declaration of the ordered summary quantile collection.
-pub static QUANTILE_VALUE_ELEMENT: F =
-    F::payload("quantile_value", T::Struct(&QUANTILE_VALUE_FIELDS), false);
+pub static QUANTILE_VALUE_ELEMENT: F = F::payload(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&QUANTILE_VALUE_FIELDS),
+    false,
+);
 
 /// Ordered fields of one exemplar.
 ///
@@ -77,7 +83,11 @@ pub static EXEMPLAR_FIELDS: [F; 6] = [
 ];
 
 /// Element declaration of the ordered exemplar collection.
-pub static EXEMPLAR_ELEMENT: F = F::sensitive("exemplar", T::Struct(&EXEMPLAR_FIELDS), false);
+pub static EXEMPLAR_ELEMENT: F = F::sensitive(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&EXEMPLAR_FIELDS),
+    false,
+);
 
 /// The canonical `vala.metrics.points` ledger.
 ///

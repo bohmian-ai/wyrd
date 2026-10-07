@@ -449,7 +449,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Unordered key/value entries, the Iceberg `map` type.\n\nKey and value are full [`FieldSpec`]s for the same reason as [`Self::List`]'s element: each keeps its name, nullability, metadata, and stable field id. The key must be non-nullable; register refuses a nullable key with `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`.",
+          "description": "Unordered key/value entries, the Iceberg `map` type.\n\nKey and value are full [`FieldSpec`]s for the same reason as [`Self::List`]'s element: each keeps its name, nullability, metadata, and stable field id. An Iceberg map key is always required, so register stores a key declared nullable as non-nullable.",
           "type": "object",
           "required": [
             "Map"

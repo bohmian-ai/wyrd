@@ -30,6 +30,7 @@ use vala_eval::executor::{EvalReport, EvalWorkflowSummary, SkipReason, TaskRunOu
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
 use wyrd_spec::vala::BifrostError;
+use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
@@ -563,7 +564,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(
                 WYRD_EVENT_TIME,
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
                 false,
             ),
         ]);
@@ -769,7 +770,8 @@ fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef 
     Arc::new(StringArray::from_iter(values))
 }
 
-/// Build a nullable UTC microsecond timestamp column.
+/// Build a nullable microsecond timestamp column in the stored
+/// [`UTC_TIME_ZONE`] spelling every built-in result table declares.
 fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
     Arc::new(
         TimestampMicrosecondArray::from_iter(
@@ -777,7 +779,7 @@ fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayR
                 .into_iter()
                 .map(|value| value.map(|at| at.timestamp_micros())),
         )
-        .with_timezone("UTC"),
+        .with_timezone(UTC_TIME_ZONE),
     )
 }
 

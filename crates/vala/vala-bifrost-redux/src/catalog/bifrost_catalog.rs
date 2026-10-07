@@ -25,6 +25,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
 use wyrd_spec::vala::api::{
     AuditEvent, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
+    RegisterOutcome, RegisterTableResponse,
 };
 
 use crate::catalog::error::BifrostCatalogError;
@@ -90,6 +91,20 @@ impl TableUid {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+}
+
+/// What one locked registration decided.
+///
+/// Built-in provisioning needs only the uid; a caller registration answers
+/// with all three, so the outcome and fingerprint come from the transaction
+/// that decided them rather than from a separate pre-check.
+struct Registration {
+    /// The registered table's uid, new or existing.
+    table_uid: TableUid,
+    /// Whether this call created the table or matched an existing one.
+    outcome: RegisterOutcome,
+    /// The stored user-schema fingerprint the registration was compared on.
+    fingerprint: SchemaFingerprint,
 }
 
 /// Inputs for one tenant-qualified physical table registration.
@@ -804,6 +819,7 @@ impl BifrostCatalog {
         }
         self.create_table_locked(request, None, CompactionRegistration::default())
             .await
+            .map(|registration| registration.table_uid)
     }
 
     /// Register a caller-owned dataset in the tenant-qualified dataset namespace.
@@ -814,9 +830,14 @@ impl BifrostCatalog {
     /// nothing and the table follows Forge's default. On an existing table each
     /// declared option must match the stored explicit value or be omitted.
     ///
+    /// The answer is decided under the registration lock: `Created` for a new
+    /// table, `AlreadyExists` for a repeat whose Iceberg schema, layout, and
+    /// compaction match, and the table's uid and stored fingerprint either way.
+    ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// compaction target or type, control row, or audit event is invalid.
+    /// compaction target or type, control row, or audit event is invalid, and
+    /// `UnsupportedType` naming the field when a column has no Iceberg type.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
@@ -825,24 +846,30 @@ impl BifrostCatalog {
         physical_layout: Option<PhysicalLayoutWire>,
         compaction: CompactionRegistration,
         audit: Option<AuditEvent>,
-    ) -> Result<TableUid, BifrostCatalogError> {
+    ) -> Result<RegisterTableResponse, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
             return Err(BifrostCatalogError::MetadataMismatch(
                 "caller-owned registrations must use vala.datasets".to_owned(),
             ));
         }
-        self.create_table_locked(
-            CreateTableRequest {
-                table,
-                user_fields,
-                tenant,
-                physical_layout,
-                audit,
-            },
-            None,
-            compaction,
-        )
-        .await
+        let registration = self
+            .create_table_locked(
+                CreateTableRequest {
+                    table,
+                    user_fields,
+                    tenant,
+                    physical_layout,
+                    audit,
+                },
+                None,
+                compaction,
+            )
+            .await?;
+        Ok(RegisterTableResponse {
+            outcome: registration.outcome,
+            table_uid: hex::encode(registration.table_uid.as_bytes()),
+            fingerprint: hex::encode(registration.fingerprint.0),
+        })
     }
 
     /// Ensure one canonical built-in exists for a tenant.
@@ -880,6 +907,7 @@ impl BifrostCatalog {
             CompactionRegistration::default(),
         )
         .await
+        .map(|registration| registration.table_uid)
     }
 
     /// Resolve one canonical layout and register the tenant-qualified table.
@@ -893,7 +921,13 @@ impl BifrostCatalog {
     /// existing row is compared on schema fingerprint first, then on layout, so
     /// a schema conflict never masquerades as a layout conflict. An exact
     /// repeat of a prior registration is a no-op returning the same
-    /// [`TableUid`].
+    /// [`TableUid`] with [`RegisterOutcome::AlreadyExists`].
+    ///
+    /// A caller registration's fields are first replaced by their
+    /// [`crate::tables::iceberg_form`], so its fingerprint, physical table, and
+    /// every later description are the one Iceberg form; a spelling of the same
+    /// Iceberg type therefore repeats rather than conflicts. A built-in is
+    /// declared in that form already.
     ///
     /// `canonical_schema` is the built-in's own complete physical schema when
     /// this registration comes from [`Self::ensure_builtin`], and `None` for a
@@ -916,9 +950,24 @@ impl BifrostCatalog {
         request: CreateTableRequest,
         canonical_schema: Option<SchemaRef>,
         compaction: CompactionRegistration,
-    ) -> Result<TableUid, BifrostCatalogError> {
+    ) -> Result<Registration, BifrostCatalogError> {
+        let mut request = request;
         if canonical_schema.is_none() {
             reject_reserved_field_names(&request.user_fields)?;
+            request.user_fields = request
+                .user_fields
+                .iter()
+                .map(|field| {
+                    crate::tables::iceberg_form(field).map_err(|_| {
+                        BifrostCatalogError::Registration(
+                            wyrd_spec::vala::BifrostError::UnsupportedType {
+                                field: field.name().clone(),
+                                data_type: field.data_type().to_string(),
+                            },
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
         }
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
@@ -966,7 +1015,11 @@ impl BifrostCatalog {
             // verdict still commits once, in the transaction that observed it.
             append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
             conn.commit().await?;
-            return TableUid::from_row(&row.table_uid, &row.fqn);
+            return Ok(Registration {
+                table_uid: TableUid::from_row(&row.table_uid, &row.fqn)?,
+                outcome: RegisterOutcome::AlreadyExists,
+                fingerprint,
+            });
         }
 
         self.ensure_namespace(binding.physical_namespace()).await?;
@@ -990,7 +1043,11 @@ impl BifrostCatalog {
         .await?;
         append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
         conn.commit().await?;
-        Ok(table_uid)
+        Ok(Registration {
+            table_uid,
+            outcome: RegisterOutcome::Created,
+            fingerprint,
+        })
     }
 
     /// Create the physical Iceberg table for one canonical layout.
@@ -1072,8 +1129,10 @@ impl BifrostCatalog {
     /// # Errors
     ///
     /// Returns a metadata mismatch when the location, format version, schema,
-    /// partition, or sort recipe diverges, or an Iceberg error when its schema cannot be
-    /// converted for shape validation.
+    /// partition, or sort recipe diverges, or an Iceberg error when its schema
+    /// has no Arrow form. The schema must equal the expected one exactly, by
+    /// name, order, nullability, and type at every depth, because registration
+    /// only ever declares Iceberg's own Arrow form.
     fn validate_physical_table(
         &self,
         table: &Table,
@@ -1100,7 +1159,9 @@ impl BifrostCatalog {
         }
         let actual_schema =
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?;
-        if !schema_shape_matches(expected_schema, &actual_schema) {
+        if SchemaFingerprint::from_arrow_schema_exact(expected_schema)
+            != SchemaFingerprint::from_arrow_schema_exact(&actual_schema)
+        {
             return Err(BifrostCatalogError::MetadataMismatch(format!(
                 "physical table schema mismatch: expected {expected_schema:?}, actual {actual_schema:?}"
             )));
@@ -1506,27 +1567,6 @@ impl BifrostCatalog {
     }
 }
 
-/// Compares physical schema shapes across Arrow and Iceberg representations.
-///
-/// The sole spelling alias is the UTC timestamp timezone emitted as `UTC` by
-/// Arrow and `+00:00` by Iceberg. Field order, names, nullability, units, and
-/// every other data-type detail remain exact.
-pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
-    expected.fields().len() == actual.fields().len()
-        && expected
-            .fields()
-            .iter()
-            .zip(actual.fields())
-            .all(|(expected, actual)| field_shape_matches(expected, actual))
-}
-
-/// Whether two fields describe the same column name, nullability, and layout.
-fn field_shape_matches(expected: &Field, actual: &Field) -> bool {
-    expected.name() == actual.name()
-        && expected.is_nullable() == actual.is_nullable()
-        && crate::tables::arrow_type_shape_matches(expected.data_type(), actual.data_type())
-}
-
 /// Resolves the physical schema and canonical layout one registration writes.
 ///
 /// The physical schema is `canonical_schema` when the caller supplied one — the
@@ -1781,68 +1821,6 @@ fn provider_error(error: IcebergError) -> BifrostCatalogError {
     BifrostCatalogError::DataFusion(datafusion::error::DataFusionError::External(Box::new(
         error,
     )))
-}
-
-#[cfg(test)]
-mod schema_shape_tests {
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-
-    use super::schema_shape_matches;
-
-    /// UTC and Iceberg's equivalent offset spelling have the same physical shape.
-    #[test]
-    fn schema_shape_accepts_utc_offset_alias() {
-        let utc = Schema::new(vec![Field::new(
-            "observed_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
-        let offset = Schema::new(vec![Field::new(
-            "observed_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-            false,
-        )]);
-
-        assert!(schema_shape_matches(&utc, &offset));
-        assert!(schema_shape_matches(&offset, &utc));
-    }
-
-    /// A non-UTC timezone remains a different physical schema shape.
-    #[test]
-    fn schema_shape_rejects_non_utc_timezone() {
-        let utc = Schema::new(vec![Field::new(
-            "observed_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
-        let other = Schema::new(vec![Field::new(
-            "observed_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
-            false,
-        )]);
-
-        assert!(!schema_shape_matches(&utc, &other));
-    }
-
-    /// The same columns in a different order are a different physical shape.
-    ///
-    /// Position is the whole comparison. Nothing consults a declared Iceberg
-    /// field id to call two orderings the same table, so a reordered canonical
-    /// schema is a mismatch here and a `MetadataMismatch` at registration.
-    #[test]
-    fn schema_shape_rejects_reordered_columns() {
-        let declared = Schema::new(vec![
-            Field::new("seq", DataType::Int64, false),
-            Field::new("entry_hash", DataType::Utf8, false),
-        ]);
-        let reordered = Schema::new(vec![
-            Field::new("entry_hash", DataType::Utf8, false),
-            Field::new("seq", DataType::Int64, false),
-        ]);
-
-        assert!(!schema_shape_matches(&declared, &reordered));
-        assert!(!schema_shape_matches(&reordered, &declared));
-    }
 }
 
 /// Validates every reconciled hot row against its binding and adds its bytes.
@@ -2321,11 +2299,14 @@ mod production_pin_tests {
                 .expect("dataset registers");
             for _ in 0..2 {
                 assert_eq!(
-                    catalog
-                        .table_uid(&table, tenant)
-                        .await
-                        .expect("the registered table resolves"),
-                    registered
+                    hex::encode(
+                        catalog
+                            .table_uid(&table, tenant)
+                            .await
+                            .expect("the registered table resolves")
+                            .as_bytes()
+                    ),
+                    registered.table_uid
                 );
             }
         });

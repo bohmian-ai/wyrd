@@ -72,7 +72,7 @@ impl TableConfig {
     ///
     /// The precision path: a caller who needs `Int32`, a non-UTC timezone,
     /// `Decimal128`, or `FixedSizeBinary` supplies Arrow directly, exactly as
-    /// [`wyrd_queue::arrow_schema_to_fieldspec`] documents.
+    /// [`wyrd_types::arrow_schema_to_fieldspec`] documents.
     ///
     /// # Errors
     ///
@@ -81,12 +81,13 @@ impl TableConfig {
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
     /// `wyrd_*`, `card_ref`, or `run_id` name, and
     /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
-    /// a column's Arrow type has no wire form or Bifrost cannot store it —
-    /// before any request is sent.
+    /// a column's Arrow type has no wire form — before any request is sent.
+    /// Whether a wire type can be stored is decided by the server at
+    /// registration, which refuses one with no Iceberg column.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
-        wyrd_queue::arrow_schema_to_fieldspec(&schema)?;
+        wyrd_types::arrow_schema_to_fieldspec(&schema)?;
         Ok(Self {
             namespace,
             name,
@@ -102,7 +103,7 @@ impl TableConfig {
     ///
     /// This is the Pydantic (`model_json_schema()`) and Zod
     /// (`z.toJSONSchema()`) door. Mapping is delegated verbatim to
-    /// [`wyrd_queue::json_schema_to_arrow`], the single owner of the
+    /// [`wyrd_types::json_schema_to_arrow`], the single owner of the
     /// JSON-Schema-to-Arrow table, so all three languages agree on the columns
     /// one model produces.
     ///
@@ -115,7 +116,7 @@ impl TableConfig {
         fqn: &str,
         schema: &serde_json::Value,
     ) -> Result<Self, BifrostClientError> {
-        let arrow = wyrd_queue::json_schema_to_arrow(schema)?;
+        let arrow = wyrd_types::json_schema_to_arrow(schema)?;
         Self::from_arrow(fqn, Arc::new(arrow))
     }
 
@@ -190,7 +191,7 @@ impl TableConfig {
     pub(crate) fn from_description(
         description: &BifrostTableDescription,
     ) -> Result<Self, BifrostClientError> {
-        let user_schema = wyrd_queue::fieldspec_to_arrow(&description.user_fields)?;
+        let user_schema = wyrd_types::fieldspec_to_arrow(&description.user_fields)?;
         Ok(Self {
             namespace: description.entry.namespace.clone(),
             name: description.entry.name.clone(),
@@ -293,7 +294,7 @@ impl TableConfig {
         RegisterTableRequest {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema)
+            fields: wyrd_types::arrow_schema_to_fieldspec(&self.user_schema)
                 .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: self.physical_layout.clone(),
             compaction_target_file_size_bytes: self.compaction_target_file_size_bytes,
@@ -349,7 +350,7 @@ impl From<TableConfig> for TableConfigWire {
         Self {
             namespace: config.namespace,
             name: config.name,
-            fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema)
+            fields: wyrd_types::arrow_schema_to_fieldspec(&config.user_schema)
                 .expect("every TableConfig constructor admits only a wire-representable schema"),
             physical_layout: config.physical_layout,
             compaction_target_file_size_bytes: config.compaction_target_file_size_bytes,
@@ -372,7 +373,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
         Ok(Self {
             namespace: wire.namespace,
             name: wire.name,
-            user_schema: Arc::new(wyrd_queue::fieldspec_to_arrow(&wire.fields)?),
+            user_schema: Arc::new(wyrd_types::fieldspec_to_arrow(&wire.fields)?),
             physical_layout: wire.physical_layout,
             compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
             compaction_type: wire.compaction_type,

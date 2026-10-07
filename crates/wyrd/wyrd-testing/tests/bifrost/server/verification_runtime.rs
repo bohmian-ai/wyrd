@@ -42,10 +42,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
-use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantJsonEncoderFactory, variant_field,
-    variant_storage_type,
-};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderFactory};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -76,6 +73,7 @@ use wyrd_sql::queries::verifier_runs::RunInput;
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_types::variant::{variant_field, variant_storage_type};
 
 use super::query::{ServerJourneyError, audit_rows, scheduled_context};
 
@@ -2212,7 +2210,7 @@ impl TypedPayloadJourney {
         let mut bytes = Vec::new();
         let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
-            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
             .build::<_, JsonArray>(&mut bytes);
         for batch in &batches {
             writer.write(batch)?;

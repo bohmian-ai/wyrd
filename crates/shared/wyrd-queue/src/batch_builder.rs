@@ -30,7 +30,10 @@ use wyrd_spec::vala::ids::RunId;
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
 use crate::sealed_sender::encode_ipc;
-use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant, variant_field};
+use wyrd_types::timestamp::{TimestampKind, parse_ltz, parse_ntz, parse_tz};
+use wyrd_types::variant::{is_variant, variant_field};
+
+use crate::variant::{EncodedVariant, VariantColumnBuilder};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -135,7 +138,7 @@ impl RowPreflight {
                 spec.name
             )));
         }
-        Ok(Self::new(&crate::schema::fieldspec_to_arrow(
+        Ok(Self::new(&wyrd_types::fieldspec_to_arrow(
             &description.user_fields,
         )?))
     }
@@ -381,6 +384,11 @@ fn build_column(field: &Field, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRe
         build_variant(path, cells)
     } else {
         match field.data_type() {
+            DataType::Struct(children)
+                if TimestampKind::of(field.data_type()) == Some(TimestampKind::Tz) =>
+            {
+                build_timestamp_tz(children, path, cells)
+            }
             DataType::Struct(children) => {
                 build_struct(children, path, cells).and_then(|(columns, nulls)| {
                     assembled(
@@ -415,6 +423,41 @@ fn assembled<A: arrow::array::Array + 'static>(
         let row = cells.first().map_or(0, |cell| cell.row);
         Failure::schema(row, format!("nested column assembly failed: {e}"))
     })
+}
+
+/// Build one `TIMESTAMP_TZ` column from RFC 3339 texts with offsets.
+///
+/// Each present text becomes its instant in `utc` and the writer's wall-clock
+/// reading in `local`; a null row keeps zero children under the struct's
+/// validity bit.
+///
+/// # Errors
+///
+/// Returns a schema-parse refusal at the first value that is not an RFC 3339
+/// text with an offset.
+fn build_timestamp_tz(
+    fields: &Fields,
+    path: &str,
+    cells: &[Cell<'_>],
+) -> Result<ArrayRef, Failure> {
+    let values = collect(path, cells, |v| v.as_str().and_then(parse_tz))?;
+    let child = |index: usize, pick: fn((i64, i64)) -> i64| -> ArrayRef {
+        Arc::new(
+            TimestampMicrosecondArray::from_iter_values(
+                values.iter().map(|value| value.map_or(0, pick)),
+            )
+            .with_data_type(fields[index].data_type().clone()),
+        )
+    };
+    let nulls = NullBuffer::from(values.iter().map(Option::is_some).collect::<Vec<_>>());
+    assembled(
+        cells,
+        StructArray::try_new(
+            fields.clone(),
+            vec![child(0, |(utc, _)| utc), child(1, |(_, local)| local)],
+            Some(nulls),
+        ),
+    )
 }
 
 /// Build the children and validity of a struct (or the root row object).
@@ -715,7 +758,8 @@ fn build_scalar(data_type: &DataType, path: &str, cells: &[Cell<'_>]) -> Result<
             v.as_str().and_then(parse_date_days)
         })?)),
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let values = collect(path, cells, |v| v.as_str().and_then(parse_rfc3339_micros))?;
+            let parse = if tz.is_some() { parse_ltz } else { parse_ntz };
+            let values = collect(path, cells, |v| v.as_str().and_then(parse))?;
             Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz.clone()))
         }
         DataType::FixedSizeBinary(width) => {
@@ -793,83 +837,6 @@ fn parse_date_days(text: &str) -> Option<i32> {
     i32::try_from(days_from_civil(year, month, day)).ok()
 }
 
-/// Parse an RFC 3339 timestamp into microseconds since the Unix epoch.
-///
-/// Supports `YYYY-MM-DDThh:mm:ss[.frac][Z|±hh:mm]` (also a space date/time
-/// separator). Dependency-free: `chrono` is not a permitted dependency here.
-fn parse_rfc3339_micros(text: &str) -> Option<i64> {
-    let (date, rest) = text.split_once(['T', ' '])?;
-    let mut dparts = date.split('-');
-    let year: i64 = dparts.next()?.parse().ok()?;
-    let month: i64 = dparts.next()?.parse().ok()?;
-    let day: i64 = dparts.next()?.parse().ok()?;
-    if dparts.next().is_some() {
-        return None;
-    }
-
-    // Split trailing timezone from the time-of-day.
-    let (time, offset_secs) = if let Some(stripped) = rest.strip_suffix('Z') {
-        (stripped, 0_i64)
-    } else if let Some(idx) = rest.rfind(['+', '-']) {
-        let (t, off) = rest.split_at(idx);
-        (t, parse_offset_secs(off)?)
-    } else {
-        (rest, 0_i64)
-    };
-
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
-        None => (time, ""),
-    };
-    let mut tparts = hms.split(':');
-    let hour: i64 = tparts.next()?.parse().ok()?;
-    let minute: i64 = tparts.next()?.parse().ok()?;
-    let second: i64 = tparts.next()?.parse().ok()?;
-    if tparts.next().is_some()
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=60).contains(&second)
-    {
-        return None;
-    }
-
-    let micros_frac = parse_fraction_micros(frac)?;
-    let days = days_from_civil(year, month, day);
-    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_secs;
-    Some(secs * 1_000_000 + micros_frac)
-}
-
-fn parse_offset_secs(offset: &str) -> Option<i64> {
-    let (sign, body) = offset.split_at(1);
-    let sign = match sign {
-        "+" => 1,
-        "-" => -1,
-        _ => return None,
-    };
-    let mut parts = body.split(':');
-    let hours: i64 = parts.next()?.parse().ok()?;
-    let minutes: i64 = parts.next().unwrap_or("0").parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(sign * (hours * 3_600 + minutes * 60))
-}
-
-fn parse_fraction_micros(frac: &str) -> Option<i64> {
-    if frac.is_empty() {
-        return Some(0);
-    }
-    if !frac.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let mut digits = frac.to_owned();
-    digits.truncate(6);
-    while digits.len() < 6 {
-        digits.push('0');
-    }
-    digits.parse().ok()
-}
-
 #[cfg(test)]
 mod batch_builder_tests {
     //! `RowPreflight` proof: user cols + `card_ref`/`run_id`, nested types,
@@ -883,7 +850,9 @@ mod batch_builder_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::ids::RunId;
 
-    use crate::variant::{variant_cell_to_json, variant_field};
+    use wyrd_types::variant::variant_field;
+
+    use crate::variant::variant_cell_to_json;
     use crate::{PreparedRows, RowPreflight, WyrdQueueError};
 
     /// A two-column user schema: required `id`, optional `name`.
@@ -966,6 +935,78 @@ mod batch_builder_tests {
         ] {
             let error = prepare(&user_schema(), &[row]).expect_err("row is refused");
             assert_eq!(error.code(), code, "row {row}");
+        }
+    }
+
+    /// Each timestamp type keeps its own reading from JSON text: LTZ stores
+    /// one instant from any offset, NTZ stores the wall clock and refuses an
+    /// offset, TZ stores the instant and the writer's wall clock, and both
+    /// zoned types refuse an offset-free reading.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a column stores the wrong reading or accepts text its type
+    /// refuses.
+    #[test]
+    fn each_timestamp_type_keeps_its_own_reading() {
+        use arrow::datatypes::TimestampMicrosecondType;
+        use wyrd_types::TimestampKind;
+
+        /// 2026-10-06T17:00:00Z in microseconds.
+        const MOMENT: i64 = 1_791_306_000_000_000;
+        /// The moment's wall-clock reading in UTC-05:00.
+        const CHICAGO: i64 = MOMENT - 5 * 3_600 * 1_000_000;
+        let column = |kind: TimestampKind| {
+            wyrd_types::fieldspec_to_arrow(&[wyrd_spec::vala::api::FieldSpec {
+                name: "at".to_owned(),
+                data_type: kind.data_type_spec(),
+                nullable: true,
+                metadata: std::collections::BTreeMap::new(),
+            }])
+            .expect("a timestamp column maps")
+        };
+        let values = |array: &dyn Array| {
+            array
+                .as_primitive::<TimestampMicrosecondType>()
+                .values()
+                .to_vec()
+        };
+        let offsets = [
+            r#"{"at": "2026-10-06T17:00:00Z"}"#,
+            r#"{"at": "2026-10-06T12:00:00-05:00"}"#,
+            r#"{"at": "2026-10-07T02:00:00+09:00"}"#,
+        ];
+
+        let ltz = prepare(&column(TimestampKind::Ltz), &offsets).expect("LTZ prepares");
+        let ntz = prepare(
+            &column(TimestampKind::Ntz),
+            &[r#"{"at": "2026-10-06T12:00:00"}"#],
+        )
+        .expect("NTZ prepares");
+        let tz = prepare(
+            &column(TimestampKind::Tz),
+            &[r#"{"at": "2026-10-06T12:00:00-05:00"}"#, r#"{"at": null}"#],
+        )
+        .expect("TZ prepares");
+        let tz = tz.batch().column(0).as_struct();
+        let refusals = [
+            (TimestampKind::Ltz, r#"{"at": "2026-10-06T17:00:00"}"#),
+            (TimestampKind::Tz, r#"{"at": "2026-10-06T17:00:00"}"#),
+            (TimestampKind::Ntz, r#"{"at": "2026-10-06T12:00:00-05:00"}"#),
+        ];
+
+        assert_eq!(values(ltz.batch().column(0)), vec![MOMENT; 3]);
+        assert_eq!(values(ntz.batch().column(0)), vec![CHICAGO]);
+        assert_eq!(values(tz.column(0)), vec![MOMENT, 0]);
+        assert_eq!(values(tz.column(1)), vec![CHICAGO, 0]);
+        assert!(tz.is_null(1));
+        for (kind, row) in refusals {
+            let refused = prepare(&column(kind), &[row]).expect_err("the reading is refused");
+            assert_eq!(
+                refused.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{kind:?} {row}"
+            );
         }
     }
 

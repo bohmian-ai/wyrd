@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use parquet_variant_compute::VariantType;
-use wyrd_queue::variant::variant_storage_type;
+use wyrd_types::variant::variant_storage_type;
 
 /// Arrow field metadata key Parquet and Iceberg read a field id from.
 ///
@@ -37,10 +37,17 @@ pub fn utf8(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Utf8, nullable)
 }
 
+/// Declare one UTC microsecond timestamp column in Iceberg's own Arrow form.
+///
+/// Iceberg reads a `timestamptz` back as the `+00:00` zone, so declaring that
+/// spelling keeps every built-in a fixed point of its registered schema.
 pub fn ts_us_utc(name: &str, nullable: bool) -> Field {
     Field::new(
         name,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+        ),
         nullable,
     )
 }

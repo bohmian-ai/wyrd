@@ -202,7 +202,8 @@ mod tests {
     use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
     use serde_json::{Value, json};
-    use wyrd_queue::variant::{variant_cell_to_json, variant_field};
+    use wyrd_queue::variant::variant_cell_to_json;
+    use wyrd_types::variant::variant_field;
 
     use super::*;
 

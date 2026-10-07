@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::spec::Schema as IcebergSchema;
@@ -389,7 +389,7 @@ impl ScribeIngressCpuPool {
 /// Native payloads may carry one nullable Utf8 `run_id` correlation field and
 /// MAY additionally carry an optional caller-supplied `wyrd_event_time` column.
 /// When present, that column MUST be exactly the managed physical type
-/// (`Timestamp(Microsecond, UTC)`), MUST NOT be nullable-with-nulls, and MUST
+/// (`Timestamp(Microsecond, "+00:00")`), MUST NOT be nullable-with-nulls, and MUST
 /// NOT be duplicated; it is then validated against the acceptance `window` and,
 /// if in range, preserved verbatim as the authoritative event time. When absent,
 /// the server stamps `wyrd_event_time` with the ingest receipt time. Projected
@@ -556,6 +556,7 @@ fn decode_rows(
             return Err(ScribeError::InvalidFrame);
         }
     }
+    let rows = &*cast_to_registered(rows, context.registered_schema)?;
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition)?;
     }
@@ -574,6 +575,124 @@ fn decode_rows(
                 table: "resolved ingress table".to_owned(),
             }),
         None => Ok(stamped),
+    }
+}
+
+/// Casts each caller column to its registered Arrow type when both are the
+/// same Iceberg type.
+///
+/// Registration stores Iceberg's own Arrow form of every column, for example
+/// `Int32` for a declared `Int8`, `+00:00` for a `UTC` zone, and `element` for
+/// a list element named `item`, so a writer
+/// holding the narrower or alternative spelling would otherwise fail the
+/// fingerprint check. iceberg-rust's Arrow conversion decides the equivalence
+/// and Arrow's `cast` converts the values once, so every later check, the WAL,
+/// and storage see only the registered type. A column with no registered
+/// counterpart, or a different Iceberg type, is left for the fingerprint check
+/// to refuse. Without a registered schema the batch is returned as is.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::FingerprintMismatch`] when the registered schema has
+/// no Arrow form or Arrow cannot cast an equivalent column.
+fn cast_to_registered<'a>(
+    rows: &'a RecordBatch,
+    registered: Option<&IcebergSchema>,
+) -> Result<std::borrow::Cow<'a, RecordBatch>, ScribeError> {
+    let mismatch = || ScribeError::FingerprintMismatch {
+        table: "resolved ingress table".to_owned(),
+    };
+    let Some(registered) = registered else {
+        return Ok(std::borrow::Cow::Borrowed(rows));
+    };
+    let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
+    let schema = rows.schema();
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(rows.num_columns());
+    let mut cast_any = false;
+    for (field, column) in schema.fields().iter().zip(rows.columns()) {
+        let wanted = target.field_with_name(field.name()).ok().filter(|wanted| {
+            exact_layout(field) != exact_layout(wanted) && same_iceberg_type(field, wanted)
+        });
+        if let Some(wanted) = wanted {
+            columns.push(arrow::compute::cast(column, wanted.data_type()).map_err(|_| mismatch())?);
+            fields.push(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(wanted.data_type().clone()),
+            );
+            cast_any = true;
+        } else {
+            columns.push(Arc::clone(column));
+            fields.push(field.as_ref().clone());
+        }
+    }
+    if !cast_any {
+        return Ok(std::borrow::Cow::Borrowed(rows));
+    }
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map(std::borrow::Cow::Owned)
+    .map_err(|_| mismatch())
+}
+
+/// Fingerprints one column's exact Arrow layout, nested names included.
+///
+/// Metadata is ignored, so a sent column already in the registered form is
+/// left as is while one spelling a list element `item` or map entries
+/// `entries` is cast to Iceberg's names like any other spelling.
+fn exact_layout(field: &Field) -> SchemaFingerprint {
+    SchemaFingerprint::from_arrow_schema_exact(&Schema::new(vec![field.clone()]))
+}
+
+/// Reports whether two Arrow fields convert to the same Iceberg column.
+///
+/// Each field is converted alone with fresh field ids, so the comparison sees
+/// only Iceberg type, nesting, and nullability, never either side's ids. The
+/// sent field's zoned timestamps are first relabelled by [`utc_labelled`], so
+/// a writer's display zone never decides the column. A field Iceberg cannot
+/// represent matches nothing.
+fn same_iceberg_type(sent: &Field, registered: &Field) -> bool {
+    let iceberg = |field: Field| {
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
+            field.with_metadata(std::collections::HashMap::new()),
+        ]))
+        .ok()
+        .map(|schema| schema.as_struct().clone())
+    };
+    let sent = sent.clone().with_data_type(utc_labelled(sent.data_type()));
+    matches!((iceberg(sent), iceberg(registered.clone())), (Some(sent), Some(registered)) if sent == registered)
+}
+
+/// Relabels every zoned timestamp in `data_type`, nested ones included, with
+/// the stored `+00:00` zone.
+///
+/// Arrow stores a zoned timestamp as UTC epoch time whatever its zone label,
+/// so the label only says how to display it and the relabelled column holds
+/// the same instants. A naive timestamp keeps no zone: it is a wall-clock
+/// reading, a different Iceberg type, and stays refused for a zoned column.
+fn utc_labelled(data_type: &DataType) -> DataType {
+    let field = |field: &FieldRef| {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(utc_labelled(field.data_type())),
+        )
+    };
+    match data_type {
+        DataType::Timestamp(unit, Some(_)) => {
+            DataType::Timestamp(*unit, Some(iceberg::arrow::UTC_TIME_ZONE.into()))
+        }
+        DataType::List(item) => DataType::List(field(item)),
+        DataType::LargeList(item) => DataType::LargeList(field(item)),
+        DataType::FixedSizeList(item, len) => DataType::FixedSizeList(field(item), *len),
+        DataType::Struct(children) => DataType::Struct(children.iter().map(field).collect()),
+        DataType::Map(entries, sorted) => DataType::Map(field(entries), *sorted),
+        other => other.clone(),
     }
 }
 
@@ -841,7 +960,7 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
-/// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, UTC)`,
+/// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, "+00:00")`,
 /// contains any null, or is duplicated. Returns [`ScribeError::EventTimeOutOfRange`]
 /// when a present `wyrd_event_time` value (either mode) falls outside the
 /// acceptance `window`. Returns a typed Scribe error when correlation resolution,
@@ -948,7 +1067,7 @@ fn stamp_correlation_columns(
 ///
 /// Native ingest MAY carry `wyrd_event_time`, but only when it is exactly the
 /// managed physical type that [`append_managed_columns`] stamps —
-/// `Timestamp(Microsecond)` with the `UTC` timezone — appears exactly once, and
+/// `Timestamp(Microsecond)` with Iceberg's `+00:00` UTC zone — appears exactly once, and
 /// contains no nulls. This mirrors how the server-stamped column is
 /// constructed so caller and server values are physically interchangeable, and
 /// keeps the day-partition splitter able to derive a non-null partition day for
@@ -961,7 +1080,7 @@ fn stamp_correlation_columns(
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when the column is duplicated, is not
-/// `Timestamp(Microsecond, UTC)`, or contains any null value.
+/// `Timestamp(Microsecond, "+00:00")`, or contains any null value.
 fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
     let schema = rows.schema();
     let mut matched = None;
@@ -976,7 +1095,10 @@ fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
     let Some((index, field)) = matched else {
         return Ok(());
     };
-    let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let expected = DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+    );
     if field.data_type() != &expected {
         return Err(ScribeError::InvalidFrame);
     }
@@ -1219,7 +1341,7 @@ fn managed_arrays(
     let row_count = rows.num_rows();
     let admitted_at = Arc::new(
         TimestampMicrosecondArray::from(vec![values.receipt_micros; row_count])
-            .with_timezone("UTC"),
+            .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
     ) as ArrayRef;
     policy
         .managed_columns()
@@ -2181,6 +2303,7 @@ mod tests {
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
     use crate::tables::CorrelationPolicy;
+    use crate::tables::managed_columns::ensure_managed_columns;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -2314,6 +2437,230 @@ mod tests {
                 .count(),
             1,
         );
+    }
+
+    /// The user columns the cast tests register, in Iceberg's Arrow form.
+    fn cast_table_columns() -> Vec<Field> {
+        let element = |data_type| Arc::new(Field::new("element", data_type, true));
+        vec![
+            Field::new("i", DataType::Int32, true),
+            Field::new("u", DataType::Int64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::LargeBinary, true),
+            Field::new("l", DataType::List(element(DataType::Int32)), true),
+            Field::new("n", DataType::List(element(DataType::Int64)), true),
+        ]
+    }
+
+    /// Decode `rows` as one canonical batch for a table registered with
+    /// [`cast_table_columns`], the path every production writer takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the decode refusal for `rows`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registered schema does not convert to Iceberg.
+    fn decode_for_cast_table(rows: RecordBatch) -> Result<RecordBatch, ScribeError> {
+        let registered = crate::tables::iceberg_schema_for(&Schema::new(ensure_managed_columns(
+            cast_table_columns(),
+            CorrelationPolicy::Observation,
+        )))
+        .expect("the registered schema converts to Iceberg");
+        decode(
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            &DecodeContext {
+                principal: &principal(),
+                expected_schema_fingerprint: source_schema_fingerprint(
+                    &Schema::new(cast_table_columns()),
+                    CorrelationPolicy::Observation,
+                ),
+                request_id: &RequestId::now_v7(),
+                window: EventTimeWindow::default(),
+                receipt_micros: receipt_now(),
+                definition: None,
+                registered_schema: Some(&registered),
+            },
+        )
+    }
+
+    /// One valid row and one null row of narrower spellings for every
+    /// [`cast_table_columns`] column, plus a caller `wyrd_event_time` of
+    /// `event_micros` in Arrow's `UTC` zone. The `ts` column holds the
+    /// instant `1` labelled `ts_zone`, or a naive reading when it is `None`.
+    ///
+    /// The writer sends `Int8`, `UInt32`, a `UTC` zone, `LargeUtf8`, `Binary`,
+    /// a `List<Int16>` with Arrow's default `item` element, and a `List<Int64>`
+    /// differing only in that element name.
+    fn narrow_spellings(event_micros: i64, ts_zone: Option<&str>) -> RecordBatch {
+        let item = |data_type| DataType::List(Arc::new(Field::new("item", data_type, true)));
+        let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let mut items = arrow::array::ListBuilder::new(arrow::array::Int16Builder::new());
+        items.values().append_value(7);
+        items.append(true);
+        items.append(false);
+        let mut renamed = arrow::array::ListBuilder::new(arrow::array::Int64Builder::new());
+        renamed.values().append_value(9);
+        renamed.append(true);
+        renamed.append(false);
+        batch(
+            vec![
+                Field::new(WYRD_EVENT_TIME, utc.clone(), false),
+                Field::new("i", DataType::Int8, true),
+                Field::new("u", DataType::UInt32, true),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Microsecond, ts_zone.map(Into::into)),
+                    true,
+                ),
+                Field::new("s", DataType::LargeUtf8, true),
+                Field::new("b", DataType::Binary, true),
+                Field::new("l", item(DataType::Int16), true),
+                Field::new("n", item(DataType::Int64), true),
+            ],
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![event_micros; 2]).with_timezone("UTC"),
+                ),
+                Arc::new(arrow::array::Int8Array::from(vec![Some(-3), None])),
+                Arc::new(arrow::array::UInt32Array::from(vec![Some(u32::MAX), None])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone_opt(ts_zone),
+                ),
+                Arc::new(arrow::array::LargeStringArray::from(vec![Some("x"), None])),
+                Arc::new(arrow::array::BinaryArray::from(vec![
+                    Some(b"y".as_slice()),
+                    None,
+                ])),
+                Arc::new(items.finish()),
+                Arc::new(renamed.finish()),
+            ],
+        )
+    }
+
+    /// Spellings Iceberg stores as the registered column type are cast to it.
+    ///
+    /// Each [`narrow_spellings`] column decodes to exactly the registered
+    /// layout, nested names included, with its values intact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is refused, a column keeps its sent layout, or a
+    /// value is lost.
+    #[test]
+    fn same_iceberg_type_spellings_cast_to_the_registered_type() {
+        let stamped = decode_for_cast_table(narrow_spellings(receipt_now(), Some("UTC")))
+            .expect("same-Iceberg-type spellings are accepted");
+
+        for declared in &cast_table_columns() {
+            let schema = stamped.schema();
+            let arrived = schema
+                .field_with_name(declared.name())
+                .expect("declared field");
+            assert_eq!(
+                super::exact_layout(arrived),
+                super::exact_layout(declared),
+                "`{}` arrives as {:?}",
+                declared.name(),
+                arrived.data_type()
+            );
+            let column = stamped
+                .column_by_name(declared.name())
+                .expect("declared column");
+            assert_eq!(
+                column.null_count(),
+                1,
+                "`{}` keeps its null",
+                declared.name()
+            );
+        }
+        let ints = stamped
+            .column_by_name("u")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .expect("u is Int64");
+        assert_eq!(ints.value(0), i64::from(u32::MAX));
+    }
+
+    /// A caller `wyrd_event_time` sent with Arrow's `UTC` zone is cast to the
+    /// managed `+00:00` form before the event-time check, keeping its value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is refused or the event time changes zone or
+    /// value.
+    #[test]
+    fn a_caller_utc_event_time_casts_to_the_managed_zone() {
+        let event_micros = receipt_now();
+
+        let stamped = decode_for_cast_table(narrow_spellings(event_micros, Some("UTC")))
+            .expect("a `UTC` event time is accepted");
+
+        let event_time = stamped
+            .column_by_name(WYRD_EVENT_TIME)
+            .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+            .expect("the caller event time is kept");
+        assert_eq!(event_time.timezone(), Some(iceberg::arrow::UTC_TIME_ZONE));
+        assert_eq!(event_time.value(0), event_micros);
+    }
+
+    /// A zoned timestamp in any display zone is stored as the same instant
+    /// under the `+00:00` label.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a zone label is refused, kept, or changes the instant.
+    #[test]
+    fn a_zone_label_never_changes_the_instant() {
+        for zone in ["America/Chicago", "-05:00", "+09:00"] {
+            let stamped = decode_for_cast_table(narrow_spellings(receipt_now(), Some(zone)))
+                .unwrap_or_else(|error| panic!("`{zone}` is accepted: {error:?}"));
+
+            let ts = stamped
+                .column_by_name("ts")
+                .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .expect("ts is a microsecond timestamp");
+            assert_eq!(ts.timezone(), Some(iceberg::arrow::UTC_TIME_ZONE), "{zone}");
+            assert_eq!(ts.value(0), 1, "{zone}");
+        }
+    }
+
+    /// A naive timestamp is a wall-clock reading with no instant, so it is
+    /// refused for a zoned column rather than guessed as UTC.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the naive batch is accepted.
+    #[test]
+    fn a_naive_timestamp_is_refused_for_a_zoned_column() {
+        assert!(matches!(
+            decode_for_cast_table(narrow_spellings(receipt_now(), None)),
+            Err(ScribeError::FingerprintMismatch { .. })
+        ));
+    }
+
+    /// A wider `Int64` sent for an `Int32` column is a different Iceberg type
+    /// and is refused rather than cast.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the wider batch is accepted.
+    #[test]
+    fn a_wider_type_is_refused() {
+        let wider = batch(
+            vec![Field::new("i", DataType::Int64, true)],
+            vec![Arc::new(Int64Array::from(vec![Some(1_i64)]))],
+        );
+
+        assert!(matches!(
+            decode_for_cast_table(wider),
+            Err(ScribeError::FingerprintMismatch { .. })
+        ));
     }
 
     /// A canonical built-in's validator refusal reaches the caller unchanged.
@@ -3147,11 +3494,15 @@ mod tests {
     fn managed_event_time(values: Vec<i64>) -> (Field, ArrayRef) {
         let field = Field::new(
             WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+            ),
             false,
         );
-        let array =
-            Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef;
+        let array = Arc::new(
+            TimestampMicrosecondArray::from(values).with_timezone(iceberg::arrow::UTC_TIME_ZONE),
+        ) as ArrayRef;
         (field, array)
     }
 
@@ -3515,7 +3866,10 @@ mod tests {
             .clone();
         assert_eq!(
             event_field.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            &DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(iceberg::arrow::UTC_TIME_ZONE.into())
+            ),
         );
         assert!(!event_field.is_nullable());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
@@ -3544,14 +3898,18 @@ mod tests {
             vec![
                 Field::new(
                     WYRD_EVENT_TIME,
-                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    DataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                    ),
                     false,
                 ),
                 Field::new(CARD_REF, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(
-                    arrow::array::TimestampNanosecondArray::from(vec![1_i64]).with_timezone("UTC"),
+                    arrow::array::TimestampNanosecondArray::from(vec![1_i64])
+                        .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
                 ),
                 card_column(),
             ],
@@ -3574,13 +3932,19 @@ mod tests {
             vec![
                 Field::new(
                     WYRD_EVENT_TIME,
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    DataType::Timestamp(
+                        TimeUnit::Microsecond,
+                        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                    ),
                     true,
                 ),
                 Field::new(CARD_REF, DataType::Utf8, false),
             ],
             vec![
-                Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![None::<i64>])
+                        .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
+                ),
                 card_column(),
             ],
         );

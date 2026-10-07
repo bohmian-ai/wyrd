@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field};
 
-use wyrd_queue::variant::variant_field;
+use wyrd_types::variant::variant_field;
 
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;

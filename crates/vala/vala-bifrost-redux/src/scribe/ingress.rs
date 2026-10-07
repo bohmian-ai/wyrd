@@ -106,15 +106,6 @@ struct AdmittedRowContext {
     material_limit: usize,
     /// Native event-time acceptance window.
     event_time_window: crate::scribe::admission::EventTimeWindow,
-    /// Native schema frame start established by preflight.
-    native_schema_start: usize,
-    /// Native schema frame end established by preflight.
-    native_schema_end: usize,
-    /// Fixed native source descriptors established by preflight.
-    native_sources: [crate::scribe::material_plan::SourceMaterialPlan;
-        crate::scribe::material_plan::MAX_SOURCE_PLANS],
-    /// Live prefix length within `native_sources`.
-    native_source_count: usize,
     /// Server-owned built-in whose declared physical contract the decode must
     /// preserve, including its correlation policy.
     ///
@@ -288,7 +279,7 @@ impl ScribeImpl {
                 let plan = planner.plan_canonical(&canonical.batches, frame.measured_wire_bytes)?;
                 validate_decoded_request_size(
                     plan.current_material_bytes,
-                    plan.request_bytes,
+                    plan.request_len,
                     self.decoded_request_limit(),
                 )?;
                 plan
@@ -339,10 +330,6 @@ impl ScribeImpl {
             receipt_micros,
             material_limit,
             event_time_window,
-            native_schema_start,
-            native_schema_end,
-            native_sources,
-            native_source_count,
             definition,
             registered_schema,
         } = context;
@@ -356,10 +343,6 @@ impl ScribeImpl {
                     batch_id,
                     event_time_window,
                     receipt_micros,
-                    schema_start: native_schema_start,
-                    schema_end: native_schema_end,
-                    sources: native_sources,
-                    source_count: native_source_count,
                     definition,
                     registered_schema,
                     expanded_limit_bytes: self.ingest_limits.expanded_bytes(),
@@ -421,7 +404,7 @@ impl ScribeImpl {
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
         let material_plan = self.plan_transport_payload(frame)?;
-        let held_bytes = material_plan.held_material_bytes();
+        let held_bytes = material_plan.held_material_bytes;
         let mut memory = match decode_owner {
             Some(owner) => owner.complete(),
             None => self.memory.try_reserve_ingress(MemoryCategory::Raw, 0)?,
@@ -582,10 +565,6 @@ impl ScribeImpl {
                     receipt_micros,
                     material_limit: material_plan.current_material_bytes,
                     event_time_window: self.admission.config().event_time_window,
-                    native_schema_start: material_plan.native_schema_start,
-                    native_schema_end: material_plan.native_schema_end,
-                    native_sources: material_plan.sources,
-                    native_source_count: material_plan.source_count,
                     definition: builtin_definition,
                     registered_schema,
                 },
@@ -608,7 +587,6 @@ impl ScribeImpl {
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
         };
-        let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
         let mut prepared = self.preprocess(admitted).await?;
         self.charge_prepared(&mut prepared)?;
         self.shards
@@ -621,7 +599,7 @@ impl ScribeImpl {
             .record(append_started.elapsed().as_secs_f64());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
-            rows_accepted: planned_rows_accepted,
+            rows_accepted: completion.rows,
             receipt_micros,
             first_commit: completion.first_commit,
         })
@@ -904,7 +882,10 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                ),
                 false,
             ),
             Field::new("value", DataType::Utf8, false),
@@ -914,7 +895,7 @@ mod tests {
             vec![
                 Arc::new(
                     TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
-                        .with_timezone("UTC"),
+                        .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
                 ),
                 Arc::new(StringArray::from(vec![value])),
             ],

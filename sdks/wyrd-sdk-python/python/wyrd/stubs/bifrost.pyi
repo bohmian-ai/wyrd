@@ -177,6 +177,9 @@ class TableConfig:
         Args:
             model: a Pydantic model class, not an instance. Its
                 ``model_json_schema()`` becomes the declared user columns.
+                Datetime fields declare the timestamp types in
+                ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
+                other ``datetime`` is ``TIMESTAMP_LTZ``.
                 ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on

@@ -23,7 +23,8 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Map, Value};
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, variant_storage_type};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_types::variant::variant_storage_type;
 
 /// The trace every fixture span, and the correlated error log, belong to.
 pub const TRACE_ID: [u8; 16] = [

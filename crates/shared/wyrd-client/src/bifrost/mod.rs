@@ -68,8 +68,11 @@ pub use wyrd_spec::vala::api::CompactionTypeWire;
 
 // C4a forward schema helpers, re-exported so SDK users build the user Arrow
 // schema from a `FieldSpec` set or a JSON-Schema value without reaching into
-// `wyrd-queue` directly.
-pub use wyrd_queue::{fieldspec_to_arrow, json_schema_to_arrow};
+// `wyrd-types` directly.
+/// The three timestamp types a model field declares a column with:
+/// `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, and `TIMESTAMP_TZ`.
+pub use wyrd_types::{TimestampLtz, TimestampNtz, TimestampTz};
+pub use wyrd_types::{fieldspec_to_arrow, json_schema_to_arrow};
 
 /// Server-free unit lane for the Bifrost client: scope identity, producer pooling, and
 /// the asymmetric backpressure contract — all driven through mock/stall sinks.

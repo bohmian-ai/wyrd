@@ -38,7 +38,7 @@ use wyrd_tonic::otlp::common::v1::{AnyValue, EntityRef, InstrumentationScope, Ke
 use wyrd_tonic::otlp::resource::v1::Resource;
 
 /// Element declaration of the key-name lists inside one entity reference.
-pub static ENTITY_REF_KEY_ELEMENT: F = F::sensitive("item", T::Utf8, false);
+pub static ENTITY_REF_KEY_ELEMENT: F = F::sensitive(iceberg::spec::LIST_FIELD_NAME, T::Utf8, false);
 
 /// Ordered fields of one `OTel` resource entity reference.
 pub static ENTITY_REF_FIELDS: [F; 4] = [
@@ -52,7 +52,11 @@ pub static ENTITY_REF_FIELDS: [F; 4] = [
 ///
 /// All three signal ledgers declare their resource entity references through
 /// this one element, so the persisted layout cannot drift between signals.
-pub static ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Struct(&ENTITY_REF_FIELDS), false);
+pub static ENTITY_REF_ELEMENT: F = F::sensitive(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&ENTITY_REF_FIELDS),
+    false,
+);
 
 /// One `OTLP` value or attribute collection that cannot be stored as Variant.
 ///

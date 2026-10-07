@@ -29,7 +29,12 @@ const {
   connectWyrdClient,
   describeTableConfig,
   openWyrdState,
+  storedTimestampText,
+  tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  timestampFormat,
+  timestampKinds,
+  timestampText,
   variantToValue,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
@@ -367,6 +372,15 @@ export class BifrostQueryStream
       : tableFromIPC(ipc).schema;
   }
 
+  /**
+   * @internal Each top-level timestamp column's Bifrost timestamp type,
+   * decided in Rust from the retained schema; empty until the stream completes.
+   */
+  get timestampKinds(): Readonly<Record<string, string>> {
+    const ipc = this.#native.schemaIpc;
+    return ipc === null || ipc === undefined ? {} : timestampKinds(ipc);
+  }
+
   [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
     return this;
   }
@@ -479,7 +493,34 @@ function layoutJson(layout?: TableLayout): string | undefined {
  * on Zod, or on any other schema library.
  */
 export interface JsonSchemaSource {
-  toJSONSchema(): Readonly<Record<string, unknown>>;
+  toJSONSchema(params?: {
+    override?(context: {
+      zodSchema: unknown;
+      jsonSchema: Record<string, unknown>;
+    }): void;
+  }): Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Mark a Zod local date-time with the `TIMESTAMP_NTZ` format.
+ *
+ * Zod's `toJSONSchema` hook, read structurally so Zod stays out of this SDK's
+ * dependencies. `z.iso.datetime()` already declares `date-time`, which is
+ * `TIMESTAMP_LTZ`; a local-only one declares no format, so without this it
+ * would register as text. Other schema libraries never call the hook.
+ */
+function zodTimestampFormat(context: {
+  zodSchema: unknown;
+  jsonSchema: Record<string, unknown>;
+}): void {
+  const def = (
+    context.zodSchema as {
+      _zod?: { def?: { format?: string; local?: boolean; offset?: boolean } };
+    }
+  )._zod?.def;
+  if (def?.format === "datetime" && def.local === true && def.offset !== true) {
+    context.jsonSchema.format = TimestampNTZ.format;
+  }
 }
 
 /**
@@ -517,6 +558,12 @@ export class TableConfig {
    * dependency of this SDK and any peer offering the same method works
    * unchanged.
    *
+   * Time fields declare Wyrd timestamp columns: `TimestampNTZ.schema(z)`,
+   * `TimestampLTZ.schema(z)`, and `TimestampTZ.schema(z)` declare their own
+   * type, `z.iso.datetime()` declares `TIMESTAMP_LTZ`, and
+   * `z.iso.datetime({ local: true })` declares `TIMESTAMP_NTZ`. Zod refuses to
+   * describe `z.date()` in JSON Schema, so it is refused here too.
+   *
    * `compactionTargetFileSizeBytes` pins the table's Forge compaction file
    * target; omitted, the table follows the server's deployment default.
    * Registration records it once, and a later registration naming a different
@@ -540,7 +587,9 @@ export class TableConfig {
   ): TableConfig {
     const document =
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
-        ? (schema as JsonSchemaSource).toJSONSchema()
+        ? (schema as JsonSchemaSource).toJSONSchema({
+            override: zodTimestampFormat,
+          })
         : schema;
     return new TableConfig(
       tableConfigFromJsonSchema(
@@ -551,6 +600,36 @@ export class TableConfig {
         compactionType,
       ),
     );
+  }
+
+  /**
+   * Declare a table's columns from an explicit Arrow schema.
+   *
+   * Use this for column types JSON Schema cannot express, such as `Int32`,
+   * `Decimal`, `Map`, or a nanosecond timestamp. `schema` holds user columns
+   * only; the layout and compaction arguments are as for
+   * {@link TableConfig.fromJsonSchema}.
+   *
+   * @throws {WyrdError} `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` for a column
+   * type with no wire form, or another catalog code for an invalid table name
+   * or a server-owned column. A type with a wire form but no Iceberg column is
+   * refused by {@link Bifrost.register}.
+   */
+  static fromArrow(
+    table: string,
+    schema: Schema,
+    layout?: TableLayout,
+    compactionTargetFileSizeBytes?: number,
+    compactionType?: CompactionType,
+  ): TableConfig {
+    const declared = tableConfigFromArrowIpc(
+      table,
+      Buffer.from(tableToIPC(new Table(schema), "stream")),
+      layoutJson(layout),
+      compactionTargetFileSizeBytes,
+      compactionType,
+    );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
   }
 
   /**
@@ -637,45 +716,163 @@ export interface RowSchema<T> {
   parse(value: unknown): T;
 }
 
-/** The Arrow extension name every Variant column carries. */
-const VARIANT_EXTENSION = "arrow.parquet.variant";
+/** Brands a timestamp text with the Bifrost timestamp type it was checked as. */
+declare const timestampBrand: unique symbol;
 
-/** Whether `field` is a Variant or nests one inside a Struct or List. */
-function holdsVariant(field: Field): boolean {
-  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
-    return true;
-  }
-  if (DataType.isStruct(field.type) || DataType.isList(field.type)) {
-    return (field.type.children as Field[]).some(holdsVariant);
-  }
-  return false;
+/** `TIMESTAMP_NTZ` text: an RFC 3339 wall-clock reading with no offset. */
+export type TimestampNTZ = string & { readonly [timestampBrand]: "TIMESTAMP_NTZ" };
+/** `TIMESTAMP_LTZ` text: one RFC 3339 instant, rendered in UTC. */
+export type TimestampLTZ = string & { readonly [timestampBrand]: "TIMESTAMP_LTZ" };
+/** `TIMESTAMP_TZ` text: one RFC 3339 instant in the writer's offset. */
+export type TimestampTZ = string & { readonly [timestampBrand]: "TIMESTAMP_TZ" };
+
+/**
+ * A Zod-style namespace, named structurally so this SDK never depends on Zod.
+ *
+ * Zod's `meta` and `refine` both return the string schema they are called on,
+ * so a field built from it has the type `meta` returns.
+ */
+export interface StringSchemaFactory {
+  string(): { meta(meta: Record<string, unknown>): unknown };
+}
+
+/** The string schema type a {@link StringSchemaFactory} builds. */
+export type StringSchemaOf<Z extends StringSchemaFactory> = ReturnType<
+  ReturnType<Z["string"]>["meta"]
+>;
+
+/**
+ * One Wyrd timestamp type: its name, its JSON Schema format, and the checks
+ * that make a text a value of it.
+ */
+export interface WyrdTimestampType<T extends string> {
+  /** `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ`. */
+  readonly name: string;
+  /** The JSON Schema `format` that declares a column of this type. */
+  readonly format: string;
+  /**
+   * Check `text` and return its canonical text.
+   *
+   * The text is parsed by the same Rust parser an insert uses, so a value this
+   * accepts is one Bifrost accepts.
+   *
+   * @throws TypeError when the text is not this type: an offset for
+   * `TIMESTAMP_NTZ`, no offset for the others, or not RFC 3339.
+   */
+  parse(text: string): T;
+  /**
+   * A string schema for a field of this type, built with the caller's Zod.
+   *
+   * It carries this type's format, so a table declared from it registers this
+   * column type, and it accepts only text {@link WyrdTimestampType.parse}
+   * accepts.
+   */
+  schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z>;
 }
 
 /**
- * Replace every Variant cell inside one row value with its native value,
- * leaving every other value as Apache Arrow produced it.
+ * Build one Wyrd timestamp type from its name.
  *
- * Decoding stays in the shared Rust owner: objects become plain objects,
- * arrays arrays, and an integer outside the safe range a `bigint`.
+ * The format, the check, and the canonical text all come from the Rust owner,
+ * so the three types restate nothing.
+ */
+function wyrdTimestamp<T extends string>(name: string): WyrdTimestampType<T> {
+  const format = timestampFormat(name) as string;
+  const accepts = (text: string): boolean => timestampText(name, text) != null;
+  return {
+    name,
+    format,
+    parse(text: string): T {
+      const canonical = timestampText(name, text);
+      if (canonical == null) {
+        throw new TypeError(`${name} does not accept ${JSON.stringify(text)}`);
+      }
+      return canonical as T;
+    },
+    schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z> {
+      const field = z.string().meta({ format }) as {
+        refine(check: (value: string) => boolean, message: string): StringSchemaOf<Z>;
+      };
+      return field.refine(accepts, `not a ${name}`);
+    },
+  };
+}
+
+/** `TIMESTAMP_NTZ`: a wall-clock reading with no instant. */
+export const TimestampNTZ = wyrdTimestamp<TimestampNTZ>("TIMESTAMP_NTZ");
+/** `TIMESTAMP_LTZ`: one instant. */
+export const TimestampLTZ = wyrdTimestamp<TimestampLTZ>("TIMESTAMP_LTZ");
+/** `TIMESTAMP_TZ`: one instant plus the writer's wall-clock reading. */
+export const TimestampTZ = wyrdTimestamp<TimestampTZ>("TIMESTAMP_TZ");
+
+/**
+ * One stored timestamp cell as its Wyrd timestamp type's text.
+ *
+ * Apache Arrow hands a microsecond timestamp over as fractional milliseconds,
+ * which round back to the exact microseconds; a `TIMESTAMP_TZ` cell is its
+ * `{utc, local}` struct. Rust renders the text.
+ */
+function timestampValue(kind: string, value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  const micros = (millis: unknown): number => Math.round((millis as number) * 1000);
+  const stored = value as { utc: unknown; local: unknown };
+  const text =
+    typeof value === "number"
+      ? storedTimestampText(kind, micros(value))
+      : storedTimestampText(kind, micros(stored.utc), micros(stored.local));
+  if (text == null) {
+    throw new TypeError(`stored ${kind} value is out of range`);
+  }
+  return text;
+}
+
+/** The Arrow extension name every Variant column carries. */
+const VARIANT_EXTENSION = "arrow.parquet.variant";
+
+/**
+ * One cell as the plain JavaScript value a typed row receives.
+ *
+ * A Variant decodes through the shared Rust owner, a Struct becomes a plain
+ * object, a List an array, and a Map an object keyed by its entry keys, at
+ * every depth. A 64-bit integer becomes a `number` when it is a safe integer
+ * and stays a `bigint` otherwise, the rule Variant integers already follow, so
+ * one schema both declares a table and parses its rows.
  */
 function nativeValue(field: Field, value: unknown): unknown {
-  if (value === null || value === undefined || !holdsVariant(field)) {
+  if (value === null || value === undefined) {
     return value;
   }
   if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
     const cell = value as { metadata: Uint8Array; value: Uint8Array };
     return variantToValue(cell.metadata, cell.value);
   }
-  const children = field.type.children as Field[];
+  const children = field.type.children as Field[] | null;
   if (DataType.isStruct(field.type)) {
     const struct = value as Record<string, unknown>;
     return Object.fromEntries(
-      children.map((child) => [child.name, nativeValue(child, struct[child.name])]),
+      (children ?? []).map((child) => [child.name, nativeValue(child, struct[child.name])]),
     );
   }
-  return Array.from(value as Iterable<unknown>, (item) =>
-    nativeValue(children[0] as Field, item),
-  );
+  if (DataType.isList(field.type)) {
+    return Array.from(value as Iterable<unknown>, (item) =>
+      nativeValue(children?.[0] as Field, item),
+    );
+  }
+  if (DataType.isMap(field.type)) {
+    const entry = children?.[0]?.type.children as Field[];
+    return Object.fromEntries(
+      Array.from(value as Iterable<[unknown, unknown]>, ([key, item]) => [
+        String(key),
+        nativeValue(entry[1] as Field, item),
+      ]),
+    );
+  }
+  if (typeof value === "bigint" && Number.isSafeInteger(Number(value))) {
+    return Number(value);
+  }
+  return value;
 }
 
 /**
@@ -905,8 +1102,12 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout. Variant cells, top level or
-   * nested in a Struct or List, reach `rows` as their native value.
+   * nothing about the table's stored layout. Every cell reaches `rows` as a
+   * plain value: Struct as an object, List as an array, Map as an object,
+   * Variant as its native value, and a safe 64-bit integer as a `number`. A
+   * top-level timestamp column's cell is its Wyrd timestamp type's text:
+   * `TIMESTAMP_NTZ` with no offset, `TIMESTAMP_LTZ` in UTC, and
+   * `TIMESTAMP_TZ` in the writer's offset.
    *
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
    * partially valid result is never returned as success.
@@ -934,14 +1135,18 @@ export class Bifrost {
     if (rows === undefined) {
       return result;
     }
-    const variantFields = schema.fields.filter(holdsVariant);
+    const kinds = stream.timestampKinds;
     return result
       .toArrow()
       .toArray()
       .map((row: { toJSON(): Record<string, unknown> }) => {
         const values = row.toJSON();
-        for (const field of variantFields) {
-          values[field.name] = nativeValue(field, values[field.name]);
+        for (const field of schema.fields) {
+          const kind = kinds[field.name];
+          values[field.name] =
+            kind === undefined
+              ? nativeValue(field, values[field.name])
+              : timestampValue(kind, values[field.name]);
         }
         return rows.parse(values);
       });

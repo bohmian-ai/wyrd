@@ -19,12 +19,9 @@ impl SchemaFingerprint {
     /// Compute a fingerprint over the schema exactly as it is spelled.
     ///
     /// [`Self::from_arrow_schema`] answers a catalog question — is this the same
-    /// table? — and therefore normalizes the renderings an Iceberg round trip
-    /// changes. A reader that has to decode bytes is asking a different
-    /// question: are these the same arrays? `Utf8` and `LargeUtf8` are one
-    /// Iceberg type but two memory layouts, so a decode-side identity that
-    /// collapsed them would accept a schema whose offset width does not match
-    /// the file.
+    /// table? — over field names and types only. A reader that has to decode
+    /// bytes is asking a different question: are these the same arrays? This
+    /// encoding therefore also commits every nested name and nullability.
     ///
     /// The encoding is a deterministic recursive walk that commits exactly what
     /// changes an Arrow array's buffers: field and child names, their order,
@@ -270,51 +267,28 @@ fn hash_decimal(hasher: &mut Sha256, tag: &str, precision: u8, scale: i8) {
     hasher.update(scale.to_le_bytes());
 }
 
-/// Canonical name given to every list element while fingerprinting.
+/// Return one Arrow type with every nested field's metadata dropped.
 ///
-/// A list's element field is positional, not addressable, and each writer names
-/// it by its own convention (Arrow says `item`, Iceberg says `element`, the
-/// canonical ledgers say `event`). Pinning one name keeps a table's identity
-/// stable across those round trips.
-const LIST_ELEMENT: &str = "element";
-
-/// Return one Arrow type reduced to its fingerprint-significant form.
-///
-/// Three normalizations apply, each removing a rendering difference that does
-/// not change what the table stores:
-///
-/// - nested field metadata is dropped, because a nested type's `Debug` includes
-///   its children's metadata map, whose `HashMap` iteration order is not stable;
-///   the sensitivity markers it carries are committed by the
-///   canonical physical fingerprint instead;
-/// - the large and small variable-width types collapse together, because
-///   Iceberg has one binary and one string type and a schema read back from it
-///   always returns the large form;
-/// - a UTC timestamp offset is written as `UTC`, which Iceberg returns as
-///   `+00:00`.
-///
-/// Without these, no canonical signal table could match its own catalog
-/// registration after an Iceberg round trip.
+/// A nested type's `Debug` includes its children's metadata maps, whose
+/// `HashMap` iteration order is not stable, so they are removed; the
+/// sensitivity markers they carry are committed by the canonical physical
+/// fingerprint instead. Names, nullability, and types stay exact: registration
+/// stores and ingest casts to Iceberg's own Arrow form, so there is no second
+/// spelling to normalize.
 fn strip_metadata(data_type: &DataType) -> DataType {
     match data_type {
-        DataType::List(child) => DataType::List(std::sync::Arc::new(Field::new(
-            LIST_ELEMENT,
-            strip_metadata(child.data_type()),
-            child.is_nullable(),
-        ))),
+        DataType::List(child) => DataType::List(std::sync::Arc::new(bare_field(child))),
+        DataType::Map(entries, sorted) => {
+            DataType::Map(std::sync::Arc::new(bare_field(entries)), *sorted)
+        }
         DataType::Struct(children) => {
             DataType::Struct(children.iter().map(|child| bare_field(child)).collect())
-        }
-        DataType::LargeBinary => DataType::Binary,
-        DataType::LargeUtf8 => DataType::Utf8,
-        DataType::Timestamp(unit, Some(zone)) if zone.as_ref() == "+00:00" => {
-            DataType::Timestamp(*unit, Some("UTC".into()))
         }
         other => other.clone(),
     }
 }
 
-/// Return one field with no metadata and a fingerprint-normalized nested type.
+/// Return one field with no metadata at any depth.
 fn bare_field(field: &Field) -> Field {
     Field::new(
         field.name(),

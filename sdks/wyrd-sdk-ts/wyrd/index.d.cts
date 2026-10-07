@@ -923,6 +923,34 @@ export interface NativeWyrdError {
 export declare function openWyrdState(path: string): NativeWyrdState
 
 /**
+ * Renders one stored timestamp cell as its Bifrost timestamp type's text.
+ *
+ * `kind` is a [`TimestampKind::name`] and `stored` the column's microseconds;
+ * a `TIMESTAMP_TZ` cell also passes its `local` writer reading. The typed row
+ * terminal calls this for every timestamp cell, so reads render in Rust.
+ * Returns `None` for an unknown type or a value out of range.
+ */
+export declare function storedTimestampText(kind: string, stored: number, local?: number | undefined | null): string | null
+
+/**
+ * Builds one table config from the schema of an Arrow IPC stream.
+ *
+ * This is the `TableConfig.fromArrow` door for types JSON Schema cannot
+ * express. The schema maps through the same `TableConfig::from_arrow` owner
+ * Rust and Python use, so a type with no wire form is refused here with the
+ * same catalog error, returned as metadata like a describe refusal.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the bytes are not an Arrow IPC stream, the layout
+ * is not one physical-layout declaration, the compaction target is not a
+ * non-negative integer, or the compaction type is not one known hyphenated
+ * wire spelling. A table name or column refusal is returned as catalog
+ * metadata.
+ */
+export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
+
+/**
  * Builds one table config from a JSON Schema document.
  *
  * This is the Zod (`z.toJSONSchema()`) door; the mapping is the same
@@ -938,6 +966,39 @@ export declare function openWyrdState(path: string): NativeWyrdState
  * hyphenated wire spelling.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfig
+
+/**
+ * The JSON Schema `format` a Bifrost timestamp type declares itself with.
+ *
+ * `kind` is a [`TimestampKind::name`]; returns `None` for an unknown type. The
+ * TypeScript Wyrd timestamp types read their format here rather than restating
+ * the format table.
+ */
+export declare function timestampFormat(kind: string): string | null
+
+/**
+ * The Bifrost timestamp type of every top-level timestamp column in a
+ * schema-only Arrow IPC stream.
+ *
+ * Maps each column to `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as
+ * [`TimestampKind::of`] decides it, so the typed row terminal renders each
+ * column's cells without restating that decision.
+ *
+ * # Errors
+ *
+ * Returns a napi error when the bytes are not an Arrow IPC stream.
+ */
+export declare function timestampKinds(schemaIpc: Buffer): Record<string, string>
+
+/**
+ * Checks one timestamp text against a Bifrost timestamp type and returns its
+ * canonical text.
+ *
+ * `kind` is a [`TimestampKind::name`]. The text is parsed exactly as the write
+ * path parses it, so a value the TypeScript Wyrd types accept is one an
+ * insert accepts. Returns `None` for an unknown type or refused text.
+ */
+export declare function timestampText(kind: string, text: string): string | null
 
 /**
  * Decodes one Variant cell's `metadata`/`value` bytes into its native

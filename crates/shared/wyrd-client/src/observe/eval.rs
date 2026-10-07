@@ -9,11 +9,11 @@ use opentelemetry::trace::TraceContextExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use wyrd_queue::variant::variant_storage_type;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::ids::{RecordId, SessionId, SpanId, TraceId};
+use wyrd_types::variant::variant_storage_type;
 
 use crate::bifrost::WriterTable;
 use crate::observe::{ProjectedColumn, invalid_observation, require_projection, row_bytes};
@@ -97,7 +97,10 @@ fn projection_columns() -> [ProjectedColumn; 7] {
         ("span_id", DataType::FixedSizeBinary(8), true),
         (
             "created_at",
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(wyrd_spec::vala::api::UTC_TIME_ZONE.into()),
+            ),
             false,
         ),
         ("media", variant_storage_type(), true),

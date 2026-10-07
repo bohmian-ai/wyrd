@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
@@ -3577,32 +3577,18 @@ fn persisted_follower_scan_id(table: &str, tier: RemotePersistedTier, occurrence
     format!("oracle:{table}:{}:{occurrence}", tier.tag())
 }
 
-/// Computes the fingerprint a follower scan assignment must carry for a schema,
-/// after canonicalizing equivalent UTC timezone spellings.
+/// Computes the fingerprint a follower scan assignment must carry for a schema.
 ///
-/// Iceberg projects UTC as `+00:00`, while Arrow's Parquet reader projects the
-/// same logical timezone as `UTC`. This boundary removes that adapter spelling
-/// drift without weakening any column, order, or non-UTC type check.
+/// Every input is an Iceberg provider schema, which is Iceberg's one Arrow
+/// form, so the fingerprint is taken exactly as spelled.
 ///
 /// Every component that builds or validates a `FollowerScanAssignment` must use
 /// this function; the follower compares its own result against the assignment's
 /// value after resolving the provider, so an independently derived fingerprint
 /// is rejected on any spelling difference.
+#[must_use]
 pub fn assignment_schema_fingerprint(schema: &Schema) -> String {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let data_type = match field.data_type() {
-                DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "+00:00" => {
-                    DataType::Timestamp(*unit, Some("UTC".into()))
-                }
-                data_type => data_type.clone(),
-            };
-            Field::new(field.name(), data_type, field.is_nullable())
-        })
-        .collect::<Vec<_>>();
-    hex::encode(SchemaFingerprint::from_arrow_schema(&Schema::new(fields)).as_ref())
+    hex::encode(SchemaFingerprint::from_arrow_schema(schema).as_ref())
 }
 
 /// Registers one table beneath its explicit Wyrd catalog/schema hierarchy.
@@ -4733,7 +4719,6 @@ mod tests {
         assert_ne!(one, narrower);
     }
 
-    use arrow::datatypes::{DataType, Field, Schema};
     use chrono::Utc;
     use std::sync::atomic::AtomicUsize;
     use wyrd_spec::vala::api::{ClusterCapabilities, ClusterRole};
@@ -5515,27 +5500,5 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(rows, 12);
         assert_eq!(bytes, 72);
-    }
-
-    /// Equivalent Arrow UTC spellings produce one sealed-fragment schema identity.
-    #[test]
-    fn oracle_sealed_fragment_fingerprint_canonicalizes_utc_aliases() {
-        let iceberg = Schema::new(vec![Field::new(
-            "event_time",
-            DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                Some("+00:00".into()),
-            ),
-            false,
-        )]);
-        let parquet = Schema::new(vec![Field::new(
-            "event_time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
-        assert_eq!(
-            assignment_schema_fingerprint(&iceberg),
-            assignment_schema_fingerprint(&parquet),
-        );
     }
 }

@@ -104,6 +104,7 @@ wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { workspace = true }
 wyrd-client = { workspace = true, features = ["test-support"] }
 wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }

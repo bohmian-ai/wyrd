@@ -91,6 +91,19 @@ impl WyrdQueueError {
     }
 }
 
+impl From<BifrostError> for WyrdQueueError {
+    /// Carry a refusal from the shared column-type mappings.
+    ///
+    /// A schema-parse refusal stays [`WyrdQueueError::SchemaParse`]; every
+    /// other catalogued refusal is a [`WyrdQueueError::Contract`].
+    fn from(error: BifrostError) -> Self {
+        match error {
+            BifrostError::SchemaParse { detail } => Self::SchemaParse(detail),
+            other => Self::Contract(other),
+        }
+    }
+}
+
 impl From<&WyrdQueueError> for WyrdError {
     /// Map to the stable [`WyrdError`] catalog at the surface boundary.
     ///

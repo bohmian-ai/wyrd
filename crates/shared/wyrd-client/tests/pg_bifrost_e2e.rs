@@ -8,6 +8,13 @@
 //! journeys. The timeout journey uses a delayed server WAL to prove that the
 //! public SDK retains its owned batch through ambiguous transport settlement.
 
+#[path = "bifrost/every_iceberg_column_type.rs"]
+mod every_iceberg_column_type;
+#[path = "bifrost/register_a_table_from_a_model.rs"]
+mod register_a_table_from_a_model;
+#[path = "bifrost/three_timestamp_types.rs"]
+mod three_timestamp_types;
+
 mod pg_tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1084,7 +1091,7 @@ mod pg_tests {
             "the description publishes the registry's exact canonical fingerprint"
         );
 
-        let described_schema = wyrd_queue::schema::writable_schema(&canonical, true)
+        let described_schema = wyrd_types::schema::writable_schema(&canonical, true)
             .expect("the canonical description projects an Arrow schema");
         let physical = (definition.schema)();
         for stored in physical.fields() {
@@ -1102,11 +1109,8 @@ mod pg_tests {
                 .field_with_name(stored.name())
                 .unwrap_or_else(|_| panic!("described schema keeps `{}`", stored.name()));
             assert!(
-                vala_bifrost_redux::tables::arrow_type_shape_matches(
-                    stored.data_type(),
-                    described.data_type()
-                ),
-                "`{}` keeps its stored type shape: stored {:?}, described {:?}",
+                stored.data_type().equals_datatype(described.data_type()),
+                "`{}` keeps its stored type: stored {:?}, described {:?}",
                 stored.name(),
                 stored.data_type(),
                 described.data_type()
@@ -1118,11 +1122,15 @@ mod pg_tests {
                 stored.name()
             );
             assert!(
-                described.metadata().is_empty(),
+                described
+                    .metadata()
+                    .keys()
+                    .all(|key| wyrd_types::schema::is_extension_key(key)),
                 "`{}` sends no field identity: the stable id and sensitivity \
                  tag are the server's own, re-derived on every stamp, so \
                  ingress compares an incoming block by shape and never asks a \
-                 writer to restate them",
+                 writer to restate them; only a Variant's extension keys, \
+                 which are its type, travel on the field",
                 stored.name()
             );
         }
@@ -1164,7 +1172,7 @@ mod pg_tests {
             "a dynamic table publishes no canonical physical fingerprint"
         );
         assert!(
-            wyrd_queue::schema::writable_schema(&dynamic, false)
+            wyrd_types::schema::writable_schema(&dynamic, false)
                 .expect("the dynamic description projects an Arrow schema")
                 .field_with_name("card_ref")
                 .expect("the Gate correlation input is described")
@@ -1711,7 +1719,7 @@ mod pg_tests {
     /// Both planes are configured from the live harness: HTTP for register,
     /// describe, and query; gRPC for ingest. `connect_retries: 0` keeps a
     /// journey failure immediate instead of retried.
-    async fn admin_client(srv: &WyrdTestServer, service: &str) -> WyrdClient {
+    pub(crate) async fn admin_client(srv: &WyrdTestServer, service: &str) -> WyrdClient {
         let bootstrap = srv
             .bootstrap_service(service, &["admin"])
             .await
@@ -2925,7 +2933,8 @@ mod pg_tests {
     #[tokio::test]
     async fn variant_tables_round_trip_and_refuse_atomically() {
         use arrow::array::{ArrayRef, Int64Array, StringArray};
-        use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
+        use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+        use wyrd_types::variant::is_variant;
 
         let srv = WyrdTestServer::start_bound()
             .await
@@ -3059,8 +3068,16 @@ mod pg_tests {
         assert_eq!(sdk_code(&invalid), "WYRD_VALA_400_VARIANT_INVALID_JSON");
 
         let unstorable = Arc::new(Schema::new(vec![Field::new("n", DataType::UInt64, true)]));
-        let unsupported = TableConfig::from_arrow(&owned_fqn("variant_unsupported"), unstorable)
-            .expect_err("the SDK refuses an unstorable type before any request");
+        let unsupported = Bifrost::connect_with_table(
+            &client,
+            TableConfig::from_arrow(&owned_fqn("variant_unsupported"), unstorable)
+                .expect("UInt64 has a wire form"),
+        )
+        .await
+        .expect("writer connects")
+        .register()
+        .await
+        .expect_err("registration refuses a type with no Iceberg column");
         assert_eq!(
             sdk_code(&unsupported),
             "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"

@@ -1725,7 +1725,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            crate::variant::variant_field("payload", true),
+            wyrd_types::variant::variant_field("payload", true),
         ]));
         let producer = Producer::with_budget(
             "vala.bifrost.prepared",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
@@ -11,6 +12,7 @@ import pyarrow
 
 from .. import _wyrd as _native
 from ..client import WyrdClient
+from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 
 _Row = TypeVar("_Row", bound="RowModel")
 
@@ -213,6 +215,9 @@ class TableConfig:
         Args:
             model: a Pydantic model class, not an instance. Its
                 ``model_json_schema()`` becomes the declared user columns.
+                Datetime fields declare the timestamp types in
+                ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
+                other ``datetime`` is ``TIMESTAMP_LTZ``.
                 ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
@@ -245,7 +250,12 @@ class TableConfig:
                 ``Bifrost.register()``.
 
         """
-        schema = model.model_json_schema()
+        if "pydantic" in sys.modules:
+            from ._pydantic import json_schema
+
+            schema = json_schema(model)
+        else:
+            schema = model.model_json_schema()
         self._native = _native.bifrost.TableConfig.from_json_schema(
             table,
             json.dumps(schema),
@@ -991,11 +1001,33 @@ def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:
     table = result.to_arrow()
     decode = result._native.variant_to_python
     variant_columns = [field for field in table.schema if _holds_variant(field)]
+    timestamp_columns = [
+        (name, TIMESTAMP_TYPES[kind]) for name, kind in result._native.timestamp_kinds()
+    ]
     rows = table.to_pylist()
     for row in rows:
         for field in variant_columns:
             row[field.name] = _native_value(field, row[field.name], decode)
+        for name, timestamp in timestamp_columns:
+            row[name] = _wyrd_timestamp(timestamp, row[name])
     return [model.model_validate(row) for row in rows]
+
+
+def _wyrd_timestamp(
+    timestamp: type[TimestampNTZ] | type[TimestampLTZ] | type[TimestampTZ], value: Any
+) -> Any:
+    """Convert one top-level timestamp cell to its Wyrd timestamp type.
+
+    A ``TIMESTAMP_TZ`` cell arrives as its stored ``{utc, local}`` mapping; the
+    other two arrive as the ``datetime`` pyarrow produced. Every model field,
+    Wyrd or ``datetime``, then validates a Wyrd value.
+    """
+
+    if value is None:
+        return None
+    if timestamp is TimestampTZ:
+        return TimestampTZ.from_stored(value["utc"], value["local"])
+    return timestamp.of(value)
 
 
 _VARIANT_EXTENSION = b"arrow.parquet.variant"

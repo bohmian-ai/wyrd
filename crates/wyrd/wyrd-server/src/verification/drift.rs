@@ -1105,13 +1105,13 @@ mod tests {
                         TimestampMicrosecondArray::from_iter_values(
                             rows.iter().map(|r| micros(r.4)),
                         )
-                        .with_timezone("UTC"),
+                        .with_timezone(wyrd_spec::vala::api::UTC_TIME_ZONE),
                     ),
                     "created_at" => Arc::new(
                         TimestampMicrosecondArray::from_iter_values(
                             rows.iter().map(|r| micros(r.5)),
                         )
-                        .with_timezone("UTC"),
+                        .with_timezone(wyrd_spec::vala::api::UTC_TIME_ZONE),
                     ),
                     "record_id" => {
                         Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.6)))

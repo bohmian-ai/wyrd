@@ -34,7 +34,11 @@ pub static SPAN_EVENT_FIELDS: [F; 4] = [
 ];
 
 /// Element declaration of the ordered span-event collection.
-pub static SPAN_EVENT_ELEMENT: F = F::sensitive("event", T::Struct(&SPAN_EVENT_FIELDS), false);
+pub static SPAN_EVENT_ELEMENT: F = F::sensitive(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&SPAN_EVENT_FIELDS),
+    false,
+);
 
 /// Ordered fields of one nested span link.
 pub static SPAN_LINK_FIELDS: [F; 6] = [
@@ -47,7 +51,11 @@ pub static SPAN_LINK_FIELDS: [F; 6] = [
 ];
 
 /// Element declaration of the ordered span-link collection.
-pub static SPAN_LINK_ELEMENT: F = F::sensitive("link", T::Struct(&SPAN_LINK_FIELDS), false);
+pub static SPAN_LINK_ELEMENT: F = F::sensitive(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&SPAN_LINK_FIELDS),
+    false,
+);
 
 /// The canonical `vala.traces.spans` ledger.
 ///

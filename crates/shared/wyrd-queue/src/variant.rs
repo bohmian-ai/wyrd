@@ -27,17 +27,19 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray, make_array};
 use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
+use arrow::datatypes::TimestampMicrosecondType;
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
-use arrow_schema::extension::ExtensionType;
-use arrow_schema::{DataType, Field, FieldRef, Fields};
+use arrow_schema::{DataType, FieldRef};
 use parquet_variant::{ObjectFieldBuilder, Variant, VariantBuilder, VariantBuilderExt};
-use parquet_variant_compute::{VariantArray, VariantType};
+use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
+use wyrd_types::timestamp::{TimestampKind, TimestampTz};
+use wyrd_types::variant::{is_variant, variant_storage_fields};
 
 /// Why one Variant value cannot be stored.
 ///
@@ -274,20 +276,26 @@ pub fn variant_cell_to_json(column: &dyn Array, row: usize) -> Result<Value, Var
         .map_err(invalid)
 }
 
-/// Renders Arrow Variant columns as their JSON value in Arrow's JSON writer.
+/// Renders Wyrd column types as their JSON value in Arrow's JSON writer.
 ///
 /// Arrow's JSON writer would otherwise print a Variant as its storage struct
-/// of `metadata`/`value` bytes. Installing this factory on a writer's
-/// [`EncoderOptions`] makes every field
-/// carrying the `arrow.parquet.variant` extension — top level or nested in a
-/// Struct or List — render through upstream [`VariantArray`] as the same JSON
-/// value [`variant_bytes_to_json`] yields, so every row-as-JSON surface shares
-/// one rendering and a double such as `3.0` stays a float. Other fields keep
-/// Arrow's default encoders.
+/// of `metadata`/`value` bytes and a `TIMESTAMP_TZ` as its `{utc, local}`
+/// struct. Installing this factory on a writer's [`EncoderOptions`] makes
+/// every such field, top level or nested in a Struct or List, render as its
+/// Wyrd value, so every row-as-JSON surface shares one rendering:
+///
+/// - a field carrying the `arrow.parquet.variant` extension renders through
+///   upstream [`VariantArray`] as the same JSON value
+///   [`variant_bytes_to_json`] yields, and a double such as `3.0` stays a
+///   float;
+/// - a `TIMESTAMP_TZ` field renders as its [`TimestampTz`] text, the instant
+///   in the writer's offset.
+///
+/// Other fields keep Arrow's default encoders.
 #[derive(Debug, Default)]
-pub struct VariantJsonEncoderFactory;
+pub struct WyrdJsonEncoderFactory;
 
-impl EncoderFactory for VariantJsonEncoderFactory {
+impl EncoderFactory for WyrdJsonEncoderFactory {
     /// Pre-render every non-null cell of a Variant field as JSON text.
     ///
     /// Rendering is done up front because the encoder itself cannot fail.
@@ -304,6 +312,9 @@ impl EncoderFactory for VariantJsonEncoderFactory {
         array: &'a dyn Array,
         _options: &'a EncoderOptions,
     ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
+        if TimestampKind::of(field.data_type()) == Some(TimestampKind::Tz) {
+            return render_timestamp_tz(field, array).map(Some);
+        }
         if !is_variant(field) {
             return Ok(None);
         }
@@ -331,6 +342,41 @@ impl EncoderFactory for VariantJsonEncoderFactory {
             array.logical_nulls(),
         )))
     }
+}
+
+/// Pre-render every non-null cell of a `TIMESTAMP_TZ` field as its
+/// [`TimestampTz`] JSON text.
+///
+/// # Errors
+///
+/// Returns [`ArrowError::JsonError`] when a stored `utc`/`local` pair does not
+/// rebuild an instant with an offset under a day.
+fn render_timestamp_tz<'a>(
+    field: &FieldRef,
+    array: &'a dyn Array,
+) -> Result<NullableEncoder<'a>, ArrowError> {
+    let stored = array.as_struct();
+    let utc = stored.column(0).as_primitive::<TimestampMicrosecondType>();
+    let local = stored.column(1).as_primitive::<TimestampMicrosecondType>();
+    let rendered = (0..stored.len())
+        .map(|row| {
+            if stored.is_null(row) {
+                return Ok(String::new());
+            }
+            TimestampTz::from_stored(utc.value(row), local.value(row))
+                .and_then(|at| serde_json::to_string(&at).ok())
+                .ok_or_else(|| {
+                    ArrowError::JsonError(format!(
+                        "field {} row {row} is not a valid TIMESTAMP_TZ",
+                        field.name()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NullableEncoder::new(
+        Box::new(RenderedJson(rendered)),
+        array.logical_nulls(),
+    ))
 }
 
 /// Prepare one stored Variant column for upstream decoding.
@@ -399,40 +445,6 @@ impl Encoder for RenderedJson {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         out.extend_from_slice(self.0[idx].as_bytes());
     }
-}
-
-/// Return the canonical unshredded Variant storage type.
-///
-/// Two non-null `Binary` children, `metadata` then `value`: the exact shape
-/// the Iceberg schema converter produces for an Iceberg `variant`, so writers
-/// and a catalog round trip agree.
-#[must_use]
-pub fn variant_storage_type() -> DataType {
-    DataType::Struct(variant_storage_fields())
-}
-
-/// Return the two children of the canonical Variant storage struct.
-fn variant_storage_fields() -> Fields {
-    Fields::from(vec![
-        Field::new("metadata", DataType::Binary, false),
-        Field::new("value", DataType::Binary, false),
-    ])
-}
-
-/// Declare one Variant field: canonical storage under the
-/// `arrow.parquet.variant` extension.
-#[must_use]
-pub fn variant_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, variant_storage_type(), nullable).with_extension_type(VariantType)
-}
-
-/// Report whether a field carries the `arrow.parquet.variant` extension.
-///
-/// The extension name, not the storage struct, is what makes a column a
-/// Variant: a user Struct with `metadata`/`value` children stays a Struct.
-#[must_use]
-pub fn is_variant(field: &Field) -> bool {
-    field.extension_type_name() == Some(VariantType::NAME)
 }
 
 /// Accumulates encoded Variant values into one canonical Arrow column.
@@ -766,8 +778,9 @@ mod tests {
     use arrow::array::{BinaryArray, RecordBatch, StringArray};
     use arrow::json::WriterBuilder;
     use arrow::json::writer::JsonArray;
-    use arrow_schema::Schema;
+    use arrow_schema::{Field, Fields, Schema};
     use serde_json::json;
+    use wyrd_types::variant::{variant_field, variant_storage_type};
 
     /// JSON converts with exact integers, null-vs-missing, and limits.
     ///
@@ -955,9 +968,70 @@ mod tests {
         )
         .expect("batch");
         let mut writer = WriterBuilder::new()
-            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());
         assert!(writer.write(&batch).is_err());
+    }
+
+    /// Arrow's JSON writer renders a `TIMESTAMP_TZ` as the instant in the
+    /// writer's offset, and a null as null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column renders as its stored struct or loses the
+    /// offset.
+    #[test]
+    fn json_writer_renders_timestamp_tz_in_the_writers_offset() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::buffer::NullBuffer;
+        use wyrd_types::TimestampKind;
+
+        let field = wyrd_types::spec_to_field(
+            &wyrd_spec::vala::api::FieldSpec {
+                name: "submitted_at".to_owned(),
+                data_type: TimestampKind::Tz.data_type_spec(),
+                nullable: true,
+                metadata: BTreeMap::new(),
+            },
+            false,
+        );
+        let DataType::Struct(children) = field.data_type().clone() else {
+            panic!("TIMESTAMP_TZ is a struct");
+        };
+        let child = |index: usize, values: Vec<i64>| -> ArrayRef {
+            Arc::new(
+                TimestampMicrosecondArray::from(values)
+                    .with_data_type(children[index].data_type().clone()),
+            )
+        };
+        let moment = 1_791_306_000_000_000_i64;
+        let column = StructArray::new(
+            children.clone(),
+            vec![
+                child(0, vec![moment, 0]),
+                child(1, vec![moment - 5 * 3_600 * 1_000_000, 0]),
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(column)])
+                .expect("batch");
+
+        let mut writer = WriterBuilder::new()
+            .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
+            .build::<_, JsonArray>(Vec::new());
+        writer.write(&batch).expect("writes");
+        writer.finish().expect("finishes");
+        let rows: Value = serde_json::from_slice(&writer.into_inner()).expect("JSON");
+
+        assert_eq!(
+            rows,
+            json!([
+                {"submitted_at": "2026-10-06T12:00:00-05:00"},
+                {"submitted_at": null},
+            ])
+        );
     }
 
     /// Arrow's JSON writer renders top-level and nested Variants as values.
@@ -1004,7 +1078,7 @@ mod tests {
         .expect("batch");
         let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
-            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());
         writer.write(&batch).expect("writes");
         writer.finish().expect("finishes");
@@ -1043,7 +1117,7 @@ mod tests {
         .expect("batch");
         let mut writer = WriterBuilder::new()
             .with_explicit_nulls(true)
-            .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());
         writer
             .write(&batch)

@@ -25,7 +25,6 @@ pub mod config;
 pub mod error;
 pub mod producer;
 pub mod queue;
-pub mod schema;
 pub mod sealed_sender;
 pub mod sink;
 pub mod variant;
@@ -43,10 +42,6 @@ pub use producer::{
     ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, ProducerMetrics,
 };
 pub use queue::{Flushable, RecordQueue, Row};
-pub use schema::{
-    arrow_schema_to_fieldspec, check_supported, field_to_spec, fieldspec_to_arrow,
-    is_extension_key, json_schema_to_arrow, json_schema_to_fieldspec, spec_to_field,
-};
 pub use sealed_sender::SealedBatchSender;
 pub use sink::{
     BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SharedIpcBytes, SinkError,

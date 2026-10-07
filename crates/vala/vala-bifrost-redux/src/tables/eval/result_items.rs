@@ -5,7 +5,7 @@
 
 use arrow::datatypes::Field;
 
-use wyrd_queue::variant::variant_field;
+use wyrd_types::variant::variant_field;
 
 use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};

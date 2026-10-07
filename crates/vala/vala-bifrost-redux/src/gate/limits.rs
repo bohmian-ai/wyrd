@@ -18,15 +18,6 @@ pub const BIFROST_INGEST_REQUEST_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// the generated typed-request backing. Every ingest decoder refuses a request
 /// whose expanded data exceeds this multiple of its wire ceiling before WAL.
 pub const BIFROST_INGEST_EXPANSION_FACTOR: usize = 4;
-/// Largest flattened native schema node count the IPC preflight represents.
-///
-/// A fixed structural parser bound, not a memory ceiling: the table's physical
-/// leaf count is validated at registration.
-pub const BIFROST_NATIVE_FIELD_LIMIT: usize = 256;
-/// Largest native record-batch count the IPC preflight represents.
-///
-/// A fixed structural parser bound, not a memory ceiling.
-pub const BIFROST_NATIVE_SOURCE_LIMIT: usize = 64;
 /// Largest recursive OTLP `AnyValue` nesting depth any decoder accepts.
 ///
 /// A fixed structural parser bound, not a memory ceiling.

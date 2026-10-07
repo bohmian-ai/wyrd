@@ -8,13 +8,14 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::{self, NestedField, Type};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wyrd_queue::is_extension_key;
-use wyrd_queue::variant::{EncodedVariant, is_variant};
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_types::is_extension_key;
+use wyrd_types::variant::is_variant;
 
 pub mod audit;
 pub mod dev;
@@ -200,7 +201,7 @@ pub struct BuiltinTableDefinition {
 /// can skip that, and the schema fingerprint compares storage types only.
 /// Every table validator runs this walk over its declared fields, top level
 /// and nested inside Structs and Lists: every field holding a Variant must
-/// match its declaration on the wire, where `wyrd_queue::field_to_spec` keeps
+/// match its declaration on the wire, where `wyrd_types::field_to_spec` keeps
 /// the `arrow.parquet.variant` extension that storage types drop, and every
 /// present Variant value must pass [`EncodedVariant::from_bytes`]. Fields are
 /// checked in logical order first, then values row by row in input order and
@@ -220,9 +221,9 @@ pub(crate) fn validate_declared_variants(
 ) -> Result<(), BifrostError> {
     let schema = batch.schema();
     let wire = |field: &Field| {
-        wyrd_queue::field_to_spec(field)
+        wyrd_types::field_to_spec(field)
             .ok()
-            .map(|spec| wyrd_queue::spec_to_field(&spec, false))
+            .map(|spec| wyrd_types::spec_to_field(&spec, false))
     };
     let mut variant_columns = Vec::new();
     for declared in declared {
@@ -545,6 +546,57 @@ pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceb
     }
 }
 
+/// Return the one Arrow form Bifrost stores for a declared column.
+///
+/// Iceberg is the schema authority: the declaration is converted to its
+/// Iceberg column and back with iceberg-rust's own conversions, so every
+/// spelling of one Iceberg type — `Int8` and `Int32`, `UTC` and `+00:00`,
+/// `LargeUtf8` and `Utf8`, a list element named `item` and `element` — leaves
+/// as the single Arrow type Iceberg reads it as. Registration stores, describes,
+/// and fingerprints only this form, so a table cannot carry a declared type
+/// that differs from its physical one. The ids the round trip assigns are
+/// dropped, because the registered table, not a declaration, owns field ids;
+/// every other metadata entry Iceberg keeps, such as a Variant's extension
+/// type, stays.
+///
+/// # Errors
+///
+/// Returns the Iceberg conversion error when the column has no Iceberg type.
+pub fn iceberg_form(declared: &Field) -> Result<Field, iceberg::Error> {
+    let stored = iceberg::arrow::schema_to_arrow_schema(
+        &iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
+            declared.clone(),
+        ]))?,
+    )?;
+    Ok(without_field_id(&stored.fields()[0]))
+}
+
+/// Strip `PARQUET:field_id` from `field` and from every nested child.
+///
+/// Every other metadata entry and the field's name, type, and nullability are
+/// kept, so only the id assignment is removed.
+fn without_field_id(field: &Field) -> Field {
+    let data_type = match field.data_type() {
+        DataType::List(element) => DataType::List(Arc::new(without_field_id(element))),
+        DataType::Map(entries, sorted) => {
+            DataType::Map(Arc::new(without_field_id(entries)), *sorted)
+        }
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| without_field_id(child))
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    let mut metadata = field.metadata().clone();
+    metadata.remove(fields::PARQUET_FIELD_ID);
+    field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata)
+}
+
 /// Report whether every top-level field carries a registered field id.
 ///
 /// An empty schema carries none, which keeps the automatic assignment for the
@@ -701,6 +753,14 @@ pub fn restamp_field_identity(
 }
 
 /// Recursively retype one array's data to `target`, children included.
+///
+/// A `List` element and a `Map`'s entries struct are each the single child, so
+/// both recurse through the same arm.
+///
+/// # Errors
+///
+/// Returns the Arrow validation error when the retyped data does not describe
+/// its own buffers.
 fn retype(
     data: arrow::array::ArrayData,
     target: &arrow::datatypes::DataType,
@@ -708,7 +768,7 @@ fn retype(
     use arrow::datatypes::DataType;
 
     let children = match target {
-        DataType::List(element) => data
+        DataType::List(element) | DataType::Map(element, _) => data
             .child_data()
             .iter()
             .map(|child| retype(child.clone(), element.data_type()))
@@ -725,63 +785,6 @@ fn retype(
         .data_type(target.clone())
         .child_data(children)
         .build()
-}
-
-/// Report whether an actual Arrow type is the expected one after a storage
-/// round trip.
-///
-/// The installed Iceberg conversion normalizes some Arrow types on the way
-/// back — a binary or string column widens to its large variant, a list may
-/// return as a large list, and a zoned timestamp may return as `+00:00` — so a
-/// physical table's schema is compared by shape rather than by exact equality.
-/// Nested children are compared by name, never by position.
-#[must_use]
-pub fn arrow_type_shape_matches(
-    expected: &arrow::datatypes::DataType,
-    actual: &arrow::datatypes::DataType,
-) -> bool {
-    use arrow::datatypes::DataType as Arrow;
-    if expected.equals_datatype(actual) {
-        return true;
-    }
-    match (expected, actual) {
-        (Arrow::Binary, Arrow::LargeBinary)
-        | (Arrow::LargeBinary, Arrow::Binary)
-        | (Arrow::Utf8, Arrow::LargeUtf8)
-        | (Arrow::LargeUtf8, Arrow::Utf8) => true,
-        (
-            Arrow::List(expected) | Arrow::LargeList(expected),
-            Arrow::List(actual) | Arrow::LargeList(actual),
-        ) => {
-            expected.is_nullable() == actual.is_nullable()
-                && arrow_type_shape_matches(expected.data_type(), actual.data_type())
-        }
-        (Arrow::Struct(expected), Arrow::Struct(actual)) => {
-            expected.len() == actual.len()
-                && expected.iter().all(|field| {
-                    actual
-                        .iter()
-                        .find(|candidate| candidate.name() == field.name())
-                        .is_some_and(|candidate| {
-                            field.is_nullable() == candidate.is_nullable()
-                                && arrow_type_shape_matches(
-                                    field.data_type(),
-                                    candidate.data_type(),
-                                )
-                        })
-                })
-        }
-        (
-            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
-            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
-        ) => {
-            expected_unit == actual_unit
-                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
-                    || (expected_timezone.as_ref() == "+00:00"
-                        && actual_timezone.as_ref() == "UTC"))
-        }
-        _ => false,
-    }
 }
 
 /// Version byte prefixing every canonical physical fingerprint encoding.
@@ -1059,9 +1062,10 @@ mod tests {
 
     use super::*;
     use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
-    use wyrd_queue::variant::{VariantViolation, variant_field};
+    use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
+    use wyrd_types::variant::variant_field;
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
     ///
@@ -1118,6 +1122,20 @@ mod tests {
             SpansTable::schema_fingerprint()
         );
         assert_eq!((spans.schema)(), SpansTable::schema());
+    }
+
+    /// The wire zone clients and the server spell stored timestamps with is
+    /// the one iceberg-rust reads a `timestamptz` back with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two spellings differ.
+    #[test]
+    fn the_wire_utc_zone_is_icebergs() {
+        assert_eq!(
+            wyrd_spec::vala::api::UTC_TIME_ZONE,
+            iceberg::arrow::UTC_TIME_ZONE
+        );
     }
 
     /// Every built-in keeps its managed columns, a stable fingerprint, and the
@@ -1830,62 +1848,23 @@ mod tests {
         }]
     }
 
-    /// Recursively assert two field sequences agree by declared identity.
+    /// Assert two field lists have one exact Arrow layout.
     ///
-    /// Binding is by name, never by position, so a reordering
-    /// storage layer cannot silently pass.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a declared field is missing from `actual`, or when its type
-    /// or nullability differs.
-    fn assert_identity_matches(expected: &Fields, actual: &Fields, context: &str) {
-        assert_eq!(
-            expected.len(),
-            actual.len(),
-            "{context} keeps its declared field count"
-        );
-        for field in expected {
-            let found = actual
-                .iter()
-                .find(|candidate| candidate.name() == field.name())
-                .unwrap_or_else(|| panic!("{context} keeps field {}", field.name()));
-            assert_field_pair(field, found, context);
-        }
-    }
-
-    /// Assert one declared field and its round-tripped counterpart agree.
-    ///
-    /// A list's single element is matched positionally because the Iceberg
-    /// projection renames it to `element`; everything else is matched by name.
+    /// Built-ins declare Iceberg's own Arrow form, so every storage leg must
+    /// return exactly the declared names, order, nullability, and types at
+    /// every depth. Metadata is ignored because it changes no buffer.
     ///
     /// # Panics
     ///
-    /// Panics when the nullability, type shape, or any nested child differs.
-    fn assert_field_pair(expected: &Field, actual: &Field, context: &str) {
+    /// Panics when any name, position, nullability, or type differs.
+    fn assert_same_layout(expected: &Fields, actual: &Fields, context: &str) {
         assert_eq!(
-            expected.is_nullable(),
-            actual.is_nullable(),
-            "{context} keeps the nullability of {}",
-            expected.name()
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(
+                expected.clone()
+            )),
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(actual.clone())),
+            "{context} keeps its exact layout: {expected:#?} became {actual:#?}"
         );
-        assert!(
-            arrow_type_shape_matches(expected.data_type(), actual.data_type()),
-            "{context} keeps the type of {}: {:?} became {:?}",
-            expected.name(),
-            expected.data_type(),
-            actual.data_type()
-        );
-        match (expected.data_type(), actual.data_type()) {
-            (
-                DataType::List(expected_child) | DataType::LargeList(expected_child),
-                DataType::List(actual_child) | DataType::LargeList(actual_child),
-            ) => assert_field_pair(expected_child, actual_child, context),
-            (DataType::Struct(expected_children), DataType::Struct(actual_children)) => {
-                assert_identity_matches(expected_children, actual_children, context);
-            }
-            _ => {}
-        }
     }
 
     /// Round-trip one canonical batch through Arrow IPC and read it back.
@@ -2000,11 +1979,11 @@ mod tests {
             assert!(batch.num_rows() > 0, "{label} fixture produces rows");
 
             let ipc = ipc_round_trip(&batch);
-            assert_identity_matches(&declared, ipc.schema().fields(), label);
+            assert_same_layout(&declared, ipc.schema().fields(), label);
             assert_eq!(ipc, batch, "{label} keeps every value through IPC");
 
             let parquet = parquet_round_trip(&batch);
-            assert_identity_matches(&declared, parquet.schema().fields(), label);
+            assert_same_layout(&declared, parquet.schema().fields(), label);
             assert_eq!(
                 parquet.columns(),
                 batch.columns(),
@@ -2015,7 +1994,7 @@ mod tests {
                 .expect("the canonical schema converts to Iceberg");
             let restored = iceberg::arrow::schema_to_arrow_schema(&iceberg)
                 .expect("the Iceberg schema converts back to Arrow");
-            assert_identity_matches(&declared, restored.fields(), label);
+            assert_same_layout(&declared, restored.fields(), label);
         }
     }
 
@@ -2073,8 +2052,10 @@ mod tests {
         let schema = Fields::from(vec![nested, naive, zoned]);
         let bytes = canonical_physical_fingerprint_bytes(&schema).expect("the schema encodes");
         assert_eq!(
-            canonical_physical_fingerprint_bytes(&without_field_ids(&schema))
-                .expect("the id-free schema encodes"),
+            canonical_physical_fingerprint_bytes(
+                &schema.iter().map(|field| without_field_id(field)).collect()
+            )
+            .expect("the id-free schema encodes"),
             bytes,
             "field ids contribute nothing to the encoding"
         );
@@ -2152,25 +2133,194 @@ mod tests {
         }
     }
 
-    /// Strip every `PARQUET:field_id` entry from `fields`, nested children included.
-    fn without_field_ids(fields: &Fields) -> Fields {
-        fields
-            .iter()
-            .map(|field| {
-                let data_type = match field.data_type() {
-                    DataType::List(child) => DataType::List(Arc::new(
-                        without_field_ids(&Fields::from(vec![child.as_ref().clone()]))[0]
-                            .as_ref()
-                            .clone(),
+    /// Stamping a populated Map column re-types its entries in place.
+    ///
+    /// The key and value take their registered ids and the stamped column
+    /// keeps every entry, null map, and null value it arrived with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when stamping refuses the Map, a key or value lacks its
+    /// registered id, or a value changes.
+    #[test]
+    fn stamped_map_columns_carry_registered_entry_ids() {
+        use arrow::array::{
+            Array, ArrayRef, AsArray, Int64Array, MapArray, StringArray, StructArray,
+        };
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            Arc::new(Field::new("key_value", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2, 0, 1]),
+            entries,
+            Some(NullBuffer::from(vec![true, false, true])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "attrs",
+            map.data_type().clone(),
+            true,
+        )]));
+        let registered = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&schema)
+            .expect("the map has an Iceberg projection");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(map) as ArrayRef]).expect("valid map batch");
+
+        let stamped =
+            stamp_registered_field_ids(&batch, &registered).expect("the map is registered");
+
+        let adopted = iceberg::arrow::arrow_schema_to_schema(&stamped.schema())
+            .expect("every stamped field carries an id");
+        assert_eq!(adopted.as_struct(), registered.as_struct());
+        let (before, after) = (batch.column(0).as_map(), stamped.column(0).as_map());
+        assert_eq!(after.offsets(), before.offsets());
+        assert_eq!(after.nulls(), before.nulls());
+        assert_eq!(after.keys(), before.keys());
+        assert_eq!(after.values(), before.values());
+    }
+
+    /// Every built-in declares exactly the Arrow form Iceberg stores for it.
+    ///
+    /// Iceberg is the one schema authority, so a built-in's physical schema
+    /// must already be a fixed point of [`iceberg_form`]: no timezone,
+    /// element-name, or width spelling may differ from what the registered
+    /// table reads back. The comparison is the exact-layout fingerprint, which
+    /// commits names, order, nullability, and exact types at every depth and
+    /// ignores metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in column has no Iceberg type or its declaration
+    /// differs from its Iceberg form.
+    #[test]
+    fn every_builtin_declares_its_iceberg_form() {
+        let exact = |field: &Field| {
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&Schema::new(vec![
+                field.clone(),
+            ]))
+        };
+        let mut differing = Vec::new();
+        for definition in builtin_tables() {
+            for declared in (definition.schema)().fields() {
+                let stored =
+                    iceberg_form(declared).expect("every built-in column has an Iceberg type");
+                if exact(declared) != exact(&stored) {
+                    differing.push(format!(
+                        "{}.{}.{}: declared {} but Iceberg stores {}",
+                        definition.namespace,
+                        definition.name,
+                        declared.name(),
+                        declared.data_type(),
+                        stored.data_type(),
+                    ));
+                }
+            }
+        }
+        assert!(differing.is_empty(), "{}", differing.join("\n"));
+    }
+
+    /// Every spelling of one Iceberg type registers as Iceberg's single Arrow
+    /// form, and a type with no Iceberg column is refused.
+    ///
+    /// The stored form carries no field id at any depth, keeps a Variant's
+    /// extension type, and is its own form, so registering a stored or described
+    /// schema again cannot change it. Each refused type is refused nested in a
+    /// struct and as a map value as well as top level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a spelling stores as another type, an id survives, the form
+    /// is not a fixed point, or an unstorable type is accepted.
+    #[test]
+    fn declared_columns_register_as_their_one_iceberg_form() {
+        let map = |key_nullable: bool, value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("k", DataType::Utf8, key_nullable),
+                        Field::new("v", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let element = |data_type: DataType| Arc::new(Field::new("element", data_type, true));
+        for (declared, stored) in [
+            (DataType::Int8, DataType::Int32),
+            (DataType::UInt16, DataType::Int32),
+            (DataType::UInt32, DataType::Int64),
+            (
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
+            ),
+            (DataType::LargeUtf8, DataType::Utf8),
+            (DataType::Binary, DataType::LargeBinary),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
+                DataType::List(element(DataType::Int32)),
+            ),
+            (
+                map(true, DataType::Int8),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Int32, true),
+                        ])),
+                        false,
                     )),
-                    DataType::Struct(children) => DataType::Struct(without_field_ids(children)),
-                    other => other.clone(),
-                };
-                let mut metadata = field.metadata().clone();
-                metadata.remove(fields::PARQUET_FIELD_ID);
-                Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
-            })
-            .collect()
+                    false,
+                ),
+            ),
+        ] {
+            let form = iceberg_form(&Field::new("c", declared.clone(), true))
+                .unwrap_or_else(|error| panic!("{declared} is storable: {error}"));
+            assert_eq!(form, Field::new("c", stored, true), "{declared}");
+            assert_eq!(iceberg_form(&form).expect("the form is storable"), form);
+        }
+        let variant = variant_field("payload", true);
+        let form = iceberg_form(&variant).expect("a Variant is storable");
+        assert!(is_variant(&form), "the Variant keeps its extension type");
+        assert_eq!(iceberg_form(&form).expect("the form is storable"), form);
+
+        for unstorable in [
+            DataType::UInt64,
+            DataType::Date64,
+            DataType::Time32(ArrowTimeUnit::Second),
+            DataType::Time64(ArrowTimeUnit::Nanosecond),
+            DataType::Timestamp(ArrowTimeUnit::Second, None),
+            DataType::Timestamp(ArrowTimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("America/New_York".into())),
+        ] {
+            for declared in [
+                unstorable.clone(),
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "inner",
+                    unstorable.clone(),
+                    true,
+                )])),
+                map(false, unstorable.clone()),
+            ] {
+                assert!(
+                    iceberg_form(&Field::new("c", declared.clone(), true)).is_err(),
+                    "{declared} must be refused"
+                );
+            }
+        }
     }
 
     /// The registry dispatches one canonical value validator per signal table,
@@ -2221,7 +2371,7 @@ mod tests {
                                 ))) as Arc<dyn Array>
                             };
                             let DataType::Struct(children) =
-                                wyrd_queue::variant::variant_storage_type()
+                                wyrd_types::variant::variant_storage_type()
                             else {
                                 panic!("Variant storage is a struct");
                             };
@@ -2286,9 +2436,10 @@ mod tests {
 
     /// Assert every widened or re-spelled physical type drifts the identity.
     ///
-    /// `Utf8`/`LargeUtf8`, `Binary`/`LargeBinary`, and a re-spelled UTC offset
-    /// are the normalizations an Arrow-normalizing intermediary would silently
-    /// apply, so each one is walked over the real physical schema.
+    /// `Utf8`/`LargeUtf8`, `Binary`/`LargeBinary`, and Iceberg's `+00:00` zone
+    /// re-spelled as Arrow's `UTC` are the normalizations an Arrow-normalizing
+    /// intermediary would silently apply, so each one is walked over the real
+    /// physical schema.
     ///
     /// # Panics
     ///
@@ -2302,7 +2453,7 @@ mod tests {
             DataType::Utf8 => Some(DataType::LargeUtf8),
             DataType::Binary => Some(DataType::LargeBinary),
             DataType::Timestamp(unit, Some(_)) => {
-                Some(DataType::Timestamp(*unit, Some("+00:00".into())))
+                Some(DataType::Timestamp(*unit, Some("UTC".into())))
             }
             _ => None,
         };
@@ -2570,17 +2721,25 @@ mod tests {
     /// Panics when a column is not Variant or an entity-reference shape drifts.
     fn assert_builtin_variant_columns() {
         let entity_ref = DataType::List(Arc::new(Field::new(
-            "entity_ref",
+            iceberg::spec::LIST_FIELD_NAME,
             DataType::Struct(Fields::from(vec![
                 Field::new("type", DataType::Utf8, false),
                 Field::new(
                     "id_keys",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    DataType::List(Arc::new(Field::new(
+                        iceberg::spec::LIST_FIELD_NAME,
+                        DataType::Utf8,
+                        false,
+                    ))),
                     false,
                 ),
                 Field::new(
                     "description_keys",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    DataType::List(Arc::new(Field::new(
+                        iceberg::spec::LIST_FIELD_NAME,
+                        DataType::Utf8,
+                        false,
+                    ))),
                     false,
                 ),
                 Field::new("schema_url", DataType::Utf8, false),
@@ -2638,9 +2797,14 @@ mod tests {
                     .field_with_name("resource_entity_refs")
                     .expect("signal tables carry entity references");
                 assert!(!refs.is_nullable());
-                assert!(
-                    arrow_type_shape_matches(refs.data_type(), &entity_ref),
-                    "vala.{namespace}.{name}.resource_entity_refs is the locked Struct list"
+                assert_same_layout(
+                    &Fields::from(vec![Field::new(
+                        "resource_entity_refs",
+                        entity_ref.clone(),
+                        false,
+                    )]),
+                    &Fields::from(vec![refs.clone()]),
+                    &format!("vala.{namespace}.{name}.resource_entity_refs"),
                 );
                 let DataType::List(element) = refs.data_type() else {
                     panic!("resource_entity_refs is a list");

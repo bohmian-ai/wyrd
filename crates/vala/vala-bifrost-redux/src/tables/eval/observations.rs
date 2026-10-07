@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use wyrd_runtime::Principal;
 use wyrd_spec::ids::CardUid;
 
-use wyrd_queue::variant::variant_field;
+use wyrd_types::variant::variant_field;
 
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::resolve_card_uids;

@@ -63,10 +63,11 @@ use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwn
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
+use wyrd_types::variant::is_variant;
 
 /// Bounded wait every fixture handshake uses instead of a sleep.
 const FIXTURE_BOUND: Duration = Duration::from_secs(30);
@@ -2926,12 +2927,10 @@ fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -
                 .map(|row| Some(row % 2 == 0))
                 .collect::<BooleanArray>(),
         ),
-        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == "UTC" => {
-            Arc::new(
-                TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
-                    .with_timezone("UTC"),
-            )
-        }
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) => Arc::new(
+            TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
+                .with_timezone(Arc::clone(zone)),
+        ),
         DataType::Struct(children) => Arc::new(StructArray::new(
             children.clone(),
             children

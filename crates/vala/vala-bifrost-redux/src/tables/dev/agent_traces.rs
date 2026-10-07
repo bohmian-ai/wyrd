@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use wyrd_queue::variant::variant_field;
+use wyrd_types::variant::variant_field;
 
 use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{

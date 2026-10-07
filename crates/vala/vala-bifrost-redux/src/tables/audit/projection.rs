@@ -240,7 +240,10 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
     let mut fields = AuditLogTable::arrow_fields();
     fields.push(Field::new(
         WYRD_EVENT_TIME,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+        ),
         false,
     ));
     let schema = Arc::new(Schema::new(fields));
@@ -260,7 +263,8 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         detail_values,
         Arc::new(StringArray::from(credential_id_values)),
         Arc::new(
-            TimestampMicrosecondArray::from(event_time_values).with_timezone(Arc::from("UTC")),
+            TimestampMicrosecondArray::from(event_time_values)
+                .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
         ),
     ];
     let rows = RecordBatch::try_new(schema, columns)

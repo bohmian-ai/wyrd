@@ -3916,7 +3916,7 @@ pub(super) fn leaf_resolves(schema: &Schema, leaf: &ScanLeaf) -> bool {
         }
         ScanLeaf::Variant { column, .. } => schema
             .field_with_name(column)
-            .is_ok_and(wyrd_queue::variant::is_variant),
+            .is_ok_and(wyrd_types::variant::is_variant),
     }
 }
 
@@ -6461,7 +6461,7 @@ mod tests {
     fn leaf_session() -> (SchemaRef, datafusion::prelude::SessionContext) {
         use datafusion::datasource::MemTable;
         use datafusion::execution::SessionStateBuilder;
-        use wyrd_queue::variant::variant_field;
+        use wyrd_types::variant::variant_field;
 
         let inner = DataType::Struct(vec![Field::new("b", DataType::Int64, true)].into());
         let schema = Arc::new(Schema::new(vec![

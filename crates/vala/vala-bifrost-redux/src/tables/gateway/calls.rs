@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use wyrd_queue::variant::variant_field;
+use wyrd_types::variant::variant_field;
 
 use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
@@ -46,7 +46,7 @@ impl CallsTable {
     #[must_use]
     pub fn usage_type() -> DataType {
         DataType::List(Arc::new(Field::new(
-            "item",
+            iceberg::spec::LIST_FIELD_NAME,
             DataType::Struct(Fields::from(vec![
                 utf8("dimension", false),
                 utf8("unit", false),
@@ -59,7 +59,11 @@ impl CallsTable {
     /// Arrow type of the sorted pricing-version set.
     #[must_use]
     pub fn pricing_versions_type() -> DataType {
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)))
+        DataType::List(Arc::new(Field::new(
+            iceberg::spec::LIST_FIELD_NAME,
+            DataType::Utf8,
+            false,
+        )))
     }
 
     /// Arrow type of the captured binary payload object references.
@@ -71,7 +75,7 @@ impl CallsTable {
     #[must_use]
     pub fn payload_object_refs_type() -> DataType {
         DataType::List(Arc::new(Field::new(
-            "item",
+            iceberg::spec::LIST_FIELD_NAME,
             DataType::Struct(Fields::from(vec![
                 utf8("digest", false),
                 utf8("content_type", false),

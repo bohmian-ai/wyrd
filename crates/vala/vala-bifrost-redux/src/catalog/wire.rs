@@ -8,7 +8,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 
-use wyrd_queue::field_to_spec;
+use wyrd_types::field_to_spec;
 
 use crate::catalog::BifrostCatalogError;
 use crate::tables::managed_columns::is_managed_column;

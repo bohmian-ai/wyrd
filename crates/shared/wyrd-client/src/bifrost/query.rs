@@ -81,6 +81,13 @@ pub enum BifrostClientError {
     #[error("{0}")]
     Client(#[from] WyrdClientError),
 }
+impl From<wyrd_spec::vala::BifrostError> for BifrostClientError {
+    /// Carry a refusal from the shared column-type mappings as the queue
+    /// error it has always surfaced as, so its stable code is unchanged.
+    fn from(error: wyrd_spec::vala::BifrostError) -> Self {
+        Self::Queue(error.into())
+    }
+}
 
 impl BifrostClientError {
     /// Returns terminal metadata when a validated failed terminal caused this error.
@@ -1789,7 +1796,7 @@ pub(super) mod tests {
             "a canonical table publishes its exact physical fingerprint"
         );
 
-        let writable = wyrd_queue::schema::writable_schema(&described, true)
+        let writable = wyrd_types::schema::writable_schema(&described, true)
             .expect("the description projects an Arrow schema");
         assert_eq!(
             writable
@@ -1808,7 +1815,7 @@ pub(super) mod tests {
             "no writable column repeats the server-owned field id back on the wire"
         );
         assert_eq!(
-            wyrd_queue::schema::writable_schema(&described, false)
+            wyrd_types::schema::writable_schema(&described, false)
                 .expect("event time is optional")
                 .fields()
                 .len(),

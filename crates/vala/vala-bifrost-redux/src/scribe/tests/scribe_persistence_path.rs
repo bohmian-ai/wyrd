@@ -58,13 +58,19 @@ fn batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
         Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                ),
                 false,
             ),
             Field::new("value", DataType::Int64, false),
         ])),
         vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![timestamp])
+                    .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
+            ),
             Arc::new(Int64Array::from(vec![42])),
         ],
     )
@@ -144,7 +150,10 @@ fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> R
     let timestamp = partition.start_utc().timestamp_micros();
     let mut fields = vec![Field::new(
         "wyrd_event_time",
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+        ),
         false,
     )];
     fields.extend(
@@ -155,7 +164,8 @@ fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> R
             .map(|field| field.as_ref().clone()),
     );
     let mut columns: Vec<ArrayRef> = vec![Arc::new(
-        TimestampMicrosecondArray::from(vec![timestamp; projected.num_rows()]).with_timezone("UTC"),
+        TimestampMicrosecondArray::from(vec![timestamp; projected.num_rows()])
+            .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
     )];
     columns.extend(projected.columns().iter().map(Arc::clone));
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -634,7 +644,7 @@ fn cross_day_batch(
                     day_one.start_utc().timestamp_micros(),
                     day_two.start_utc().timestamp_micros(),
                 ])
-                .with_timezone("UTC"),
+                .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
             ),
             Arc::new(Int64Array::from(vec![101_i64, 202_i64])),
         ],

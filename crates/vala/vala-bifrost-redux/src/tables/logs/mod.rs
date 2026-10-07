@@ -16,7 +16,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use serde_json::json;
     use std::sync::Arc;
-    use wyrd_queue::variant::{variant_cell_to_json, variant_field, variant_storage_type};
+    use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::vala::BifrostError;
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{
@@ -24,6 +24,7 @@ mod tests {
     };
     use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_types::variant::{variant_field, variant_storage_type};
 
     use super::records::LOG_FIELDS;
     use super::{canonical_log_schema, project_resource_logs};

@@ -25,6 +25,133 @@ assignment.
 TASK-002 may run in parallel after TASK-001. Final integrated verification waits
 for both and runs `mise run verify:bifrost` once, as TASK-003's last command.
 
+## Added Scope and Progress (record for resuming shredding)
+
+This branch carries two pieces of work beyond the shredding outcome above.
+Both were done before shredding resumed. Their requirements go into spec
+revision 18+ (merge plan decision D4,
+`changes/active/bifrost-variant/merge-integration-into-task-003.md`), and this
+task file records them. Spec revision 18 must also update `spec_revision` and
+`requirements` above.
+
+### Added A: three timestamp types — implemented, uncommitted
+
+Each user column picks one of three Snowflake-named types:
+
+| Type | Meaning | Iceberg storage |
+|---|---|---|
+| `TIMESTAMP_NTZ` | Wall clock | `timestamp` |
+| `TIMESTAMP_LTZ` | Instant | `timestamptz` |
+| `TIMESTAMP_TZ` | Instant plus the writer's wall clock | `struct<utc: timestamptz, local: timestamp>` |
+
+- **Declaration by format.** A model declares the type through its JSON
+  Schema `format`:
+  - `timestamp-ntz` and `partial-date-time` → NTZ;
+  - `date-time` → LTZ;
+  - `timestamp-tz` → TZ.
+- **Declaration from Arrow.** Any zoned timestamp, of any zone label, declares
+  LTZ and is stored and read as `+00:00`. A naive timestamp declares NTZ.
+- **System-owned timestamps** are always LTZ.
+- **Conversion.** Users supply datetimes and Bifrost converts them to the
+  column's type.
+  - A naive value is refused for a zoned column.
+  - An offset is refused for an NTZ column.
+  - An Arrow LTZ batch in any zone is one instant; a naive batch for an LTZ
+    column is refused (`FINGERPRINT_MISMATCH`).
+- **Ownership.** Every type is a Wyrd type, independent of other libraries.
+  - Pydantic, Zod, chrono and Arrow types convert to Wyrd types at runtime.
+  - Rust owns parsing, rendering and the format table
+    (`crates/shared/wyrd-types/src/timestamp.rs`, `TimestampKind`).
+  - Python: `wyrd.types.TimestampNTZ/LTZ/TZ`, plus the Pydantic mapping in
+    `bifrost/_pydantic.py`.
+  - TS: the checked-text types `TimestampNTZ/LTZ/TZ` (`parse`, `schema(z)`),
+    backed by the native `timestamp_format`, `timestamp_text`,
+    `stored_timestamp_text` and `timestamp_kinds`.
+  - Reads return each type's value. Python returns datetimes; TS returns
+    Rust-rendered RFC 3339 text for top-level timestamp columns.
+  - `z.date()` stays refused.
+- **Tests.**
+  - `wyrd-types`, `timestamp.rs` unit tests: `formats_name_their_timestamp_type`,
+    `arrow_forms_are_recognized`, `each_type_parses_its_own_text`,
+    `wyrd_values_round_trip_their_text`, `each_type_renders_and_checks_its_text`,
+    `rust_types_declare_their_format`.
+  - Rust journey `crates/shared/wyrd-client/tests/bifrost/three_timestamp_types.rs`:
+    `wyrd_timestamps_read_back_as_wyrd_values`,
+    `the_customers_local_hour_is_queryable`,
+    `chrono_timestamps_go_through_wyrd_types`,
+    `an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused`.
+  - Python journey
+    `sdks/wyrd-sdk-python/tests/integration/bifrost/test_three_timestamp_types.py`:
+    six tests, covering the four above plus the naive-into-LTZ and
+    offset-into-NTZ refusals at insert.
+  - Python unit tests `sdks/wyrd-sdk-python/tests/unit/bifrost/test_timestamp_types.py`.
+  - TS journey `sdks/wyrd-sdk-ts/wyrd/tests/integration/three-timestamp-types.test.ts`:
+    six tests, the same set.
+  - TS unit tests `sdks/wyrd-sdk-ts/wyrd/tests/unit/timestamp-types.test.ts`:
+    three tests.
+
+### Added B: every Iceberg-supported column type usable from Rust, Python and TypeScript — implemented
+
+- **Committed:** `d4a0cba97` adds Map.
+- **Uncommitted:**
+  - the shared crate `crates/shared/wyrd-types`, which owns the declared-type
+    ↔ JSON Schema/Arrow mapping (moved from `wyrd-queue/src/schema.rs`);
+  - TS `TableConfig.fromArrow`;
+  - registration stores and fingerprints each field's Iceberg form, so the
+    registered Iceberg schema is the table's single source of truth. Describing
+    a narrower declaration returns the wide registered type and re-registering
+    it is `AlreadyExists`;
+  - Scribe casts a written column to its registered Arrow type when both are
+    the same Iceberg type (narrower spellings, any-zone timestamps), before the
+    fingerprint check.
+- **Tests.**
+  - `wyrd-types` `schema.rs` unit tests: `arrow_schema_maps_precision_types_verbatim`,
+    `arrow_schema_refuses_unrepresentable_types`,
+    `map_declarations_round_trip_through_arrow`, and the `fieldspec_to_arrow_*`
+    round trips.
+  - Rust journey `crates/shared/wyrd-client/tests/bifrost/every_iceberg_column_type.rs`:
+    `every_iceberg_type_round_trips_with_nested_nulls`,
+    `a_narrower_type_reads_back_the_same_values`,
+    `a_narrower_declaration_is_the_table_it_describes`,
+    `a_type_with_no_iceberg_column_is_refused_at_registration`,
+    `a_refused_registration_creates_no_table`.
+  - Rust journey `register_a_table_from_a_model.rs`: six tests.
+  - Python `test_every_iceberg_column_type.py` (six tests) and
+    `test_register_a_table_from_a_model.py` (five tests).
+  - TS `every-iceberg-column-type.test.ts` (four tests) and
+    `register-a-table-from-a-model.test.ts` (five tests).
+
+### Changes the merge applies to A and B
+
+These are merge-plan decisions D1–D3:
+
+- **D1.** `check_supported` is restored in `wyrd-types` as the single
+  unsupported-type decider, for the SDK declaration and server registration.
+  It has no zone clause. The catalog `iceberg_form` refusal becomes an internal
+  invariant.
+- **D2.** As implemented, any zone declares `TIMESTAMP_LTZ`. REQ-016 drops "a
+  timestamp with a non-UTC zone".
+- **D3.** TS typed reads keep Int64 as `bigint`.
+  - The TS test "a 64-bit integer reads back as a number when it is safe" and
+    `register-a-table-from-a-model.test.ts` change to `bigint`.
+  - The three TS journeys above join `test:bifrost:journey:typescript`.
+- **Cast pass.** Scribe's cast and the integration branch's by-name reorder
+  become one pass (`conform_to_registered`).
+
+### Shredding progress (this task's own scenarios)
+
+Each status was found by searching the tree for that scenario's named tests.
+
+| Scenario | Status | Evidence |
+|---|---|---|
+| 1. Only final output files infer a bounded standard layout | **Not started** | No analyzer or `VariantParquetWriterBuilder` in the iceberg-rust fork; no shredding in `scribe/` or `forge/`; tests `recovery_runs_are_unshredded_and_final_objects_infer` and `variant_inference_memory_releases_on_every_terminal` absent |
+| 2. Recovery and compaction preserve standard logical values | **Not started** | `variant_staging_restores_and_publishes_once`, `rolled_outputs_infer_independent_variant_layouts` and `standard_variant_layouts_round_trip_per_file` absent |
+| 3. Distinct logical semantics share physical pushdown | **Partly done** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`. The DataFusion fork per-file read plan (`per_file_plan_covers_projection_filter_and_pruning` in the fork) and `oracle::nested_pushdown::tests::both_readers_use_shared_per_file_plan` exist. The journey `published::struct_and_variant_share_physical_pushdown` is absent. |
+| 4. Unsigned distributed predicates preserve authority | **Partly done** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). The journeys `distributed::unsigned_leaf_predicates_round_trip_and_execute` and MCP `sensitive_variant_leaf_is_denied_before_io` are absent. |
+| Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
+
+After the merge, resume shredding at Scenario 1.
+
 ## Owners, Scope, Consumers, and Prohibited Changes
 
 - `encode_batch` keeps Scribe recovery-stage runs on the stable unshredded

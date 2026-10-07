@@ -10,6 +10,7 @@ pub mod gateway;
 pub mod operators;
 pub mod verification;
 
+use std::collections::HashMap;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +35,7 @@ use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
+use wyrd_types::TimestampKind;
 
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
@@ -420,6 +422,54 @@ pub fn table_config_from_json_schema(
     NativeTableConfig::project(&apply_compaction_type(config, compaction_type.as_deref())?)
 }
 
+/// Builds one table config from the schema of an Arrow IPC stream.
+///
+/// This is the `TableConfig.fromArrow` door for types JSON Schema cannot
+/// express. The schema maps through the same `TableConfig::from_arrow` owner
+/// Rust and Python use, so a type with no wire form is refused here with the
+/// same catalog error, returned as metadata like a describe refusal.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not an Arrow IPC stream, the layout
+/// is not one physical-layout declaration, the compaction target is not a
+/// non-negative integer, or the compaction type is not one known hyphenated
+/// wire spelling. A table name or column refusal is returned as catalog
+/// metadata.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn table_config_from_arrow_ipc(
+    table: String,
+    schema_ipc: Buffer,
+    layout_json: Option<String>,
+    compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<String>,
+) -> Result<NativeTableConfigResult> {
+    let schema = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(schema_ipc), None)
+        .map_err(napi_error)?
+        .schema();
+    let config = match TableConfig::from_arrow(&table, schema) {
+        Ok(config) => config,
+        Err(error) => {
+            return Ok(NativeTableConfigResult {
+                config: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            });
+        }
+    };
+    let config = apply_layout(config, layout_json.as_deref())?;
+    let config = apply_compaction_target(config, compaction_target_file_size_bytes)?;
+    Ok(NativeTableConfigResult {
+        config: Some(NativeTableConfig::project(&apply_compaction_type(
+            config,
+            compaction_type.as_deref(),
+        )?)?),
+        error: None,
+    })
+}
+
 /// Decodes one Variant cell's `metadata`/`value` bytes into its native
 /// JavaScript value.
 ///
@@ -442,6 +492,74 @@ pub fn variant_to_value(metadata: Uint8Array, value: Uint8Array) -> Result<Value
             "query result Variant does not decode: {violation:?}"
         ))
     })
+}
+
+/// The JSON Schema `format` a Bifrost timestamp type declares itself with.
+///
+/// `kind` is a [`TimestampKind::name`]; returns `None` for an unknown type. The
+/// TypeScript Wyrd timestamp types read their format here rather than restating
+/// the format table.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn timestamp_format(kind: String) -> Option<&'static str> {
+    TimestampKind::from_name(&kind).map(TimestampKind::json_format)
+}
+
+/// Checks one timestamp text against a Bifrost timestamp type and returns its
+/// canonical text.
+///
+/// `kind` is a [`TimestampKind::name`]. The text is parsed exactly as the write
+/// path parses it, so a value the TypeScript Wyrd types accept is one an
+/// insert accepts. Returns `None` for an unknown type or refused text.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn timestamp_text(kind: String, text: String) -> Option<String> {
+    TimestampKind::from_name(&kind)?.canonical(&text)
+}
+
+/// Renders one stored timestamp cell as its Bifrost timestamp type's text.
+///
+/// `kind` is a [`TimestampKind::name`] and `stored` the column's microseconds;
+/// a `TIMESTAMP_TZ` cell also passes its `local` writer reading. The typed row
+/// terminal calls this for every timestamp cell, so reads render in Rust.
+/// Returns `None` for an unknown type or a value out of range.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn stored_timestamp_text(kind: String, stored: i64, local: Option<i64>) -> Option<String> {
+    TimestampKind::from_name(&kind)?.render(stored, local)
+}
+
+/// The Bifrost timestamp type of every top-level timestamp column in a
+/// schema-only Arrow IPC stream.
+///
+/// Maps each column to `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as
+/// [`TimestampKind::of`] decides it, so the typed row terminal renders each
+/// column's cells without restating that decision.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not an Arrow IPC stream.
+// justification: napi boundary; a JavaScript buffer arrives as an owned
+// handle, so the generated binding cannot take a borrowed slice
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub fn timestamp_kinds(schema_ipc: Buffer) -> Result<HashMap<String, &'static str>> {
+    let schema = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(schema_ipc), None)
+        .map_err(napi_error)?
+        .schema();
+    Ok(schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            TimestampKind::of(field.data_type()).map(|kind| (field.name().clone(), kind.name()))
+        })
+        .collect())
 }
 
 /// Fetches an already-registered table's config by name.

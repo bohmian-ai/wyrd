@@ -54,6 +54,7 @@ futures-util = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 secrecy = { workspace = true }
 tempfile = { workspace = true }
 wyrd-interfaces = { workspace = true }

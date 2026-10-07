@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-types = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 futures-util = { workspace = true }

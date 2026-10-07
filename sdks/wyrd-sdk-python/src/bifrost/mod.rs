@@ -304,6 +304,24 @@ impl PyQueryResult {
         self.inner.num_rows()
     }
 
+    /// The Bifrost timestamp type of every top-level timestamp column.
+    ///
+    /// Returns `(column, type name)` pairs, the name being `TIMESTAMP_NTZ`,
+    /// `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as [`wyrd_types::TimestampKind`]
+    /// decides it, so the typed row terminal turns each column's values into
+    /// the matching Wyrd timestamp type without restating that decision.
+    fn timestamp_kinds(&self) -> Vec<(String, &'static str)> {
+        self.inner
+            .schema()
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                wyrd_types::TimestampKind::of(field.data_type())
+                    .map(|kind| (field.name().clone(), kind.name()))
+            })
+            .collect()
+    }
+
     /// Decodes one Variant cell's `metadata`/`value` bytes into its native
     /// Python value.
     ///
@@ -1038,7 +1056,7 @@ fn record(
 ) -> WyrdPyResult<()> {
     let schema_value: Value =
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
-    let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
+    let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| invalid_argument("schema", error))?;
     wyrd_client::bifrost::observe::record(
         &bifrost.borrow().handle,

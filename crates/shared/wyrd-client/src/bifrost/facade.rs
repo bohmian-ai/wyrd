@@ -19,7 +19,7 @@ use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 use wyrd_queue::QueueConfig;
-use wyrd_queue::variant::VariantJsonEncoderFactory;
+use wyrd_queue::variant::WyrdJsonEncoderFactory;
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -477,7 +477,7 @@ impl Bifrost {
     /// express — binary payloads, fixed-size identities, and nested list or
     /// struct columns — which is what the canonical signal tables are made of.
     /// Build the batch from the table's own published contract
-    /// ([`Self::describe`] plus `wyrd_queue::schema::writable_schema`) rather
+    /// ([`Self::describe`] plus `wyrd_types::schema::writable_schema`) rather
     /// than from a restated schema.
     ///
     /// The table is named explicitly instead of taken from the bound active
@@ -909,7 +909,7 @@ impl QueryResult {
     /// the column names and types `T` sees are exactly the schema the server
     /// sent — there is no second, hand-written type mapping to disagree with
     /// it. A Variant column renders as its JSON value through the shared
-    /// [`VariantJsonEncoderFactory`],
+    /// [`WyrdJsonEncoderFactory`],
     /// so `T` reads it as a `serde_json::Value` or any type that value fits.
     /// An empty result writes no array at all, which is the zero-row case.
     ///
@@ -921,7 +921,7 @@ impl QueryResult {
         let mut bytes = Vec::new();
         {
             let mut writer = WriterBuilder::new()
-                .with_encoder_factory(Arc::new(VariantJsonEncoderFactory))
+                .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
                 .build::<_, JsonArray>(&mut bytes);
             for batch in &self.batches {
                 writer
@@ -1064,10 +1064,9 @@ mod tests {
     use arrow::ipc::reader::StreamReader;
     use serde_json::json;
     use wyrd_queue::MockSink;
-    use wyrd_queue::variant::{
-        EncodedVariant, VariantColumnBuilder, is_variant, variant_cell_to_json, variant_field,
-    };
+    use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, variant_cell_to_json};
     use wyrd_spec::error::WyrdError;
+    use wyrd_types::variant::{is_variant, variant_field};
 
     use super::*;
     use crate::bifrost::query::tests::recording_server;

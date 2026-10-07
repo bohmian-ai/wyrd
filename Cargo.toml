@@ -56,6 +56,7 @@ wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
 wyrd-queue = { path = "crates/shared/wyrd-queue", version = "0.0.1" }
+wyrd-types = { path = "crates/shared/wyrd-types", version = "0.0.1" }
 wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }

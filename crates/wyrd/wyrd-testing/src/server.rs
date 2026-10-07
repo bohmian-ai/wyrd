@@ -58,7 +58,7 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
-use wyrd_queue::variant::{variant_cell_to_json, variant_storage_type};
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
@@ -80,6 +80,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
+use wyrd_types::variant::variant_storage_type;
 
 use crate::bifrost::ForgeObjectStoreControl;
 

@@ -51,9 +51,9 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 use wyrd_queue::variant::{
-    EncodedVariant, VariantColumnBuilder, VariantViolation, is_variant, mask_placeholders,
-    variant_field, variant_storage_type,
+    EncodedVariant, VariantColumnBuilder, VariantViolation, mask_placeholders,
 };
+use wyrd_types::variant::{is_variant, variant_field, variant_storage_type};
 
 use super::QueryCatalogError;
 

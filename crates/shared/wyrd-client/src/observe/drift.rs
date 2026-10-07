@@ -38,7 +38,10 @@ fn projection_columns() -> [ProjectedColumn; 6] {
         ("session_id", DataType::Utf8, true),
         (
             "created_at",
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some(wyrd_spec::vala::api::UTC_TIME_ZONE.into()),
+            ),
             false,
         ),
     ]

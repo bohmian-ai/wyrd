@@ -75,7 +75,10 @@ fn batch_with_value(value: i64) -> RecordBatch {
         Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                ),
                 false,
             ),
             Field::new("value", DataType::Int64, false),
@@ -83,7 +86,7 @@ fn batch_with_value(value: i64) -> RecordBatch {
         vec![
             Arc::new(
                 TimestampMicrosecondArray::from(vec![fixture_event_time_micros()])
-                    .with_timezone("UTC"),
+                    .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
             ),
             Arc::new(Int64Array::from(vec![value])),
         ],

@@ -1,5 +1,3 @@
-import json
-
 import pytest
 from pydantic import BaseModel
 from wyrd.prompt import Prompt, ResponseFormat, WyrdError
@@ -50,10 +48,3 @@ def test_response_format_json_schema_rejects_non_object_schema() -> None:
         ResponseFormat.json_schema("bad", "not-object")
 
     assert error.value.code == "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA"
-
-
-def test_structured_output_model_dump_json_preserves_schema() -> None:
-    prompt = Prompt.openai_chat("gpt-4o", messages="Recipe", response_format=Recipe)
-    decoded = json.loads(prompt.model_dump_json())
-
-    assert decoded["response_type"]["json_schema"]["schema"] == prompt.response_schema

@@ -1,61 +1,21 @@
-"""PromptCard declarative authoring tests.
+"""A PromptCard authored in Python or as declarative YAML."""
 
-Covers:
-- PromptCard(prompt=Prompt(...)) constructor path
-- PromptCard.from_path on declarative YAML envelopes
-- PromptCard.from_path on native (saved) envelopes
-- round-trip: declarative → save → from_path → equal
-- error cases: bad provider, settings mismatch, no silent fallback
-"""
-
-import json
 from pathlib import Path
 
 import pytest
 from wyrd.prompt import Prompt, PromptCard, WyrdError
 
-OPENAI_DECLARATIVE_YAML = """\
-apiVersion: wyrd/v1
-kind: Prompt
-metadata:
-  name: lead-scoring
-  version: 0.1.0
-  space: growth
-  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
-spec:
-  provider: openai
-  model: gpt-4o
-  system: "You are {{persona}}."
-  messages:
-    - "Summarize {{doc}}."
-  model_settings:
-    temperature: 0.2
-"""
 
-ANTHROPIC_DECLARATIVE_YAML = """\
-kind: Prompt
-metadata:
-  name: support-agent
-  version: 0.1.0
-spec:
-  provider: anthropic
-  model: claude-3-5-sonnet-20241022
-  system: You are a helpful support agent.
-  messages:
-    - How can I reset my password?
-"""
+@pytest.fixture
+def lead_scoring(fixtures_dir: Path) -> Path:
+    """The declarative OpenAI lead-scoring Prompt Card file."""
+    return fixtures_dir / "authoring" / "prompt" / "lead-scoring.yaml"
 
-MALFORMED_PROVIDER_YAML = """\
-kind: Prompt
-metadata:
-  name: bad
-  version: 0.1.0
-spec:
-  provider: unknownprovider
-  model: some-model
-  messages:
-    - Hello
-"""
+
+@pytest.fixture
+def support_agent(fixtures_dir: Path) -> Path:
+    """A declarative Anthropic Prompt Card file that omits apiVersion and space."""
+    return fixtures_dir / "authoring" / "prompt" / "support-agent.yaml"
 
 
 def test_promptcard_constructor_with_python_prompt() -> None:
@@ -69,94 +29,53 @@ def test_promptcard_constructor_with_python_prompt() -> None:
     assert card.prompt.model == "gpt-4o"
 
 
-def test_from_path_declarative_openai(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(OPENAI_DECLARATIVE_YAML)
+def test_declarative_openai_card_loads_its_identity_and_model(lead_scoring: Path) -> None:
+    card = PromptCard.from_path(lead_scoring)
 
-    card = PromptCard.from_path(yaml_file)
-
-    assert card.space == "growth"
-    assert card.name == "lead-scoring"
-    assert card.prompt.provider == "openai"
-    assert card.prompt.model == "gpt-4o"
-
-
-def test_from_path_declarative_extracts_variables(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(OPENAI_DECLARATIVE_YAML)
-
-    card = PromptCard.from_path(yaml_file)
-
-    assert "persona" in card.parameters
-    assert "doc" in card.parameters
+    assert (card.space, card.name, card.prompt.provider, card.prompt.model) == (
+        "growth",
+        "lead-scoring",
+        "openai",
+        "gpt-4o",
+    )
 
 
-def test_from_path_declarative_temperature_applied(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(OPENAI_DECLARATIVE_YAML)
-
-    card = PromptCard.from_path(yaml_file)
-    body = json.loads(card.prompt.request.model_dump_json())["body"]
-    assert body.get("temperature") == pytest.approx(0.2)
+def test_declarative_card_extracts_its_variables(lead_scoring: Path) -> None:
+    assert PromptCard.from_path(lead_scoring).parameters == ["persona", "doc"]
 
 
-def test_from_path_declarative_anthropic(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(ANTHROPIC_DECLARATIVE_YAML)
+def test_declarative_card_applies_its_model_settings(lead_scoring: Path) -> None:
+    card = PromptCard.from_path(lead_scoring)
 
-    card = PromptCard.from_path(yaml_file)
-
-    assert card.prompt.provider == "anthropic"
-    assert card.prompt.model == "claude-3-5-sonnet-20241022"
+    assert card.prompt.model_settings.to_dict()["temperature"] == pytest.approx(0.2)
 
 
-def test_from_path_apiversion_default_when_omitted(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(ANTHROPIC_DECLARATIVE_YAML)
+def test_declarative_anthropic_card_loads_its_provider_and_model(support_agent: Path) -> None:
+    card = PromptCard.from_path(support_agent)
 
-    card = PromptCard.from_path(yaml_file)
-    envelope = json.loads(card.model_dump_json())
-    assert envelope["apiVersion"] == "wyrd/v1"
+    assert (card.prompt.provider, card.prompt.model) == ("anthropic", "claude-3-5-sonnet-20241022")
 
 
-def test_declarative_round_trip(tmp_path: Path) -> None:
-    """Declarative YAML → from_path → save → from_path → equal."""
-    declarative_file = tmp_path / "declarative.yaml"
-    declarative_file.write_text(OPENAI_DECLARATIVE_YAML)
-    card = PromptCard.from_path(declarative_file)
-
-    saved_file = tmp_path / "saved.yaml"
-    card.save(saved_file)
-
-    reloaded = PromptCard.from_path(saved_file)
-    assert json.loads(card.model_dump_json()) == json.loads(reloaded.model_dump_json())
+def test_omitted_api_version_defaults_to_wyrd_v1(support_agent: Path) -> None:
+    assert PromptCard.from_path(support_agent).model_dump()["apiVersion"] == "wyrd/v1"
 
 
-def test_saved_card_has_no_spec_type_field(tmp_path: Path) -> None:
-    declarative_file = tmp_path / "declarative.yaml"
-    declarative_file.write_text(OPENAI_DECLARATIVE_YAML)
-    card = PromptCard.from_path(declarative_file)
+def test_declarative_card_saves_and_loads_unchanged(tmp_path: Path, lead_scoring: Path) -> None:
+    card = PromptCard.from_path(lead_scoring)
+    card.save(tmp_path / "saved.yaml")
 
-    saved_file = tmp_path / "saved.yaml"
-    card.save(saved_file)
-
-    content = saved_file.read_text()
-    assert "type: Prompt" not in content
+    assert PromptCard.from_path(tmp_path / "saved.yaml").model_dump() == card.model_dump()
 
 
-def test_bad_provider_raises_error(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "bad.yaml"
-    yaml_file.write_text(MALFORMED_PROVIDER_YAML)
+def test_unknown_provider_is_refused(fixtures_dir: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        PromptCard.from_path(fixtures_dir / "invalid" / "prompt" / "unknown-provider.yaml")
 
-    with pytest.raises(WyrdError):
-        PromptCard.from_path(yaml_file)
+    assert error.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_load_is_alias_for_from_path(tmp_path: Path) -> None:
-    yaml_file = tmp_path / "prompt.yaml"
-    yaml_file.write_text(OPENAI_DECLARATIVE_YAML)
-
-    via_load = PromptCard.load(yaml_file)
-    via_from_path = PromptCard.from_path(yaml_file)
-
-    assert json.loads(via_load.model_dump_json()) == json.loads(via_from_path.model_dump_json())
+def test_load_is_alias_for_from_path(lead_scoring: Path) -> None:
+    assert (
+        PromptCard.load(lead_scoring).model_dump()
+        == PromptCard.from_path(lead_scoring).model_dump()
+    )

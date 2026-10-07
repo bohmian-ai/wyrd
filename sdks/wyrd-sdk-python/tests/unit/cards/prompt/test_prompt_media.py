@@ -1,36 +1,39 @@
+"""Media placed in a Prompt becomes each provider's native media part."""
+
 from pathlib import Path
 
 import pytest
 from wyrd.prompt import MediaRef, Prompt, WyrdError
 
-
-def assert_code(error: pytest.ExceptionInfo[WyrdError], code: str) -> None:
-    assert error.value.code == code
+LOGO_URL = "https://example.test/logo.png"
 
 
-def test_openai_eager_image_url_base64_and_path(tmp_path: Path) -> None:
-    image = tmp_path / "logo.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+def test_openai_eager_image_url_is_an_image_part() -> None:
+    prompt = Prompt.openai_chat("gpt-4o").user("look").user(Prompt.openai_image_url(LOGO_URL))
 
-    url_prompt = (
-        Prompt.openai_chat("gpt-4o")
-        .user("look")
-        .user(Prompt.openai_image_url("https://example.test/logo.png"))
-    )
-    base64_prompt = Prompt.openai_chat("gpt-4o").user(
+    assert prompt.request.openai().messages[1].content.as_parts()[0].as_image_url().url == LOGO_URL
+
+
+def test_openai_eager_file_data_is_a_file_part() -> None:
+    prompt = Prompt.openai_chat("gpt-4o").user(
         Prompt.openai_file_data("data:image/png;base64,QUJD", filename="logo.png")
-    )
-    path_prompt = Prompt("look ${media:logo}", "gpt-4o", provider="openai").bind_media(
-        "logo", MediaRef.image_path(image)
     )
 
     assert (
-        url_prompt.request.model_dump()["body"]["messages"][1]["content"][0]["type"] == "image_url"
+        prompt.request.openai().messages[0].content.as_parts()[0].as_file().filename == "logo.png"
     )
-    assert base64_prompt.request.model_dump()["body"]["messages"][0]["content"][0]["type"] == "file"
-    assert path_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["image_url"][
-        "url"
-    ].startswith("data:image/png;base64,")
+
+
+def test_openai_image_path_binds_as_a_data_url(tmp_path: Path) -> None:
+    image = tmp_path / "logo.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    prompt = Prompt("look ${media:logo}", "gpt-4o", provider="openai").bind_media(
+        "logo", MediaRef.image_path(image)
+    )
+
+    url = prompt.request.openai().messages[0].content.as_parts()[1].as_image_url().url
+    assert url.startswith("data:image/png;base64,")
 
 
 def test_openai_rejects_document_url() -> None:
@@ -39,68 +42,71 @@ def test_openai_rejects_document_url() -> None:
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("doc", MediaRef.document_url("https://example.test/doc.pdf"))
 
-    assert_code(error, "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER")
+    assert error.value.code == "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER"
 
 
-def test_anthropic_eager_image_and_document_blocks() -> None:
+def test_anthropic_eager_media_become_image_and_document_blocks() -> None:
     prompt = (
         Prompt.anthropic("claude-sonnet-4")
-        .user(Prompt.anthropic_image_url("https://example.test/logo.png"))
+        .user(Prompt.anthropic_image_url(LOGO_URL))
         .user(Prompt.anthropic_image_base64("image/png", "QUJD"))
         .user(Prompt.anthropic_document_text("text/plain", "hello", title="doc"))
     )
-    content = prompt.request.model_dump()["body"]["messages"]
 
-    assert content[0]["content"][0]["type"] == "image"
-    assert content[1]["content"][0]["source"]["type"] == "base64"
-    assert content[2]["content"][0]["type"] == "document"
+    blocks = [
+        (message["content"][0]["type"], message["content"][0]["source"]["type"])
+        for message in prompt.request.messages
+    ]
+
+    assert blocks == [("image", "url"), ("image", "base64"), ("document", "text")]
 
 
-def test_anthropic_late_document_url_and_base64() -> None:
-    url_prompt = Prompt("read ${media:doc}", "claude-sonnet-4", provider="anthropic").bind_media(
-        "doc", MediaRef.document_url("https://example.test/doc.pdf")
+@pytest.mark.parametrize(
+    ("media", "source_type"),
+    [
+        pytest.param(MediaRef.document_url("https://example.test/doc.pdf"), "url", id="url"),
+        pytest.param(MediaRef.document_base64("application/pdf", "QUJD"), "base64", id="base64"),
+    ],
+)
+def test_anthropic_late_document_binds_as_a_document_block(
+    media: MediaRef, source_type: str
+) -> None:
+    prompt = Prompt("read ${media:doc}", "claude-sonnet-4", provider="anthropic").bind_media(
+        "doc", media
     )
-    b64_prompt = Prompt("read ${media:doc}", "claude-sonnet-4", provider="anthropic").bind_media(
-        "doc", MediaRef.document_base64("application/pdf", "QUJD")
-    )
 
-    assert (
-        url_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["type"] == "document"
-    )
-    assert (
-        b64_prompt.request.model_dump()["body"]["messages"][0]["content"][1]["source"]["type"]
-        == "base64"
-    )
+    block = prompt.request.messages[0]["content"][1]
+    assert (block["type"], block["source"]["type"]) == ("document", source_type)
 
 
-def test_gemini_inline_data_and_gs_file_uri() -> None:
-    inline = Prompt.gemini("gemini-2.5-pro").user(Prompt.google_inline_data("image/png", "QUJD"))
-    gs = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini").bind_media(
+def test_gemini_eager_inline_data_is_an_inline_data_part() -> None:
+    prompt = Prompt.gemini("gemini-2.5-pro").user(Prompt.google_inline_data("image/png", "QUJD"))
+
+    assert prompt.request.gemini().contents[0].parts[0].kind == "inline_data"
+
+
+def test_gemini_gs_uri_binds_as_a_file_data_part() -> None:
+    prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini").bind_media(
         "img", MediaRef.image_url("gs://bucket/logo.png", mime_type="image/png")
     )
 
-    assert "inline_data" in inline.request.model_dump()["body"]["contents"][0]["parts"][0]
-    assert gs.request.model_dump()["body"]["contents"][0]["parts"][1]["file_data"][
-        "file_uri"
-    ].startswith("gs://")
+    assert prompt.request.gemini().contents[0].parts[1].kind == "file_data"
 
 
 def test_gemini_rejects_ordinary_https_media_uri() -> None:
     prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="gemini")
 
     with pytest.raises(WyrdError) as error:
-        prompt.bind_media(
-            "img", MediaRef.image_url("https://example.test/logo.png", mime_type="image/png")
-        )
+        prompt.bind_media("img", MediaRef.image_url(LOGO_URL, mime_type="image/png"))
 
-    assert_code(error, "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER")
+    assert error.value.code == "WYRD_PROMPT_400_UNSUPPORTED_MEDIA_FOR_PROVIDER"
 
 
 def test_vertex_mirrors_gemini_media_behavior() -> None:
     prompt = Prompt("see ${media:img}", "gemini-2.5-pro", provider="vertex")
     bound = prompt.bind_media("img", MediaRef.image_base64("image/png", "QUJD"))
 
-    assert "inline_data" in bound.request.model_dump()["body"]["contents"][0]["parts"][1]
+    assert bound.request.gemini().contents[0].parts[1].kind == "inline_data"
 
 
 def test_gemini_url_missing_mime_raises_exact_code() -> None:
@@ -109,21 +115,28 @@ def test_gemini_url_missing_mime_raises_exact_code() -> None:
     with pytest.raises(WyrdError) as error:
         prompt.bind_media("img", MediaRef.image_url("gs://bucket/logo.png"))
 
-    assert_code(error, "WYRD_PROMPT_400_INVALID_MEDIA_TYPE")
+    assert error.value.code == "WYRD_PROMPT_400_INVALID_MEDIA_TYPE"
 
 
-def test_oversized_file_directory_and_system_media_raise_exact_codes(tmp_path: Path) -> None:
+def test_oversized_media_file_is_refused(tmp_path: Path) -> None:
     oversize = tmp_path / "oversize.png"
     oversize.write_bytes(b"0" * (20 * 1024 * 1024 + 1))
 
-    with pytest.raises(WyrdError) as too_large:
+    with pytest.raises(WyrdError) as error:
         MediaRef.image_path(oversize)
-    assert_code(too_large, "WYRD_PROMPT_400_MEDIA_TOO_LARGE")
 
-    with pytest.raises(WyrdError) as directory:
+    assert error.value.code == "WYRD_PROMPT_400_MEDIA_TOO_LARGE"
+
+
+def test_directory_media_path_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(WyrdError) as error:
         MediaRef.image_path(tmp_path)
-    assert_code(directory, "WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE")
 
-    with pytest.raises(WyrdError) as system:
+    assert error.value.code == "WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE"
+
+
+def test_media_in_the_system_message_is_refused() -> None:
+    with pytest.raises(WyrdError) as error:
         Prompt("hello", "gpt-4o", provider="openai", system="${media:logo}")
-    assert_code(system, "WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE")
+
+    assert error.value.code == "WYRD_PROMPT_400_MEDIA_IN_SYSTEM_MESSAGE"

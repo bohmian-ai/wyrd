@@ -2,7 +2,7 @@
 
 `ty` checks this module in the `py:typecheck` lane, so each assignment is a
 static assertion that the public TypedDict and Literal projections accept the
-contract shape without an `Any` hop. The runtime asserts keep it a unit test.
+contract shape without an `Any` hop. It sits outside pytest collection.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from wyrd.gateway import (
 )
 
 
-def test_gateway_contract_shapes_are_typed_dicts() -> None:
+def gateway_contract_shapes_are_typed_dicts() -> tuple[object, ...]:
     view: ProviderCredentialView = {
         "name": "openai-key",
         "provider": "openai",
@@ -67,22 +67,17 @@ def test_gateway_contract_shapes_are_typed_dicts() -> None:
     }
     capture: GatewayCapturePolicy = {"mode": "payload", "payload_fields": ["request"], "version": 2}
 
-    assert view["source"] == {"environment": {"binding": "OPENAI_API_KEY"}}
-    assert deployment["adapter"] != "openai"
-    assert fallback["rules"][0]["candidates"][0]["provider"] == "vertex"
-    assert governance["budgets"][0]["period"] == "calendar_month_utc"
-    assert capture["version"] == 2
+    return (view, deployment, fallback, governance, capture)
 
 
-def test_managed_secrets_are_readable_but_not_submittable() -> None:
+def managed_secrets_are_readable_but_not_submittable() -> ProviderCredentialView:
     """The SDK projects the redacted managed source and exports no write type.
 
     Credential mutation is a CLI and scoped MCP administration path, so the
     package exposes a source view and no write body at all.
     """
-    import wyrd.gateway
+    from wyrd.gateway import ProviderCredentialWrite  # ty: ignore[unresolved-import]  # noqa: F401
 
-    assert not hasattr(wyrd.gateway, "ProviderCredentialWrite")
     source: ProviderCredentialSourceView = "managed_secret"
     view: ProviderCredentialView = {
         "name": "openai-key",
@@ -94,5 +89,4 @@ def test_managed_secrets_are_readable_but_not_submittable() -> None:
         "rotated_at": None,
         "revoked_at": None,
     }
-
-    assert view["source"] == "managed_secret"
+    return view

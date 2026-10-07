@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     )
 
 
-def test_every_provider_variant_is_accepted() -> None:
+def every_provider_variant_is_accepted() -> tuple[object, ...]:
     creates: list[CreateOperatorConnectionRequest] = [
         {"provider": "slack", "name": "s", "workspace_id": "T1", "bot_token": "x"},
         {"provider": "pager_duty", "name": "p", "integration_key": "x"},
@@ -78,13 +78,10 @@ def test_every_provider_variant_is_accepted() -> None:
             "auth": {"scheme": "header", "name": "X-Api-Key"},
         },
     ]
-    view = views[0]
-    if view["provider"] == "slack":
-        assert view["workspace_id"] == "T1"
-    assert (len(creates), len(updates), len(views)) == (5, 5, 3)
+    return (creates, updates, views)
 
 
-def test_invalid_provider_combinations_are_rejected() -> None:
+def invalid_provider_combinations_are_rejected() -> list[object]:
     missing_workspace: CreateOperatorConnectionRequest = {
         "provider": "slack",
         "name": "s",
@@ -112,7 +109,7 @@ def test_invalid_provider_combinations_are_rejected() -> None:
         "provider": "pager_duty",
         "workspace_id": "T1",
     }  # ty: ignore[invalid-assignment]
-    rejected = [
+    return [
         missing_workspace,
         foreign_field,
         partial_basic,
@@ -121,7 +118,6 @@ def test_invalid_provider_combinations_are_rejected() -> None:
         crossed,
         pager_workspace,
     ]
-    assert len(rejected) == 7
 
 
 def nested_config_is_absent(view: OperatorConnectionView) -> object:
@@ -132,3 +128,10 @@ def nested_config_is_absent(view: OperatorConnectionView) -> object:
 def workspace_requires_narrowing(view: OperatorConnectionView) -> object:
     """``workspace_id`` is only reachable after narrowing to Slack."""
     return view["workspace_id"]  # ty: ignore[invalid-key]
+
+
+def workspace_is_reachable_after_narrowing(view: OperatorConnectionView) -> object:
+    """Narrowing to Slack makes ``workspace_id`` a known key."""
+    if view["provider"] == "slack":
+        return view["workspace_id"]
+    return None

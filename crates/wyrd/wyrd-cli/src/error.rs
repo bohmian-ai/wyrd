@@ -335,10 +335,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             WyrdCliError::ClientTransport { .. } => {
                 WyrdError::ClientTransportDown { message, details }
             }
-            WyrdCliError::CardLoad(error) => WyrdError::LoaderInvalidEnvelope {
-                message,
-                details: serde_json::json!({ "diagnostics": error.diagnostics }),
-            },
+            WyrdCliError::CardLoad(error) => WyrdError::from(error),
             WyrdCliError::InvalidArgument { field, .. } => WyrdError::Validation {
                 message,
                 details: serde_json::json!({ "field": field }),

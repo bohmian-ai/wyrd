@@ -497,7 +497,7 @@ impl PyWorkflow {
     ///     Workflow: Fully hydrated and validated workflow.
     ///
     /// Raises:
-    ///     `WyrdError`: `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the file
+    ///     `WyrdError`: `WYRD_LOADER_400_INVALID_ENVELOPE` when the file
     ///         fails to load; `WYRD_CLIENT_401_NO_CREDENTIALS` when a
     ///         registry ref needs a credential and none is configured;
     ///         `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot

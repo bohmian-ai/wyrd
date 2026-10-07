@@ -214,23 +214,13 @@ impl Cards {
     ///
     /// # Errors
     ///
-    /// Returns an error when the document cannot be loaded or converted into a registration
-    /// request, or when the registry rejects the registration.
+    /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE`, carrying the loader's per-file
+    /// diagnostics, when the document cannot be loaded or converted into a
+    /// registration request (the same code `wyrd apply` reports for that tree),
+    /// or the registry's error when it rejects the registration.
     pub async fn register_from_path(&self, path: &Path) -> Result<RegistrationReceipt, WyrdError> {
-        let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
-            message: format!("card tree failed to load: {error}"),
-            // The loader counts its diagnostics in `Display` but carries the
-            // per-file code, span, message, and remediation on the value. An
-            // author who only sees the count cannot fix the tree, so the
-            // structured diagnostics travel in the error details.
-            details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
-        })?;
-        let input = wyrd_loader::build_registration_input(tree).map_err(|error| {
-            WyrdError::RegistryInvalidCardSpec {
-                message: format!("card tree failed validation: {error}"),
-                details: serde_json::json!({ "path": path, "error": error.to_string() }),
-            }
-        })?;
+        let tree = wyrd_loader::load(path)?;
+        let input = wyrd_loader::build_registration_input(tree)?;
         self.register(&input).await
     }
 

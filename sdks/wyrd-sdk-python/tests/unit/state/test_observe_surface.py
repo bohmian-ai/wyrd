@@ -222,6 +222,12 @@ def test_verify_refuses_a_context_list_for_an_eval_verifier(state: WyrdState) ->
     assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
+def test_the_verification_module_is_not_importable() -> None:
+    """Direct judgment lives on ``run.observe.verify``; no handle module remains (AC-046)."""
+    with pytest.raises(ModuleNotFoundError):
+        __import__("wyrd.verification")
+
+
 # ── Run scope: ambient OpenTelemetry span correlation ───────────────────────
 
 

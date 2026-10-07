@@ -4372,11 +4372,17 @@ mod tests {
             .expect("the aborted driver ends promptly")
             .expect_err("the driver was aborted, never completed");
 
+        // The envelope is returned by the bounded release after the graph
+        // leaves the map, so the wait covers both rather than reading the
+        // envelope in the window between them.
         await_until(|| {
             fixture
                 .supervisor
                 .live_graphs()
                 .is_ok_and(|graphs| graphs == 0)
+                && oracle
+                    .snapshot()
+                    .is_ok_and(|live| live.oracle_analytical_queries == 0)
         })
         .await;
         assert_eq!(

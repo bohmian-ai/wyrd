@@ -715,7 +715,7 @@ selection.
   - `restart_recovers_hot_promotion_with_empty_schedule`: `BifrostClusterSpec::two_mixed().without_audit_publication_for_test()`.
   - `prove_published_governance`: `one_mixed().with_metadata_cache_mode(...).without_audit_publication_for_test()`.
   - `staged_backlog_survives_abrupt_restart`: `one_mixed().without_audit_publication_for_test()`.
-  
+
   `scribe_shards_obey_global_and_tenant_budgets` replaces `start_scribe_server()` with `WyrdTestServer::builder().without_audit_publication_for_test().start_bound()`, and the `start_scribe_server` import is dropped. The stale comment "Audited reads above keep publishing retained audit..." in `compaction_geometry_exact_rows_and_non_destructive_second_pass` is shortened.
 - **Why:** With continuous publication, the tenant audit table took Forge worker slots, parked promotions, and pod-wide Scribe insertion and budget counters that these journeys assert as theirs alone. Which verification change made this visible is my inference; the commits do not name the trigger.
 - **Replay rule:** Wherever the variant edits these four files, keep every `without_audit_publication_for_test()` call from HEAD, and add it to any new variant journey that asserts pod-wide Scribe or Forge counts or a single table's promotion or compaction.

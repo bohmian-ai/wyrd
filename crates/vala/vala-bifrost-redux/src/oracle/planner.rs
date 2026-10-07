@@ -47,16 +47,13 @@ impl OraclePlanner {
     /// canonical table references that parse produced.
     ///
     /// # Errors
-    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
+    /// Returns [`BifrostError::QueryInvalidDeadline`] for an out-of-range
+    /// deadline and [`BifrostError::QueryInvalidSql`] for SQL floor violations.
     pub fn validate_query(
         &self,
         request: &BifrostQueryRequest,
     ) -> Result<Vec<TableRef>, BifrostError> {
-        request
-            .validate()
-            .map_err(|error| BifrostError::QueryInvalidSql {
-                detail: error.to_string(),
-            })?;
+        request.validate().map_err(BifrostError::from)?;
         if request.sql.len() > self.config.max_sql_bytes {
             return Err(BifrostError::QueryInvalidSql {
                 detail: "query exceeds configured SQL byte limit".to_owned(),

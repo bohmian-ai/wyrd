@@ -5199,6 +5199,26 @@ mod tests {
         }
     }
 
+    /// An out-of-range deadline is refused with the deadline code, not as SQL,
+    /// so a raw HTTP or MCP caller sees the same code an SDK raises before IO.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request validates or refuses with another error.
+    #[test]
+    fn query_floor_refuses_an_out_of_range_deadline() {
+        let planner = OraclePlanner::new(OracleConfig::default());
+        let request = BifrostQueryRequest {
+            sql: "SELECT 1".to_owned(),
+            params: Vec::new(),
+            deadline_ms: Some(0),
+        };
+        assert_eq!(
+            planner.validate_query(&request),
+            Err(BifrostError::QueryInvalidDeadline)
+        );
+    }
+
     /// The SQL parser accepts a complete query and extracts its canonical tables.
     #[test]
     fn query_floor_extracts_joined_and_cte_tables() {

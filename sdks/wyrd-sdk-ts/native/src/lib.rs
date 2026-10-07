@@ -1173,7 +1173,7 @@ fn correlation(
 ///
 /// # Errors
 ///
-/// Returns the shared deadline refusal, `WYRD_SPEC_400_VALIDATION`, for a
+/// Returns the shared deadline refusal, `WYRD_VALA_400_QUERY_INVALID_DEADLINE`, for a
 /// non-finite, fractional, or beyond-`i64` number.
 fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
     value

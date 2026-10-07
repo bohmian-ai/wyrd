@@ -490,25 +490,29 @@ pub enum QueryContractError {
     InvalidDeadline,
 }
 
-/// Projects a query request refusal onto the public catalog.
+/// Projects a query request refusal onto the Bifrost error catalog.
 ///
-/// A deadline outside its range is a request-field fault, not a SQL fault, so
-/// it is the shared `WYRD_SPEC_400_VALIDATION` naming `deadline_ms`; every
-/// other contract refusal concerns the SQL text or its bind values and stays
-/// `WYRD_VALA_400_QUERY_INVALID_SQL`. Client surfaces that validate a request
-/// before IO route through this one projection.
-impl From<QueryContractError> for crate::error::WyrdError {
+/// A deadline outside its range is `WYRD_VALA_400_QUERY_INVALID_DEADLINE`;
+/// every other contract refusal concerns the SQL text or its bind values and is
+/// `WYRD_VALA_400_QUERY_INVALID_SQL`. Client pre-IO validation and Oracle's
+/// server-side validation both route through this one projection.
+impl From<QueryContractError> for crate::vala::error::BifrostError {
     fn from(error: QueryContractError) -> Self {
         match error {
-            QueryContractError::InvalidDeadline => Self::Validation {
-                message: error.to_string(),
-                details: serde_json::json!({ "field": "deadline_ms" }),
+            QueryContractError::InvalidDeadline => Self::QueryInvalidDeadline,
+            other => Self::QueryInvalidSql {
+                detail: other.to_string(),
             },
-            other => Self::Vala {
-                error: crate::vala::error::BifrostError::QueryInvalidSql {
-                    detail: other.to_string(),
-                },
-            },
+        }
+    }
+}
+
+/// Lifts a query request refusal into the public error through its Bifrost
+/// projection, so client surfaces can `?` a validation result directly.
+impl From<QueryContractError> for crate::error::WyrdError {
+    fn from(error: QueryContractError) -> Self {
+        Self::Vala {
+            error: error.into(),
         }
     }
 }
@@ -1269,8 +1273,8 @@ mod query_terminal_tests {
         );
     }
 
-    /// An out-of-range deadline projects onto the shared request-validation
-    /// code, while an empty statement stays the SQL refusal.
+    /// An out-of-range deadline projects onto the Bifrost deadline code, while
+    /// an empty statement stays the SQL refusal.
     ///
     /// # Panics
     ///
@@ -1289,7 +1293,7 @@ mod query_terminal_tests {
 
         assert_eq!(
             refusal(request("SELECT 1", Some(0))),
-            "WYRD_SPEC_400_VALIDATION"
+            "WYRD_VALA_400_QUERY_INVALID_DEADLINE"
         );
         assert_eq!(
             refusal(request(" ", None)),

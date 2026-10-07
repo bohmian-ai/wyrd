@@ -286,6 +286,7 @@ fn bifrost_error_from_code(
                 .unwrap_or(message)
                 .to_owned(),
         },
+        "WYRD_VALA_400_QUERY_INVALID_DEADLINE" => BifrostError::QueryInvalidDeadline,
         "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE" => BifrostError::OracleRoleUnavailable,
         // Ingest backpressure. A caller that cannot see this code cannot tell
         // "the pod is out of WAL space, retry when it drains" from a generic
@@ -522,6 +523,17 @@ mod tests {
         }));
         assert_eq!(invalid_sql.status(), 400);
         assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
+
+        let invalid_deadline = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
+            "detail": "deadline_ms must be an integer between 1 and 4294967295",
+            "details": {},
+        }));
+        assert_eq!(invalid_deadline.status(), 400);
+        assert_eq!(
+            invalid_deadline.code(),
+            "WYRD_VALA_400_QUERY_INVALID_DEADLINE"
+        );
 
         let card_scope = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_403_BIFROST_CARD_SCOPE",

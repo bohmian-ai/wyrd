@@ -443,6 +443,20 @@ pub enum BifrostError {
         detail: String,
     },
 
+    /// The query request's `deadline_ms` is outside `1..=u32::MAX`
+    /// milliseconds.
+    ///
+    /// Clients refuse it before IO and the server refuses it in Oracle
+    /// validation, so every surface reports this one code.
+    #[error("deadline_ms must be an integer between 1 and 4294967295")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
+        status = 400,
+        title = "Invalid query deadline",
+        remediation = "Omit deadline_ms or pass a whole number of milliseconds between 1 and 4294967295."
+    )]
+    QueryInvalidDeadline,
+
     /// The query exceeded the configured execution time budget.
     #[error("query execution timed out")]
     #[wyrd_error(

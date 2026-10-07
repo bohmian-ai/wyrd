@@ -63,4 +63,4 @@ def test_out_of_range_deadline_is_refused(wyrd_server: WyrdTestServer, deadline_
 
     with pytest.raises(WyrdError) as raised:
         asyncio.run(stream())
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert raised.value.code == "WYRD_VALA_400_QUERY_INVALID_DEADLINE"

@@ -16,6 +16,8 @@ export interface ServerOptions {
   readonly provider?: (request: ReceivedRequest) => Reply;
   /** Run Drift baseline fitting, scheduled Verifier runs, and Operators. */
   readonly verificationRuntime?: boolean;
+  /** Accept human single sign-on, so saved user logins can authenticate. */
+  readonly humanSso?: boolean;
 }
 
 /**
@@ -35,7 +37,8 @@ function deploy(server: NativeWyrdTestServer): void {
  * `test` with one real Wyrd server per story file, started with `options`.
  *
  * `provider` is the local upstream the server calls, started before the
- * server so its address is the server's provider base URL. Each test starts
+ * server; with `options.provider` set, its address is the server's provider
+ * base URL, and without it the server keeps its default upstreams. Each test starts
  * from the deployment environment, so a test that switches principal with
  * `vi.stubEnv` leaves the next test unaffected.
  */
@@ -51,7 +54,12 @@ export function serverTest(options: ServerOptions = {}) {
     ],
     server: [
       async ({ provider }, use) => {
-        const server = startTestServer(provider.url, true, options.verificationRuntime);
+        const server = startTestServer(
+          options.provider && provider.url,
+          true,
+          options.verificationRuntime,
+          options.humanSso,
+        );
         deploy(server);
         await use(server);
         vi.unstubAllEnvs();

@@ -26,7 +26,12 @@ Refusals load one deliberately broken Card from `invalid/`:
 |---|---|
 | `invalid/wrong-artifact-digest/support-model.yaml` | `WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH` |
 | `invalid/operator-path-without-connection.yaml` | `WYRD_SPEC_400_INVALID_OPERATOR` |
-| `invalid/retired-drift-kind.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` |
+| `invalid/retired-drift-kind.yaml` | `WYRD_REGISTRY_400_INVALID_CARD_SPEC` |
 
 Names are fixed, so registering a fixture again is idempotent. Add a story
 only when a journey needs Cards none of these provide.
+
+Python unit tests also load offline inputs: `bundles/` holds downloaded
+Service bundles that `WyrdState` hydrates without a server, `authoring/`
+holds Cards loaded through `from_path`, and `invalid/{data,model,prompt,bundles}/`
+holds one broken input per local refusal.

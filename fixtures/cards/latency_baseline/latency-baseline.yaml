@@ -22,5 +22,5 @@ spec:
     byte_count: 1213
     sha256: c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906
 artifacts:
-  - relative_path: data/latency.parquet
+  - relative_path: data/data.parquet
     content_type: application/vnd.apache.parquet

@@ -101,8 +101,18 @@ class Judgment:
         ...
 
     @property
-    def kind(self) -> Literal["drift", "eval"]:
-        """The Verifier classification."""
+    def kind(
+        self,
+    ) -> Literal[
+        "drift_psi",
+        "drift_spc",
+        "drift_custom",
+        "eval_assertion",
+        "eval_llm_judge",
+        "eval_other",
+        "unknown",
+    ]:
+        """The Verifier classification: method family and profile."""
         ...
 
     @property

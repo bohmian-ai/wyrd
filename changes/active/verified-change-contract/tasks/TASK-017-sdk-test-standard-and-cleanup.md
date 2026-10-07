@@ -199,4 +199,4 @@ Commit range `04d1882dc~1..a97c14f87` (78 commits, 04d1882dc through a97c14f87 i
   - `535979176`: test servers wait for a routable Oracle at start.
   - `3e9b80458`: the drift journey compares median client bytes.
   - `a97c14f87`: adds the three SDK verify tasks and runs them from gate.
-- `git diff --check 04d1882dc~1..a97c14f87` reported nothing.
+- `git diff --check 04d1882dc~1..67e6c1155` reported nothing. 67e6c1155 trims one whitespace-only ledger line that `a97c14f87` carried.

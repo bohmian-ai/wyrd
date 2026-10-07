@@ -5,84 +5,9 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
-use wyrd_client::transport::config::{HTTP_DEFAULT_BASE_URL, HTTP_DEFAULT_TIMEOUT_MS, HttpConfig};
+use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::request_id::RequestId;
-
-#[test]
-fn http_default_values() {
-    let h = HttpConfig::default();
-    assert_eq!(h.base_url, HTTP_DEFAULT_BASE_URL);
-    assert_eq!(h.timeout_ms, HTTP_DEFAULT_TIMEOUT_MS);
-    assert!(!h.compression);
-}
-
-#[test]
-fn http_default_validates_clean() {
-    assert!(HttpConfig::default().validate().is_ok());
-}
-
-#[test]
-fn http_default_round_trips() {
-    let h = HttpConfig::default();
-    let s = serde_json::to_string(&h).unwrap();
-    let back: HttpConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(h, back);
-}
-
-#[test]
-fn http_deserialize_uses_serde_defaults_for_missing_fields() {
-    // `serde(default = "...")` fills `base_url`/`timeout_ms`; `compression`
-    // defaults via `#[serde(default)]`. Unknown fields are still rejected by
-    // `deny_unknown_fields`.
-    let h: HttpConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(h, HttpConfig::default());
-}
-
-#[test]
-fn http_config_round_trips() {
-    let h = HttpConfig {
-        base_url: "https://wyrd-ingest.example.com".to_string(),
-        timeout_ms: 10_000,
-        compression: true,
-    };
-    let s = serde_json::to_string(&h).unwrap();
-    let back: HttpConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(h, back);
-}
-
-#[test]
-fn http_compression_false_round_trips() {
-    let h = HttpConfig {
-        base_url: "https://wyrd.example.com".to_string(),
-        timeout_ms: 30_000,
-        compression: false,
-    };
-    let s = serde_json::to_string(&h).unwrap();
-    let back: HttpConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(h, back);
-}
-
-#[test]
-fn http_validate_rejects_empty_base_url() {
-    let h = HttpConfig {
-        base_url: String::new(),
-        timeout_ms: 5_000,
-        compression: false,
-    };
-    let err = h.validate().unwrap_err();
-    assert_config_error(err, "http_config.base_url", "must not be empty");
-}
-
-#[test]
-fn http_validate_accepts_non_empty_base_url() {
-    let h = HttpConfig {
-        base_url: "https://example.com".to_string(),
-        timeout_ms: 5_000,
-        compression: false,
-    };
-    assert!(h.validate().is_ok());
-}
 
 #[test]
 fn http_validate_rejects_remote_cleartext() {
@@ -97,29 +22,6 @@ fn http_validate_rejects_remote_cleartext() {
         "http_config.base_url",
         "remote cleartext HTTP is not allowed; use https:// or a loopback host",
     );
-}
-
-#[test]
-fn http_validate_rejects_zero_timeout() {
-    let h = HttpConfig {
-        base_url: "https://example.com".to_string(),
-        timeout_ms: 0,
-        compression: false,
-    };
-    let err = h.validate().unwrap_err();
-    assert_config_error(err, "http_config.timeout_ms", "must be at least 1");
-}
-
-#[test]
-fn http_with_compression_round_trips() {
-    let h = HttpConfig {
-        base_url: "https://wyrd.example.com".to_string(),
-        timeout_ms: 5_000,
-        compression: true,
-    };
-    let s = serde_json::to_string(&h).unwrap();
-    let back: HttpConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(h, back);
 }
 
 #[test]

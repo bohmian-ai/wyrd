@@ -10,7 +10,7 @@
 //!  1. **Token-layer e2e** — `client.auth().bearer()` exchanges the resolved
 //!     API key at the real `/auth/token` and mints a JWT. A success proves the
 //!     client's API-key → JWT path works against the live server.
-//!  2. **Data-plane header contract** — `client.request_json` (which sends
+//!  2. **Data-plane header contract** — `Cards::list` (which sends
 //!     `x-wyrd-access-token`) to `GET /v1/cards` is *authenticated* and
 //!     rejected only at the permission check (`403 PERMISSION_403_DENIED_RBAC`,
 //!     the service holds no role), never `401`. The negative control re-sends
@@ -40,6 +40,8 @@ use wyrd_testing::human_login::{
 
 mod pg_tests {
     use wyrd_client::WyrdClient;
+    use wyrd_client::cards::Cards;
+    use wyrd_client::cards::ListCardsRequest;
     use wyrd_client::config::ClientConfig;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -82,12 +84,18 @@ mod pg_tests {
 
         // (2) Data-plane: the request carries x-wyrd-access-token, so the server
         // authenticates the principal and rejects only at the permission check.
-        let err = client
-            .request_json::<serde_json::Value, serde_json::Value>(
-                reqwest::Method::GET,
-                "/v1/cards",
-                None,
-            )
+        let err = Cards::with_client(WyrdClient::clone(&client))
+            .list(ListCardsRequest {
+                kind: None,
+                space: None,
+                name: None,
+                version_range: None,
+                status: None,
+                filter: None,
+                include_prerelease: false,
+                limit: None,
+                cursor: None,
+            })
             .await
             .expect_err("a role-less token is authenticated, then permission-rejected");
         assert_eq!(

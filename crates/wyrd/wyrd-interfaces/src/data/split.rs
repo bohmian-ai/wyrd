@@ -11,7 +11,7 @@ use wyrd_utils::py::WyrdPyResult;
 use {
     chrono::{DateTime, Utc},
     pyo3::prelude::*,
-    pyo3::types::{PyAny, PyBool, PyFloat, PyInt, PyList, PyModule, PyString},
+    pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyString},
     wyrd_spec::card::data::ColValue,
     wyrd_spec::envelope::CardKind,
     wyrd_spec::ids::ColumnName,
@@ -265,9 +265,23 @@ fn col_value_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ColValue> {
     .into())
 }
 
+/// Read a materialized split's Artifact `CardRef` from a mapping or any
+/// `CardRefLike` object, such as `wyrd.cards.CardRef`.
+///
+/// A non-mapping value is converted through its `to_dict()`, the
+/// `CardRefLike` protocol method, before it is parsed as a `CardRef`.
+///
+/// # Errors
+/// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when the value cannot be
+/// converted, is not a valid `CardRef`, or does not target an Artifact card.
 #[cfg(feature = "python")]
 fn card_ref_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<CardRef> {
-    let raw = pyobject_to_json(value).map_err(|error| {
+    let mapping = if value.is_instance_of::<PyDict>() || !value.hasattr("to_dict")? {
+        value.clone()
+    } else {
+        value.call_method0("to_dict")?
+    };
+    let raw = pyobject_to_json(&mapping).map_err(|error| {
         invalid_split_rule(
             "materialized split card_ref must be a CardRef mapping",
             json!({ "source": error.to_string() }),

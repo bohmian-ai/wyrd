@@ -215,6 +215,9 @@ class CardRef:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` if a field is invalid.
         """
         ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return this reference as its ``CardRef`` mapping, satisfying ``CardRefLike``."""
+        ...
     def __str__(self) -> str:
         """The canonical ``space/Kind/name@version`` text of this reference."""
         ...

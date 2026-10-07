@@ -204,14 +204,15 @@ run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate
   && mise run test:gateway:native:inner \
   && mise run test:gateway:vault:inner \
   && mise run test:gateway:journey:surfaces:inner \
+  && cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E \"test(/^(gateway_admin|gateway_inference)::/)\" \
   && mise run py:test:gateway:journey:inner \
   && mise run ts:test:gateway:journey:inner'"""
 
 [tasks."test:gateway:gate"]
 hide = true
-description = """The gate's share of the gateway: only the ignored Rust, Vault, CLI, MCP, and Rust SDK
-journeys. py:test:integration and ts:test:integration own the Python and TypeScript gateway
-journeys. Run `test:gateway:journey` for the complete, standalone lane."""
+description = """The gate's share of the gateway: only the ignored Rust, Vault, CLI, and MCP journeys. The
+verify:*-sdk tasks own the Rust, Python, and TypeScript SDK gateway journeys. Run
+`test:gateway:journey` for the complete, standalone lane."""
 run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner \
   && mise run test:gateway:native:inner \
   && mise run test:gateway:vault:inner \
@@ -226,12 +227,11 @@ run = "cargo nextest run --locked -p wyrd-testing --test gateway -P journey --ru
 
 [tasks."test:gateway:journey:surfaces:inner"]
 hide = true
-description = "Run the CLI, MCP, and Rust SDK gateway administration journeys with their lifecycle already provisioned"
+description = "Run the CLI and MCP gateway administration journeys with their lifecycle already provisioned"
 env = { WYRD_CLI_E2E = "1" }
 run = [
   "cargo test --locked -p wyrd-cli --test cli -- --ignored gateway_server_journey:: --nocapture --test-threads=1",
   "cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=gateway::pg_tests::agent_administers_redacted_gateway_configuration)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|gateway_inference)::/)'",
 ]
 
 [tasks."py:test:gateway:journey:inner"]
@@ -612,6 +612,25 @@ run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integr
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
 depends = ["check", "check:deps", "check:tenant-isolation", "test:bifrost"]
+
+[tasks."verify:python-sdk"]
+description = """Complete Python SDK gate: fmt, Clippy, codegen, Python format/lint/types, the wheel boundary, and
+every Python test tier. py:test:integration selects every integration-marked test, so it already runs the Bifrost,
+gateway, Card, WyrdState, and story journeys. The identity journeys need Keycloak and Dex, which one run owns at a
+time, so every verify task shares the one test:identity:journey dependency and gate runs it once."""
+depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey"]
+
+[tasks."verify:rust-sdk"]
+description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
+Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
+depends = ["check", "test:identity:journey"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not (test(/^saved_user_auth::/) | test(=workflow_loading::authored_load_child))'\""
+
+[tasks."verify:typescript-sdk"]
+description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
+tests, every integration journey (Bifrost, gateway, and story journeys), plus the shared identity journeys (see
+verify:python-sdk)."""
+depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey"]
 
 [tasks."test:rust"]
 description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to
@@ -1547,17 +1566,9 @@ depends = [
   "test:rust",
   "test:bifrost:gate",
   "test:gateway:gate",
-  "test:identity:journey",
-  "py:setup",
-  "py:format:check",
-  "py:lints",
-  "py:typecheck",
-  "py:test:unit",
-  "py:test:integration",
-  "ts:napi:check",
-  "ts:typecheck",
-  "ts:test:unit",
-  "ts:test:integration",
+  "verify:python-sdk",
+  "verify:rust-sdk",
+  "verify:typescript-sdk",
   "examples:python:datacard",
 ]
 

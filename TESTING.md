@@ -82,6 +82,18 @@ mise run test:bifrost:journey:scribe:production-geometry  # scheduled 512 MiB ob
 #                     :sdk :forge :scribe :oracle :otlp :server :mcp :python :typescript
 ```
 
+### SDKs
+
+```bash
+mise run verify:python-sdk               # checks + unit, TensorFlow, harness, every integration journey, identity
+mise run verify:rust-sdk                 # checks + wyrd-sdk-rust unit and every story journey, identity
+mise run verify:typescript-sdk           # checks + napi/package/types, unit, every integration journey, identity
+```
+
+Each also runs `test:identity:journey` against Keycloak and Dex, so Docker must
+be available. One run owns those containers at a time, so the three tasks share
+that one dependency and `gate`, which runs all three, runs it once.
+
 ### Everything else
 
 ```bash

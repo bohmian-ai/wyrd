@@ -1,6 +1,6 @@
 # SPEC-bifrost-variant revision 21: one stratified sampling algorithm
 
-Status: proposed, awaiting human approval. Substance agreed in
+Status: approved by the user on 2026-10-07. Substance agreed in
 `tasks/TASK-003-decisions.md` §2.
 
 Kept apart from `spec.md` for the same reason as revision 20: `spec.md`
@@ -220,7 +220,7 @@ Replace the title and body with:
 
 Prepend:
 
-> - **Revision 21 (proposed):** By explicit human direction, replaces
+> - **Revision 21 (2026-10-07, approved):** By explicit human direction, replaces
 >   first-rows inference with one seeded algorithm.
 >   - Scribe samples each claim, stratified by `principal_id`: Cochran at 99%
 >     confidence and ±0.02 margin (4147 rows per stratum, with

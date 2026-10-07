@@ -857,11 +857,74 @@ The variant forked from Forge at `5ab92b003`. These first-parent Forge commits u
 - **Audit 5 s polling removal:** This was done on the Forge branch, not the verification branch, in 2880705a0 "Publish audit continuously instead of on a fixed 5s tick". The verification side still had `PUBLICATION_INTERVAL = 5s` at b1b8f25f7. It reached this branch through merge ce866229d.
   - In HEAD: yes. In the variant (509f972c6): no (`PUBLICATION_INTERVAL` is still at `audit/publication.rs:45`).
   - 5 s survives only as `PUBLICATION_RETRY`, the backoff for a failed tenant.
-- **Forge 5 s loop:** None was removed. The Forge worker still pulls the leader at most once per `DEFAULT_PULL_INTERVAL = 5s` (worker.rs:65, RisingWave's compactor pull period, added in e04cef237), with 250 ms idle sleeps. `LEADER_HEARTBEAT` is still 10 s. The boot-delay removals that look like it:
-  - **c6ceefb0a "Elect the Forge leader immediately at boot":** The first leader heartbeat no longer waits one `LEADER_HEARTBEAT` (10 s) unless a test owns the trigger (`interval_at(if quiet { now + LEADER_HEARTBEAT } else { now }, ...)`). In the variant: yes. In HEAD: yes. In b1b8f25f7: no.
-  - **a5319f4ad (2026-09-09):** The coordinator plans on start instead of deferring one `maintenance_interval` (about 1 min by default). In the variant, HEAD, and b1b8f25f7: yes.
-  - **4ddb42cee:** The worker loop backs off and retries on a database read failure instead of exiting. It is not a tick change. In the variant: yes. In HEAD: yes.
-- The variant has every Forge timing change except the audit publisher change.
+- **Forge has no 5 s loop to remove.** `git log -S"from_secs(5)"` over `forge/` since main (55db718bf) finds no removed 5 s timer. Forge follows RisingWave's pull model:
+  - The worker pulls the leader at most once per `DEFAULT_PULL_INTERVAL = 5s` (`forge/worker.rs:65`), for at most `min(max_task_parallelism - running, 4)` tasks. Both values are RisingWave's: `iceberg_compaction_pull_interval_ms = 5000` (`risingwave/src/common/src/config/storage.rs:1218`) and `MAX_PULL_TASK_COUNT = 4` (`risingwave/src/storage/src/hummock/compactor/mod.rs:412`). This is the pull period added in e04cef237. It is not a leftover loop; do not remove it.
+  - Between pulls, the worker claims durable SQL work and sleeps 250 ms when idle, as it did at main.
+- **What was actually removed:** the leader-side polling planner. Everything below is in the variant already; none of it needs replaying.
+  - 12bef6736 dropped the scheduler's per-table candidate scan in favour of RisingWave's task-type planner.
+  - 6531e5bea selects due tables from a leader-owned sorted index instead.
+  - 37a526d61 runs maintenance on the leader's hourly timer and drops the durable planner. `DEFAULT_MAINTENANCE_INTERVAL` went from 60 s to 1 h (`wyrd-server/src/boot/mod.rs:78`). The timer is `scheduler.rs:328` `maintain`, and its first tick fires at once like RisingWave's GC loop. L17 records the conflict that commit caused.
+- **Boot-delay removals:**
+  - **c6ceefb0a "Elect the Forge leader immediately at boot":** the first leader heartbeat no longer waits one `LEADER_HEARTBEAT` (10 s) unless a test owns the trigger. In the variant: yes. In HEAD: yes. In b1b8f25f7: no.
+  - **a5319f4ad:** the coordinator plans on start instead of deferring one `maintenance_interval`. In the variant, HEAD, and b1b8f25f7: yes.
+  - **4ddb42cee:** the worker backs off and retries on a database read failure instead of exiting. This is not a tick change. In the variant and HEAD: yes.
+- The only timing change the variant lacks is the audit publisher (2880705a0).
+- **Correction:** an earlier draft of this section said Forge's "5 s loop" survived, as if it were debt. That was wrong. The 5 s value is the RisingWave pull period, by design.
+
+## Repository standards the variant has not adopted
+
+Commit 515f16c97 ("Close out the repository check audit, pedantic lints, and test binary layout") and commit a354e407f landed on the verification side only. The variant (509f972c6) predates both. Conflict markers will not show most of this: AUTO merges the files cleanly, and then `mise run lints`, `check:deps` or the test lanes fail. Apply these rules to every variant-origin line, not only to conflicted files.
+
+**S1. Workspace pedantic clippy reaches 35 more crates.**
+- HEAD's `[workspace.lints.clippy]` adds the following to the variant's table:
+  - `unwrap_used = "warn"` and `allow_attributes_without_reason = "warn"`.
+  - Reasoned allows for `doc_markdown`, `too_many_lines`, `needless_pass_by_value`, `similar_names`, `unused_self` and `cast_precision_loss`. The truncating, sign-loss and wrapping cast lints stay on.
+- `mise run lints` runs with `-D warnings`.
+- 35 manifests carry `[lints] workspace = true` in HEAD but not in the variant:
+  - workspace-hack.
+  - Every `wyrd-auth-*` crate, plus wyrd-client, wyrd-crypt, wyrd-dev-fixtures, wyrd-error-derive, wyrd-queue, wyrd-runtime, wyrd-semver, wyrd-telemetry, wyrd-tls, wyrd-utils and wyrd-version.
+  - Every `skald-*` crate.
+  - vala-drift, vala-eval, vala-ingest and vala-sql.
+  - wyrd-spec, wyrd-cli, wyrd-mcp, wyrd-server, wyrd-sql, wyrd-testing, wyrd-tonic, wyrd and examples/rust.
+- Variant code added in those crates has never been linted as pedantic.
+- **Replay rule:** keep HEAD's lint table and every `[lints] workspace = true` line. Fix each finding at the site: no blanket `#[allow]`, and any `#[expect]` or `#[allow]` states a `reason`. L05, L20 and L38 show the recurring shapes:
+  - `r"..."` instead of `r#"..."#`.
+  - `Err(A | B)` patterns.
+  - `map_or` / `map_or_else`.
+  - `Box::pin` on large futures.
+  - `if let .. else` instead of a single-arm `match`.
+  - Checked float-to-int conversions.
+  - No `unwrap()` outside tests.
+- Tests read configuration through `wyrd_client::Environment` and do not mutate the process environment.
+
+**S2. Repository checks went from 42 to 9.** The following scripts are deleted, along with their `mise` tasks:
+- `scripts/check_clippy_allow.py`, `check_unwrap_audit.py`, `check_test_contracts.py` and `add_justification.py`.
+- `scripts/checks/{bifrost-resource-governance,client-tier,error-coverage,fixtures-no-server,forbid,from-pools-allowlist,mocks-scope,no-legacy-server-vocab,no-testing-in-prod-deps,no-tonic-outside-wyrd-tonic,object-store-pin,proto-drift,pyo3-scope,rustls-provider,single-into-response-impl,test-coverage}.sh`.
+- `scripts/sync-agent-skills.sh` and `scripts/test-families.sh`.
+- The retired tasks include:
+  - `check:client-tier` and its CLI, registry and SDK variants.
+  - `check:pyo3-scope` and `check:sdk-pyo3-scope`.
+  - `check:unwrap-audit`, `check:clippy-allow-audit` and `check:test-contracts`.
+  - `check:mocks-scope`, `check:from-pools-allowlist` and `check:object-store-pin`.
+  - `check:proto-drift`, `check:rustls-provider` and `check:single-into-response-impl`.
+  - `check:error-coverage` and `check:test-coverage`.
+  - The `check:registry-*` and `check:security-*` tasks.
+  - `check:tokens`, `check:skills-sync` and `skills:sync`.
+  - `check:default` and `lints:default`.
+- Clippy, the compiler or Postgres readiness now enforce those rules. `check:deps` owns crate boundaries and the object-store pin. `check:tenant-isolation` keeps only the TenantConn code-shape guards.
+- **Replay rule:** resolve every modify/delete on these files as delete (L07). If a variant mise task or CI step calls one, delete the call. Do not restore the script.
+
+**S3. One integration test binary per crate.**
+- vala-sql, wyrd-server, wyrd-sql, wyrd-storage and wyrd-client no longer have `[[test]]` blocks. Their `tests/*.rs` targets fold into `tests/integration/main.rs` as `mod` lines. The variant still declares 8, 8, 3, 4 and 1 `[[test]]` blocks.
+- Lanes select modules with `--test integration -E 'test(/^<module>::/)'`.
+- Every PgFixture-backed `pg_*` module shares the `pg-servers` nextest group in `.config/nextest.toml`.
+- `PgFixture::superuser_pool()` is synchronous.
+- **Replay rule:** move each new variant test file under `tests/integration/` and add its `mod` line in alphabetical order. Remove its `[[test]]` block, drop `.await` on `superuser_pool()`, and point any variant mise lane at `--test integration` with a module filter (L03).
+
+**S4. Bins and profile.**
+- The three capacity bins are one `[[bin]] capacity` (L25). `bench:bifrost:ingest-capacity`, `bench:bifrost:query-capacity` and `bench:verification:capacity` are gone.
+- `[profile.dev] debug = "line-tables-only"` replaces the variant's `[profile.dev.package."*"]` form.
+- The checked-in proto descriptor stays deleted (L08).
 
 ## Predicted overlap with bifrost-variant
 

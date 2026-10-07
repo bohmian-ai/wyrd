@@ -348,9 +348,14 @@ async fn drift_burst_survives_a_byte_budget_override() {
 }
 
 /// One state with the default queue emits paced 100-feature drift
-/// observations for 15 seconds: client-owned bytes stay flat (the last third
-/// of samples never exceeds the first third by more than one message), drain
-/// to zero, and every observation lands exactly once.
+/// observations for 15 seconds: client-owned bytes stay flat (the median of
+/// the last third of samples stays within one message of the first third's),
+/// drain to zero, and every observation lands exactly once.
+///
+/// The comparison uses medians because a seal reserves a full
+/// `max_message_bytes` before encoding. A sample that lands mid-encode reads
+/// that reservation on top of the staged rows, so a third's maximum depends on
+/// sampling luck. A backlog raises every later sample and moves the median.
 ///
 /// # Panics
 /// Panics when the client bytes grow, the drained queue owns bytes, or an
@@ -391,12 +396,8 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
         emit_with_resubmit(&observed.state, &model, &features).await;
     }
     let third = samples.len() / 3;
-    let early = samples[..third].iter().copied().max().unwrap_or(0);
-    let late = samples[samples.len() - third..]
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let early = median(&samples[..third]);
+    let late = median(&samples[samples.len() - third..]);
     observed.state.flush().await.expect("the emission drains");
     let drained = owned_bytes();
     let groups: Vec<RecordCount> = observed
@@ -405,9 +406,19 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
 
     assert!(
         late <= early + QueueConfig::default().max_message_bytes,
-        "client-owned bytes grew: early max {early}, late max {late}"
+        "client-owned bytes grew: early median {early}, late median {late}"
     );
     assert_eq!(drained, 0, "a drained queue owns no bytes");
     assert_exactly_once(&groups, RATE * SECONDS, FEATURES);
     observed.server.shutdown().await.expect("server stops");
+}
+
+/// Returns the median of `samples`, or zero for an empty slice.
+///
+/// An even count takes the upper middle value, so the result is always an
+/// observed sample.
+fn median(samples: &[usize]) -> usize {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
 }

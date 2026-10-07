@@ -1149,16 +1149,11 @@ mod pg_tests {
                 r#"{"id": 1, "value": "described"}"#,
                 Some(&writer_card),
                 None,
-                chrono::Utc::now().timestamp_micros(),
+                None,
             )
             .expect("a described row is accepted");
         builder
-            .append_json_row(
-                r#"{"id": 2, "value": "uncorrelated"}"#,
-                None,
-                None,
-                chrono::Utc::now().timestamp_micros(),
-            )
+            .append_json_row(r#"{"id": 2, "value": "uncorrelated"}"#, None, None, None)
             .expect("a described row without Card correlation is accepted");
         let ipc = builder.finish_ipc().expect("seal the described batch");
 

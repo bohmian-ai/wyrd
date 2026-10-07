@@ -134,3 +134,21 @@ Rerun results:
 | `mise run test:bifrost:journey:sdk` (owns `pg_bifrost_e2e`) | 17/17 passed |
 | `mise run test:bifrost:journey:server` | 32/32 passed |
 | `mise run fmt`, `mise run lints`, `git diff --check` | clean |
+
+## Correction: only observations are stamped
+
+The first implementation stamped in `WriterPool::insert_rows`, so plain
+`Bifrost::insert`/`insert_into`/`insert_rows_into` writes were also
+client-stamped. REQ-187 covers observation rows only. Now
+`Bifrost::insert_observation` (used by `observe.record`, `observe.eval`, and
+`observe.drift`, so by all three SDKs) is the only place that stamps. Plain
+writes send no `wyrd_event_time` column, and Scribe stamps them with the
+receipt instant. A payload `wyrd_event_time` still wins on either path.
+`observe.verify` writes no client row. A sealed batch carries the column for
+every row or for none, and `RecordQueue::seal` starts a new chunk wherever
+stamped and unstamped rows meet.
+
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| Plain writes are not client-stamped | `WriterPool::insert` passes `None` | unit `observe::tests::plain_inserts_leave_event_time_to_the_server`; Oracle journey `published_cache_pruning_and_shutdown_are_production_governed` (PostgreSQL-clock floor) | PASS |
+| Stamped and unstamped rows never share a batch | `RecordQueue::seal` chunk split | unit `queue::tests::stamped_and_unstamped_rows_seal_apart`; `batch_builder_tests::stamped_rows_carry_event_time_and_keep_a_payload_value` | PASS |

@@ -417,6 +417,37 @@ impl Bifrost {
                 rows,
                 correlation.card_ref,
                 correlation.run_id,
+                None,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Enqueue every JSON row of one observation into a described table, or
+    /// none of them, stamped with this client's clock at emit.
+    ///
+    /// The observation counterpart to [`Self::insert_rows_into`]: every row
+    /// gets one `wyrd_event_time` read now, so batching, linger, retry, and
+    /// flush never move it. A row whose own JSON carries `wyrd_event_time`
+    /// keeps that value. Plain writes stay unstamped and take the server's
+    /// receipt instant.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::insert_rows_into`].
+    pub(crate) fn insert_observation(
+        &self,
+        table: &WriterTable,
+        rows: Vec<Vec<u8>>,
+        correlation: Correlation,
+    ) -> Result<(), BifrostClientError> {
+        self.writer
+            .insert_rows(
+                table.fqn(),
+                table.user_schema(),
+                rows,
+                correlation.card_ref,
+                correlation.run_id,
+                Some(chrono::Utc::now().timestamp_micros()),
             )
             .map_err(Into::into)
     }

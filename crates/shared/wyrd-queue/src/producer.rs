@@ -476,7 +476,7 @@ impl Producer {
         json: Vec<u8>,
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
-        event_time_micros: i64,
+        event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
         self.enqueue_rows(vec![json], card_ref, run_id, event_time_micros)
     }
@@ -490,7 +490,8 @@ impl Producer {
     /// the same correlation and the same `event_time_micros`: the writer's
     /// `wyrd_event_time` stamp in microseconds since the Unix epoch (UTC),
     /// sealed unchanged however long the row waits, unless a row's own JSON
-    /// carries `wyrd_event_time`.
+    /// carries `wyrd_event_time`. `None` leaves the event time to the server's
+    /// receipt instant.
     ///
     /// # Errors
     ///
@@ -504,7 +505,7 @@ impl Producer {
         rows: Vec<Vec<u8>>,
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
-        event_time_micros: i64,
+        event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
         let count = rows.len();
         let charges = rows
@@ -1186,7 +1187,7 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0, "idle producers hold no bytes");
         for producer in &producers {
             producer
-                .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, 0)
+                .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
                 .expect("each table admits its row");
         }
         for producer in &producers {
@@ -1215,7 +1216,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 9}"#.to_vec(), Some(card()), None, 0)
+            .enqueue(br#"{"id": 9}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted before timeout");
         assert!(matches!(
             producer.flush(),
@@ -1263,7 +1264,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 1}"#.to_vec(), Some(card()), None, 0)
+            .enqueue(br#"{"id": 1}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(
             producer.flush().is_err(),
@@ -1303,7 +1304,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id": 7}"#.to_vec(), Some(card()), None, 0)
+            .enqueue(br#"{"id": 7}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(matches!(
             producer.flush(),
@@ -1344,11 +1345,11 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, 0)
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
             .expect("row accepted");
         assert!(producer.shutdown().is_err(), "the first send is ambiguous");
         assert!(matches!(
-            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None, 0),
+            producer.enqueue(br#"{"id":2}"#.to_vec(), Some(card()), None, None),
             Err(WyrdQueueError::QueueFull)
         ));
         wait_until("the retained batch ACKs in the background", || {
@@ -1425,7 +1426,7 @@ mod tests {
         )
         .expect("producer starts");
         producer
-            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, 0)
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None, None)
             .expect("row admitted");
         attempted
             .recv()
@@ -1657,7 +1658,7 @@ mod tests {
         .expect("producer starts");
         for record in 0..2 {
             producer
-                .enqueue_rows(rows(1), Some(card()), None, 0)
+                .enqueue_rows(rows(1), Some(card()), None, None)
                 .unwrap_or_else(|error| panic!("record {record} admitted: {error}"));
             wait_until("each record seals while a slot is free", || {
                 sink.attempted() == record + 1
@@ -1665,7 +1666,7 @@ mod tests {
         }
         for _ in 0..1_000 {
             producer
-                .enqueue_rows(rows(1), Some(card()), None, 0)
+                .enqueue_rows(rows(1), Some(card()), None, None)
                 .expect("admission never waits on stalled sends");
         }
         wait_until("rows behind busy slots stay staged", || {
@@ -1716,7 +1717,7 @@ mod tests {
         let oversized_count = oversized.len() as u64;
         assert!(charge(&oversized) > budget.admission_limit());
         assert!(matches!(
-            producer.enqueue_rows(oversized, Some(card()), None, 0),
+            producer.enqueue_rows(oversized, Some(card()), None, None),
             Err(WyrdQueueError::PayloadTooLarge)
         ));
         let refused = rows(9);
@@ -1725,7 +1726,7 @@ mod tests {
             .expect("test leaves room for fewer than nine rows");
         let blocked = budget.used_bytes();
         assert!(matches!(
-            producer.enqueue_rows(refused, Some(card()), None, 0),
+            producer.enqueue_rows(refused, Some(card()), None, None),
             Err(WyrdQueueError::Backpressure)
         ));
         assert_eq!(budget.used_bytes(), blocked, "no row kept its bytes");
@@ -1737,7 +1738,7 @@ mod tests {
         );
         assert_eq!(producer.metrics().dropped, oversized_count + 9);
         producer
-            .enqueue_rows(rows(9), Some(card()), None, 0)
+            .enqueue_rows(rows(9), Some(card()), None, None)
             .expect("a record that fits is admitted whole");
         producer.shutdown().expect("admitted rows drain");
         assert_eq!(received_rows(&sink), 9, "exactly the admitted rows publish");
@@ -1764,7 +1765,7 @@ mod tests {
         let count = batch.len() as u64;
         assert!(batch.iter().map(Vec::len).sum::<usize>() >= 2 * 1024);
         by_bytes
-            .enqueue_rows(batch, None, None, 0)
+            .enqueue_rows(batch, None, None, None)
             .expect("record admitted");
         wait_until("staging reaching the byte ceiling seals", || {
             received_rows(&sink) == count
@@ -1780,7 +1781,7 @@ mod tests {
         )
         .expect("producer starts");
         by_linger
-            .enqueue(br#"{"id":1}"#.to_vec(), None, None, 0)
+            .enqueue(br#"{"id":1}"#.to_vec(), None, None, None)
             .expect("row admitted");
         wait_until("an elapsed linger seals", || {
             received_rows(&sink) == count + 1
@@ -1813,7 +1814,7 @@ mod tests {
             .reserve(budget.admission_limit() - budget.used_bytes() - charge(&row))
             .expect("test exhausts admission but for one row");
         producer
-            .enqueue_rows(row, Some(card()), None, 0)
+            .enqueue_rows(row, Some(card()), None, None)
             .expect("the last admissible row is admitted");
         assert!(matches!(
             budget.reserve(1),

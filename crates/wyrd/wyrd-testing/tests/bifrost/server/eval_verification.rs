@@ -1007,7 +1007,7 @@ fn answered_observation(
             .to_string(),
             Some(subject),
             None,
-            at.timestamp_micros(),
+            Some(at.timestamp_micros()),
         )
         .expect("the observation row matches the fixed projection");
     builder.finish_ipc().expect("the observation frame encodes")
@@ -1567,7 +1567,7 @@ fn stamped_observation(
             .to_string(),
             Some(subject),
             None,
-            at.timestamp_micros(),
+            Some(at.timestamp_micros()),
         )
         .expect("the observation row matches the fixed projection");
     builder.finish_ipc().expect("the observation frame encodes")

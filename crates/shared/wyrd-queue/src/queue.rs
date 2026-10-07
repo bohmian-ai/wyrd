@@ -42,11 +42,12 @@ pub struct Row {
     /// The optional per-row run correlation field.
     pub run_id: Option<RunId>,
     /// The writer's `wyrd_event_time` stamp, in microseconds since the Unix
-    /// epoch (UTC), taken when the row was emitted.
+    /// epoch (UTC), taken when an observation was emitted, or `None` for a
+    /// plain write the server stamps on receipt.
     ///
     /// Sealing, retry, and flush never change it. A `wyrd_event_time` in the
     /// row's own JSON is kept instead of this stamp.
-    pub event_time_micros: i64,
+    pub event_time_micros: Option<i64>,
     /// The one handle-wide byte reservation held while the row is buffered.
     pub(crate) _guard: ClientByteGuard,
 }
@@ -537,7 +538,9 @@ impl RecordQueue {
     /// Seals all staged rows onto the back of the outbox without awaiting the sink.
     ///
     /// Rows are chunked so each chunk's JSON stays within the message
-    /// ceiling. Each chunk reserves a frame of the message ceiling from the
+    /// ceiling, and a new chunk starts wherever writer-stamped and unstamped
+    /// rows meet, because a sealed batch either carries `wyrd_event_time` for
+    /// every row or for none. Each chunk reserves a frame of the message ceiling from the
     /// sealing headroom before encoding, then shrinks it to the encoded size.
     /// A chunk that cannot be framed is bisected so every encodable row still
     /// seals; a single row that cannot be framed is settled as lost. Rows
@@ -553,7 +556,12 @@ impl RecordQueue {
         let mut chunk = Vec::new();
         let mut chunk_bytes = 0;
         for row in self.drain() {
-            if !chunk.is_empty() && chunk_bytes + row.json.len() > self.config.max_message_bytes {
+            let stamp_changes = chunk.last().is_some_and(|last: &Row| {
+                last.event_time_micros.is_some() != row.event_time_micros.is_some()
+            });
+            if !chunk.is_empty()
+                && (stamp_changes || chunk_bytes + row.json.len() > self.config.max_message_bytes)
+            {
                 chunks.push_back(std::mem::take(&mut chunk));
                 chunk_bytes = 0;
             }
@@ -677,6 +685,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
     use super::*;
     use crate::sink::MockSink;
@@ -689,7 +698,7 @@ mod tests {
             json,
             card_ref: Some("prod/Service/queue@1.0.0".parse().expect("valid test card")),
             run_id: None,
-            event_time_micros: 0,
+            event_time_micros: None,
         }
     }
 
@@ -875,6 +884,44 @@ mod tests {
             .await
             .expect("restored later row settles");
         assert_eq!(receipt_ids(&poison_sink.received()), vec![1, 3]);
+    }
+
+    /// Writer-stamped and unstamped rows of one table seal into separate
+    /// batches in admission order, so only the stamped batch carries
+    /// `wyrd_event_time` and the server stamps the other on receipt.
+    #[tokio::test]
+    async fn stamped_and_unstamped_rows_seal_apart() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
+        let sink = Arc::new(MockSink::new());
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            schema,
+            sink.clone(),
+            QueueConfig::default(),
+            budget.clone(),
+            Arc::new(Counters::default()),
+        );
+        for (id, stamp) in [(1, Some(10)), (2, Some(20)), (3, None), (4, Some(40))] {
+            let mut row = row(&budget, id);
+            row.event_time_micros = stamp;
+            queue.push(row);
+        }
+        queue.seal_and_send().await.expect("every row settles");
+
+        let received = sink.received();
+        assert_eq!(receipt_ids(&received), vec![1, 2, 3, 4]);
+        let carries_event_time: Vec<bool> = received
+            .iter()
+            .map(|receipt| {
+                StreamReader::try_new(Cursor::new(&receipt.bytes), None)
+                    .expect("receipt is valid IPC")
+                    .schema()
+                    .field_with_name(WYRD_EVENT_TIME)
+                    .is_ok()
+            })
+            .collect();
+        assert_eq!(carries_event_time, vec![true, false, true]);
     }
 
     /// A fixed identity produces the exact deterministic sequence through the

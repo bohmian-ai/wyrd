@@ -1420,3 +1420,70 @@ async fn emits_stamp_their_own_event_time_and_keep_a_callers() {
         "the caller's wyrd_event_time is kept, not overwritten"
     );
 }
+
+/// A plain Bifrost write is not an observation, so the client leaves its event
+/// time to the server's receipt instant: interleaved with a stamped
+/// `observe.record` on the same table, it seals into its own batch without a
+/// `wyrd_event_time` column while the observation keeps its stamp.
+#[tokio::test]
+async fn plain_inserts_leave_event_time_to_the_server() {
+    let server = DescribeServer::start(fixed_table_bodies());
+    let table = "vala.datasets.app_events";
+    server.publish(
+        table,
+        &description(table, vec![Field::new("event", DataType::Utf8, false)]),
+    );
+    let (_bundle, state) = state_fixture();
+    let sink = Arc::new(MockSink::new());
+    state
+        .adopt_started_bifrost_for_test(bifrost_over(
+            &server,
+            Arc::clone(&sink),
+            QueueConfig {
+                linger_ms: 60_000,
+                ..QueueConfig::default()
+            },
+        ))
+        .await
+        .expect("startup");
+    let run = state.run();
+    let started = state.started_bifrost().expect("Bifrost is started");
+    let destination = started
+        .bifrost
+        .writer_table(table)
+        .await
+        .expect("the table is described");
+
+    run.observe()
+        .record(table, &json!({ "event": "observed" }))
+        .await
+        .expect("record enqueues");
+    started
+        .bifrost
+        .insert_into(
+            &destination,
+            json!({ "event": "plain" }).to_string().into_bytes(),
+            run.correlation(),
+        )
+        .expect("a plain row enqueues");
+    drop(started);
+    state.shutdown().await.expect("shutdown drains");
+
+    let carries_event_time: Vec<bool> = sink
+        .received()
+        .iter()
+        .filter(|receipt| receipt.table == table)
+        .map(|receipt| {
+            arrow::ipc::reader::StreamReader::try_new(receipt.bytes.as_slice(), None)
+                .expect("the settled frame is IPC")
+                .schema()
+                .field_with_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
+                .is_ok()
+        })
+        .collect();
+    assert_eq!(
+        carries_event_time,
+        vec![true, false],
+        "the observation is stamped and the plain write is not"
+    );
+}

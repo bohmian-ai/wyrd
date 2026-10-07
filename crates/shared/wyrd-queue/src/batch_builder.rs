@@ -3,8 +3,9 @@
 //! The Wyrd-native `DynamicBatchBuilder` analog, minus server-stamped column
 //! injection. The client batch carries **user columns plus the two per-row
 //! correlation columns `card_ref` and `run_id`** (both client-supplied), then
-//! the writer-owned non-null `wyrd_event_time`; the server stamps only the
-//! per-request system columns. Rows are appended as deferred `serde_json::Value`
+//! the non-null `wyrd_event_time` when the rows carry one; the server stamps
+//! the per-request system columns and, for a batch without event time, its
+//! receipt instant. Rows are appended as deferred `serde_json::Value`
 //! (parse-on-build) and driven through one typed Arrow builder per column at
 //! [`finish`](BatchBuilder::finish).
 
@@ -47,8 +48,9 @@ struct BuiltRow {
     /// The run correlation, or `None` when the row belongs to no run.
     run_id: Option<String>,
     /// Microseconds since the Unix epoch, UTC: the payload's own
-    /// `wyrd_event_time` when it carries one, else the writer's stamp.
-    event_time: i64,
+    /// `wyrd_event_time` when it carries one, else the writer's stamp, else
+    /// `None` so the server stamps its receipt instant.
+    event_time: Option<i64>,
 }
 
 /// Accumulates JSON rows against a resolved user-only Arrow schema and seals them
@@ -72,8 +74,8 @@ impl BatchBuilder {
     ///
     /// Only `user_fields` become builder columns: the correlation columns and
     /// the `wyrd_event_time` managed candidate are appended once by
-    /// [`Self::output_schema`]. Passing the described correlation fields in
-    /// here as well would
+    /// [`Self::output_schema`], the latter only when the rows carry an event
+    /// time. Passing the described correlation fields in here as well would
     /// send each of them twice.
     ///
     /// # Errors
@@ -115,7 +117,9 @@ impl BatchBuilder {
     /// `event_time_micros` (microseconds since the Unix epoch, UTC) is the
     /// writer's stamp and becomes the row's `wyrd_event_time`, unless the
     /// payload carries its own non-null `wyrd_event_time` RFC 3339 string,
-    /// which is kept instead; a null payload value counts as absent.
+    /// which is kept instead; a null payload value counts as absent. A row
+    /// with neither has no event time, and the server stamps its receipt
+    /// instant.
     ///
     /// # Errors
     /// - [`WyrdQueueError::SchemaParse`] if `json` is not a JSON object, or its
@@ -128,7 +132,7 @@ impl BatchBuilder {
         json: &str,
         card_ref: Option<&CardRef>,
         run_id: Option<&RunId>,
-        event_time_micros: i64,
+        event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
         let value: Value = serde_json::from_str(json)
             .map_err(|e| WyrdQueueError::SchemaParse(format!("row is not valid JSON: {e}")))?;
@@ -139,14 +143,13 @@ impl BatchBuilder {
         };
         let event_time = match obj.remove(WYRD_EVENT_TIME) {
             None | Some(Value::Null) => event_time_micros,
-            Some(value) => value
-                .as_str()
-                .and_then(parse_rfc3339_micros)
-                .ok_or_else(|| {
+            Some(value) => Some(value.as_str().and_then(parse_rfc3339_micros).ok_or_else(
+                || {
                     WyrdQueueError::SchemaParse(format!(
                         "payload `{WYRD_EVENT_TIME}` is not an RFC 3339 timestamp"
                     ))
-                })?,
+                },
+            )?),
         };
         for key in obj.keys() {
             if is_reserved_column(key) {
@@ -164,15 +167,21 @@ impl BatchBuilder {
         Ok(())
     }
 
+    /// Whether the sealed batch carries `wyrd_event_time`: any row has one.
+    fn carries_event_time(&self) -> bool {
+        self.rows.iter().any(|row| row.event_time.is_some())
+    }
+
     /// Drive one typed Arrow builder per user column plus the two reserved
-    /// correlation columns and the non-null
+    /// correlation columns and, when the rows carry one, the non-null
     /// `wyrd_event_time: Timestamp(Microsecond, UTC)` column, producing one
     /// `RecordBatch`.
     ///
     /// # Errors
     /// [`WyrdQueueError::SchemaParse`] when a value's JSON shape does not match its
-    /// column's type, a null/absent value lands on a non-nullable column, or a
-    /// column type is unsupported by the builder.
+    /// column's type, a null/absent value lands on a non-nullable column, a
+    /// column type is unsupported by the builder, or some rows carry an event
+    /// time and others do not.
     pub fn finish(&self) -> Result<RecordBatch, WyrdQueueError> {
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len() + 3);
         for field in self.schema.fields() {
@@ -192,10 +201,19 @@ impl BatchBuilder {
                 .map(|r| r.run_id.clone())
                 .collect::<StringArray>(),
         ));
-        columns.push(Arc::new(
-            TimestampMicrosecondArray::from_iter_values(self.rows.iter().map(|r| r.event_time))
-                .with_timezone("UTC"),
-        ));
+        if self.carries_event_time() {
+            let mut event_times = Vec::with_capacity(self.rows.len());
+            for (idx, row) in self.rows.iter().enumerate() {
+                event_times.push(row.event_time.ok_or_else(|| {
+                    WyrdQueueError::SchemaParse(format!(
+                        "row {idx} has no `{WYRD_EVENT_TIME}` while other rows of the batch do"
+                    ))
+                })?);
+            }
+            columns.push(Arc::new(
+                TimestampMicrosecondArray::from(event_times).with_timezone("UTC"),
+            ));
+        }
 
         let batch = RecordBatch::try_new(self.output_schema(), columns).map_err(|e| {
             WyrdQueueError::SchemaParse(format!("record batch assembly failed: {e}"))
@@ -204,7 +222,8 @@ impl BatchBuilder {
     }
 
     /// The sealed batch schema: user fields followed by the two correlation
-    /// columns, then the non-null `wyrd_event_time`.
+    /// columns, then the non-null `wyrd_event_time` when any buffered row
+    /// carries one.
     #[must_use]
     pub fn output_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self
@@ -215,11 +234,13 @@ impl BatchBuilder {
             .collect();
         fields.push(Field::new(CARD_REF_COLUMN, DataType::Utf8, true));
         fields.push(Field::new(RUN_ID_COLUMN, DataType::Utf8, true));
-        fields.push(Field::new(
-            WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ));
+        if self.carries_event_time() {
+            fields.push(Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ));
+        }
         Arc::new(Schema::new(fields))
     }
 
@@ -546,20 +567,25 @@ mod batch_builder_tests {
                 r#"{"id": 1, "name": "a"}"#,
                 Some(&card("alpha")),
                 Some(&RunId::from_string("run-1".to_owned())),
-                0,
+                None,
             )
             .expect("row appends");
         builder
-            .append_json_row(r#"{"id": 2, "name": null}"#, Some(&card("beta")), None, 0)
+            .append_json_row(
+                r#"{"id": 2, "name": null}"#,
+                Some(&card("beta")),
+                None,
+                None,
+            )
             .expect("row appends");
         builder
-            .append_json_row(r#"{"id": 3, "name": "c"}"#, None, None, 0)
+            .append_json_row(r#"{"id": 3, "name": "c"}"#, None, None, None)
             .expect("a row without Card correlation appends");
 
         let batch = builder.finish().expect("finish");
 
-        // user columns + card_ref + run_id + wyrd_event_time
-        assert_eq!(batch.num_columns(), 5);
+        // user columns + card_ref + run_id; unstamped rows carry no event time
+        assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
         assert_eq!(schema.field(2).name(), "card_ref");
@@ -614,34 +640,40 @@ mod batch_builder_tests {
                 r#"{"id": 1, "card_ref": "x"}"#,
                 Some(&card("alpha")),
                 None,
-                0,
+                None,
             )
             .unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
 
         let err = builder
-            .append_json_row(r#"{"id": 1, "wyrd_ts": 1}"#, Some(&card("alpha")), None, 0)
+            .append_json_row(
+                r#"{"id": 1, "wyrd_ts": 1}"#,
+                Some(&card("alpha")),
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
     }
 
     /// A writer's stamp becomes the non-null `Timestamp(Microsecond, UTC)`
     /// `wyrd_event_time` column after correlation, a payload event time wins
-    /// over the stamp, and a non-string payload event time is refused.
+    /// over the stamp, a batch mixing timed and untimed rows is refused, and
+    /// a non-string payload event time is refused.
     #[test]
     fn stamped_rows_carry_event_time_and_keep_a_payload_value() {
         use arrow::array::TimestampMicrosecondArray;
 
         let mut builder = BatchBuilder::new(user_schema());
         builder
-            .append_json_row(r#"{"id": 1}"#, None, None, 1_000)
+            .append_json_row(r#"{"id": 1}"#, None, None, Some(1_000))
             .expect("stamped row appends");
         builder
             .append_json_row(
                 r#"{"id": 2, "wyrd_event_time": "1970-01-01T00:00:00.000002Z"}"#,
                 None,
                 None,
-                1_000,
+                Some(1_000),
             )
             .expect("a payload event time is admitted");
         let batch = builder.finish().expect("finish");
@@ -663,8 +695,20 @@ mod batch_builder_tests {
             "the payload value wins"
         );
 
+        let mut mixed = BatchBuilder::new(user_schema());
+        mixed
+            .append_json_row(r#"{"id": 1}"#, None, None, Some(1_000))
+            .expect("stamped row appends");
+        mixed
+            .append_json_row(r#"{"id": 2}"#, None, None, None)
+            .expect("untimed row appends");
+        assert_eq!(
+            mixed.finish().unwrap_err().code(),
+            "WYRD_VALA_400_SCHEMA_PARSE"
+        );
+
         let err = BatchBuilder::new(user_schema())
-            .append_json_row(r#"{"id": 1, "wyrd_event_time": 5}"#, None, None, 0)
+            .append_json_row(r#"{"id": 1, "wyrd_event_time": 5}"#, None, None, None)
             .unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
@@ -677,7 +721,7 @@ mod batch_builder_tests {
                 r#"{"id": "not-an-int", "name": "a"}"#,
                 Some(&card("alpha")),
                 None,
-                0,
+                None,
             )
             .expect("appends deferred");
 
@@ -689,7 +733,7 @@ mod batch_builder_tests {
     fn non_nullable_absent_value_fails() {
         let mut builder = BatchBuilder::new(user_schema());
         builder
-            .append_json_row(r#"{"name": "a"}"#, Some(&card("alpha")), None, 0)
+            .append_json_row(r#"{"name": "a"}"#, Some(&card("alpha")), None, None)
             .expect("appends deferred");
 
         let err = builder.finish().unwrap_err();
@@ -704,7 +748,7 @@ mod batch_builder_tests {
                 r#"{"id": 7, "name": "seven"}"#,
                 Some(&card("alpha")),
                 None,
-                0,
+                None,
             )
             .expect("appends");
 
@@ -713,7 +757,7 @@ mod batch_builder_tests {
         let mut reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader");
         let decoded = reader.next().expect("one batch").expect("ok");
         assert_eq!(decoded.num_rows(), 1);
-        assert_eq!(decoded.num_columns(), 5);
+        assert_eq!(decoded.num_columns(), 4);
         let ids = decoded
             .column(0)
             .as_any()
@@ -742,10 +786,12 @@ mod batch_builder_tests {
             .append_json_row(
                 r#"{"trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "b7ad6b7169203331"}"#,
                 None,
-                None, 0)
+                None,
+                None,
+            )
             .expect("appends");
         builder
-            .append_json_row(r#"{"trace_id": null, "span_id": null}"#, None, None, 0)
+            .append_json_row(r#"{"trace_id": null, "span_id": null}"#, None, None, None)
             .expect("absent identity appends");
 
         let batch = builder.finish().expect("finish");
@@ -789,7 +835,7 @@ mod batch_builder_tests {
         ] {
             let mut builder = BatchBuilder::new(trace_schema());
             builder
-                .append_json_row(row, None, None, 0)
+                .append_json_row(row, None, None, None)
                 .expect("appends deferred");
             let err = builder
                 .finish()

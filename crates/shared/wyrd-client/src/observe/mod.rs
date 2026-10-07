@@ -195,7 +195,7 @@ impl Observe<'_> {
     ) -> Result<(), WyrdError> {
         let record = drift::observation(features, session_id)?;
         let started = self.run.state.started_bifrost()?;
-        started.bifrost.insert_rows_into(
+        started.bifrost.insert_observation(
             &started.drift,
             drift::rows(&record)?,
             self.run.correlation(),
@@ -235,9 +235,11 @@ impl Observe<'_> {
     fn eval_value(&self, context: Value, options: EvalObservationOptions) -> Result<(), WyrdError> {
         let record = eval::observation(context, options)?;
         let started = self.run.state.started_bifrost()?;
-        started
-            .bifrost
-            .insert_into(&started.eval, eval::row(&record)?, self.run.correlation())?;
+        started.bifrost.insert_observation(
+            &started.eval,
+            vec![eval::row(&record)?],
+            self.run.correlation(),
+        )?;
         Ok(())
     }
 
@@ -283,9 +285,11 @@ impl Observe<'_> {
         }
         let started = self.run.state.started_bifrost()?;
         let destination = started.bifrost.writer_table(table).await?;
-        started
-            .bifrost
-            .insert_into(&destination, row_bytes(row)?, self.run.correlation())?;
+        started.bifrost.insert_observation(
+            &destination,
+            vec![row_bytes(row)?],
+            self.run.correlation(),
+        )?;
         Ok(())
     }
 }

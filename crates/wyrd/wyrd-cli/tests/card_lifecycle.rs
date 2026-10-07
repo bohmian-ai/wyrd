@@ -900,7 +900,14 @@ mod pg_tests {
             "json",
         );
         assert_eq!(denied_get.status.code(), Some(77));
-        assert_eq!(first_stderr_json(&denied_get)["status"], 403);
+        let denied_error = first_stderr_json(&denied_get);
+        assert_eq!(denied_error["kind"], "wyrd_cli_error");
+        assert_eq!(denied_error["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(denied_error["status"], 403);
+        assert_eq!(
+            denied_error["remediation"],
+            "Request the required role from a workspace admin."
+        );
         assert!(!temp.path().join("denied-hydration").exists());
 
         let get = run_cli_async_with_token!(

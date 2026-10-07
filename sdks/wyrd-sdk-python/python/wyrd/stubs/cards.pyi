@@ -206,7 +206,13 @@ class CardRef:
         *,
         space: str,
         uid: str | None = ...,
-    ) -> None: ...
+    ) -> None:
+        """Build a reference from its kind, name, version, and space.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` if a field is invalid.
+        """
+        ...
     def __str__(self) -> str:
         """The canonical ``space/Kind/name@version`` text of this reference."""
         ...

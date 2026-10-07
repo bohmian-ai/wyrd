@@ -1,0 +1,5 @@
+- relative_path: tiny.bin
+  sha256: Zhm4QK74MjjhbfAtoVF3GkB7846c+YPv3mX2aZ8RYwg=
+  size_bytes: 9
+  content_type: application/octet-stream
+  local_path: cards/training/artifacts/tiny.bin

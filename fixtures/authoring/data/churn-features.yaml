@@ -1,0 +1,44 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: default
+  name: churn-features
+  version: 1.0.0
+  uid: 01920000-0000-7000-8000-000000000001
+spec:
+  interface:
+    kind: Pandas
+    meta:
+      framework_version: 2.3.3
+      compression: Snappy
+  schema:
+    columns:
+    - name: year
+      dtype: int64
+      nullable: false
+    - name: churned
+      dtype: bool
+      nullable: false
+  splits:
+    train:
+      label: train
+      strategy:
+        kind: Column
+        value:
+          name: year
+          op: Le
+          value: 2024
+    test:
+      label: test
+      strategy:
+        kind: Materialized
+        value:
+          kind: Artifact
+          name: churn-test-rows
+          version: 1.0.0
+          space: default
+  target_columns:
+  - churned
+  stats:
+    byte_count: 0
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'

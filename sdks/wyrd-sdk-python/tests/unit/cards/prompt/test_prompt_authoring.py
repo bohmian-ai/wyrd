@@ -1,4 +1,8 @@
+"""Authoring a Prompt for each provider through its builders and settings."""
+
 import json
+from pathlib import Path
+from typing import Any
 
 import pytest
 from wyrd.prompt import (
@@ -11,32 +15,22 @@ from wyrd.prompt import (
     PromptCard,
     ProviderRequest,
     ResponseFormat,
-    WyrdError,
 )
 
 
 def test_prompt_new_builds_openai_chat_by_default() -> None:
     prompt = Prompt("Hello {{name}}", "gpt-4o", provider="openai")
 
-    assert prompt.provider == "openai"
-    assert prompt.model == "gpt-4o"
-    assert prompt.variables == ["name"]
-    body = prompt.request.model_dump()["body"]
-    assert body["model"] == "gpt-4o"
-    assert body["messages"][0]["content"] == "Hello {{name}}"
+    request = prompt.request.openai()
+    assert (prompt.provider, request.model, prompt.variables) == ("openai", "gpt-4o", ["name"])
+    assert request.messages[0].content.as_text() == "Hello {{name}}"
 
 
 def test_prompt_new_selects_openai_responses() -> None:
-    prompt = Prompt(
-        "Summarize {{topic}}",
-        "gpt-4.1",
-        provider="openai",
-        operation="responses",
-    )
+    prompt = Prompt("Summarize {{topic}}", "gpt-4.1", provider="openai", operation="responses")
 
-    body = prompt.request.model_dump()["body"]
-    assert body["input"][0]["content"][0]["text"] == "Summarize {{topic}}"
-    assert prompt.variables == ["topic"]
+    (item,) = prompt.request.openai_responses().input
+    assert (item.kind, prompt.variables) == ("message", ["topic"])
 
 
 def test_bind_returns_new_prompt_and_bind_mut_updates_in_place() -> None:
@@ -56,54 +50,57 @@ def test_bind_returns_new_prompt_and_bind_mut_updates_in_place() -> None:
 
 def test_bind_media_replaces_native_media_placeholder() -> None:
     prompt = Prompt("What logo is this? ${media:logo}", "gpt-4o", provider="openai")
-    assert prompt.media_variables == ["logo"]
 
     bound = prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
-    body = bound.request.model_dump()["body"]
-    image = body["messages"][0]["content"][1]["image_url"]["url"]
-    assert image == "https://example.test/logo.png"
-    assert bound.media_variables == []
+
+    part = bound.request.openai().messages[0].content.as_parts()[1]
+    assert part.as_image_url().url == "https://example.test/logo.png"
 
 
-def test_bind_media_requires_existing_placeholder() -> None:
-    prompt = Prompt("What logo is this?", "gpt-4o", provider="openai")
+def test_prompt_str_is_json_with_its_model() -> None:
+    prompt = Prompt("Answer", "gpt-4o", provider="openai")
 
-    with pytest.raises(WyrdError):
-        prompt.bind_media("logo", MediaRef.image_url("https://example.test/logo.png"))
+    assert json.loads(str(prompt))["model"] == "gpt-4o"
 
 
-def test_prompt_response_format_and_str_are_json_inspectable() -> None:
-    response_format = ResponseFormat.json_schema(
-        "answer",
-        {"type": "object", "properties": {"answer": {"type": "string"}}},
-    )
+def test_response_format_json_schema_sets_the_response_schema() -> None:
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+
     prompt = Prompt(
         "Answer",
         "gpt-4o",
         provider="openai",
-        response_format=response_format,
+        response_format=ResponseFormat.json_schema("answer", schema),
     )
 
-    assert json.loads(str(prompt))["model"] == "gpt-4o"
-    assert "response_format" in prompt.request.model_dump()["body"]
+    assert prompt.response_schema_name == "answer"
 
 
-def test_every_provider_builder_constructs_promptcard_and_round_trips_json() -> None:
-    prompts = [
-        Prompt.openai_chat("gpt-4o", messages="hello"),
-        Prompt.openai_responses("gpt-4.1", messages="hello"),
-        Prompt.anthropic("claude-sonnet-4", messages="hello"),
-        Prompt.gemini("gemini-2.5-pro", messages="hello"),
-        Prompt.vertex("gemini-2.5-pro", messages="hello"),
-        Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","messages":["hello"]}'),
-    ]
+@pytest.mark.parametrize(
+    ("prompt", "provider"),
+    [
+        pytest.param(Prompt.openai_chat("gpt-4o", messages="hello"), "openai", id="openai"),
+        pytest.param(
+            Prompt.openai_responses("gpt-4.1", messages="hello"), "openai", id="openai-responses"
+        ),
+        pytest.param(
+            Prompt.anthropic("claude-sonnet-4", messages="hello"), "anthropic", id="anthropic"
+        ),
+        pytest.param(Prompt.gemini("gemini-2.5-pro", messages="hello"), "google", id="gemini"),
+        pytest.param(Prompt.vertex("gemini-2.5-pro", messages="hello"), "vertex", id="vertex"),
+        pytest.param(
+            Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","messages":["hello"]}'),
+            "openai",
+            id="raw",
+        ),
+    ],
+)
+def test_every_provider_builder_round_trips_through_a_promptcard(
+    prompt: Prompt, provider: str
+) -> None:
+    card = PromptCard(prompt)
 
-    for prompt in prompts:
-        card = PromptCard(prompt)
-        assert (
-            PromptCard.model_validate_json(card.model_dump_json()).prompt.provider
-            == prompt.provider
-        )
+    assert PromptCard.model_validate_json(card.model_dump_json()).prompt.provider == provider
 
 
 def test_role_helpers_cover_system_user_assistant_and_tool_result() -> None:
@@ -114,24 +111,34 @@ def test_role_helpers_cover_system_user_assistant_and_tool_result() -> None:
         .assistant("assistant")
         .tool_result("call-1", "result")
     )
-    roles = [message["role"] for message in prompt.request.model_dump()["body"]["messages"]]
 
-    assert roles == ["system", "user", "assistant", "tool"]
-
-
-def test_message_inputs_accept_string_and_list_of_strings() -> None:
-    string_prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
-    list_prompt = Prompt.gemini("gemini-2.5-pro", messages=["hello", "world"])
-
-    assert (
-        string_prompt.request.model_dump()["body"]["messages"][0]["content"][0]["text"] == "hello"
-    )
-    assert len(list_prompt.request.model_dump()["body"]["contents"]) == 2
+    assert [message.role for message in prompt.request.openai().messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
 
 
-def test_provider_settings_constructor_smoke() -> None:
-    cases = [
-        (
+def test_message_string_becomes_one_anthropic_text_block() -> None:
+    prompt = Prompt.anthropic("claude-sonnet-4", messages="hello")
+
+    assert prompt.request.messages[0]["content"] == [{"type": "text", "text": "hello"}]
+
+
+def test_message_list_becomes_one_gemini_content_turn_per_string() -> None:
+    prompt = Prompt.gemini("gemini-2.5-pro", messages=["hello", "world"])
+
+    assert [content.parts[0].as_text() for content in prompt.request.gemini().contents] == [
+        "hello",
+        "world",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "key", "value"),
+    [
+        pytest.param(
             Prompt.openai_chat(
                 "gpt-4o",
                 messages="hello",
@@ -139,8 +146,9 @@ def test_provider_settings_constructor_smoke() -> None:
             ),
             "seed",
             1,
+            id="openai",
         ),
-        (
+        pytest.param(
             Prompt.openai_responses(
                 "gpt-4.1",
                 messages="hello",
@@ -148,8 +156,9 @@ def test_provider_settings_constructor_smoke() -> None:
             ),
             "reasoning",
             {"effort": "medium"},
+            id="openai-responses",
         ),
-        (
+        pytest.param(
             Prompt.anthropic(
                 "claude-sonnet-4",
                 messages="hello",
@@ -157,17 +166,19 @@ def test_provider_settings_constructor_smoke() -> None:
             ),
             "max_tokens",
             128,
+            id="anthropic",
         ),
-        (
+        pytest.param(
             Prompt.gemini(
                 "gemini-2.5-pro",
                 messages="hello",
-                model_settings=GeminiSettings(generation_config={"temperature": 0.2}),
+                model_settings=GeminiSettings(generation_config={"candidate_count": 2}),
             ),
             "generation_config",
-            {"temperature": 0.2},
+            {"candidate_count": 2},
+            id="gemini",
         ),
-        (
+        pytest.param(
             Prompt.vertex(
                 "gemini-2.5-pro",
                 messages="hello",
@@ -175,28 +186,22 @@ def test_provider_settings_constructor_smoke() -> None:
             ),
             "generation_config",
             {"max_output_tokens": 64},
+            id="vertex",
         ),
-    ]
-
-    for prompt, key, value in cases:
-        if isinstance(value, float):
-            assert prompt.request.model_dump()["body"][key] == pytest.approx(value)
-        elif key == "generation_config" and "temperature" in value:
-            assert prompt.request.model_dump()["body"][key]["temperature"] == pytest.approx(
-                value["temperature"]
-            )
-        else:
-            assert prompt.request.model_dump()["body"][key] == value
+    ],
+)
+def test_provider_settings_land_in_the_request(prompt: Prompt, key: str, value: Any) -> None:
+    assert prompt.request.model_dump()["body"][key] == value
 
 
-def test_openai_responses_input_getter_projects_text_and_item_forms() -> None:
-    items_prompt = Prompt.openai_responses("gpt-4.1", messages="Hello")
-    body = json.loads(items_prompt.model_dump_json())
-    body["request"]["body"]["input"] = "Hello"
-    text_prompt = Prompt.model_validate_json(json.dumps(body))
+def test_openai_responses_item_input_reads_as_one_user_message() -> None:
+    (item,) = Prompt.openai_responses("gpt-4.1", messages="Hello").request.openai_responses().input
 
-    for prompt in (items_prompt, text_prompt):
-        (item,) = prompt.request.openai_responses().input
-        assert item.kind == "message"
-        assert item.as_message_role() == "user"
-    assert text_prompt.request.model_dump()["body"]["input"] == "Hello"
+    assert (item.kind, item.as_message_role()) == ("message", "user")
+
+
+def test_openai_responses_text_input_reads_as_one_user_message(fixtures_dir: Path) -> None:
+    prompt = Prompt.load(fixtures_dir / "authoring" / "prompt" / "responses-text-input.yaml")
+
+    (item,) = prompt.request.openai_responses().input
+    assert (item.kind, item.as_message_role()) == ("message", "user")

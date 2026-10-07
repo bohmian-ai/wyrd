@@ -1,0 +1,9 @@
+request:
+  provider: open_ai_responses
+  body:
+    model: gpt-4.1
+    input: Hello
+model: gpt-4.1
+variables: []
+media_variables: []
+response_type: text

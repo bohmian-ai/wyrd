@@ -1,0 +1,10 @@
+kind: Prompt
+metadata:
+  name: support-agent
+  version: 0.1.0
+spec:
+  provider: anthropic
+  model: claude-3-5-sonnet-20241022
+  system: You are a helpful support agent.
+  messages:
+    - How can I reset my password?

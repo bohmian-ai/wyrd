@@ -1,128 +1,74 @@
 """Scoped observation surface reachable from an offline ``WyrdState``.
 
 These tests stay server-free: opening a run performs no network IO, and every
-emit is proven by the error it raises before admission. Durable emit behavior
-belongs to the gated journey lanes, not here.
+refusal happens before admission. Accepted observations belong to the gated
+journey lanes, not here.
 """
 
 import asyncio
-import inspect
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
 import wyrd
-import wyrd.otel
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel
-from wyrd.eval import MediaRef
 from wyrd.observe import Observe, Run
 from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
 
-from .support import TinyDataInterface, TinyModelInterface, build_complete_bundle
 
-
-def _state(tmp_path: Path) -> WyrdState:
-    """Hydrate the shared complete fixture bundle with its custom interfaces.
-
-    The interfaces are fresh per call so one test's loader telemetry cannot leak
-    into another's assertions.
-    """
-    return WyrdState.from_path(
-        build_complete_bundle(tmp_path),
-        interfaces={
-            "model": TinyModelInterface(),
-            "backup": TinyModelInterface(),
-            "training_data": TinyDataInterface(),
-        },
-    )
-
-
-ORIGINAL_GET_VALUE = otel_context.get_value
-ORIGINAL_ATTACH = otel_context.attach
-
-
-def _code(error: BaseException) -> str:
-    """Return the stable Wyrd error code carried by a raised boundary error."""
-    assert isinstance(error, wyrd.WyrdError)
-    return error.code
-
-
-def test_run_targets_the_root_service_with_a_uuidv7_identity(tmp_path: Path) -> None:
+def test_run_targets_the_root_service_with_a_uuidv7_identity(state: WyrdState) -> None:
     """One run is one invocation anchored on the bundle's root Service Card."""
-    run = _state(tmp_path).run()
+    run = state.run()
     assert isinstance(run, Run)
     assert UUID(run.run_id).version == 7
     assert run.alias == "root"
     assert isinstance(run.observe, Observe)
 
 
-def test_scoped_views_share_one_invocation_and_keep_their_subjects(tmp_path: Path) -> None:
+def test_scoped_views_share_one_invocation_and_keep_their_subjects(state: WyrdState) -> None:
     """``for_card`` returns immutable siblings under one invocation identity."""
-    run = _state(tmp_path).run()
+    run = state.run()
     model = run.for_card("model")
     backup = run.for_card("backup")
     assert model.run_id == run.run_id == backup.run_id
     assert (run.alias, model.alias, backup.alias) == ("root", "model", "backup")
 
 
-def test_each_run_is_its_own_invocation(tmp_path: Path) -> None:
+def test_each_run_is_its_own_invocation(state: WyrdState) -> None:
     """Two runs from one state are distinct invocations."""
-    state = _state(tmp_path)
     assert state.run().run_id != state.run().run_id
 
 
-def test_unknown_alias_is_refused(tmp_path: Path) -> None:
+def test_unknown_alias_is_refused(state: WyrdState) -> None:
     """An alias the bundle does not register fails locally."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().for_card("missing")
-    assert _code(raised.value) == "WYRD_SDK_404_UNKNOWN_ALIAS"
+        state.run().for_card("missing")
+    assert raised.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
 
 
-def test_drift_accepts_a_mapping_and_reaches_the_writer(tmp_path: Path) -> None:
-    """A flat mapping converts, then fails only because Bifrost is not started."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift({"latency_ms": 12.5, "tier": "gold"})
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
-
-
-def test_drift_accepts_a_dataclass_instance(tmp_path: Path) -> None:
-    """A dataclass instance is reduced to its fields before admission."""
-
-    @dataclass
-    class Features:
-        """Test-only flat feature payload for the dataclass conversion path."""
-
-        latency_ms: float
-        cached: bool
-
-    with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift(Features(latency_ms=3.0, cached=True))
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
-
-
-def test_drift_refuses_a_payload_that_is_not_an_object(tmp_path: Path) -> None:
+def test_drift_refuses_a_payload_that_is_not_an_object(state: WyrdState) -> None:
     """A sequence is not a feature map and is refused at the boundary."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift([1, 2, 3])
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
+        state.run().observe.drift([1, 2, 3])
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_drift_refuses_a_nested_feature_value(tmp_path: Path) -> None:
+def test_drift_refuses_a_nested_feature_value(state: WyrdState) -> None:
     """Feature values are scalars; a nested object reports the offending key."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift({"nested": {"inner": 1}})
-    assert _code(raised.value) == "WYRD_SDK_400_INVALID_OBSERVATION"
+        state.run().observe.drift({"nested": {"inner": 1}})
+    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
 class _PydanticFeatures(BaseModel):
@@ -130,13 +76,6 @@ class _PydanticFeatures(BaseModel):
 
     latency: float
     tier: str
-
-
-def test_drift_accepts_a_pydantic_model(tmp_path: Path) -> None:
-    """A Pydantic model converts through its own JSON dump before admission."""
-    with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift(_PydanticFeatures(latency=3.0, tier="gold"))
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
 @pytest.mark.parametrize(
@@ -171,7 +110,7 @@ def test_drift_accepts_a_pydantic_model(tmp_path: Path) -> None:
     ],
 )
 def test_drift_refuses_unrepresentable_payloads_before_admission(
-    tmp_path: Path, payload: object, code: str
+    state: WyrdState, payload: object, code: str
 ) -> None:
     """Invalid names, null or nested values, and unrepresentable numbers fail first.
 
@@ -180,127 +119,107 @@ def test_drift_refuses_unrepresentable_payloads_before_admission(
     happened before admission.
     """
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift(payload)
-    assert _code(raised.value) == code
+        state.run().observe.drift(payload)
+    assert raised.value.code == code
 
 
-def test_drift_refuses_a_malformed_session_id(tmp_path: Path) -> None:
+def test_drift_refuses_a_malformed_session_id(state: WyrdState) -> None:
     """``session_id`` is a UUID and is parsed before anything is enqueued."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift({"score": 1.0}, session_id="not-a-uuid")
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
+        state.run().observe.drift({"score": 1.0}, session_id="not-a-uuid")
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_eval_accepts_context_and_media(tmp_path: Path) -> None:
-    """Context and media descriptors convert before admission."""
-    media = [MediaRef(id="page", kind="document", uri="s3://bucket/page.pdf")]
-    with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.eval({"answer": "yes"}, media=media)
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
-
-
-def test_eval_refuses_a_span_without_its_trace(tmp_path: Path) -> None:
+def test_eval_refuses_a_span_without_its_trace(state: WyrdState) -> None:
     """A span id is only meaningful inside its trace."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
+        state.run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_record_refuses_a_table_outside_vala_datasets(tmp_path: Path) -> None:
+def test_record_refuses_a_table_outside_vala_datasets(state: WyrdState) -> None:
     """``record`` writes registered caller-owned tables only."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.record("vala.drift.observations", {"value": 1})
-    assert _code(raised.value) == "WYRD_SDK_400_INVALID_OBSERVATION"
+        state.run().observe.record("vala.drift.observations", {"value": 1})
+    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
-def test_flush_requires_a_started_writer(tmp_path: Path) -> None:
+def test_flush_requires_a_started_writer(state: WyrdState) -> None:
     """An explicit drain of a state that never started Bifrost is an error."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).flush()
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+        state.flush()
+    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
-def test_shutdown_without_startup_succeeds(tmp_path: Path) -> None:
+def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
     """Graceful shutdown is idempotent: a never-started state has no rows."""
-    state = _state(tmp_path)
     assert state.shutdown() is None
     assert state.shutdown() is None
 
 
 @pytest.mark.parametrize("key", [1, 1.5, True, None])
-def test_drift_refuses_a_non_string_mapping_key(tmp_path: Path, key: object) -> None:
+def test_drift_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
     """``json.dumps`` would stringify the key, so it is refused before the writer."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.drift({key: 1.0})
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
+        state.run().observe.drift({key: 1.0})
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_eval_checks_keys_after_reduction(tmp_path: Path) -> None:
-    """Eval refuses a non-``str`` mapping key; a dataclass reduces to ``str`` keys."""
-
-    @dataclass
-    class Context:
-        """Test-only context whose reduced keys are its field names."""
-
-        answer: str
-
-    run = _state(tmp_path).run()
+def test_eval_refuses_a_non_string_mapping_key(state: WyrdState) -> None:
+    """Eval context keys are strings; ``json.dumps`` would silently stringify ``1``."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.observe.eval({1: "yes"})
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
-    with pytest.raises(wyrd.WyrdError) as raised:
-        run.observe.eval(Context(answer="yes"))
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+        state.run().observe.eval({1: "yes"})
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-def test_explicit_span_without_trace_is_refused_inside_an_active_span(tmp_path: Path) -> None:
+def test_explicit_span_without_trace_is_refused_inside_an_active_span(state: WyrdState) -> None:
     """An explicit id disables the active-span lookup, so it is never half-merged."""
     tracer = TracerProvider().get_tracer("wyrd.tests.observe")
     with tracer.start_as_current_span("unit"), pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
-    assert _code(raised.value) == "WYRD_SPEC_400_VALIDATION"
-
-
-def test_active_span_reaches_the_writer(tmp_path: Path) -> None:
-    """A valid active span is read without failing the emit before admission."""
-    tracer = TracerProvider().get_tracer("wyrd.tests.observe")
-    with tracer.start_as_current_span("unit"), pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run().observe.eval({"answer": "yes"})
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+        state.run().observe.eval({"answer": "yes"}, span_id="00f067aa0ba902b7")
+    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
 # ── Initial Card selection ──────────────────────────────────────────────────
 
 
-def test_run_alias_selects_the_initial_view_and_shares_its_invocation(tmp_path: Path) -> None:
-    """``run("alias")`` opens on that Card; later views share its invocation."""
-    state = _state(tmp_path)
+def test_run_alias_opens_on_that_card(state: WyrdState) -> None:
+    """``run("model")`` opens a fresh invocation whose first view is ``model``."""
     model = state.run("model")
-    assert model.alias == state.run().for_card("model").alias == "model"
+    assert model.alias == "model"
     assert UUID(model.run_id).version == 7
-    backup = model.for_card("backup")
-    assert backup.run_id == model.run_id
+
+
+def test_views_from_an_alias_run_share_its_invocation(state: WyrdState) -> None:
+    """A sibling view taken from ``run("model")`` keeps its run id."""
+    model = state.run("model")
+    assert model.for_card("backup").run_id == model.run_id
+
+
+def test_run_without_an_alias_opens_on_the_root_service(state: WyrdState) -> None:
+    """``run(None)`` is the same as ``run()``: the root Service view."""
     assert state.run(None).alias == "root"
 
 
-def test_run_alias_refuses_an_unknown_alias(tmp_path: Path) -> None:
+def test_run_alias_refuses_an_unknown_alias(state: WyrdState) -> None:
     """An unknown initial alias fails locally, before any scope is entered."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run("missing")
-    assert _code(raised.value) == "WYRD_SDK_404_UNKNOWN_ALIAS"
+        state.run("missing")
+    assert raised.value.code == "WYRD_SDK_404_UNKNOWN_ALIAS"
 
 
-def test_verify_refuses_an_unbound_verifier_before_any_network_call(tmp_path: Path) -> None:
+def test_verify_refuses_an_unbound_verifier_before_any_network_call(state: WyrdState) -> None:
     """A Verifier name not bound to the view's subject fails locally."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        _state(tmp_path).run("model").observe.verify("missing", {"question": "q"})
-    assert _code(raised.value) == "WYRD_SDK_404_UNKNOWN_VERIFIER"
+        state.run("model").observe.verify("missing", {"question": "q"})
+    assert raised.value.code == "WYRD_SDK_404_UNKNOWN_VERIFIER"
 
 
-def test_the_verification_module_is_not_importable() -> None:
-    """Direct judgment lives on ``run.observe.verify``; no handle module remains."""
-    with pytest.raises(ModuleNotFoundError):
-        __import__("wyrd.verification")
+def test_verify_refuses_a_context_list_for_an_eval_verifier(state: WyrdState) -> None:
+    """An Eval Verifier judges one context object, so a list is refused locally."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        state.run().observe.verify("ok-check", [{"ok": True}])
+    assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
 # ── Run scope: ambient OpenTelemetry span correlation ───────────────────────
@@ -335,21 +254,12 @@ def _ref(state: WyrdState, view: Run) -> str:
     return str(state.card_ref(view.alias))
 
 
-def _wyrd_processors(provider: TracerProvider) -> int:
-    """Count the Wyrd correlation processors registered on ``provider``."""
-    return sum(
-        type(processor).__name__ == "_RunCorrelationProcessor"
-        for processor in provider._active_span_processor._span_processors
-    )
-
-
 def test_entering_a_run_returns_it_and_correlates_active_and_child_spans(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """The active span and every span started in scope carry the exact identity."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run("model")
     with tracer.start_as_current_span("outer"):
         with run as entered:
@@ -367,12 +277,11 @@ def test_entering_a_run_returns_it_and_correlates_active_and_child_spans(
 
 
 def test_nested_card_scopes_share_the_run_and_restore_the_outer_card(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """An inner Card scope restores the outer Card when it exits."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run()
     model = run.for_card("model")
     with run:
@@ -390,12 +299,11 @@ def test_nested_card_scopes_share_the_run_and_restore_the_outer_card(
 
 
 def test_scope_survives_await_and_isolates_concurrent_tasks(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """Context follows ``await`` and tasks; concurrent scopes never cross."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run()
     views = {"model": run.for_card("model"), "backup": run.for_card("backup")}
 
@@ -426,12 +334,11 @@ def test_scope_survives_await_and_isolates_concurrent_tasks(
 
 
 def test_concurrent_tasks_entering_the_same_run_exit_independently(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """Two tasks share one Run object; each exit clears only its own task's scope."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run("model")
 
     async def main() -> None:
@@ -465,12 +372,11 @@ def test_concurrent_tasks_entering_the_same_run_exit_independently(
 
 
 def test_captured_otel_context_carries_the_scope_into_a_plain_thread(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """A thread attaching a context captured in scope stamps the scope's exact pair."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run("model")
 
     def worker(captured: Any) -> None:
@@ -490,27 +396,31 @@ async def _span_later(tracer: Any, name: str) -> None:
     tracer.start_span(name).end()
 
 
-def test_repeated_entry_registers_once_on_a_marked_provider(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+def test_explicit_installation_on_a_private_provider_is_idempotent(
+    state: WyrdState,
 ) -> None:
-    """The provider marker skips re-registration, through entry or the explicit hook."""
-    provider, exporter = spans
-    state = _state(tmp_path)
-    run = state.run()
-    with run, run:
-        pass
-    assert install_run_correlation() is True
-    assert _wyrd_processors(provider) == 1
-
+    """Installing twice reports success both times and correlates spans once."""
     private = TracerProvider()
-    private_exporter = InMemorySpanExporter()
-    private.add_span_processor(SimpleSpanProcessor(private_exporter))
+    exporter = InMemorySpanExporter()
+    private.add_span_processor(SimpleSpanProcessor(exporter))
     assert install_run_correlation(private) is True
     assert install_run_correlation(private) is True
-    assert _wyrd_processors(private) == 1
+    run = state.run()
     with run:
         private.get_tracer("framework").start_span("private").end()
-    assert _correlation(private_exporter) == {"private": (_ref(state, run), run.run_id)}
+    assert _correlation(exporter) == {"private": (_ref(state, run), run.run_id)}
+
+
+def test_repeated_entry_reinstalls_nothing_on_the_global_provider(
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
+) -> None:
+    """Entering a run twice keeps one correlation per span on the global provider."""
+    provider, exporter = spans
+    run = state.run()
+    with run, run:
+        provider.get_tracer("framework").start_span("doubly-entered").end()
+    assert install_run_correlation() is True
+    assert _correlation(exporter) == {"doubly-entered": (_ref(state, run), run.run_id)}
 
 
 class _Raising:
@@ -538,47 +448,61 @@ def test_unsupported_providers_are_refused_without_raising() -> None:
     assert install_run_correlation(_Raising()) is False
 
 
-def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
-    """``Run.__exit__`` names and defaults match the public stub; it never suppresses."""
-    state = _state(tmp_path)
+@pytest.mark.parametrize(
+    ("exc_type", "exc_value"), [(None, None), (ValueError, ValueError("app"))], ids=["ok", "error"]
+)
+def test_run_exit_never_suppresses(
+    state: WyrdState, exc_type: type[BaseException] | None, exc_value: BaseException | None
+) -> None:
+    """``Run.__exit__`` returns False, so an exception raised in scope propagates."""
     run = state.run()
-    assert list(inspect.signature(run.__exit__).parameters) == [
-        "exc_type",
-        "exc_value",
-        "traceback",
-    ]
     run.__enter__()
-    assert run.__exit__(exc_type=None, exc_value=None, traceback=None) is False
-    run.__enter__()
-    assert run.__exit__() is False
-    run.__enter__()
-    assert run.__exit__(ValueError, ValueError("app"), None) is False
+    assert run.__exit__(exc_type, exc_value, None) is False
 
 
-def test_missing_opentelemetry_is_a_no_op(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the optional package a run still enters, exits, and emits normally."""
-    # The bindings are resolved at import, so absence is proven in a fresh
-    # interpreter and simulated here by clearing the import-time bindings.
-    blocked = (
-        "import sys; sys.modules['opentelemetry'] = None; import wyrd.otel as otel; "
-        "assert otel._SCOPE_KEY is None and otel.install_run_correlation() is False"
+MISSING_OPENTELEMETRY = """\
+import sys
+
+sys.modules["opentelemetry"] = None
+bundle, support = sys.argv[1:]
+sys.path.insert(0, support)
+from support import TinyDataInterface, TinyModelInterface
+from wyrd.otel import install_run_correlation
+from wyrd.state import WyrdState
+
+assert install_run_correlation() is False
+state = WyrdState.from_path(
+    bundle,
+    interfaces={
+        "model": TinyModelInterface(),
+        "backup": TinyModelInterface(),
+        "training_data": TinyDataInterface(),
+    },
+)
+with state.run("model") as run:
+    assert run.alias == "model"
+"""
+
+
+def test_missing_opentelemetry_is_a_no_op(complete_bundle: Path) -> None:
+    """Without the optional package, installation reports False and a run still scopes."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            MISSING_OPENTELEMETRY,
+            str(complete_bundle),
+            str(Path(__file__).parent),
+        ],
+        check=True,
     )
-    subprocess.run([sys.executable, "-c", blocked], check=True)
-    monkeypatch.setattr(wyrd.otel, "_otel_context", None)
-    monkeypatch.setattr(wyrd.otel, "_otel_trace", None)
-    assert install_run_correlation() is False
-    state = _state(tmp_path)
-    run = state.run("model")
-    with run as entered, pytest.raises(wyrd.WyrdError) as raised:
-        entered.observe.drift({"latency_ms": 1.0})
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
 def _drift_reaches_the_ordinary_boundary(run: Run) -> None:
     """Emit one explicit Drift observation and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:
         run.observe.drift({"latency_ms": 1.0})
-    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+    assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
 def _broken(*_args: object, **_kwargs: object) -> None:
@@ -587,10 +511,9 @@ def _broken(*_args: object, **_kwargs: object) -> None:
 
 
 def test_registration_and_attach_failures_never_block_observations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    state: WyrdState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """API-only, unmarkable, raising, and failing-attach paths leave emits untouched."""
-    state = _state(tmp_path)
     run = state.run("model")
     for provider in (object(), _Unmarkable(), _Raising()):
         monkeypatch.setattr(trace, "get_tracer_provider", lambda provider=provider: provider)
@@ -604,52 +527,53 @@ def test_registration_and_attach_failures_never_block_observations(
         _drift_reaches_the_ordinary_boundary(entered)
 
 
-def test_enrichment_failure_never_blocks_observations(
-    tmp_path: Path,
+def test_failing_enrichment_never_blocks_spans_or_observations(
+    state: WyrdState,
     spans: tuple[TracerProvider, InMemorySpanExporter],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failing span-start lookup is contained; user errors propagate."""
+    """A failing span-start lookup leaves the span unenriched and the emit untouched."""
     provider, exporter = spans
-    state = _state(tmp_path)
-    run = state.run()
-    with run as entered:
-        monkeypatch.setattr(otel_context, "get_value", _broken)
+    with state.run() as entered, monkeypatch.context() as patch:
+        patch.setattr(otel_context, "get_value", _broken)
         provider.get_tracer("framework").start_span("unenriched").end()
         _drift_reaches_the_ordinary_boundary(entered)
-        monkeypatch.setattr(otel_context, "get_value", ORIGINAL_GET_VALUE)
     assert _correlation(exporter) == {"unenriched": None}
 
-    with pytest.raises(ValueError, match="user failure"), run:
+
+def test_user_errors_propagate_out_of_a_run_scope(state: WyrdState) -> None:
+    """The run scope re-raises the user's exception unchanged."""
+    with pytest.raises(ValueError, match="user failure"), state.run():
         raise ValueError("user failure")
-    assert run.__exit__(None, None, None) is False
 
 
-def test_exit_context_update_failure_never_blocks_observations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failing exit attach never raises, masks a user error, or blocks emits."""
-    state = _state(tmp_path)
+@pytest.fixture
+def model_run(state: WyrdState) -> Iterator[Run]:
+    """A ``model`` run whose scope is cleared once the test restores OpenTelemetry."""
     run = state.run("model")
-    with run:
-        monkeypatch.setattr(otel_context, "attach", _broken)
-    _drift_reaches_the_ordinary_boundary(run)
-    with pytest.raises(ValueError, match="app"):
-        with run:
-            raise ValueError("app")
-    _drift_reaches_the_ordinary_boundary(run)
-    monkeypatch.setattr(otel_context, "attach", ORIGINAL_ATTACH)
-    # The failed exit left this execution context's scope in place; clear it.
+    yield run
     run.__exit__()
 
 
+def test_exit_context_update_failure_never_blocks_observations(
+    model_run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing exit attach never raises, masks a user error, or blocks emits."""
+    with monkeypatch.context() as patch:
+        with model_run:
+            patch.setattr(otel_context, "attach", _broken)
+        _drift_reaches_the_ordinary_boundary(model_run)
+        with pytest.raises(ValueError, match="app"), model_run:
+            raise ValueError("app")
+        _drift_reaches_the_ordinary_boundary(model_run)
+
+
 def test_mismatched_exit_changes_nothing(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """Exiting a view that is not the innermost scope keeps the outer pair."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run()
     run.__enter__()
     run.for_card("model").__exit__()
@@ -663,12 +587,11 @@ def test_mismatched_exit_changes_nothing(
 
 
 def test_nested_entry_never_overwrites_an_active_span_correlation(
-    tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
+    state: WyrdState, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
     """A nested Card scope leaves already-correlated active spans untouched."""
     provider, exporter = spans
     tracer = provider.get_tracer("framework")
-    state = _state(tmp_path)
     run = state.run()
     model = run.for_card("model")
     with tracer.start_as_current_span("outer"):

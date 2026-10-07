@@ -10,4 +10,8 @@ spec:
     - alias: agent
       ref: ./observed-agent.yaml
     - alias: model
-      ref: ./observed-model.yaml
+      ref:
+        kind: Model
+        name: observed-model
+        version: 1.0.0
+        space: default

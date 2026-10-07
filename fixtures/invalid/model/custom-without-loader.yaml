@@ -1,0 +1,25 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  space: prod
+  name: custom-without-loader
+  version: 1.0.0
+  uid: 01920000-0000-7000-8000-000000000004
+spec:
+  interface:
+    kind: Custom
+    meta:
+      framework_version: python
+      loader_module: ''
+      loader_class: ''
+  task_type: Other
+  signature:
+    inputs:
+    - name: tenure_months
+      dtype: float64
+      nullable: false
+    outputs:
+    - name: churn_probability
+      dtype: float64
+      nullable: false
+  card_refs: []

@@ -20,3 +20,6 @@ spec:
     outputs:
       - name: score
         dtype: float64
+artifacts:
+  - relative_path: latency-model.bin
+    content_type: application/octet-stream

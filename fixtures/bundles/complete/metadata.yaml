@@ -1,0 +1,124 @@
+apiVersion: wyrd/hydrated-bundle/v1
+hydration: complete
+root:
+  kind: Service
+  name: service
+  version: 1.0.0
+  space: default
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01
+cards:
+- aliases:
+  - model
+  - primary_model
+  card_ref:
+    kind: Model
+    name: model
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
+  card_path: cards/model/card.yaml
+  relationships_path: cards/model/relationships.yaml
+  artifact_inventory_path: cards/model/artifacts.yaml
+  artifacts:
+  - relative_path: tiny.bin
+    sha256: zNv7mZO+iMU2sLfNKr5g7ag8fOGtUwxqKtqBUQ/xVIw=
+    size_bytes: 10
+    content_type: application/octet-stream
+    local_path: cards/model/artifacts/tiny.bin
+- aliases:
+  - backup
+  card_ref:
+    kind: Model
+    name: backup
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03
+  card_path: cards/backup/card.yaml
+  relationships_path: cards/backup/relationships.yaml
+  artifact_inventory_path: cards/backup/artifacts.yaml
+  artifacts:
+  - relative_path: tiny.bin
+    sha256: zNv7mZO+iMU2sLfNKr5g7ag8fOGtUwxqKtqBUQ/xVIw=
+    size_bytes: 10
+    content_type: application/octet-stream
+    local_path: cards/backup/artifacts/tiny.bin
+- aliases:
+  - training_data
+  card_ref:
+    kind: Data
+    name: training
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b07
+  card_path: cards/training/card.yaml
+  relationships_path: cards/training/relationships.yaml
+  artifact_inventory_path: cards/training/artifacts.yaml
+  artifacts:
+  - relative_path: tiny.bin
+    sha256: Zhm4QK74MjjhbfAtoVF3GkB7846c+YPv3mX2aZ8RYwg=
+    size_bytes: 9
+    content_type: application/octet-stream
+    local_path: cards/training/artifacts/tiny.bin
+- aliases:
+  - triage_prompt
+  card_ref:
+    kind: Prompt
+    name: triage
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04
+  card_path: cards/triage/card.yaml
+  relationships_path: cards/triage/relationships.yaml
+  artifact_inventory_path: cards/triage/artifacts.yaml
+  artifacts: []
+- aliases:
+  - agent_triage
+  card_ref:
+    kind: Agent
+    name: triage
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b06
+  card_path: cards/triage_agent/card.yaml
+  relationships_path: cards/triage_agent/relationships.yaml
+  artifact_inventory_path: cards/triage_agent/artifacts.yaml
+  artifacts: []
+- aliases:
+  - agent_inline
+  card_ref:
+    kind: Agent
+    name: inline
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b05
+  card_path: cards/inline_agent/card.yaml
+  relationships_path: cards/inline_agent/relationships.yaml
+  artifact_inventory_path: cards/inline_agent/artifacts.yaml
+  artifacts: []
+- aliases:
+  - ok_check
+  card_ref:
+    kind: Verifier
+    name: ok-check
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b08
+  card_path: cards/ok_check/card.yaml
+  relationships_path: cards/ok_check/relationships.yaml
+  artifact_inventory_path: cards/ok_check/artifacts.yaml
+  artifacts: []
+- aliases:
+  - root
+  card_ref:
+    kind: Service
+    name: service
+    version: 1.0.0
+    space: default
+    uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01
+  card_path: cards/service/card.yaml
+  relationships_path: cards/service/relationships.yaml
+  artifact_inventory_path: cards/service/artifacts.yaml
+  artifacts: []
+card_count: 8
+artifact_count: 3
+downloaded_artifact_count: 3

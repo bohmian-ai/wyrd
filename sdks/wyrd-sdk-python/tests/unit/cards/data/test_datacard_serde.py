@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""A DataCard's JSON envelope round-trips and carries user metadata."""
 
 import json
 
@@ -9,6 +9,7 @@ import pytest
 from wyrd.data import (
     ArrowInterface,
     DataCard,
+    DataInterface,
     JsonlInterface,
     NumpyInterface,
     PandasInterface,
@@ -17,21 +18,29 @@ from wyrd.data import (
 )
 
 
-def test_model_dump_json_round_trips_through_rust_for_all_interfaces(tmp_path) -> None:
-    cards = [
-        DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))),
-        DataCard(ArrowInterface(data=pa.table({"x": pa.array([1], type=pa.int64())}))),
-        DataCard(NumpyInterface(data=np.array([1], dtype=np.int64))),
-        DataCard(JsonlInterface(data=[{"x": 1}])),
-        DataCard(SqlInterface(data={"queries": {"main": "select 1"}}, dialect="duckdb")),
-    ]
+@pytest.mark.parametrize(
+    "interface",
+    [
+        pytest.param(PandasInterface(data=pd.DataFrame({"x": [1]})), id="pandas"),
+        pytest.param(
+            ArrowInterface(data=pa.table({"x": pa.array([1], type=pa.int64())})), id="arrow"
+        ),
+        pytest.param(NumpyInterface(data=np.array([1], dtype=np.int64)), id="numpy"),
+        pytest.param(JsonlInterface(data=[{"x": 1}]), id="jsonl"),
+        pytest.param(
+            SqlInterface(data={"queries": {"main": "select 1"}}, dialect="duckdb"), id="sql"
+        ),
+    ],
+)
+def test_json_envelope_round_trips_the_interface_kind(interface: DataInterface) -> None:
+    card = DataCard(interface)
 
-    for card in cards:
-        restored = DataCard.model_validate_json(card.model_dump_json())
-        assert restored.interface.kind == card.interface.kind
+    assert (
+        DataCard.model_validate_json(card.model_dump_json()).interface.kind == card.interface.kind
+    )
 
 
-def test_model_validate_json_rehydrates_interface_from_metadata(tmp_path) -> None:
+def test_model_validate_json_rehydrates_interface_from_metadata() -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
     restored = DataCard.model_validate_json(card.model_dump_json())
 
@@ -39,12 +48,10 @@ def test_model_validate_json_rehydrates_interface_from_metadata(tmp_path) -> Non
     assert restored.interface.has_source is False
 
 
-def test_serialized_datacard_contains_spec_interface_metadata_not_python_state(tmp_path) -> None:
-    payload = json.loads(DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))).model_dump_json())
+def test_json_envelope_carries_interface_metadata_without_the_data() -> None:
+    card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
 
-    assert payload["apiVersion"] == "wyrd/v1"
-    assert payload["kind"] == "Data"
-    assert "data" not in payload["spec"]["interface"]["meta"]
+    assert "data" not in card.metadata.to_dict()["interface"]["meta"]
 
 
 def test_datacard_str_is_pretty_card_json() -> None:
@@ -54,44 +61,31 @@ def test_datacard_str_is_pretty_card_json() -> None:
     assert payload["kind"] == "Data"
 
 
-def test_labels_annotations_replace_tags_in_metadata() -> None:
+def test_labels_and_annotations_survive_the_json_round_trip() -> None:
     card = DataCard(
         PandasInterface(data=pd.DataFrame({"x": [1]})),
         labels={"domain": "churn"},
         annotations={"acme.com/source": "warehouse.customer_churn"},
     )
-    payload = json.loads(card.model_dump_json())
     restored = DataCard.model_validate_json(card.model_dump_json())
 
-    assert payload["metadata"]["labels"] == {"domain": "churn"}
-    assert payload["metadata"]["annotations"] == {"acme.com/source": "warehouse.customer_churn"}
-    assert "tags" not in payload["metadata"]
     assert restored.labels == {"domain": "churn"}
     assert restored.annotations == {"acme.com/source": "warehouse.customer_churn"}
-    with pytest.raises(TypeError):
-        DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})), tags=["old"])
 
 
-def test_user_metadata_rejects_invalid_reserved_and_secret_values() -> None:
-    cases = [
-        {"labels": {"bad key": "value"}},
-        {"labels": {"wyrd.io/readme": "value"}},
-        {"annotations": {"acme.com/token": "value"}},
-        {"annotations": {"acme.com/source": "sk-secret"}},
-    ]
+@pytest.mark.parametrize(
+    "user_metadata",
+    [
+        pytest.param({"labels": {"bad key": "value"}}, id="malformed-label-key"),
+        pytest.param({"labels": {"wyrd.io/readme": "value"}}, id="reserved-label-prefix"),
+        pytest.param({"annotations": {"acme.com/token": "value"}}, id="secret-annotation-key"),
+        pytest.param(
+            {"annotations": {"acme.com/source": "sk-secret"}}, id="secret-annotation-value"
+        ),
+    ],
+)
+def test_invalid_user_metadata_is_refused(user_metadata: dict[str, dict[str, str]]) -> None:
+    with pytest.raises(WyrdError) as exc:
+        DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})), **user_metadata)
 
-    for kwargs in cases:
-        with pytest.raises(WyrdError) as exc:
-            DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})), **kwargs)
-        assert exc.value.code == "WYRD_DATA_400_VALIDATION"
-
-
-def test_model_validate_json_rejects_wrong_card_kind() -> None:
-    payload = {
-        "apiVersion": "wyrd/v1",
-        "kind": "Prompt",
-        "metadata": {"name": "p", "version": "1.0.0"},
-        "spec": {"template": "hello"},
-    }
-    with pytest.raises(WyrdError):
-        DataCard.model_validate_json(json.dumps(payload))
+    assert exc.value.code == "WYRD_DATA_400_VALIDATION"

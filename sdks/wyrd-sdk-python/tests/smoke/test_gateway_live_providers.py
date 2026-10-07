@@ -23,10 +23,10 @@ from collections.abc import Iterator, Sequence
 from typing import Any
 
 import anthropic
-import httpx
 import openai
 import pytest
 from google import genai
+from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
@@ -175,16 +175,7 @@ def caller(server: WyrdTestServer, provider: str, models: Sequence[str]) -> str:
             for native in models
         ],
     )
-    response = httpx.post(
-        f"{server.base_url}/auth/token",
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-            "subject_token": key,
-            "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
-        },
-    )
-    response.raise_for_status()
-    return response.json()["access_token"]
+    return WyrdClient(server_url=server.base_url, credential=key).access_token()
 
 
 @contextlib.contextmanager

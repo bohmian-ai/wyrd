@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: default
+  name: empty-schema
+  version: 1.0.0
+spec:
+  interface:
+    kind: Pandas
+    meta:
+      framework_version: 2.3.3
+      compression: Snappy
+  schema:
+    columns: []
+  stats:
+    byte_count: 0
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'

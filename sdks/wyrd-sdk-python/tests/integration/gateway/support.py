@@ -4,23 +4,20 @@ One recording stdlib HTTP server stands in for every built-in provider the
 test server's adapters reach: OpenAI under ``/v1``, Anthropic Messages, Gemini
 and Vertex ``GenerateContent``, and OpenAI embeddings and images. Journeys
 point a real ``WyrdTestServer`` at it, drive unmodified clients through the
-server, and read the eventual ``vala.gateway.calls`` rows with bounded polling.
+server, and read the published ``vala.gateway.calls`` rows once.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import struct
-import time
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
-import httpx
-import pytest
-from wyrd import WyrdError
-from wyrd.bifrost import AsyncBifrost
+from wyrd import cli
+from wyrd.bifrost import Bifrost
+from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
@@ -225,48 +222,6 @@ def _sse(events: list[Any]) -> str:
     )
 
 
-def admin_headers(server: WyrdTestServer, api_key: str) -> dict[str, str]:
-    """Administration headers carrying an access token exchanged from ``api_key``.
-
-    Administration routes read the Wyrd access token, not the API key, so a
-    raw-HTTP caller exchanges the key first through the same public auth route
-    every client uses.
-    """
-    return {"x-wyrd-access-token": f"Bearer {exchange(server, api_key)}"}
-
-
-def put_credential(
-    server: WyrdTestServer, body: dict[str, Any], key: str | None = None
-) -> httpx.Response:
-    """Submit one provider credential over the same HTTP operation the CLI uses.
-
-    The Python SDK exposes no credential mutation — submitting, rotating,
-    revoking, and deleting are CLI and scoped MCP paths — so a journey that
-    needs a credential in place calls the public route directly, as the CLI
-    does. The response is returned unraised so a caller can assert a denial.
-    """
-    return httpx.put(
-        f"{server.base_url}/v1/admin/gateway/provider-credentials/{body['name']}",
-        json=body,
-        headers=admin_headers(server, key or server.api_key),
-        timeout=30.0,
-    )
-
-
-def delete_credential(server: WyrdTestServer, name: str) -> httpx.Response:
-    """Delete one provider credential over the same HTTP operation the CLI uses.
-
-    Deletion is a CLI and scoped MCP path for the same reason submission is:
-    the name alone does not say whether a managed secret backs it. The
-    response is returned unraised so a caller can assert a conflict.
-    """
-    return httpx.delete(
-        f"{server.base_url}/v1/admin/gateway/provider-credentials/{name}",
-        headers=admin_headers(server, server.api_key),
-        timeout=30.0,
-    )
-
-
 def deploy(
     server: WyrdTestServer,
     provider: str,
@@ -276,21 +231,20 @@ def deploy(
 ) -> None:
     """Store a provider's ``Environment`` credential and one built-in deployment of ``model``.
 
-    The deployment goes through the public Python ``Gateway`` as the harness
-    admin. The credential cannot: the SDK has no mutation method, so it uses
-    the same HTTP operation the CLI does, reading the operator binding the
-    test server assigns to ``provider``.
+    The credential goes through in-process ``wyrd gateway credential put`` and
+    the deployment through the public Python ``Gateway``, both as the harness
+    admin, reading the operator binding the test server assigns to ``provider``.
     """
     gateway = Gateway(server_url=server.base_url, credential=server.api_key)
     credential = f"{provider}-key"
-    put_credential(
-        server,
+    cli.put_provider_credential(
         {
             "name": credential,
             "provider": provider,
             "source": {"environment": {"binding": BINDINGS[provider]}},
         },
-    ).raise_for_status()
+        server=server.base_url,
+    )
     header = {"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(provider)
     auth = (
         {"api_key_header": {"header": header, "credential": credential}}
@@ -309,63 +263,16 @@ def deploy(
     )
 
 
-def exchange(server: WyrdTestServer, api_key: str) -> str:
-    """Exchange an API key for a Wyrd access token through the public auth route."""
-    response = httpx.post(
-        f"{server.base_url}/auth/token",
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-            "subject_token": api_key,
-            "subject_token_type": "urn:wyrd:oauth:token-type:api_key",
-        },
-    )
-    response.raise_for_status()
-    return response.json()["access_token"]
+def access_token(api_key: str) -> str:
+    """A Wyrd access token for ``api_key``, from the public client the way a third-party caller gets one."""
+    return WyrdClient(credential=api_key).access_token()
 
 
-def principal(token: str) -> str:
-    """Principal id carried in a Wyrd access token."""
-    claims = token.split(".")[1]
-    return json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))["principal"][
-        "id"
-    ]
-
-
-def call_rows(
-    server: WyrdTestServer, token: str, where: str, count: int, columns: str = "*"
-) -> list[dict[str, Any]]:
-    """Poll ``vala.gateway.calls`` until ``count`` rows match ``where``.
-
-    Capture publication is asynchronous, so each bounded attempt flushes Scribe
-    before reading, and every read carries its own bound so one stalled query
-    cannot hang the journey. A query the Oracle refuses admission to under load
-    is retried like a stalled one — that refusal is the documented retryable
-    429, not an answer about the rows. Ten seconds of attempts without the rows
-    fails.
-    """
+def calls(server: WyrdTestServer, where: str, columns: str) -> list[dict[str, Any]]:
+    """Publish the gateway's captured calls, then read the ``vala.gateway.calls`` rows matching ``where``."""
+    server.flush_bifrost()
     query = f"SELECT {columns} FROM vala.gateway.calls WHERE {where} ORDER BY started_at"
-
-    async def read() -> list[dict[str, Any]]:
-        bifrost = AsyncBifrost(server_url=server.base_url, credential=token)
-        result = await asyncio.wait_for(bifrost.sql(query), timeout=10)
-        return result.to_arrow().to_pylist()
-
-    rows: list[dict[str, Any]] = []
-    for _ in range(40):
-        server.flush_bifrost()
-        try:
-            rows = asyncio.run(read())
-        except TimeoutError:
-            continue
-        except WyrdError as error:
-            if "query admission rejected" not in str(error):
-                raise
-            time.sleep(0.25)
-            continue
-        if len(rows) >= count:
-            return rows
-        time.sleep(0.25)
-    pytest.fail(f"{count} rows matching {where} never published: {rows}")
+    return Bifrost().sql(query).to_arrow().to_pylist()
 
 
 def assert_upstream_credentials(received: Received, header: str, token: str) -> None:

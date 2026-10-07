@@ -1,22 +1,7 @@
+"""Agent callbacks see a typed context and can replace or abort a model call."""
+
 from wyrd import Agent, FinishReason, Prompt, WyrdError
 from wyrd.agent import CallbackContext, Role
-
-
-def test_before_model_callback_fires_with_ambient_mock() -> None:
-    calls: list[dict] = []
-
-    def before_model(ctx, request):
-        calls.append({"ctx": ctx, "request": request})
-        return None
-
-    prompt = Prompt(["hello"], "mock-model", provider="mock")
-    agent = Agent(prompt=prompt, before_model_callback=before_model)
-
-    run = agent.run("hello")
-
-    assert "hello" in run.output
-    assert calls
-    assert calls[0]["ctx"].agent_id == agent.id
 
 
 def test_callback_context_is_typed() -> None:

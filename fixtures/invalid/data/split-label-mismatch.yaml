@@ -1,0 +1,43 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: default
+  name: split-label-mismatch
+  version: 1.0.0
+spec:
+  interface:
+    kind: Pandas
+    meta:
+      framework_version: 2.3.3
+      compression: Snappy
+  schema:
+    columns:
+    - name: year
+      dtype: int64
+      nullable: false
+    - name: churned
+      dtype: bool
+      nullable: false
+  splits:
+    train:
+      label: holdout
+      strategy:
+        kind: Column
+        value:
+          name: year
+          op: Le
+          value: 2024
+    test:
+      label: test
+      strategy:
+        kind: Materialized
+        value:
+          kind: Artifact
+          name: churn-test-rows
+          version: 1.0.0
+          space: default
+  target_columns:
+  - churned
+  stats:
+    byte_count: 0
+    sha256: '0000000000000000000000000000000000000000000000000000000000000000'

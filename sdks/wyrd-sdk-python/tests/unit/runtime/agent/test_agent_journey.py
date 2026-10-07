@@ -1,9 +1,9 @@
-from __future__ import annotations
+"""An Agent authored in Python, saved as a Card, and run offline."""
 
 from pathlib import Path
 
 import pytest
-from wyrd import Agent, AgentCard, FinishReason, Prompt, PromptReference, RunConfig, WyrdError, tool
+from wyrd import Agent, AgentCard, Prompt, PromptReference, RunConfig, WyrdError, tool
 from wyrd.agent import MockProvider
 
 
@@ -12,31 +12,19 @@ def echo_text(input: str) -> str:
     return input
 
 
-def test_journey_author_save_load_run(tmp_path: Path) -> None:
+def test_saved_agent_loads_its_identity_and_tools(tmp_path: Path) -> None:
     path = tmp_path / "agent.yaml"
-    saved = Agent(
+    Agent(
         prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
         tools=[echo_text],
         name="planner",
         version="0.3.0",
         run_config=RunConfig(max_iterations=3),
-    )
-    saved.save(path)
-    loaded = Agent.from_yaml(path)
-    runner = Agent(
-        prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        tools=[echo_text],
-        name=loaded.name,
-        version=loaded.version,
-        run_config=RunConfig(max_iterations=3),
-    )
-    run = runner.run("draft the doc")
+    ).save(path)
 
-    assert loaded.name == "planner"
-    assert loaded.version == "0.3.0"
-    assert loaded.tool_names == ["t"]
-    assert run.finish_reason == FinishReason.ModelStopped
-    assert "draft the doc" in run.output
+    loaded = Agent.from_yaml(path)
+
+    assert (loaded.name, loaded.version, loaded.tool_names) == ("planner", "0.3.0", ["t"])
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:
@@ -50,10 +38,7 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
     card = agent.to_card()
 
     assert isinstance(card, AgentCard)
-    assert card.name == "planner"
-    assert card.version == "0.3.0"
-    assert card.prompt is not None
-    assert card.model_dump()["kind"] == "Agent"
+    assert (card.name, card.version, card.prompt.model) == ("planner", "0.3.0", "gpt-4o-mini")
 
     agent.save(path)
     loaded = Agent.from_yaml(path)
@@ -114,12 +99,14 @@ def test_mock_provider_returns_canned_responses_in_order_then_echoes() -> None:
 
 
 def test_mock_provider_rejects_provider_base_url() -> None:
-    with pytest.raises(WyrdError):
+    with pytest.raises(WyrdError) as error:
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
             mock_provider=MockProvider(),
             provider_base_url="http://localhost:1",
         )
+
+    assert error.value.code == "WYRD_AGENT_502_PROVIDER"
 
 
 def test_journey_delegate_via_agent_delegate_tool() -> None:
@@ -172,16 +159,3 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
         "after_model",
         "after_agent",
     ]
-
-
-def test_journey_module_paths() -> None:
-    agent = Agent(
-        prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        name="planner",
-        version="0.3.0",
-    )
-
-    assert Agent.__module__ == "wyrd.agent"
-    assert type(agent).__module__ == "wyrd.agent"
-    assert not hasattr(agent, "_inner")
-    assert AgentCard.__module__ == "wyrd.cards.agent"

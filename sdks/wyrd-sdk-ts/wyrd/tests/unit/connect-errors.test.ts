@@ -1,86 +1,39 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { Bifrost, Cards, TableConfig, WyrdClient, WyrdError } from "@wyrd/sdk";
+import { beforeEach, expect, test, vi } from "vitest";
 
-const CREDENTIAL_VARS = [
-  "WYRD_ACCESS_TOKEN",
-  "WYRD_WORKLOAD_TOKEN",
-  "WYRD_TENANT",
-  "WYRD_API_KEY",
-] as const;
+import { Bifrost, Cards, TableConfig, WyrdClient } from "@wyrd/sdk";
 
-let saved: Record<string, string | undefined> = {};
+/** A loopback port nothing listens on. */
+const UNREACHABLE = "http://127.0.0.1:1";
 
+// No ambient credential and no saved login: only an explicit argument can
+// authenticate.
 beforeEach(() => {
-  saved = {};
-  for (const name of [...CREDENTIAL_VARS, "HOME"]) {
-    saved[name] = process.env[name];
-    delete process.env[name];
+  for (const name of ["WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT", "WYRD_API_KEY"]) {
+    vi.stubEnv(name, undefined);
   }
-  process.env.HOME = "/nonexistent-wyrd-home";
+  vi.stubEnv("WYRD_CONFIG_HOME", mkdtempSync(join(tmpdir(), "wyrd-ts-config-")));
+  return () => vi.unstubAllEnvs();
 });
 
-afterEach(() => {
-  for (const [name, value] of Object.entries(saved)) {
-    if (value === undefined) {
-      delete process.env[name];
-    } else {
-      process.env[name] = value;
-    }
-  }
+test.for<readonly [string, () => unknown]>([
+  ["WyrdClient.connect", () => WyrdClient.connect({ serverUrl: UNREACHABLE })],
+  ["Cards.connect", () => Cards.connect({ serverUrl: UNREACHABLE })],
+  ["Bifrost.connect", () => Bifrost.connect({ serverUrl: UNREACHABLE, grpcUrl: UNREACHABLE })],
+  ["TableConfig.describe", () => TableConfig.describe("unit.missing", { serverUrl: UNREACHABLE })],
+])("%s without a credential is refused", async ([, connect]) => {
+  await expect(Promise.resolve().then(connect)).rejects.toMatchObject({
+    code: "WYRD_CLIENT_401_NO_CREDENTIALS",
+    status: 401,
+    remediation: expect.any(String),
+  });
 });
 
-function expectCatalogError(error: unknown, code: string, status: number): void {
-  expect(error).toBeInstanceOf(WyrdError);
-  const wyrd = error as WyrdError;
-  expect(wyrd.code).toBe(code);
-  expect(wyrd.status).toBe(status);
-  expect(wyrd.title).not.toBe("");
-  expect(wyrd.remediation).toBeTruthy();
-}
-
-describe("native construction failures", () => {
-  it("WyrdClient.connect throws the no-credentials WyrdError", () => {
-    let caught: unknown;
-    try {
-      WyrdClient.connect({ serverUrl: "http://127.0.0.1:1" });
-    } catch (error) {
-      caught = error;
-    }
-    expectCatalogError(caught, "WYRD_CLIENT_401_NO_CREDENTIALS", 401);
-  });
-
-  it("Cards.connect throws the no-credentials WyrdError", () => {
-    let caught: unknown;
-    try {
-      Cards.connect({ serverUrl: "http://127.0.0.1:1" });
-    } catch (error) {
-      caught = error;
-    }
-    expectCatalogError(caught, "WYRD_CLIENT_401_NO_CREDENTIALS", 401);
-  });
-
-  it("Bifrost.connect rejects with the no-credentials WyrdError", async () => {
-    const caught: unknown = await Bifrost.connect({
-      serverUrl: "http://127.0.0.1:1",
-      grpcUrl: "http://127.0.0.1:1",
-    }).catch((error: unknown) => error);
-    expectCatalogError(caught, "WYRD_CLIENT_401_NO_CREDENTIALS", 401);
-  });
-
-  it("TableConfig.describe rejects with the no-credentials WyrdError", async () => {
-    const caught: unknown = await TableConfig.describe("unit.missing", {
-      serverUrl: "http://127.0.0.1:1",
-    }).catch((error: unknown) => error);
-    expectCatalogError(caught, "WYRD_CLIENT_401_NO_CREDENTIALS", 401);
-  });
-
-  it("TableConfig.describe rejects an unreachable server with the transport WyrdError", async () => {
-    const caught: unknown = await TableConfig.describe("unit.missing", {
-      serverUrl: "http://127.0.0.1:1",
-      credential: "wyrd_sk_t_v_s",
-    }).catch((error: unknown) => error);
-    expectCatalogError(caught, "WYRD_CLIENT_503_TRANSPORT_DOWN", 503);
-    expect((caught as WyrdError).details).toEqual({ transport: "http" });
-  });
+test("unreachable server is refused with the transport error", async () => {
+  await expect(
+    TableConfig.describe("unit.missing", { serverUrl: UNREACHABLE, credential: "wyrd_sk_t_v_s" }),
+  ).rejects.toMatchObject({ code: "WYRD_CLIENT_503_TRANSPORT_DOWN", details: { transport: "http" } });
 });

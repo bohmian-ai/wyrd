@@ -1,17 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { expect, test } from "vitest";
 
-import { cli, WyrdError } from "@wyrd/sdk";
+import { cli } from "@wyrd/sdk";
 
-describe("cli", () => {
-  it("throws a catalog error instead of exiting for a missing Card tree", () => {
-    const error = (() => {
-      try {
-        cli.plan("/nonexistent/wyrd-card.yaml");
-      } catch (reason: unknown) {
-        return reason;
-      }
-    })();
-    expect(error).toBeInstanceOf(WyrdError);
-    expect((error as WyrdError).code).toBe("WYRD_LOADER_400_INVALID_ENVELOPE");
-  });
+test("cli plan of a missing card tree raises its catalog code", () => {
+  expect(() => cli.plan("/nonexistent/wyrd-card.yaml")).toThrow(
+    expect.objectContaining({ code: "WYRD_LOADER_400_INVALID_ENVELOPE" }),
+  );
 });

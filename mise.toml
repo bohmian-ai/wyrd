@@ -608,7 +608,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-a-run.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."

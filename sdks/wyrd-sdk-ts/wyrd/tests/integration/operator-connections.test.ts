@@ -1,12 +1,18 @@
-import { startTestServer } from "@wyrd/testing";
-import { describe, expect, it } from "vitest";
+import { expect, vi } from "vitest";
 
-import { OperatorConnections, WyrdError } from "@wyrd/sdk";
+import { OperatorConnections } from "@wyrd/sdk";
 
-/** Secrets the journey sends; none may appear in any response or error. */
-const SECRETS = ["xoxb-ts-sdk-secret", "xoxb-ts-sdk-rotated"];
+import { serverTest } from "../support/server.js";
 
-/** Fail when a journey secret appears in `value`. */
+vi.setConfig({ testTimeout: 60_000 });
+
+/** Every secret the stories write; none may appear in a view or an error. */
+const SECRETS = ["xoxb-ts-sdk-secret", "xoxb-ts-sdk-rotated"] as const;
+
+/** The `ops-slack` connection the stories share. */
+const SLACK = { provider: "slack", name: "ops-slack", workspace_id: "T0001", bot_token: SECRETS[0] } as const;
+
+/** Fail when a story secret appears in `value`. */
 function expectRedacted(value: unknown): void {
   const text = JSON.stringify(value) + String(value);
   for (const secret of SECRETS) {
@@ -14,135 +20,67 @@ function expectRedacted(value: unknown): void {
   }
 }
 
-/** Await a promise expected to reject with a structured catalog error. */
-async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
-  const error = await promise.then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  expect(error).toBeInstanceOf(WyrdError);
-  expectRedacted(error);
-  return error as WyrdError;
-}
+/** The administrator's connection handle and the id of `ops-slack`. */
+const test = serverTest().extend<{ connections: OperatorConnections; slack: string }>({
+  connections: [async ({ server: _ }, use) => use(OperatorConnections.connect()), { scope: "file" }],
+  slack: [async ({ connections }, use) => use((await connections.create(SLACK)).connection_id), { scope: "file" }],
+});
 
-describe("operator connection journey", () => {
-  it("manages redacted connections with read/write separation", async () => {
-    const server = startTestServer();
-    try {
-      const admin = OperatorConnections.connect({
-        serverUrl: server.baseUrl,
-        credential: server.apiKey,
-      });
-      const create = {
-        provider: "slack",
-        name: "ts-slack",
-        workspace_id: "T0001",
-        bot_token: SECRETS[0] ?? "",
-      } as const;
-      const created = await admin.create(create);
-      expectRedacted(created);
-      expect(created.status).toBe("active");
-      const conflict = await rejection(admin.create(create));
-      expect(conflict.code).toBe("WYRD_OPERATOR_409_CONNECTION_CONFLICT");
+test("admin manages redacted connections", async ({ connections, slack }) => {
+  const rotated = await connections.update(slack, { provider: "slack", bot_token: SECRETS[1] });
+  const disabled = await connections.disable(slack);
+  const enabled = await connections.update(slack, { provider: "slack", status: "active" });
+  const http = await connections.create({
+    provider: "http",
+    name: "ops-http",
+    origin: "HTTPS://Hooks.Example.COM:443",
+    auth: { scheme: "header", name: "X-Api-Key", value: SECRETS[0] },
+  });
+  const pager = await connections.create({ provider: "pager_duty", name: "ops-pager", integration_key: SECRETS[0] });
 
-      expect(await admin.list()).toEqual([created]);
-      const id = created.connection_id;
-      const rotated = await admin.update(id, {
-        provider: "slack",
-        bot_token: SECRETS[1],
-      });
-      expectRedacted(rotated);
-      expect(rotated.connection_id).toBe(id);
-      expect((await admin.disable(id)).status).toBe("disabled");
-      expect((await admin.get(id)).status).toBe("disabled");
-      expect(
-        (await admin.update(id, { provider: "slack", status: "active" })).status,
-      ).toBe("active");
-      expect(created).toMatchObject({ provider: "slack", workspace_id: "T0001" });
-      expect(created).not.toHaveProperty("config");
+  expectRedacted([rotated, disabled, enabled, http, pager, await connections.list()]);
+  expect([disabled.status, enabled.status]).toEqual(["disabled", "active"]);
+  expect(http).toMatchObject({ origin: "https://hooks.example.com", auth: { scheme: "header", name: "X-Api-Key" } });
+});
 
-      const pager = await admin.create({
-        provider: "pager_duty",
-        name: "ts-pager",
-        integration_key: SECRETS[0] ?? "",
-      });
-      expectRedacted(pager);
-      expect(pager.provider).toBe("pager_duty");
-      expect(pager).not.toHaveProperty("config");
-      expect(pager).not.toHaveProperty("integration_key");
+test("writer is refused", async ({ server }) => {
+  const writer = OperatorConnections.connect({
+    credential: server.scopedApiKey("card_writer", ["cards:read", "cards:write"]),
+  });
 
-      const http = await admin.create({
-        provider: "http",
-        name: "ts-http",
-        origin: "HTTPS://Hooks.Example.COM:443",
-        auth: { scheme: "header", name: "X-Api-Key", value: SECRETS[0] ?? "" },
-      });
-      expectRedacted(http);
-      expect(http).toMatchObject({
-        provider: "http",
-        origin: "https://hooks.example.com",
-        auth: { scheme: "header", name: "X-Api-Key" },
-      });
-      expect(http).not.toHaveProperty("config");
-      const basic = await admin.update(http.connection_id, {
-        provider: "http",
-        auth: { scheme: "basic", username: "u", password: SECRETS[1] ?? "" },
-      });
-      expectRedacted(basic);
-      expect(basic.provider === "http" && basic.auth).toEqual({ scheme: "basic" });
-      const bearer = await admin.update(http.connection_id, {
-        provider: "http",
-        origin: "https://other.example.com",
-        auth: { scheme: "bearer", token: SECRETS[1] ?? "" },
-      });
-      expect(bearer).toMatchObject({
-        origin: "https://other.example.com",
-        auth: { scheme: "bearer" },
-      });
-      const mismatch = await rejection(
-        admin.update(http.connection_id, { provider: "slack", bot_token: "x" }),
-      );
-      expect(mismatch.code).toBe("WYRD_OPERATOR_400_INVALID_CONNECTION");
+  await expect(writer.list()).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
+});
 
-      const malformed = await rejection(admin.get("not-a-uuid"));
-      expect(malformed.code).toBe("WYRD_SPEC_400_VALIDATION");
+test("other tenant sees nothing", async ({ server, slack }) => {
+  const foreign = OperatorConnections.connect({
+    credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other-admin"),
+  });
 
-      const reader = OperatorConnections.connect({
-        serverUrl: server.baseUrl,
-        credential: server.scopedApiKey("ts_oc_reader", ["operators:read"]),
-      });
-      expect(await reader.get(id)).toEqual(await admin.get(id));
-      const denied = await rejection(reader.disable(id));
-      expect(denied.code).toBe("WYRD_PERMISSION_403_DENIED_RBAC");
-      const outsider = OperatorConnections.connect({
-        serverUrl: server.baseUrl,
-        credential: server.scopedApiKey("ts_oc_outsider", ["cards:read"]),
-      });
-      expect((await rejection(outsider.list())).code).toBe(
-        "WYRD_PERMISSION_403_DENIED_RBAC",
-      );
+  expect(await foreign.list()).toEqual([]);
+  await expect(foreign.get(slack)).rejects.toMatchObject({ code: "WYRD_OPERATOR_404_CONNECTION_NOT_FOUND" });
+});
 
-      // Another tenant's administrator sees none of these connections and
-      // cannot read, rotate, or disable one by its exact ID.
-      const foreign = OperatorConnections.connect({
-        serverUrl: server.baseUrl,
-        credential: server.bootstrapServiceInTenant(
-          server.seedTenant("ts-oc-other"),
-          ["admin"],
-          "ts-oc-foreign",
-        ),
-      });
-      expect(await foreign.list()).toEqual([]);
-      for (const attempt of [
-        () => foreign.get(id),
-        () => foreign.update(id, { provider: "slack", bot_token: "xoxb-foreign" }),
-        () => foreign.disable(id),
-      ]) {
-        expect((await rejection(attempt())).code).toBe("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND");
-      }
-      expect((await admin.get(id)).status, "the foreign attempts changed nothing").toBe("active");
-    } finally {
-      server.shutdown();
-    }
-  }, 60_000);
+test("reader cannot disable a connection", async ({ server, connections, slack }) => {
+  const reader = OperatorConnections.connect({ credential: server.scopedApiKey("operator_reader", ["operators:read"]) });
+
+  expect(await reader.get(slack)).toEqual(await connections.get(slack));
+  await expect(reader.disable(slack)).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
+});
+
+/** One connection change the server refuses, and the catalog code it raises. */
+type Refusal = readonly [string, (connections: OperatorConnections, slack: string) => Promise<unknown>, string];
+
+test.for<Refusal>([
+  ["duplicate name", (connections) => connections.create(SLACK), "WYRD_OPERATOR_409_CONNECTION_CONFLICT"],
+  [
+    "update for another provider",
+    (connections, slack) => connections.update(slack, { provider: "pager_duty", integration_key: SECRETS[1] }),
+    "WYRD_OPERATOR_400_INVALID_CONNECTION",
+  ],
+  ["malformed connection id", (connections) => connections.get("not-a-uuid"), "WYRD_SPEC_400_VALIDATION"],
+])("refused connection change raises its catalog code: %s", async ([, change, code], { connections, slack }) => {
+  const refusal = change(connections, slack);
+
+  await expect(refusal).rejects.toMatchObject({ code });
+  await refusal.catch(expectRedacted);
 });

@@ -57,7 +57,7 @@ BIFROST_ONLY = re.compile(
     r"|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)"
     r"|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs"
     r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/bifrost/|tests/test_bifrost\.py|tests/integration/test_bifrost_(e2e|query)\.py)"
-    r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/oracle-query\.test\.ts))"
+    r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/query-bifrost\.test\.ts))"
 )
 # Trees whose every file must be owned by a workspace package.
 PACKAGE_TREES = re.compile(r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)")

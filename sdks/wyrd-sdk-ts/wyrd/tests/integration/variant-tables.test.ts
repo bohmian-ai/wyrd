@@ -6,7 +6,7 @@
  * and Arrow batches go in; native values come back out, with 64-bit integers
  * as `bigint`.
  */
-import { Field, Int64, List, Struct, Table, Utf8, vectorFromArray } from "apache-arrow";
+import type { Field } from "apache-arrow";
 import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { afterEach, beforeEach, expect, it } from "vitest";
@@ -59,16 +59,6 @@ async function insert(...events: z.infer<typeof Event>[]): Promise<void> {
   server.flushBifrost();
 }
 
-/** Capture an asynchronous structured error. */
-async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
-  const error = await promise.then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  expect(error).toBeInstanceOf(WyrdError);
-  return error as WyrdError;
-}
-
 it("maps model fields to Variant, Struct, and List columns", () => {
   const schema = bifrost.table!.arrowSchema;
   const field = (name: string) => schema.fields.find((f) => f.name === name);
@@ -94,37 +84,6 @@ it("returns inserted rows as native values", async () => {
   ]);
 });
 
-it("stores Arrow JSON text as Variant", async () => {
-  // Variant columns take JSON text; omitted nullable columns are null.
-  const arrow = new Table({
-    id: vectorFromArray([1n], new Int64()),
-    payload: vectorFromArray(['{"n": 9007199254740993}'], new Utf8()),
-    mixed: vectorFromArray(['"seven"'], new Utf8()),
-  });
-  await bifrost.writeBatch(table, arrow.batches[0]!);
-  server.flushBifrost();
-
-  const rows = await bifrost.sql(`SELECT id, payload, mixed FROM ${table}`, asReturned);
-
-  expect(rows).toEqual([{ id: 1n, payload: { n: 9007199254740993n }, mixed: "seven" }]);
-});
-
-it("stores Arrow Struct and List columns", async () => {
-  // Arrow JS's own shapes: nullable children in any order, nullable list items.
-  const point = new Struct([new Field("label", new Utf8(), true), new Field("x", new Int64(), true)]);
-  const arrow = new Table({
-    tags: vectorFromArray([["a", "b"]], new List(new Field("element", new Utf8(), true))),
-    point: vectorFromArray([{ label: "a", x: 7n }], point),
-    id: vectorFromArray([1n], new Int64()),
-  });
-  await bifrost.writeBatch(table, arrow.batches[0]!);
-  server.flushBifrost();
-
-  const rows = await bifrost.sql(`SELECT id, point, tags FROM ${table}`, asReturned);
-
-  expect(rows).toEqual([{ id: 1n, point: { x: 7n, label: "a" }, tags: ["a", "b"] }]);
-});
-
 it("copies query results into another table", async () => {
   const archive = `vala.datasets.archive_${crypto.randomUUID().replaceAll("-", "")}`;
   const archiver = await Bifrost.connect({
@@ -136,7 +95,7 @@ it("copies query results into another table", async () => {
   await archiver.register();
   await insert({ id: 1, payload: { source: "row" }, mixed: 8, point: { x: 1 }, tags: ["a"] });
 
-  const copied = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${table}`);
+  const copied = await bifrost.sql(`SELECT id, mixed, payload, point, tags FROM ${table}`); // declared order
   await bifrost.writeBatch(archive, copied.batches[0]!);
   server.flushBifrost();
 
@@ -165,19 +124,6 @@ it("refuses an undeclared field and writes nothing", async () => {
   expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
 });
 
-it("refuses invalid JSON text and writes nothing", async () => {
-  const arrow = new Table({
-    id: vectorFromArray([1n], new Int64()),
-    payload: vectorFromArray(["{not json"], new Utf8()),
-  });
-
-  const error = await rejection(bifrost.writeBatch(table, arrow.batches[0]!));
-  server.flushBifrost();
-
-  expect(error.code).toBe("WYRD_VALA_400_VARIANT_INVALID_JSON");
-  expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
-});
-
 it("refuses a model allowing extra keys", () => {
   const Loose = z.looseObject({ id: z.int() }); // extra keys could be silently lost
 
@@ -200,19 +146,4 @@ it("refuses a model allowing extra keys", () => {
   expect((error as WyrdError).remediation).toBe(
     "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec; declare a Variant field for open data.",
   );
-});
-
-it("refuses a Variant column sent as neither Variant nor JSON text", async () => {
-  // A Variant column takes the Variant extension or JSON text, nothing else.
-  const arrow = new Table({
-    id: vectorFromArray([1n], new Int64()),
-    payload: vectorFromArray([7n], new Int64()),
-  });
-
-  const error = await rejection(bifrost.writeBatch(table, arrow.batches[0]!));
-  server.flushBifrost();
-
-  expect(error).toMatchObject({ code: "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE", status: 400 });
-  expect(error.message).toContain("for field payload");
-  expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
 });

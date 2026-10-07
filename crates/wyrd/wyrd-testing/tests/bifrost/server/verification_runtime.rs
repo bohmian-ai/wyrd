@@ -1956,12 +1956,12 @@ impl VariantAdmissionJourney {
     /// bytes already exceed the size limit reports size beside a refused
     /// number or an over-depth sibling. Each row goes through the public
     /// facade's JSON-row path with its integer token intact, and the refusal
-    /// surfaces from the flush before any frame is acknowledged.
+    /// surfaces from `insert_into` before the row is queued.
     ///
     /// # Errors
     ///
-    /// Returns a connect, describe, or enqueue error, or a description when
-    /// a row is accepted or refused with any other error.
+    /// Returns a connect or describe error, or a description when a row is
+    /// accepted or refused with any other error.
     async fn refuse_json_rows(&self) -> Result<(), ServerJourneyError> {
         let nested = |inner: &str, levels: usize| {
             format!("{}{inner}{}", "[".repeat(levels), "]".repeat(levels))
@@ -2035,14 +2035,12 @@ impl VariantAdmissionJourney {
                     format!("{}: {value}", Value::from(field.name().as_str()))
                 })
                 .collect::<Vec<_>>();
-            bifrost.insert_into(
-                &table,
-                format!("{{{}}}", fields.join(", ")).into_bytes(),
-                wyrd_client::bifrost::Correlation::default(),
-            )?;
             let refused = bifrost
-                .flush()
-                .await
+                .insert_into(
+                    &table,
+                    format!("{{{}}}", fields.join(", ")).into_bytes(),
+                    wyrd_client::bifrost::Correlation::default(),
+                )
                 .map(|()| "the row was accepted".to_owned())
                 .map_err(|error| WyrdError::from(&error));
             let what = format!("JSON row refused as {}", expected.code());

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 16
+revision: 17
 status: approved
 ---
 
@@ -292,21 +292,11 @@ Cancellation before handoff releases the reservation and admits nothing;
 after handoff, the existing stable-batch retry and acknowledgement rules apply.
 No fallible schema or value conversion remains after reservation.
 
-`Bifrost::write_batch(table, batch)` keeps its public signature. At the start
-of the async call it invokes the existing authoritative `describe(table)`
-operation, then conforms the batch to that returned logical schema before
-direct-send admission, matching row `insert`: user columns are matched by name
-and sent in declared order with their declared nullability; a missing nullable
-column is sent as nulls; a missing non-nullable column, or a null in one, is
-`WYRD_VALA_400_SCHEMA_PARSE`; a column the table
-does not declare is `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` naming it at row
-0; reserved correlation and managed columns pass through for the server to
-judge; and only fields declared Variant are normalized. A describe or
-conformance failure leaves queue, byte-budget, and direct-send state
-unchanged. No cache,
-overload, caller-supplied schema, or duplicated inference is added. The server
-accepts only the extension and repeats validation at its trust boundary.
-`wyrd-queue` owns direct Variant JSON/value preparation.
+`Bifrost::write_batch(table, batch)` keeps its public signature and sends the
+batch verbatim. The client neither describes nor conforms it; the server judges
+it at its trust boundary, accepts only the Variant extension for a Variant
+column, and repeats validation there. `wyrd-queue` owns row Variant JSON/value
+preparation.
 
 ### Oracle registration and distributed wire
 
@@ -793,17 +783,12 @@ string; it is not parsed as JSON.
 
 #### REQ-014 — Arrow writes to Variant columns
 
-`write_batch` in every SDK accepts, for a declared Variant column, either the
-Arrow Variant extension or a Utf8/LargeUtf8 column of JSON text, which the
-shared client converts to Variant before sending. As with row `insert`, a
-batch names its columns: their order does not matter, an omitted nullable
-column is written as nulls, a supplied column takes its declared nullability,
-an omitted required column or a null in one is refused with
-`WYRD_VALA_400_SCHEMA_PARSE`, and a column the table does not declare is
-refused with `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD`. The shared client
-applies these rules once for every SDK. The server wire contract stays exact:
-it accepts only the Variant extension for Variant columns and every declared
-column in declared order.
+`write_batch` in every SDK sends an Arrow batch verbatim. A declared Variant
+column carries the Arrow Variant extension, as a Bifrost query result does, so
+a query selecting a table's columns in their declared order copies into a table
+of the same declaration unchanged. The server judges the batch
+against the table's declared schema and refuses a mismatch with its stable
+code; no SDK converts, reorders, or fills columns.
 
 #### REQ-015 — No silent key loss
 
@@ -1135,8 +1120,8 @@ column of REQ-010 is queried with `->>`.
 #### AC-004 — User tables with open and nested data
 
 In each SDK, a table registered from a model with a free-form field, a union
-field, and a nested model accepts `insert` rows and Arrow batches (Variant
-extension and JSON text), and the values are queried by `->`, `->>`, and Struct
+field, and a nested model accepts `insert` rows and Arrow batches carrying the
+Variant extension, and the values are queried by `->`, `->>`, and Struct
 field access and decoded into native values by the typed row terminal.
 
 #### AC-005 — Refusals
@@ -1147,8 +1132,7 @@ Rust and Python additionally declare and refuse every Arrow type listed in
 REQ-016 before any request. TypeScript proves declaration-time refusals for
 unsupported forms expressible through its public JSON Schema/Zod boundary; it
 is not required to synthesize Arrow declarations that boundary cannot
-represent. A `write_batch` wire-type mismatch proves REQ-014 and does not
-substitute for declaration-time REQ-016 evidence. Invalid JSON in
+represent. Invalid JSON in
 `parse_json` returns a stable query error; `try_parse_json` returns null.
 
 #### AC-006 — Shredding equivalence
@@ -1209,6 +1193,13 @@ None.
 
 ## Revision history
 
+- **Revision 17 (2026-10-06, approved):** By explicit human direction,
+  `write_batch` sends its batch verbatim and the server judges it. The
+  client-side describe-then-conform step of revisions 7 and 15 (JSON text for
+  Variant columns, by-name matching, null-filling omitted columns) is removed:
+  it duplicated the server's contract, and its describe call failed for
+  write-only and gRPC-only callers. REQ-014, AC-004, and AC-005 are narrowed
+  to match.
 - **Revision 16 (2026-10-06, approved):** Resolves TASK-002 repeat-review
   `FIND-TASK-002-6` without adding the explicitly excluded TypeScript
   `TableConfig.fromArrow`. REQ-016 and AC-005 now require exhaustive

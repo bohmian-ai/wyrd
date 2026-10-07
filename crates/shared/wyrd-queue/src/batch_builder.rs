@@ -10,7 +10,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, new_null_array};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatch,
@@ -18,7 +17,6 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::compute::cast;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -29,9 +27,8 @@ use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
-use crate::schema::first_duplicate;
 use crate::sealed_sender::encode_ipc;
-use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant, variant_field};
+use crate::variant::{EncodedVariant, VariantColumnBuilder, is_variant};
 
 /// Reserved per-row correlation column carrying the client's card reference.
 pub const CARD_REF_COLUMN: &str = "card_ref";
@@ -50,10 +47,9 @@ pub fn is_reserved_column(name: &str) -> bool {
 ///
 /// The preflight owns the resolved user-only schema and the output schema
 /// that appends the correlation columns. It is the one owner of the column
-/// rules: [`Self::prepare`] applies them to JSON rows for `insert`, and
-/// [`Self::prepare_batch`] to Arrow batches for `write_batch`, through the
-/// same refusal and Variant-encoding helpers. Both are synchronous and mutate
-/// nothing, so every refusal happens before admission.
+/// rules for JSON rows: [`Self::prepare`] applies them for `insert`. It is
+/// synchronous and mutates nothing, so every refusal happens before
+/// admission.
 #[derive(Debug, Clone)]
 pub struct RowPreflight {
     /// Declared user columns, in logical-schema order.
@@ -210,207 +206,6 @@ impl RowPreflight {
             .saturating_add(rows.len().saturating_mul(std::mem::size_of::<Row>()));
         Ok(PreparedRows { batch, charge })
     }
-
-    /// Validate and conform one caller Arrow batch, all or none.
-    ///
-    /// The Arrow counterpart of [`Self::prepare`], with the same column
-    /// rules and the same refusal order. Columns match by name, so a batch
-    /// that names a column twice is refused before anything else is read. The
-    /// output carries every declared column in declared order, then any
-    /// reserved correlation or managed column the caller supplied, in input
-    /// order, for the server to judge. An omitted nullable column becomes
-    /// all-null with its declared type. A declared Variant column passes when
-    /// it already carries the `arrow.parquet.variant` extension (the server
-    /// validates its bytes) and is encoded from `Utf8`/`LargeUtf8` JSON text
-    /// exactly as a row value is; a null text is a null Variant. Every
-    /// supplied column takes its declared nullability, so a writer's
-    /// default-nullable Arrow field fits a required column, and otherwise
-    /// keeps its type, which the server checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WyrdQueueError::SchemaParse`] for a duplicated column name,
-    /// then [`WyrdQueueError::Contract`] with `BIFROST_UNDECLARED_FIELD` at
-    /// row 0 for a non-reserved column the schema does not declare. Otherwise
-    /// returns the refusal on the earliest input row, ties going to the
-    /// earlier declared field, as [`Self::prepare`] does:
-    /// [`WyrdQueueError::SchemaParse`] for an omitted non-nullable column
-    /// (row 0) or a null in one; `BIFROST_UNSUPPORTED_TYPE` (row 0) for a
-    /// declared Variant column that is neither the extension nor text; or the
-    /// catalogued Variant error for unstorable text. Returns
-    /// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
-    /// columns.
-    pub fn prepare_batch(&self, batch: &RecordBatch) -> Result<RecordBatch, WyrdQueueError> {
-        let schema = batch.schema();
-        if let Some(name) = first_duplicate(schema.fields().iter().map(|f| f.name().as_str())) {
-            return Err(WyrdQueueError::SchemaParse(format!(
-                "batch column `{name}` is supplied more than once"
-            )));
-        }
-        if let Some(column) = schema
-            .fields()
-            .iter()
-            .find(|f| !is_reserved_column(f.name()) && self.fields.find(f.name()).is_none())
-        {
-            return Err(undeclared(column.name().clone(), 0));
-        }
-        let mut fields = Vec::with_capacity(schema.fields().len());
-        let mut columns = Vec::with_capacity(schema.fields().len());
-        let mut failure = None;
-        for declared in &self.fields {
-            let conformed = match schema.index_of(declared.name()) {
-                Ok(index) => conform_column(declared, schema.field(index), batch.column(index)),
-                Err(_) if declared.is_nullable() => Ok((
-                    Arc::clone(declared),
-                    new_null_array(declared.data_type(), batch.num_rows()),
-                )),
-                Err(_) => Err(Failure {
-                    row: 0,
-                    error: missing_required(declared.name(), 0),
-                }),
-            };
-            match conformed {
-                Ok((field, column)) => {
-                    fields.push(field);
-                    columns.push(column);
-                }
-                Err(refused) => failure = Some(refused.after(failure)),
-            }
-        }
-        if let Some(failure) = failure {
-            return Err(failure.error);
-        }
-        for (field, column) in schema.fields().iter().zip(batch.columns()) {
-            if is_reserved_column(field.name()) {
-                fields.push(Arc::clone(field));
-                columns.push(Arc::clone(column));
-            }
-        }
-        RecordBatch::try_new(
-            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-            columns,
-        )
-        .map_err(arrow_failure)
-    }
-}
-
-/// Conform one supplied batch column to its declared field.
-///
-/// The column takes the declared nullability. A Variant declaration supplied
-/// as JSON text is encoded row by row into the extension; any other column
-/// keeps its own type for the server to check.
-///
-/// # Errors
-///
-/// Returns the earliest-row refusal among a null on a non-nullable field and
-/// the encoding of every text value, or `BIFROST_UNSUPPORTED_TYPE` at row 0
-/// for a Variant declaration supplied as neither the extension nor text.
-fn conform_column(
-    declared: &Field,
-    supplied: &Field,
-    column: &ArrayRef,
-) -> Result<(FieldRef, ArrayRef), Failure> {
-    let missing = (!declared.is_nullable())
-        .then(|| (0..column.len()).find(|&row| column.is_null(row)))
-        .flatten()
-        .map(|row| Failure {
-            row,
-            error: missing_required(declared.name(), row),
-        });
-    let conformed = if is_variant(declared) && !is_variant(supplied) {
-        encode_text_column(declared, supplied, column)
-    } else {
-        Ok((
-            Arc::new(supplied.clone().with_nullable(declared.is_nullable())),
-            Arc::clone(column),
-        ))
-    };
-    match (conformed, missing) {
-        (Ok(conformed), None) => Ok(conformed),
-        (Ok(_), Some(missing)) => Err(missing),
-        (Err(failure), missing) => Err(failure.after(missing)),
-    }
-}
-
-/// Encode a JSON-text column for a declared Variant field, a null text being
-/// a null Variant.
-///
-/// # Errors
-///
-/// Returns `BIFROST_UNSUPPORTED_TYPE` at row 0 when the column is not
-/// `Utf8`/`LargeUtf8`, and otherwise the catalogued Variant error for the
-/// first unstorable text.
-fn encode_text_column(
-    declared: &Field,
-    supplied: &Field,
-    column: &ArrayRef,
-) -> Result<(FieldRef, ArrayRef), Failure> {
-    if !matches!(supplied.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-        return Err(Failure {
-            row: 0,
-            error: WyrdQueueError::Contract(BifrostError::UnsupportedType {
-                field: supplied.name().clone(),
-                data_type: supplied.data_type().to_string(),
-            }),
-        });
-    }
-    let text = cast(column, &DataType::Utf8View).map_err(|e| Failure {
-        row: 0,
-        error: arrow_failure(e),
-    })?;
-    let text = text.as_string_view();
-    let variants = (0..text.len())
-        .map(|row| {
-            (!text.is_null(row))
-                .then(|| encode_variant(declared.name(), row, text.value(row)))
-                .transpose()
-                .map_err(|error| Failure { row, error })
-        })
-        .collect::<Result<VariantColumnBuilder, _>>()?;
-    Ok((
-        Arc::new(variant_field(declared.name(), declared.is_nullable())),
-        variants.finish(),
-    ))
-}
-
-/// The refusal for a key or column the destination does not declare.
-///
-/// Row insertion and Arrow batches share it, so both name the same code,
-/// dotted path, and first offending row.
-fn undeclared(path: String, row: usize) -> WyrdQueueError {
-    WyrdQueueError::Contract(BifrostError::UndeclaredField {
-        field: path,
-        row: u64::try_from(row).unwrap_or(u64::MAX),
-    })
-}
-
-/// The refusal for a missing value on a non-nullable field.
-///
-/// Row insertion raises it for a null or absent key, and Arrow batches for an
-/// omitted required column at row 0, with the same message.
-fn missing_required(path: &str, row: usize) -> WyrdQueueError {
-    WyrdQueueError::SchemaParse(format!(
-        "row {row} field `{path}`: null/absent value on a non-nullable column"
-    ))
-}
-
-/// Encode one JSON text value for a Variant field at `path` and `row`.
-///
-/// Row insertion and Arrow JSON-text columns share it, so a value is stored
-/// identically and refused with the same catalogued Variant error.
-///
-/// # Errors
-///
-/// Returns the catalogued Variant error naming `path` and `row`.
-fn encode_variant(path: &str, row: usize, text: &str) -> Result<EncodedVariant, WyrdQueueError> {
-    EncodedVariant::from_json_text(text).map_err(|violation| {
-        WyrdQueueError::Contract(violation.into_error(path, u64::try_from(row).unwrap_or(u64::MAX)))
-    })
-}
-
-/// Report an Arrow failure while viewing or reassembling conformed columns.
-fn arrow_failure(error: ArrowError) -> WyrdQueueError {
-    WyrdQueueError::SchemaParse(format!("batch conformance failed: {error}"))
 }
 
 /// One value of one input row on its way into a column.
@@ -494,7 +289,10 @@ fn build_column(field: &Field, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRe
         .flatten()
         .map(|cell| Failure {
             row: cell.row,
-            error: missing_required(path, cell.row),
+            error: WyrdQueueError::SchemaParse(format!(
+                "row {} field `{path}`: null/absent value on a non-nullable column",
+                cell.row
+            )),
         });
     let built = if is_variant(field) {
         build_variant(path, cells)
@@ -621,7 +419,10 @@ fn object_of<'a>(
         let error = if path.is_empty() && is_reserved_column(key) {
             WyrdQueueError::ReservedColumn(format!("payload key `{key}` is reserved"))
         } else {
-            undeclared(child_path(path, key), row)
+            WyrdQueueError::Contract(BifrostError::UndeclaredField {
+                field: child_path(path, key),
+                row: u64::try_from(row).unwrap_or(u64::MAX),
+            })
         };
         return Err(Failure { row, error });
     }
@@ -701,11 +502,13 @@ fn build_variant(path: &str, cells: &[Cell<'_>]) -> Result<ArrayRef, Failure> {
         .iter()
         .map(|cell| {
             cell.raw
-                .map(|raw| encode_variant(path, cell.row, raw.get()))
+                .map(|raw| EncodedVariant::from_json_text(raw.get()))
                 .transpose()
-                .map_err(|error| Failure {
+                .map_err(|violation| Failure {
                     row: cell.row,
-                    error,
+                    error: WyrdQueueError::Contract(
+                        violation.into_error(path, u64::try_from(cell.row).unwrap_or(u64::MAX)),
+                    ),
                 })
         })
         .collect::<Result<VariantColumnBuilder, _>>()
@@ -1191,155 +994,6 @@ mod batch_builder_tests {
             let err = prepare(&trace_schema(), &[row])
                 .expect_err("malformed fixed-size binary input is refused before admission");
             assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE", "row {row}");
-        }
-    }
-
-    /// A preflight over required `id`, optional `name`, and Variant `payload`.
-    fn preflight() -> RowPreflight {
-        RowPreflight::new(&Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            variant_field("payload", true),
-        ]))
-    }
-
-    /// One row holding each named Int64 column.
-    fn ints(columns: &[&str]) -> arrow::array::RecordBatch {
-        let fields: Vec<Field> = columns
-            .iter()
-            .map(|name| Field::new(*name, DataType::Int64, true))
-            .collect();
-        let arrays = columns
-            .iter()
-            .map(|_| std::sync::Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef)
-            .collect();
-        arrow::array::RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)
-            .expect("batch builds")
-    }
-
-    /// Columns match by name: the output follows declared order, a supplied
-    /// column takes its declared nullability, an omitted nullable column is
-    /// all-null with its declared type, and a reserved column passes through
-    /// after the declared ones.
-    #[test]
-    fn batch_columns_match_by_name_and_omitted_nullable_columns_are_null() {
-        let conformed = preflight()
-            .prepare_batch(&ints(&["run_id", "id"]))
-            .expect("conforms");
-
-        let schema = conformed.schema();
-        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, ["id", "name", "payload", "run_id"]);
-        assert!(!schema.field(0).is_nullable(), "id is declared required");
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
-        assert!(crate::variant::is_variant(schema.field(2)));
-        assert!(conformed.column(1).is_null(0) && conformed.column(2).is_null(0));
-    }
-
-    /// An undeclared column, an omitted required column, and a null in a
-    /// required column are refused.
-    #[test]
-    fn undeclared_and_missing_required_columns_are_refused() {
-        let undeclared = preflight()
-            .prepare_batch(&ints(&["id", "extra"]))
-            .expect_err("extra is not declared");
-        assert_eq!(undeclared.code(), "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD");
-        assert!(undeclared.to_string().contains("extra"), "{undeclared}");
-
-        let missing = preflight()
-            .prepare_batch(&ints(&["name"]))
-            .expect_err("id is required");
-        assert_eq!(missing.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-        assert!(missing.to_string().contains("id"), "{missing}");
-
-        let null_id = arrow::array::RecordBatch::try_from_iter([(
-            "id",
-            std::sync::Arc::new(Int64Array::from(vec![Some(1), None])) as arrow::array::ArrayRef,
-        )])
-        .expect("batch builds");
-        let null = preflight()
-            .prepare_batch(&null_id)
-            .expect_err("id is required");
-        assert_eq!(null.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-        assert!(null.to_string().contains("row 1 field `id`"), "{null}");
-    }
-
-    /// A batch naming a column twice is refused rather than keeping one of
-    /// the two supplied values.
-    #[test]
-    fn duplicate_batch_columns_are_refused() {
-        let duplicated = arrow::array::RecordBatch::try_from_iter([
-            (
-                "id",
-                std::sync::Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef,
-            ),
-            (
-                "id",
-                std::sync::Arc::new(Int64Array::from(vec![2])) as arrow::array::ArrayRef,
-            ),
-        ])
-        .expect("Arrow allows duplicate names");
-
-        let error = preflight()
-            .prepare_batch(&duplicated)
-            .expect_err("id is ambiguous");
-
-        assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
-        assert!(error.to_string().contains("`id`"), "{error}");
-    }
-
-    /// Rows and the equivalent Arrow batch report the same first refusal:
-    /// the earliest input row wins, then the earlier declared field.
-    #[test]
-    fn batch_and_rows_select_the_same_first_refusal() {
-        let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));
-        for (ids, payloads, code) in [
-            // An unstorable Variant on row 0 beats a required null on row 1.
-            (
-                [Some(1), None],
-                [Some(deep.as_str()), None],
-                "WYRD_VALA_400_VARIANT_TOO_DEEP",
-            ),
-            // On one row the earlier declared field wins.
-            (
-                [None, Some(2)],
-                [Some(deep.as_str()), None],
-                "WYRD_VALA_400_SCHEMA_PARSE",
-            ),
-        ] {
-            let rows: Vec<String> = ids
-                .iter()
-                .zip(&payloads)
-                .map(|(id, payload)| {
-                    let id = id.map_or("null".to_owned(), |id| id.to_string());
-                    format!(
-                        r#"{{"id": {id}, "payload": {}}}"#,
-                        payload.unwrap_or("null")
-                    )
-                })
-                .collect();
-            let batch = arrow::array::RecordBatch::try_from_iter([
-                (
-                    "id",
-                    std::sync::Arc::new(Int64Array::from(ids.to_vec())) as arrow::array::ArrayRef,
-                ),
-                (
-                    "payload",
-                    std::sync::Arc::new(arrow::array::StringArray::from(payloads.to_vec())),
-                ),
-            ])
-            .expect("batch builds");
-
-            let from_rows = preflight()
-                .prepare(&rows, None, None)
-                .expect_err("rows are refused");
-            let from_batch = preflight()
-                .prepare_batch(&batch)
-                .expect_err("batch is refused");
-
-            assert_eq!(from_rows.code(), code, "{rows:?}");
-            assert_eq!(from_batch.code(), code, "{rows:?}");
-            assert_eq!(from_batch.to_string(), from_rows.to_string(), "{rows:?}");
         }
     }
 }

@@ -867,10 +867,9 @@ export class Bifrost {
    * The precision write door, beside {@link Bifrost.insert}: it names its
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
-   * Columns match the table's declared columns by name: an omitted nullable
-   * column is written as nulls, and a Variant column takes either the Variant
-   * extension or JSON text. A missing required column, an undeclared column,
-   * or unstorable JSON is refused before anything is sent.
+   * Build the batch against {@link TableConfig.schema} from
+   * `describeTableConfig` - a canonical table compares an incoming block
+   * against its declared fields exactly, metadata included.
    */
   async writeBatch(table: string, batch: RecordBatch): Promise<void> {
     const ipc = tableToIPC(new Table(batch), "stream");

@@ -123,29 +123,18 @@ pub fn writable_schema(
         } else {
             &[]
         });
-    let declared = declared.collect::<Vec<_>>();
-    if let Some(name) = first_duplicate(declared.iter().map(|spec| spec.name.as_str())) {
-        return Err(WyrdQueueError::SchemaParse(format!(
-            "described column `{name}` is declared more than once"
-        )));
-    }
-    Ok(Schema::new(
-        declared
-            .into_iter()
-            .map(|spec| spec_to_field(spec, false))
-            .collect::<Vec<_>>(),
-    ))
-}
-
-/// The first column name that occurs more than once in `names`.
-///
-/// Arrow allows duplicate field names, but a writer's columns are matched by
-/// name, so a duplicate would make one of the supplied columns unreachable.
-/// The described writable schema and every caller batch refuse it through
-/// this one rule.
-pub(crate) fn first_duplicate<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut fields = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    names.into_iter().find(|name| !seen.insert(*name))
+    for spec in declared {
+        if !seen.insert(spec.name.as_str()) {
+            return Err(WyrdQueueError::SchemaParse(format!(
+                "described column `{}` is declared more than once",
+                spec.name
+            )));
+        }
+        fields.push(spec_to_field(spec, false));
+    }
+    Ok(Schema::new(fields))
 }
 
 /// Walk a JSON-Schema object into an Arrow `Schema` in one step.

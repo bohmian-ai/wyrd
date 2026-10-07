@@ -484,46 +484,27 @@ impl Bifrost {
     /// table: a batch of this kind targets one specific existing table, and
     /// binding one would invite a registration this caller does not want.
     ///
-    /// The call first describes `table` — one authoritative describe per
-    /// call, never cached — and conforms the batch to the declared columns
-    /// through [`wyrd_queue::RowPreflight::prepare_batch`], the same owner
-    /// and rules as row insertion: columns match by name in any order, an omitted nullable
-    /// column is sent as nulls, and a declared Variant column may be the
-    /// `arrow.parquet.variant` extension or `Utf8`/`LargeUtf8` JSON text,
-    /// which is encoded to it. Every supplied non-Variant column keeps its
-    /// type; whether it satisfies the destination's canonical contract is the
-    /// server's judgement, and it answers with its own stable whole-batch
-    /// refusal.
+    /// The batch is sent verbatim. Whether its columns satisfy the destination
+    /// table's canonical contract is the server's judgement, and it answers
+    /// with its own stable whole-batch refusal; this client does not pre-check
+    /// it, because a second implementation of that contract is exactly what
+    /// would drift.
     ///
     /// Unlike [`Self::insert`], durability is complete when this resolves — the
     /// batch is not buffered and needs no [`Self::flush`].
     ///
     /// # Errors
     ///
-    /// Returns the describe error for an unknown, unauthorized, or unavailable
-    /// table and any conformance refusal (`BIFROST_UNDECLARED_FIELD`,
-    /// `SCHEMA_PARSE` for an omitted required column,
-    /// `BIFROST_UNSUPPORTED_TYPE`, or a catalogued Variant error) before
-    /// admission, so neither changes queue,
-    /// budget, or direct-send state; then [`BifrostClientError::Queue`] when
-    /// the batch cannot be encoded, exceeds the accepted frame ceiling, or
-    /// cannot fit this client's byte envelope, and the server's stable refusal
-    /// when the batch is rejected.
-    ///
-    /// # Cancellation
-    ///
-    /// Abandoning the future during describe or conformance leaves no
-    /// state; once the send starts it follows the direct-send lifecycle.
+    /// Returns [`BifrostClientError::Queue`] when the batch cannot be encoded,
+    /// exceeds the accepted frame ceiling, or cannot fit this client's byte
+    /// envelope, and the server's stable refusal when the batch is rejected.
     pub async fn write_batch(
         &self,
         table: &str,
         batch: &RecordBatch,
     ) -> Result<(), BifrostClientError> {
-        let description = self.describe(table).await?;
-        let batch =
-            wyrd_queue::RowPreflight::from_description(&description)?.prepare_batch(batch)?;
         self.writer
-            .write_batch(table, &batch)
+            .write_batch(table, batch)
             .await
             .map_err(Into::into)
     }
@@ -1060,197 +1041,5 @@ impl BatchSink<ClientByteGuard> for QueryOnlySink {
                 details: serde_json::json!({ "table": batch.table }),
             },
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::ipc::reader::StreamReader;
-    use serde_json::json;
-    use wyrd_queue::MockSink;
-    use wyrd_queue::variant::{
-        EncodedVariant, VariantColumnBuilder, is_variant, variant_cell_to_json, variant_field,
-    };
-    use wyrd_spec::error::WyrdError;
-
-    use super::*;
-    use crate::bifrost::query::tests::recording_server;
-
-    /// Describe body for `vala.bifrost.events`: a Variant `payload` beside a
-    /// plain text `note`.
-    const DESCRIBED: &str = r#"{
-        "entry": {
-            "namespace": "vala.bifrost",
-            "name": "events",
-            "table_uid": "0102030405060708090a0b0c0d0e0f10",
-            "status": "Active",
-            "fingerprint": "aa",
-            "registered_at": "2026-07-01T00:00:00Z",
-            "updated_at": "2026-07-01T00:00:00Z"
-        },
-        "user_fields": [
-            { "name": "payload", "data_type": "Variant", "nullable": true, "metadata": {} },
-            { "name": "note", "data_type": "Utf8", "nullable": true, "metadata": {} }
-        ],
-        "correlation_fields": [],
-        "managed_candidates": [],
-        "physical_layout": { "partition_granularity": "hour" }
-    }"#;
-
-    /// A client over `base_url` whose writes land in `sink`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the static configuration does not build a client.
-    fn bifrost(base_url: &str, sink: &Arc<MockSink>) -> Bifrost {
-        let config = ClientConfig {
-            credential: Some(secrecy::SecretString::from("test-key")),
-            http: crate::transport::config::HttpConfig {
-                base_url: base_url.to_owned(),
-                timeout_ms: 2_000,
-                ..crate::transport::config::HttpConfig::default()
-            },
-            ..ClientConfig::default()
-        };
-        let client = WyrdClient::with_config(config).expect("static config builds a client");
-        Bifrost::with_sink(
-            &client,
-            None,
-            Arc::clone(sink) as Arc<dyn BatchSink<ClientByteGuard>>,
-            QueueConfig::default(),
-        )
-    }
-
-    /// A one-row batch of `payload` beside a JSON-looking `note`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the columns do not assemble.
-    fn batch(payload: Field, column: ArrayRef) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                payload,
-                Field::new("note", DataType::Utf8, true),
-            ])),
-            vec![
-                column,
-                Arc::new(StringArray::from(vec![r#"{"kept":"text"}"#])),
-            ],
-        )
-        .expect("batch assembles")
-    }
-
-    /// Every `write_batch` performs one authoritative describe before
-    /// admission. Utf8 and LargeUtf8 JSON text and the extension reach the
-    /// server as the Variant extension, while a same-shaped text column the
-    /// table does not declare as Variant stays text. Invalid JSON, a wrong wire
-    /// type, a column supplied twice, and a failed describe refuse before any
-    /// send or byte reservation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a call takes the wrong path or the sent wire differs.
-    #[tokio::test]
-    async fn variant_batch_describes_before_admission() {
-        let (base_url, seen) = recording_server(DESCRIBED);
-        let sink = Arc::new(MockSink::new());
-        let client = bifrost(&base_url, &sink);
-        let text = Field::new("payload", DataType::Utf8, true);
-        let encoded = EncodedVariant::from_json(&json!({"a": 1})).expect("encodes");
-        let accepted = [
-            batch(
-                text.clone(),
-                Arc::new(StringArray::from(vec![r#"{"a":1}"#])),
-            ),
-            batch(
-                Field::new("payload", DataType::LargeUtf8, true),
-                Arc::new(arrow::array::LargeStringArray::from(vec![r#"{"a":1}"#])),
-            ),
-            batch(
-                variant_field("payload", true),
-                VariantColumnBuilder::from_iter([Some(&encoded)]).finish(),
-            ),
-        ];
-        for (sent, input) in accepted.iter().enumerate() {
-            client
-                .write_batch("vala.bifrost.events", input)
-                .await
-                .expect("a declared Variant input is accepted");
-            assert_eq!(
-                seen.lock().expect("recording").len(),
-                sent + 1,
-                "one describe per call"
-            );
-            let receipt = sink.received().pop().expect("the batch was sent");
-            let wire = StreamReader::try_new(receipt.bytes.as_slice(), None)
-                .expect("frame decodes")
-                .next()
-                .expect("one batch")
-                .expect("batch decodes");
-            assert!(
-                is_variant(wire.schema().field(0)),
-                "the server receives the extension"
-            );
-            assert_eq!(
-                variant_cell_to_json(wire.column(0).as_ref(), 0).expect("renders"),
-                json!({"a": 1})
-            );
-            assert_eq!(wire.schema().field(1).data_type(), &DataType::Utf8);
-        }
-        assert!(
-            seen.lock()
-                .expect("recording")
-                .iter()
-                .all(|line| line.contains("/vala.bifrost/events")),
-            "{:?}",
-            seen.lock().expect("recording")
-        );
-
-        let refused = [
-            (
-                batch(text, Arc::new(StringArray::from(vec!["{not json"]))),
-                "WYRD_VALA_400_VARIANT_INVALID_JSON",
-            ),
-            (
-                batch(
-                    Field::new("payload", DataType::Int64, true),
-                    Arc::new(Int64Array::from(vec![1])),
-                ),
-                "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE",
-            ),
-            (
-                RecordBatch::try_from_iter([
-                    (
-                        "payload",
-                        Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
-                    ),
-                    ("payload", Arc::new(StringArray::from(vec!["2"]))),
-                ])
-                .expect("Arrow allows duplicate names"),
-                "WYRD_VALA_400_SCHEMA_PARSE",
-            ),
-        ];
-        for (input, code) in &refused {
-            let error = client
-                .write_batch("vala.bifrost.events", input)
-                .await
-                .expect_err("the batch is refused before admission");
-            assert_eq!(WyrdError::from(&error).code(), *code);
-        }
-        let offline = Arc::new(MockSink::new());
-        let error = bifrost("http://127.0.0.1:1", &offline)
-            .write_batch("vala.bifrost.events", &accepted[0])
-            .await
-            .expect_err("describe failure refuses the write");
-        assert!(!matches!(error, BifrostClientError::Queue(_)), "{error:?}");
-        assert!(offline.attempted().is_empty());
-        assert_eq!(
-            sink.attempted().len(),
-            accepted.len(),
-            "refusals send nothing"
-        );
-        assert_eq!(client.metrics().owned_bytes, 0, "no bytes stay reserved");
     }
 }

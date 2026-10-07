@@ -9,9 +9,7 @@ mod pg_tests {
 
     use std::collections::BTreeMap;
 
-    use arrow::array::{
-        ArrayRef, AsArray, BinaryArray, Int64Array, RecordBatch, StringArray, StructArray,
-    };
+    use arrow::array::{ArrayRef, AsArray, BinaryArray, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -61,9 +59,10 @@ mod pg_tests {
         tags: Option<Vec<String>>,
     }
 
-    /// The query that reads every `Event` column back.
+    /// The query that reads every `Event` column back, in the table's
+    /// declared (alphabetical) order so its result can be written verbatim.
     fn select_events(table: &str) -> String {
-        format!("SELECT id, payload, mixed, point, tags FROM {table} ORDER BY id")
+        format!("SELECT id, mixed, payload, point, tags FROM {table} ORDER BY id")
     }
 
     /// A running server plus a client writing to a freshly registered
@@ -161,22 +160,6 @@ mod pg_tests {
         }
     }
 
-    /// A one-row batch the way a user writes it: an id plus JSON text for the
-    /// `payload` and `mixed` Variant columns. Omitted nullable columns are
-    /// filled with nulls by `write_batch`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when Arrow refuses the batch.
-    fn json_text_batch(payload: &str, mixed: &str) -> RecordBatch {
-        RecordBatch::try_from_iter([
-            ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
-            ("payload", Arc::new(StringArray::from(vec![payload]))),
-            ("mixed", Arc::new(StringArray::from(vec![mixed]))),
-        ])
-        .expect("batch builds")
-    }
-
     /// The stable code an SDK error carries.
     fn code(error: &BifrostClientError) -> &'static str {
         wyrd_spec::error::WyrdError::from(error).code()
@@ -235,78 +218,6 @@ mod pg_tests {
         events.insert(&written).await;
 
         assert_eq!(events.read(&events.table).await, written);
-        events.stop().await;
-    }
-
-    /// A Utf8 column of JSON text is stored as Variant.
-    #[tokio::test]
-    async fn arrow_json_text_is_stored_as_variant() {
-        let events = Events::start().await;
-        let batch = json_text_batch(r#"{"n": 9007199254740993}"#, r#""seven""#);
-
-        events
-            .bifrost
-            .write_batch(&events.table, &batch)
-            .await
-            .expect("batch is accepted");
-        events.server.flush_bifrost().await.expect("rows publish");
-
-        let expected = Event {
-            id: 1,
-            payload: Some(json!({"n": 9_007_199_254_740_993_i64})),
-            mixed: Some(Mixed::Text("seven".to_owned())),
-            ..Event::default()
-        };
-        assert_eq!(events.read(&events.table).await, vec![expected]);
-        events.stop().await;
-    }
-
-    /// Struct and List columns built the way an Arrow writer builds them —
-    /// every child nullable, children in the writer's order, a list item
-    /// named by the writer — are stored with the table's declared types.
-    #[tokio::test]
-    async fn arrow_struct_and_list_columns_are_stored() {
-        let events = Events::start().await;
-        let point = StructArray::from(vec![
-            (
-                Arc::new(Field::new("label", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("a")])) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("x", DataType::Int64, true)),
-                Arc::new(Int64Array::from(vec![7])) as ArrayRef,
-            ),
-        ]);
-        let tags = arrow::array::ListArray::new(
-            Arc::new(Field::new("element", DataType::Utf8, true)),
-            arrow::buffer::OffsetBuffer::from_lengths([2]),
-            Arc::new(StringArray::from(vec!["a", "b"])),
-            None,
-        );
-        let batch = RecordBatch::try_from_iter([
-            ("tags", Arc::new(tags) as ArrayRef),
-            ("point", Arc::new(point)),
-            ("id", Arc::new(Int64Array::from(vec![1]))),
-        ])
-        .expect("batch builds");
-
-        events
-            .bifrost
-            .write_batch(&events.table, &batch)
-            .await
-            .expect("batch is accepted");
-        events.server.flush_bifrost().await.expect("rows publish");
-
-        let expected = Event {
-            id: 1,
-            point: Some(Point {
-                x: 7,
-                label: Some("a".to_owned()),
-            }),
-            tags: Some(vec!["a".to_owned(), "b".to_owned()]),
-            ..Event::default()
-        };
-        assert_eq!(events.read(&events.table).await, vec![expected]);
         events.stop().await;
     }
 
@@ -412,24 +323,6 @@ mod pg_tests {
         events.server.flush_bifrost().await.expect("publish");
 
         assert_eq!(code(&refused), "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD");
-        assert_eq!(events.read(&events.table).await, Vec::new());
-        events.stop().await;
-    }
-
-    /// Invalid JSON text is refused before the batch is sent.
-    #[tokio::test]
-    async fn invalid_json_text_is_refused() {
-        let events = Events::start().await;
-        let batch = json_text_batch("{not json", "1");
-
-        let refused = events
-            .bifrost
-            .write_batch(&events.table, &batch)
-            .await
-            .expect_err("the payload is not JSON");
-        events.server.flush_bifrost().await.expect("publish");
-
-        assert_eq!(code(&refused), "WYRD_VALA_400_VARIANT_INVALID_JSON");
         assert_eq!(events.read(&events.table).await, Vec::new());
         events.stop().await;
     }

@@ -84,33 +84,6 @@ def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTest
     assert rows == events
 
 
-def test_arrow_json_text_is_stored_as_variant(
-    bifrost: Bifrost, wyrd_server: WyrdTestServer
-) -> None:
-    # Variant columns take JSON text; omitted nullable columns are null.
-    arrow = pyarrow.table({"id": [1], "payload": ['{"n": 9007199254740993}'], "mixed": ['"seven"']})
-    bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])
-    wyrd_server.flush_bifrost()
-
-    rows = bifrost.sql(f"SELECT id, payload, mixed FROM {bifrost.table.fqn}", Event)
-
-    assert rows == [Event(id=1, payload={"n": 9007199254740993}, mixed="seven")]
-
-
-def test_arrow_struct_and_list_columns_are_stored(
-    bifrost: Bifrost, wyrd_server: WyrdTestServer
-) -> None:
-    # pyarrow's own shapes: nullable children in any order, nullable list items.
-    point = pyarrow.array([{"label": "a", "x": 7}])
-    arrow = pyarrow.table({"tags": [["a", "b"]], "point": point, "id": [1]})
-    bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])
-    wyrd_server.flush_bifrost()
-
-    rows = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {bifrost.table.fqn}", Event)
-
-    assert rows == [Event(id=1, point=Point(x=7, label="a"), tags=["a", "b"])]
-
-
 def test_query_results_copy_into_another_table(
     bifrost: Bifrost, wyrd_server: WyrdTestServer
 ) -> None:
@@ -153,17 +126,6 @@ def test_undeclared_field_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestServ
     wyrd_server.flush_bifrost()
 
     assert error.value.code == "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD"
-    assert len(bifrost.sql(f"SELECT id FROM {bifrost.table.fqn}")) == 0
-
-
-def test_invalid_json_text_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestServer) -> None:
-    arrow = pyarrow.table({"id": [1], "payload": ["{not json"]})
-
-    with pytest.raises(WyrdError) as error:
-        bifrost.write_batch(bifrost.table.fqn, arrow.to_batches()[0])
-    wyrd_server.flush_bifrost()
-
-    assert error.value.code == "WYRD_VALA_400_VARIANT_INVALID_JSON"
     assert len(bifrost.sql(f"SELECT id FROM {bifrost.table.fqn}")) == 0
 
 

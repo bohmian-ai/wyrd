@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pyarrow
 import pytest
@@ -95,11 +95,3 @@ def test_wyrd_fields_validate_to_wyrd_values_and_write_their_offset() -> None:
     )
     with pytest.raises(ValidationError):
         Submission(submitted_at=datetime(2026, 10, 6, 12), store_opens=datetime(2026, 10, 6, 9))
-
-
-def test_a_stored_timestamp_tz_rebuilds_the_writers_offset() -> None:
-    read = TimestampTZ.from_stored(datetime(2026, 10, 6, 17, tzinfo=UTC), datetime(2026, 10, 6, 12))
-
-    assert read == datetime(2026, 10, 6, 17, tzinfo=UTC)
-    assert read.utcoffset() == timedelta(hours=-5)
-    assert read.hour == 12

@@ -155,7 +155,7 @@ impl PyTableConfig {
 
     /// Builds one config from a `pyarrow.Schema` serialized as Arrow IPC.
     ///
-    /// The precision door: `int32`, a non-UTC timestamp, or `decimal128` has no
+    /// The precision door: `int32` or `decimal128` has no
     /// JSON Schema spelling, so the caller hands over Arrow directly rather
     /// than a document the mapper would have to widen.
     ///
@@ -320,6 +320,55 @@ impl PyQueryResult {
                     .map(|kind| (field.name().clone(), kind.name()))
             })
             .collect()
+    }
+
+    /// Renders every cell of one top-level `TIMESTAMP_TZ` column as its text.
+    ///
+    /// Each stored `{utc, local}` cell is rendered by
+    /// [`wyrd_types::TimestampKind::render`], the one owner of the writer's
+    /// offset, as RFC 3339 text in that offset; a null cell is `None`. The
+    /// typed row terminal parses the text with the standard library, so
+    /// Python restates no timestamp rule.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` carrying `WYRD_SPEC_500_INTERNAL` when the column is
+    /// absent, is not the `TIMESTAMP_TZ` struct, or holds a value out of
+    /// range, which only a faulty server result can produce.
+    fn timestamp_tz_texts(&self, column: &str) -> WyrdPyResult<Vec<Option<String>>> {
+        use arrow::array::{Array, AsArray};
+        use arrow::datatypes::TimestampMicrosecondType;
+
+        let malformed = || boundary_internal(format!("`{column}` is not a TIMESTAMP_TZ column"));
+        let mut texts = Vec::with_capacity(self.inner.num_rows());
+        for batch in self.inner.batches() {
+            let cells = batch
+                .column_by_name(column)
+                .and_then(|cells| cells.as_struct_opt())
+                .ok_or_else(malformed)?;
+            let part = |name: &str| {
+                cells
+                    .column_by_name(name)
+                    .and_then(|part| part.as_primitive_opt::<TimestampMicrosecondType>())
+                    .ok_or_else(malformed)
+            };
+            let (utc, local) = (
+                part(wyrd_types::timestamp::TIMESTAMP_TZ_UTC)?,
+                part(wyrd_types::timestamp::TIMESTAMP_TZ_LOCAL)?,
+            );
+            for row in 0..cells.len() {
+                texts.push(if cells.is_null(row) {
+                    None
+                } else {
+                    Some(
+                        wyrd_types::TimestampKind::Tz
+                            .render(utc.value(row), Some(local.value(row)))
+                            .ok_or_else(malformed)?,
+                    )
+                });
+            }
+        }
+        Ok(texts)
     }
 
     /// Decodes one Variant cell's `metadata`/`value` bytes into its native
@@ -1068,6 +1117,16 @@ fn record(
     Ok(())
 }
 
+/// The JSON Schema `format` a Wyrd timestamp type declares itself with.
+///
+/// `kind` is a [`wyrd_types::TimestampKind`] name; returns `None` for an
+/// unknown type. The Python Wyrd timestamp types read their format here
+/// rather than restating the format table.
+#[pyfunction]
+fn timestamp_format(kind: &str) -> Option<&'static str> {
+    wyrd_types::TimestampKind::from_name(kind).map(wyrd_types::TimestampKind::json_format)
+}
+
 /// Register the one Bifrost client and its result types on the supplied module.
 ///
 /// # Errors
@@ -1077,6 +1136,7 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTableConfig>()?;
     module.add_class::<PyQueryResult>()?;
     module.add_class::<PyBifrostQueryStream>()?;
+    module.add_function(wrap_pyfunction!(timestamp_format, module)?)?;
     Ok(())
 }
 

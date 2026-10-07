@@ -25,7 +25,7 @@ class _WyrdJsonSchema(GenerateJsonSchema):
 
         json_schema = super().datetime_schema(schema)
         if schema.get("tz_constraint") == "naive":
-            json_schema["format"] = TimestampNTZ._FORMAT
+            json_schema["format"] = TimestampNTZ.json_format()
         return json_schema
 
 

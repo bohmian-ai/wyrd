@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Iterator
+from datetime import datetime
 from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
@@ -1010,6 +1011,10 @@ def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:
         (name, TIMESTAMP_TYPES[kind]) for name, kind in result._native.timestamp_kinds()
     ]
     rows = table.to_pylist()
+    for name, timestamp in timestamp_columns:
+        if timestamp is TimestampTZ:
+            for row, text in zip(rows, result._native.timestamp_tz_texts(name), strict=True):
+                row[name] = text
     for row in rows:
         for field in variant_columns:
             row[field.name] = _native_value(field, row[field.name], decode)
@@ -1023,15 +1028,16 @@ def _wyrd_timestamp(
 ) -> Any:
     """Convert one top-level timestamp cell to its Wyrd timestamp type.
 
-    A ``TIMESTAMP_TZ`` cell arrives as its stored ``{utc, local}`` mapping; the
-    other two arrive as the ``datetime`` pyarrow produced. Every model field,
-    Wyrd or ``datetime``, then validates a Wyrd value.
+    A ``TIMESTAMP_TZ`` cell arrives as the RFC 3339 text the native module
+    rendered in the writer's offset; the other two arrive as the ``datetime``
+    pyarrow produced. Every model field, Wyrd or ``datetime``, then validates a
+    Wyrd value.
     """
 
     if value is None:
         return None
-    if timestamp is TimestampTZ:
-        return TimestampTZ.from_stored(value["utc"], value["local"])
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
     return timestamp.of(value)
 
 

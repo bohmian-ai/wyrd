@@ -17,8 +17,10 @@ other time types are converted to these when Bifrost writes and reads them.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, ClassVar
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+from ._wyrd import bifrost as _native_bifrost
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -28,7 +30,6 @@ class _Timestamp(datetime):
     """A ``datetime`` held to one Wyrd timestamp type's zone rule."""
 
     _NAME: ClassVar[str]
-    _FORMAT: ClassVar[str]
     _ZONED: ClassVar[bool]
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
@@ -77,14 +78,22 @@ class _Timestamp(datetime):
     def __get_pydantic_json_schema__(cls, schema: Any, handler: Any) -> dict[str, str]:
         """Declare this type's JSON Schema format, which names its column type."""
 
-        return {"type": "string", "format": cls._FORMAT}
+        return {"type": "string", "format": cls.json_format()}
+
+    @classmethod
+    def json_format(cls) -> str:
+        """The JSON Schema ``format`` that names this type's column type.
+
+        The format table is owned by Rust; this reads it from the native module.
+        """
+
+        return cast(str, _native_bifrost.timestamp_format(cls._NAME))
 
 
 class TimestampNTZ(_Timestamp):
     """``TIMESTAMP_NTZ``: a wall-clock reading with no instant."""
 
     _NAME = "TIMESTAMP_NTZ"
-    _FORMAT = "timestamp-ntz"
     _ZONED = False
 
 
@@ -92,7 +101,6 @@ class TimestampLTZ(_Timestamp):
     """``TIMESTAMP_LTZ``: one instant. Reads back in UTC."""
 
     _NAME = "TIMESTAMP_LTZ"
-    _FORMAT = "date-time"
     _ZONED = True
 
 
@@ -100,17 +108,7 @@ class TimestampTZ(_Timestamp):
     """``TIMESTAMP_TZ``: one instant in the writer's offset."""
 
     _NAME = "TIMESTAMP_TZ"
-    _FORMAT = "timestamp-tz"
     _ZONED = True
-
-    @classmethod
-    def from_stored(cls, utc: datetime, local: datetime) -> TimestampTZ:
-        """Rebuild the value from its stored instant and wall-clock reading.
-
-        The writer's offset is ``local - utc``.
-        """
-
-        return cls.of(utc.astimezone(timezone(local - utc.replace(tzinfo=None))))
 
 
 TIMESTAMP_TYPES: dict[str, type[TimestampNTZ] | type[TimestampLTZ] | type[TimestampTZ]] = {

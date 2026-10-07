@@ -1,6 +1,6 @@
 """Agent callbacks see a typed context and can replace or abort a model call."""
 
-from wyrd import Agent, FinishReason, Prompt, WyrdError
+from wyrd import Agent, FinishReason, Prompt, ProviderResponse, WyrdError
 from wyrd.agent import CallbackContext, Role
 
 
@@ -31,22 +31,7 @@ def test_callback_context_is_typed() -> None:
 
 def test_after_model_replace_with_changes_output() -> None:
     def after_model(ctx, response):
-        return {
-            "id": "replacement",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "mock-model",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "synthetic",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+        return ProviderResponse.text("synthetic")
 
     agent = Agent(
         prompt=Prompt(["hello"], "mock-model", provider="mock"),

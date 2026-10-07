@@ -114,6 +114,14 @@ pub struct ModelCard {
     pub annotations: Annotations,
     /// `ModelCard` holder metadata.
     pub metadata: ModelCardMetadata,
+    /// Server-derived BLAKE3 hash of the registered Card's artifact manifest.
+    ///
+    /// Read from `metadata.artifact_hash` of a loaded envelope and never
+    /// computed locally, so it is the trusted hash an executable model is
+    /// checked against. `None` for a locally authored holder. The registry
+    /// re-derives it on registration, so the envelope `to_card` emits omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hash: Option<String>,
     /// Local holder creation timestamp.
     ///
     /// This is construction state for the in-process holder, not part of the
@@ -234,6 +242,20 @@ impl ModelCardMetadata {
         })
     }
 
+    /// Return the declared task type as its constructor token, such as
+    /// `"binary_classification"`, the same value `task_type=` accepts.
+    #[getter(task_type)]
+    pub fn task_type_py(&self) -> &'static str {
+        task_type_token(self.task_type)
+    }
+
+    /// Return the stored interface kind, such as `"Sklearn"`, or `"Custom"`
+    /// for a subclass-backed interface.
+    #[getter]
+    pub fn interface_kind(&self) -> &'static str {
+        self.interface.kind()
+    }
+
     /// Return this metadata as a Python-serializable dict for inspection.
     ///
     /// # Errors
@@ -260,6 +282,7 @@ impl ModelCard {
             });
         }
         let metadata = card.metadata;
+        let artifact_hash = metadata.artifact_hash.clone();
         let Spec::Model(spec) = card.spec else {
             return Err(WyrdError::ModelValidation {
                 message: "ModelCard envelope spec must be a Model spec".to_owned(),
@@ -321,6 +344,7 @@ impl ModelCard {
                 sample_input: spec.sample_input,
                 card_refs,
             },
+            artifact_hash,
 
             // this should be the time the card was created on the server
             // TODO: fix this when the server returns a created_at timestamp in the envelope
@@ -433,6 +457,7 @@ impl ModelCard {
             labels: resolved_labels,
             annotations: resolved_annotations,
             metadata,
+            artifact_hash: None,
             created_at: utc_now(),
             is_card: true,
             interface: Some(handle.into_py_any(py)?),
@@ -554,6 +579,15 @@ impl ModelCard {
     #[getter]
     pub fn uid(&self) -> &str {
         &self.uid
+    }
+
+    /// Return the registered Card's server-derived artifact manifest hash.
+    ///
+    /// This is the value to pass as a trusted artifact hash when hydrating an
+    /// executable model. It is `None` for a locally authored holder.
+    #[getter]
+    pub fn artifact_hash(&self) -> Option<&str> {
+        self.artifact_hash.as_deref()
     }
 
     /// Convert this `ModelCard`'s identity into a Wyrd `CardRef`.
@@ -1146,6 +1180,20 @@ mod tests {
         assert_eq!(card_ref.version.as_str(), "0.1.0");
     }
 
+    /// A loaded envelope's server-derived `artifact_hash` is kept on the
+    /// holder verbatim, so callers read the trusted hash instead of
+    /// recomputing it.
+    #[test]
+    fn from_card_keeps_registered_artifact_hash() {
+        let mut card = model_card().to_card().expect("holder converts to a Card");
+        card.metadata.artifact_hash = Some("registered-hash".to_owned());
+
+        let loaded = ModelCard::from_card(card).expect("Model envelope loads");
+
+        assert_eq!(loaded.artifact_hash.as_deref(), Some("registered-hash"));
+    }
+
+    /// A valid locally authored Sklearn holder with labels and annotations.
     fn model_card() -> ModelCard {
         let mut labels = BTreeMap::new();
         labels.insert(label_key("domain"), label_value("churn"));
@@ -1171,6 +1219,7 @@ mod tests {
                 sample_input: None,
                 card_refs: Vec::new(),
             },
+            artifact_hash: None,
             created_at: Utc::now(),
             is_card: true,
             #[cfg(feature = "python")]

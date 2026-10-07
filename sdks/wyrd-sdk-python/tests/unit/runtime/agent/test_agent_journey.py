@@ -12,10 +12,10 @@ def echo_text(input: str) -> str:
     return input
 
 
-def test_saved_agent_loads_its_identity_and_tools(tmp_path: Path) -> None:
+def test_saved_agent_loads_and_runs_on_the_mock_provider(tmp_path: Path) -> None:
     path = tmp_path / "agent.yaml"
     Agent(
-        prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
         tools=[echo_text],
         name="planner",
         version="0.3.0",
@@ -25,6 +25,7 @@ def test_saved_agent_loads_its_identity_and_tools(tmp_path: Path) -> None:
     loaded = Agent.from_yaml(path)
 
     assert (loaded.name, loaded.version, loaded.tool_names) == ("planner", "0.3.0", ["t"])
+    assert "draft the doc" in loaded.run("draft the doc").output
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:

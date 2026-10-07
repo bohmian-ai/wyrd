@@ -7,7 +7,9 @@ use crate::request::ProviderName;
 use crate::wire::anthropic_messages::AnthropicMessagesResponse;
 use crate::wire::google_embeddings::GoogleBatchEmbedResponse;
 use crate::wire::google_generate::GoogleGenerateContentResponse;
-use crate::wire::openai_chat::OpenAiChatResponse;
+use crate::wire::openai_chat::{
+    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiUsage,
+};
 use crate::wire::openai_embeddings::OpenAiEmbeddingsResponse;
 use crate::wire::openai_responses::OpenAiResponsesResponse;
 use crate::wire::vertex_predict::VertexPredictResponse;
@@ -93,6 +95,42 @@ impl PartialEq for ProviderResponse {
 }
 
 impl ProviderResponse {
+    /// Build a finished OpenAI Chat Completions response whose one choice is
+    /// an assistant message carrying `text`.
+    ///
+    /// This is the offline shape the `mock` provider returns and the value a
+    /// callback or test hands back to replace a model response. The fixed
+    /// fields are id `mock_response`, model `mock-model`, finish reason
+    /// `stop`, and zero token usage, so the response is deterministic.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::OpenAiChatCompletion(OpenAiChatResponse {
+            id: "mock_response".to_owned(),
+            object: "chat.completion".to_owned(),
+            created: 0,
+            model: "mock-model".to_owned(),
+            choices: vec![OpenAiChatChoice {
+                index: 0,
+                message: OpenAiChatMessage {
+                    role: "assistant".to_owned(),
+                    content: Some(OpenAiMessageContent::Text(text.into())),
+                    ..Default::default()
+                },
+                finish_reason: Some("stop".to_owned()),
+                logprobs: None,
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            service_tier: None,
+        })
+    }
+
     /// Borrow response text, tool calls, usage, structured output, and finish reason.
     pub const fn adapter(&self) -> crate::adapter::ResponseAdapter<'_> {
         crate::adapter::ResponseAdapter::new(self)
@@ -114,5 +152,20 @@ impl ProviderResponse {
             Self::VertexPredict(_) => ProviderName::Vertex,
             Self::RawV1(_) => ProviderName::Custom("raw".to_owned()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderResponse;
+    use crate::request::ProviderName;
+
+    /// `ProviderResponse::text` reads back as one OpenAI assistant text answer.
+    #[test]
+    fn text_builds_an_openai_assistant_answer() {
+        let response = ProviderResponse::text("synthetic");
+
+        assert_eq!(response.provider(), ProviderName::OpenAi);
+        assert_eq!(response.adapter().text().as_deref(), Some("synthetic"));
     }
 }

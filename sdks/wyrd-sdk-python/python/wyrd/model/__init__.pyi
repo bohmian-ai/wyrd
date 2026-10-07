@@ -569,8 +569,17 @@ class ModelCardMetadata:
     """Interface, task, signature, sample-input, and artifact-reference
     metadata a ModelCard turns into a durable Model spec.
 
-    The values are read back through ``to_dict()``; the object exposes no
-    per-field attributes."""
+    ``task_type`` and ``interface_kind`` read back typed values; ``to_dict()``
+    returns the whole serialized spec."""
+
+    @property
+    def task_type(self) -> str:
+        """The task type token, as accepted by ``task_type=``, such as ``"regression"``."""
+        ...
+    @property
+    def interface_kind(self) -> str:
+        """The stored interface kind, such as ``"Sklearn"``, or ``"Custom"`` for a subclass."""
+        ...
 
     def __init__(
         self,
@@ -646,6 +655,16 @@ class ModelCard:
     task_type: str
     signature: ModelSignature
     sample_input: SampleInput | None
+
+    @property
+    def artifact_hash(self) -> str | None:
+        """The registered Card's artifact manifest hash, read from its envelope.
+
+        The registry derives it at registration; it is never computed
+        locally. Pass it as ``WyrdState.from_path(trusted_artifact_hashes=...)``
+        to load an executable model. ``None`` for a locally authored card.
+        """
+        ...
 
     @overload
     def __init__(

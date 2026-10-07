@@ -234,17 +234,14 @@ def test_modelcard_save_without_live_model_raises_model_error(
     assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
 
 
-def test_modelcard_metadata_to_dict_accepts_interface_instance(signature: ModelSignature) -> None:
+def test_modelcard_metadata_reads_back_its_interface_and_task_type(
+    signature: ModelSignature,
+) -> None:
     metadata = ModelCardMetadata(
         interface=SklearnInterface(), task_type="binary_classification", signature=signature
     )
 
-    payload = metadata.to_dict()
-
-    assert (payload["interface"]["kind"], payload["task_type"]) == (
-        "Sklearn",
-        "BinaryClassification",
-    )
+    assert (metadata.interface_kind, metadata.task_type) == ("Sklearn", "binary_classification")
 
 
 def test_sample_input_survives_save_and_load(

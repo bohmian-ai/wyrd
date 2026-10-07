@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from wyrd.cards import CardRef
 from wyrd.data import DataCard, Split, WyrdError
 
-TEST_ROWS = {"kind": "Artifact", "name": "test", "version": "1.0.0", "space": "default"}
+TEST_ROWS = CardRef("Artifact", "test", "1.0.0", space="default")
 
 
 @pytest.mark.parametrize(
@@ -74,7 +75,10 @@ def test_invalid_indices_are_refused(values: list[int]) -> None:
 
 
 def test_materialized_split_records_its_artifact_ref() -> None:
-    assert Split.materialized(TEST_ROWS).to_dict() == {"kind": "Materialized", "value": TEST_ROWS}
+    assert Split.materialized(TEST_ROWS).to_dict() == {
+        "kind": "Materialized",
+        "value": TEST_ROWS.to_dict(),
+    }
 
 
 def test_split_materialized_allows_authored_ref_without_space() -> None:
@@ -84,6 +88,13 @@ def test_split_materialized_allows_authored_ref_without_space() -> None:
         "kind": "Materialized",
         "value": {"kind": "Artifact", "name": "train", "version": "1.0.0"},
     }
+
+
+def test_materialized_split_refuses_a_non_artifact_card_ref() -> None:
+    with pytest.raises(WyrdError) as exc:
+        Split.materialized(CardRef("Model", "test", "1.0.0", space="default"))
+
+    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 
 
 def test_rule_and_materialized_splits_survive_save_and_load(tmp_path: Path) -> None:

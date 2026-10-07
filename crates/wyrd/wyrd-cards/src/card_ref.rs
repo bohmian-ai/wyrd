@@ -218,6 +218,20 @@ impl CardRefPy {
         self.0.uid.as_ref().map(ToString::to_string)
     }
 
+    /// Return this reference as its JSON-compatible `CardRef` mapping.
+    ///
+    /// This makes `CardRef` satisfy the Python `CardRefLike` protocol, so it
+    /// is accepted wherever a boundary takes a `CardRefLike`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when serialization or Python conversion fails.
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        Ok(wyrd_utils::py::json_to_pyobject(
+            py,
+            &serde_json::to_value(&self.0)?,
+        )?)
+    }
+
     /// The canonical `space/Kind/name@version` text of this reference.
     fn __str__(&self) -> String {
         self.0.to_string()

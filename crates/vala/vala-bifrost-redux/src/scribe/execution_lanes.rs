@@ -517,6 +517,10 @@ pub(crate) struct DecodeContext<'a> {
 
 /// Applies source-contract validation and server-managed stamping to one batch.
 ///
+/// With a registered schema, columns are first matched to it by name and put
+/// in its declared order ([`in_declared_order`]), so the writer's column
+/// order never matters.
+///
 /// The final step stamps the registered Iceberg table's field ids onto every
 /// field when the context carries that schema, so the WAL, staged runs, and
 /// sealed objects all number their columns exactly as the table does.
@@ -556,6 +560,14 @@ fn decode_rows(
             return Err(ScribeError::InvalidFrame);
         }
     }
+    let declared_order;
+    let rows = match context.registered_schema {
+        Some(registered) => {
+            declared_order = in_declared_order(rows, registered)?;
+            &declared_order
+        }
+        None => rows,
+    };
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition)?;
     }
@@ -578,6 +590,40 @@ fn decode_rows(
             }),
         None => Ok(stamped),
     }
+}
+
+/// Puts a batch's columns in the registered table's order, matching by name.
+///
+/// Columns are matched by name, never position: a writer may send its
+/// columns in any order, and the fingerprint, validators, and stamping that
+/// follow all see the table's declared order. A column the table does not
+/// register — a server-owned input such as `card_ref`, or a column from a
+/// stale or wrong declaration — keeps its relative place after the registered
+/// columns, so the checks that follow judge it exactly as before. Projection
+/// only reorders shared column handles; no values are copied. Callers have
+/// already refused duplicate names, so each name selects at most one column.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] if Arrow refuses the projection,
+/// which a duplicate-free index list cannot cause.
+fn in_declared_order(
+    rows: &RecordBatch,
+    registered: &IcebergSchema,
+) -> Result<RecordBatch, ScribeError> {
+    let schema = rows.schema();
+    let order = registered
+        .as_struct()
+        .fields()
+        .iter()
+        .filter_map(|field| schema.index_of(&field.name).ok())
+        .chain((0..schema.fields().len()).filter(|&index| {
+            registered
+                .field_by_name(schema.field(index).name())
+                .is_none()
+        }))
+        .collect::<Vec<_>>();
+    rows.project(&order).map_err(|_| ScribeError::InvalidFrame)
 }
 
 /// Validates a dynamic table's Variant identity and values at the trust boundary.
@@ -635,9 +681,9 @@ fn enforce_dynamic_variants(
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
-/// [`ScribeError::ContractViolation`] carrying the validator's catalogued
-/// refusal, and [`ScribeError::FingerprintMismatch`] when a canonical user
-/// block is not in the declared order.
+/// and [`ScribeError::ContractViolation`] carrying the validator's
+/// catalogued refusal. Column order is not judged here: callers reorder by
+/// name first, and the fingerprint check that follows owns the rest.
 fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
@@ -659,18 +705,6 @@ fn enforce_builtin_source_contract(
     )
     .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
-    let declared = (definition.arrow_fields)();
-    let in_order = user
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name())
-        .eq(declared.iter().map(Field::name));
-    if canonical && !in_order {
-        return Err(ScribeError::FingerprintMismatch {
-            table: format!("{}.{}", definition.namespace, definition.name),
-        });
-    }
     Ok(())
 }
 
@@ -2210,8 +2244,9 @@ mod tests {
 
     use super::{
         DecodeContext, ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
-        ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
-        source_schema_fingerprint, stamp_correlation_columns, wait_lane_drained,
+        ScribePersistenceCpuPool, ScribeWalIoPool, decode, in_declared_order,
+        record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
+        wait_lane_drained,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
@@ -4388,5 +4423,48 @@ mod tests {
             stamp_card_ref(&principal, SuppliedCardRef::Text(forged)),
             Err(ScribeError::CardUnresolved)
         ));
+    }
+
+    /// A registered `(a, b)` table: two optional Long columns.
+    fn registered_ab() -> iceberg::spec::Schema {
+        let long = || iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::optional(1, "a", long())),
+                Arc::new(iceberg::spec::NestedField::optional(2, "b", long())),
+            ])
+            .build()
+            .expect("the (a, b) schema builds")
+    }
+
+    /// Columns are matched to the registered schema by name: a batch sent as
+    /// `(card_ref, b, a)` comes back as `(a, b, card_ref)` with each column's
+    /// values intact; the unregistered `card_ref` input keeps its place after
+    /// the registered columns for the later checks to judge.
+    #[test]
+    fn columns_are_put_in_declared_order_by_name() {
+        let rows = RecordBatch::try_from_iter([
+            (
+                CARD_REF,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            ),
+            ("b", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+            ("a", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ])
+        .expect("batch builds");
+
+        let ordered = in_declared_order(&rows, &registered_ab()).expect("names all match");
+
+        let names = ordered
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "b", CARD_REF]);
+        assert_eq!(
+            ordered.column(0).as_ref(),
+            &Int64Array::from(vec![1]) as &dyn Array
+        );
     }
 }

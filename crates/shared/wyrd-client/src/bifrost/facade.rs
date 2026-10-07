@@ -485,10 +485,10 @@ impl Bifrost {
     /// binding one would invite a registration this caller does not want.
     ///
     /// The batch is sent verbatim. Whether its columns satisfy the destination
-    /// table's canonical contract is the server's judgement, and it answers
-    /// with its own stable whole-batch refusal; this client does not pre-check
-    /// it, because a second implementation of that contract is exactly what
-    /// would drift.
+    /// table's contract is the server's judgement: it matches columns to the
+    /// table by name, in any order, and answers any mismatch with its own
+    /// stable whole-batch refusal. This client does not pre-check it, because
+    /// a second implementation of that contract is exactly what would drift.
     ///
     /// Unlike [`Self::insert`], durability is complete when this resolves — the
     /// batch is not buffered and needs no [`Self::flush`].

@@ -95,7 +95,8 @@ it("copies query results into another table", async () => {
   await archiver.register();
   await insert({ id: 1, payload: { source: "row" }, mixed: 8, point: { x: 1 }, tags: ["a"] });
 
-  const copied = await bifrost.sql(`SELECT id, mixed, payload, point, tags FROM ${table}`); // declared order
+  // Not the declared (alphabetical) order: the server matches columns by name.
+  const copied = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${table}`);
   await bifrost.writeBatch(archive, copied.batches[0]!);
   server.flushBifrost();
 

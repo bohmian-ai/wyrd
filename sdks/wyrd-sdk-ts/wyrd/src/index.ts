@@ -868,8 +868,9 @@ export class Bifrost {
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
    * Build the batch against {@link TableConfig.schema} from
-   * `describeTableConfig` - a canonical table compares an incoming block
-   * against its declared fields exactly, metadata included.
+   * `describeTableConfig`. Columns match the table's declared columns by name,
+   * in any order; the server judges every column's type and refuses a stale
+   * declaration.
    */
   async writeBatch(table: string, batch: RecordBatch): Promise<void> {
     const ipc = tableToIPC(new Table(batch), "stream");

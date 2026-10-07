@@ -294,8 +294,10 @@ No fallible schema or value conversion remains after reservation.
 
 `Bifrost::write_batch(table, batch)` keeps its public signature and sends the
 batch verbatim. The client neither describes nor conforms it; the server judges
-it at its trust boundary, accepts only the Variant extension for a Variant
-column, and repeats validation there. `wyrd-queue` owns row Variant JSON/value
+it at its trust boundary. Before any other check the server matches the
+batch's columns to the registered table by name and puts them in declared
+order; it then accepts only the Variant extension for a Variant column and
+repeats validation there. `wyrd-queue` owns row Variant JSON/value
 preparation.
 
 ### Oracle registration and distributed wire
@@ -785,10 +787,11 @@ string; it is not parsed as JSON.
 
 `write_batch` in every SDK sends an Arrow batch verbatim. A declared Variant
 column carries the Arrow Variant extension, as a Bifrost query result does, so
-a query selecting a table's columns in their declared order copies into a table
-of the same declaration unchanged. The server judges the batch
-against the table's declared schema and refuses a mismatch with its stable
-code; no SDK converts, reorders, or fills columns.
+a query result copies into a table of the same declaration unchanged. Columns
+match by name in any order, as for row `insert`; the server does the matching
+and refuses any other mismatch with its stable code (a stale or wrong
+declaration stays `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`). No SDK converts, reorders, or
+fills columns, and an omitted column is not filled with nulls.
 
 #### REQ-015 — No silent key loss
 
@@ -1198,8 +1201,10 @@ None.
   client-side describe-then-conform step of revisions 7 and 15 (JSON text for
   Variant columns, by-name matching, null-filling omitted columns) is removed:
   it duplicated the server's contract, and its describe call failed for
-  write-only and gRPC-only callers. REQ-014, AC-004, and AC-005 are narrowed
-  to match.
+  write-only and gRPC-only callers. The server matches written columns to the
+  registered table by name, so `insert` and `write_batch` share one column
+  rule enforced once; the built-in positional order check is removed.
+  REQ-014, AC-004, and AC-005 are narrowed to match.
 - **Revision 16 (2026-10-06, approved):** Resolves TASK-002 repeat-review
   `FIND-TASK-002-6` without adding the explicitly excluded TypeScript
   `TableConfig.fromArrow`. REQ-016 and AC-005 now require exhaustive

@@ -59,10 +59,11 @@ mod pg_tests {
         tags: Option<Vec<String>>,
     }
 
-    /// The query that reads every `Event` column back, in the table's
-    /// declared (alphabetical) order so its result can be written verbatim.
+    /// The query that reads every `Event` column back. Its column order
+    /// differs from the table's declared (alphabetical) order on purpose: the
+    /// server matches written columns by name.
     fn select_events(table: &str) -> String {
-        format!("SELECT id, mixed, payload, point, tags FROM {table} ORDER BY id")
+        format!("SELECT id, payload, mixed, point, tags FROM {table} ORDER BY id")
     }
 
     /// A running server plus a client writing to a freshly registered

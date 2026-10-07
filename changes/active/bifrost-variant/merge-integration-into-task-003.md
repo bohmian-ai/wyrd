@@ -3,7 +3,7 @@
 - Source: `wyrd/bifrost-variant/integration` @ `66859d22f` (spec revision 17).
 - Target: `wyrd/bifrost-variant/TASK-003` (spec revision 11; working tree uncommitted).
 - Merge base: `535367c94`.
-- Status: **plan only — decisions D1–D4 made; awaiting approval to execute.** Nothing below has been executed.
+- Status: **executed through step 6; step 7 verification next; not committed.** Deviations are listed under "Execution notes".
 
 ## Evidence
 
@@ -112,3 +112,13 @@
 ### 8. Commit
 - Two commits, the merge and then the dedup, each after user approval.
 - Git identity Thorrester, no AI co-author trailers.
+
+## Execution notes (deviations from the steps above)
+
+- **Step 3, exact fingerprint.** `SchemaFingerprint::from_arrow_schema_exact` is also persisted (Parquet footers, `parquet/footer.rs`, `parquet_writer.rs`), so it is unchanged. Physical-table validation instead uses `physical_schema_matches`: the exact fingerprint plus a per-field `tables::same_iceberg_type`, which tells a Variant from a Struct at any depth. The two ported tests are `physical_schema_keeps_variant_identity_at_any_depth` and `physical_schema_rejects_reordered_columns`.
+- **Step 3, masked test.** Its owner is now Arrow's `StreamWriter`, so it is re-added at the production planner as `scribe::material_plan::tests::masked_required_struct_child_null_is_planned`.
+- **Step 3, `RowPreflight` half of `array_becomes_list`.** Row-to-Arrow conversion stays in `wyrd-queue` (the user agreed); that half stays as `batch_builder` test `a_null_list_item_is_refused_only_for_non_null_items`.
+- **D2 at registration.** Declaring a non-UTC zone failed at `iceberg_form`. One shared `tables::as_stored` now relabels any zone to `+00:00` for both registration (`iceberg_form`) and writes (`same_iceberg_type`).
+- **Step 4, Python.** Native `timestamp_format(kind)` and `QueryResult.timestamp_tz_texts(column)` replace `_FORMAT` and `TimestampTZ.from_stored`. The unit test of the deleted method is removed; the Rust `timestamp.rs` test and the Python journey `test_wyrd_timestamps_read_back_as_wyrd_values` cover the offset rebuild.
+- **Step 5, trim.** None. Each `variant_tables` and `register_a_table_from_a_model` test carries an assertion the other lacks (Variant edge values; a Struct nested in a Struct and a dict; result types versus path values).
+- **Step 5, `large_model`.** Renamed `binary_model` and changed to `Binary`, a real type change.

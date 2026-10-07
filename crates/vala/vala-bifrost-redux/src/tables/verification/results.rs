@@ -40,25 +40,30 @@ impl ResultsTable {
     ///
     /// `method` and `verdict` hold the owning enums' serialized names;
     /// `features` is a Variant because feature names are open. Every child is
-    /// non-null: a null report is a null struct, never a partial one.
+    /// nullable so a Parquet read keeps the null an absent report gives each
+    /// child: a required leaf would read back padded values, which `get_field`
+    /// exposes. The table validator refuses a partly present report.
     #[must_use]
     pub fn drift_report_fields() -> Fields {
         Fields::from(vec![
-            utf8("method", false),
-            variant_field("features", false),
-            utf8("verdict", false),
+            utf8("method", true),
+            variant_field("features", true),
+            utf8("verdict", true),
         ])
     }
 
-    /// Children of [`EVAL_SUMMARY`] in persisted order, all non-null.
+    /// Children of [`EVAL_SUMMARY`] in persisted order.
+    ///
+    /// Every child is nullable for the reason given on
+    /// [`Self::drift_report_fields`].
     #[must_use]
     pub fn eval_summary_fields() -> Fields {
         Fields::from(vec![
-            int32("total_tasks", false),
-            int32("passed_tasks", false),
-            int32("failed_tasks", false),
-            float64("pass_rate", false),
-            int64("duration_ms", false),
+            int32("total_tasks", true),
+            int32("passed_tasks", true),
+            int32("failed_tasks", true),
+            float64("pass_rate", true),
+            int64("duration_ms", true),
         ])
     }
 }
@@ -74,6 +79,8 @@ impl DomainTable for ResultsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// The implementation-specific summary columns gated behind the elevated payload permission.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
+    /// A report or summary is written whole or not at all.
+    const WHOLE_STRUCTS: &'static [&'static str] = &[DRIFT_REPORT, EVAL_SUMMARY];
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {

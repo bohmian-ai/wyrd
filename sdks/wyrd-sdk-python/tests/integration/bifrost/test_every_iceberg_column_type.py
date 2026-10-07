@@ -88,44 +88,14 @@ def test_a_narrower_declaration_is_the_table_it_describes(narrow_types: pyarrow.
         pyarrow.month_day_nano_interval(),
         pyarrow.float16(),
         pyarrow.map_(pyarrow.string(), pyarrow.float16()),
+        pyarrow.map_(pyarrow.string(), pyarrow.uint64()),
     ],
     ids=str,
 )
-def test_a_type_with_no_wire_form_is_refused_when_declared(column_type: pyarrow.DataType) -> None:
+def test_a_type_bifrost_cannot_store_is_refused_when_declared(
+    column_type: pyarrow.DataType,
+) -> None:
     with pytest.raises(WyrdError) as refused:
         TableConfig.from_arrow(pyarrow.schema([("c", column_type)]), "vala.datasets.no_wire_form")
 
     assert refused.value.code == UNSUPPORTED_TYPE
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "column_type",
-    [pyarrow.uint64(), pyarrow.date64(), pyarrow.map_(pyarrow.string(), pyarrow.uint64())],
-    ids=str,
-)
-def test_a_type_with_no_iceberg_column_is_refused_at_registration(
-    wyrd_server: WyrdTestServer, column_type: pyarrow.DataType
-) -> None:
-    refused_table = Bifrost(
-        TableConfig.from_arrow(pyarrow.schema([("c", column_type)]), "vala.datasets.no_column")
-    )
-
-    with pytest.raises(WyrdError) as refused:
-        refused_table.register()
-
-    assert refused.value.code == UNSUPPORTED_TYPE
-
-
-@pytest.mark.integration
-def test_a_refused_registration_creates_no_table(wyrd_server: WyrdTestServer) -> None:
-    refused_table = Bifrost(
-        TableConfig.from_arrow(pyarrow.schema([("c", pyarrow.uint64())]), "vala.datasets.never")
-    )
-    with pytest.raises(WyrdError):
-        refused_table.register()
-
-    with pytest.raises(WyrdError) as missing:
-        TableConfig.describe("vala.datasets.never")
-
-    assert missing.value.code == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"

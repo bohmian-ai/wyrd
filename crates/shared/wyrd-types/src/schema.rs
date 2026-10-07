@@ -1,10 +1,10 @@
-//! Pure `schema_to_fieldspec` mapping core (PyO3-free).
+//! The one declared-type mapping for Bifrost tables (PyO3-free).
 //!
-//! The mapping half of `schema_to_fieldspec` per the locked
-//! `06-serialization-spec.md` table: JSON-Schema `Value` → `Vec<FieldSpec>` and
-//! `arrow::Schema` → `Vec<FieldSpec>`, both returning the Arrow-free C2 wire type
-//! [`wyrd_spec::vala::api::FieldSpec`]. The PyO3 acquisition (Pydantic
-//! `model_json_schema()` / `pyarrow.Schema`) lives in `wyrd_client::bifrost` and calls these.
+//! Maps a JSON Schema document or an `arrow::Schema` to the wire
+//! [`wyrd_spec::vala::api::FieldSpec`] columns, and owns the one decision of
+//! which declared types Bifrost can store ([`check_supported`]), shared by the
+//! SDK declaration and server registration. Language SDKs acquire the model
+//! or Arrow schema and call these through `wyrd_client::bifrost`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -65,17 +65,63 @@ pub fn json_schema_to_fieldspec(schema: &Value) -> Result<Vec<FieldSpec>, Bifros
 /// nullability are taken verbatim from the Arrow fields.
 ///
 /// # Errors
-/// Returns
-/// [`BifrostError::UnsupportedType`] naming the first field, by dotted path,
-/// whose Arrow type has no wire form. Whether a wire type can be stored is the
-/// server's decision at registration, which converts every column to its
-/// Iceberg form.
+/// Returns [`BifrostError::UnsupportedType`] naming the first field, by dotted
+/// path, whose Arrow type has no wire form or that Bifrost cannot store (see
+/// [`check_supported`]).
 pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Result<Vec<FieldSpec>, BifrostError> {
-    schema
+    let fields = schema
         .fields()
         .iter()
         .map(|f| field_to_spec(f))
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?;
+    check_supported(&fields)?;
+    Ok(fields)
+}
+
+/// Refuse every declaration Bifrost cannot store, at any depth.
+///
+/// This is the one supported-type decision: the SDK schema doors call it
+/// before any request and the server register path repeats it, so a caller
+/// learns of an unstorable type before a table exists. Iceberg stores neither
+/// UInt64, Date64, Time32, nanosecond Time64, nor second or millisecond
+/// timestamps. A timestamp's zone label is never refused: any zoned timestamp
+/// declares `TIMESTAMP_LTZ` and is stored under the `+00:00` zone.
+///
+/// # Errors
+/// Returns [`BifrostError::UnsupportedType`] naming the first refused field by
+/// its dotted path and its Arrow type.
+pub fn check_supported(fields: &[FieldSpec]) -> Result<(), BifrostError> {
+    fields
+        .iter()
+        .try_for_each(|field| check_supported_type(&field.name, &field.data_type))
+}
+
+/// Refuse one declaration, recursing through List, Struct, and Map children.
+///
+/// # Errors
+/// As [`check_supported`].
+fn check_supported_type(path: &str, data_type: &DataTypeSpec) -> Result<(), BifrostError> {
+    let child = |child: &FieldSpec| {
+        check_supported_type(&format!("{path}.{}", child.name), &child.data_type)
+    };
+    let supported = match data_type {
+        DataTypeSpec::UInt64 | DataTypeSpec::Date64 | DataTypeSpec::Time32 { .. } => false,
+        DataTypeSpec::Time64 { unit } => *unit == TimeUnit::Microsecond,
+        DataTypeSpec::Timestamp { unit, .. } => {
+            matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond)
+        }
+        DataTypeSpec::List(element) => return child(element),
+        DataTypeSpec::Struct(children) => return children.iter().try_for_each(child),
+        DataTypeSpec::Map { key, value } => return child(key).and_then(|()| child(value)),
+        _ => true,
+    };
+    if supported {
+        return Ok(());
+    }
+    Err(BifrostError::UnsupportedType {
+        field: path.to_owned(),
+        data_type: data_type_to_arrow(data_type, false).to_string(),
+    })
 }
 
 /// Map a `Vec<FieldSpec>` into an Arrow `Schema`, the client-side forward
@@ -290,12 +336,15 @@ fn map_type(
         }
         Some("array") => match node.get("items") {
             None => DataTypeSpec::Variant,
-            Some(items) => DataTypeSpec::List(Box::new(FieldSpec {
-                name: "item".to_owned(),
-                data_type: map_type(items, defs)?.0,
-                nullable: true,
-                metadata: BTreeMap::new(),
-            })),
+            Some(items) => {
+                let (data_type, nullable) = map_type(items, defs)?;
+                DataTypeSpec::List(Box::new(FieldSpec {
+                    name: "item".to_owned(),
+                    data_type,
+                    nullable,
+                    metadata: BTreeMap::new(),
+                }))
+            }
         },
         Some("object") if node.contains_key("properties") => {
             DataTypeSpec::Struct(build_fields(prop, defs)?)
@@ -577,8 +626,8 @@ mod schema_tests {
     //! `schema_to_fieldspec` mapping-table proof: JSON-Schema and Arrow → C2 `FieldSpec`.
 
     use crate::schema::{
-        arrow_schema_to_fieldspec, field_to_spec, fieldspec_to_arrow, json_schema_to_arrow,
-        json_schema_to_fieldspec,
+        arrow_schema_to_fieldspec, check_supported, field_to_spec, fieldspec_to_arrow,
+        json_schema_to_arrow, json_schema_to_fieldspec,
     };
     use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
     use serde_json::json;
@@ -687,15 +736,28 @@ mod schema_tests {
         assert_eq!(field(inner, "zip").data_type, DataTypeSpec::Int64);
     }
 
+    /// A typed array maps to a List whose items keep the declared
+    /// nullability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an item's nullability differs from its declaration.
     #[test]
     fn array_becomes_list() {
         let schema = json!({
-            "properties": {"tags": {"type": "array", "items": {"type": "string"}}}
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "maybe_tags": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            }
         });
         let specs = json_schema_to_fieldspec(&schema).expect("maps");
 
         assert_eq!(
             field(&specs, "tags").data_type,
+            DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, false)))
+        );
+        assert_eq!(
+            field(&specs, "maybe_tags").data_type,
             DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, true)))
         );
     }
@@ -716,7 +778,7 @@ mod schema_tests {
         assert_eq!(field(inner, "x").data_type, DataTypeSpec::Float64);
     }
 
-    /// Every REQ-012 declaration form maps to its exact column, and every
+    /// Every supported open and nested declaration form maps to its exact column, and every
     /// unsupported form is refused with its exact catalog code.
     ///
     /// # Panics
@@ -743,11 +805,13 @@ mod schema_tests {
                 "wrapped": {"allOf": [{"$ref": "#/definitions/Inner"}]},
                 "untyped_list": {"type": "array"},
                 "typed_list": {"type": "array", "items": {"type": "integer"}},
+                "nullable_items": {"type": "array", "items": {"type": ["integer", "null"]}},
                 "closed": {"type": "object", "properties": {"x": {"type": "number"}}, "additionalProperties": false, "required": ["x"]},
             },
             "required": ["any", "always", "dict_any", "union", "type_list", "wrapped", "typed_list", "closed"]
         });
-        let specs = json_schema_to_fieldspec(&schema).expect("every REQ-012 form maps");
+        let specs =
+            json_schema_to_fieldspec(&schema).expect("every supported open and nested form maps");
         let inner = DataTypeSpec::Struct(vec![make_field("k", DataTypeSpec::Utf8, false)]);
         let expected = vec![
             ("any", variant.clone(), true),
@@ -765,8 +829,13 @@ mod schema_tests {
             ("untyped_list", variant, true),
             (
                 "typed_list",
-                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, true))),
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, false))),
                 false,
+            ),
+            (
+                "nullable_items",
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Int64, true))),
+                true,
             ),
             (
                 "closed",
@@ -800,6 +869,69 @@ mod schema_tests {
                 .code(),
             "WYRD_VALA_400_SCHEMA_PARSE"
         );
+
+        let ts = |unit, tz: Option<&str>| DataTypeSpec::Timestamp {
+            unit,
+            tz: tz.map(str::to_owned),
+        };
+        for data_type in [
+            DataTypeSpec::UInt64,
+            DataTypeSpec::Date64,
+            DataTypeSpec::Time32 {
+                unit: TimeUnit::Second,
+            },
+            DataTypeSpec::Time64 {
+                unit: TimeUnit::Nanosecond,
+            },
+            ts(TimeUnit::Second, None),
+            ts(TimeUnit::Millisecond, Some("UTC")),
+        ] {
+            let rendered = fieldspec_to_arrow(&[make_field("x", data_type.clone(), true)])
+                .expect("projects")
+                .field(0)
+                .data_type()
+                .to_string();
+            let nested = vec![make_field(
+                "outer",
+                DataTypeSpec::Struct(vec![make_field("bad", data_type, true)]),
+                true,
+            )];
+            let Err(error) = check_supported(&nested) else {
+                panic!("{rendered} must be refused");
+            };
+            assert_eq!(
+                error,
+                BifrostError::UnsupportedType {
+                    field: "outer.bad".to_owned(),
+                    data_type: rendered,
+                }
+            );
+            let arrow = fieldspec_to_arrow(&nested).expect("projects");
+            assert_eq!(
+                arrow_schema_to_fieldspec(&arrow)
+                    .expect_err("the SDK door refuses")
+                    .code(),
+                "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
+            );
+        }
+        check_supported(&[
+            make_field("ok_utc", ts(TimeUnit::Microsecond, Some("UTC")), true),
+            make_field(
+                "ok_any_zone",
+                ts(TimeUnit::Microsecond, Some("America/New_York")),
+                true,
+            ),
+            make_field("ok_ns", ts(TimeUnit::Nanosecond, None), true),
+            make_field(
+                "ok_time",
+                DataTypeSpec::Time64 {
+                    unit: TimeUnit::Microsecond,
+                },
+                true,
+            ),
+            make_field("ok_variant", DataTypeSpec::Variant, true),
+        ])
+        .expect("supported types pass");
     }
 
     #[test]

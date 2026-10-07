@@ -208,12 +208,13 @@ impl NativeBifrostConnection {
     }
 }
 
-/// Closed result of describing one table: its config or a catalog error.
+/// Closed result of declaring or describing one table: its config or a
+/// catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeTableConfigResult {
-    /// Described table config when the server answered.
+    /// The table config when it was declared or described.
     pub config: Option<NativeTableConfig>,
-    /// Catalog failure when description failed.
+    /// Catalog failure when declaration or description failed.
     pub error: Option<NativeWyrdError>,
 }
 
@@ -396,13 +397,18 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// `wyrd-queue` owner every language uses, so one model declares the same
 /// columns from any SDK.
 ///
+/// A catalogued refusal of the declaration itself — a table name that is not
+/// `namespace.name`, a document that does not map to columns, an open-extras
+/// object, or a server-owned column — returns in the result's structured
+/// `error`, which the TypeScript wrapper raises as a `WyrdError` carrying its
+/// code, status, details, and remediation.
+///
 /// # Errors
 ///
-/// Returns a napi error when the table is not `namespace.name`, the document is
-/// not one mappable JSON Schema, a declared column is server-owned, the
-/// layout is not one physical-layout declaration, the compaction target is
-/// not a non-negative integer, or the compaction type is not one known
-/// hyphenated wire spelling.
+/// Returns a napi error when the text is not JSON, the layout is not one
+/// physical-layout declaration, the compaction target is not a non-negative
+/// integer, the compaction type is not one known hyphenated wire spelling,
+/// or the config cannot be projected.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -413,13 +419,27 @@ pub fn table_config_from_json_schema(
     layout_json: Option<String>,
     compaction_target_file_size_bytes: Option<f64>,
     compaction_type: Option<String>,
-) -> Result<NativeTableConfig> {
+) -> Result<NativeTableConfigResult> {
     let schema: Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
-    let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
+    let config = match TableConfig::from_json_schema(&table, &schema) {
+        Ok(config) => config,
+        Err(error) => {
+            return Ok(NativeTableConfigResult {
+                config: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            });
+        }
+    };
     let config = apply_layout(config, layout_json.as_deref())?;
     let config = apply_compaction_target(config, compaction_target_file_size_bytes)?;
-    NativeTableConfig::project(&apply_compaction_type(config, compaction_type.as_deref())?)
+    Ok(NativeTableConfigResult {
+        config: Some(NativeTableConfig::project(&apply_compaction_type(
+            config,
+            compaction_type.as_deref(),
+        )?)?),
+        error: None,
+    })
 }
 
 /// Builds one table config from the schema of an Arrow IPC stream.

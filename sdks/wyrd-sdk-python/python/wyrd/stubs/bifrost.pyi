@@ -226,7 +226,7 @@ class TableConfig:
         """Declare a table from an explicit ``pyarrow.Schema``.
 
         Use this for column types JSON Schema cannot express, such as
-        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        ``int32`` or ``decimal128``. ``schema`` holds
         user columns only; every other argument and error is as for
         ``TableConfig()``.
         """
@@ -451,9 +451,9 @@ class Bifrost(_BifrostBase):
         The precision write door, beside ``insert``: it names its destination
         instead of using the active binding, carries correlation as ordinary
         columns, and is durable when it returns, so no ``flush`` follows it.
-        Build the batch against ``TableConfig.describe(...).arrow_schema``; a
-        canonical table compares an incoming block against its declared fields
-        exactly, metadata included.
+        Build the batch against ``TableConfig.describe(...).arrow_schema``.
+        Columns match the table's declared columns by name, in any order; the
+        server judges every column's type and refuses a stale declaration.
 
         Raises:
             WyrdError: the batch exceeded the byte envelope, or the server

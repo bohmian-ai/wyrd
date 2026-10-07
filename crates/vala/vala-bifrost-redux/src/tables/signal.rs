@@ -910,16 +910,8 @@ pub fn validate_canonical_user_batch(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
     let schema = batch.schema();
-    if let Some(undeclared) = schema
-        .fields()
-        .iter()
-        .find(|supplied| !declared.iter().any(|field| field.name == supplied.name()))
-    {
-        return Err(BifrostError::UndeclaredField {
-            field: undeclared.name().clone(),
-            row: 0,
-        });
-    }
+    let fields = fields::canonical_arrow_fields(declared);
+    crate::tables::refuse_undeclared(&fields, &schema)?;
     if schema.fields().len() != declared.len() {
         return Err(BifrostError::SchemaParse {
             detail: format!(
@@ -940,7 +932,6 @@ pub fn validate_canonical_user_batch(
         validate_field_identity(field, schema.field(index))?;
         supplied.push(Arc::clone(batch.column(index)));
     }
-    let fields = fields::canonical_arrow_fields(declared);
     crate::tables::validate_declared_variants(&fields, batch)?;
     let canonical = Schema::new(fields);
 
@@ -1006,7 +997,7 @@ fn validate_field_identity(
 #[cfg(test)]
 pub(crate) mod correlation_fixture {
     use super::{CardRef, CardRefScope, FromStr, KeyValue, RecordBatch, attributes_variant};
-    use wyrd_queue::variant::variant_cell_to_json;
+    use wyrd_queue::variant::{variant_bytes_to_json, variant_cell_to_json};
 
     /// A signed scope member whose mint-resolved UID makes it assertable.
     pub(crate) const IN_SCOPE: &str = "prod/Service/checkout@1.0.0";
@@ -1045,9 +1036,9 @@ pub(crate) mod correlation_fixture {
             .column_by_name("attributes")
             .expect("the batch has an attributes column");
         for (row, source) in sources.iter().enumerate() {
-            let expected = attributes_variant("attributes", source)
-                .expect("fixture attributes project")
-                .to_json()
+            let expected =
+                attributes_variant("attributes", source).expect("fixture attributes project");
+            let expected = variant_bytes_to_json(expected.metadata(), expected.value())
                 .expect("fixture attributes decode");
             assert_eq!(
                 variant_cell_to_json(attributes.as_ref(), row).expect("row decodes"),

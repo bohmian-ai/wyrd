@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant
-revision: 11
+revision: 18
 status: approved
 ---
 
@@ -86,7 +86,8 @@ User-defined tables:
 
 - `DataTypeSpec` (`crates/wyrd-spec/src/vala/api.rs:194`) has no Variant,
   JSON, or Map type.
-- The one JSON Schema mapper (`crates/shared/wyrd-queue/src/schema.rs`) refuses
+- The one JSON Schema mapper (then `crates/shared/wyrd-queue/src/schema.rs`,
+  now `crates/shared/wyrd-types/src/schema.rs`) refuses
   free-form objects (`dict[str, Any]`), keeps only the first non-null branch of
   `anyOf`, refuses `oneOf` and `allOf`, and ignores `additionalProperties`.
 - The row builder (`crates/shared/wyrd-queue/src/batch_builder.rs`) silently
@@ -156,7 +157,6 @@ Query path:
   stored and queried correctly from the residual value.
 - Inferring JSON from text: a string column holding JSON text stays text.
 - A configurable shredding key count.
-- A TypeScript `TableConfig.fromArrow`.
 - Upstreaming changes to DataFusion, iceberg-rust, or compaction-core; fork
   changes stay on the pinned forks.
 - Splitting `vala.metrics.points` into per-kind tables.
@@ -225,6 +225,15 @@ validity, numeric range, then depth. The first failure is returned. Query
 `parse_json` uses `WYRD_VALA_400_VARIANT_INVALID_JSON`; `try_parse_json`
 returns SQL null.
 
+Canonical Arrow Variant input follows the same exact numeric domain as JSON.
+Integer primitives must fit `i64`. A Decimal16 is accepted only when its scale
+is zero and its coefficient is from `i64::MAX + 1` through `u64::MAX`, which is
+the canonical Variant representation of a JSON integer in that range. Every
+other Decimal16 is refused before acknowledgement with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`.
+This keeps every accepted number exact in Rust, Python, TypeScript, HTTP, MCP,
+and CLI without adding an arbitrary-precision public number type.
+
 ### Persisted built-in Structs
 
 Field order, names, nullability, and child nullability are fixed:
@@ -238,19 +247,24 @@ resource_entity_refs: non-null List<non-null Struct<
 >>
 
 drift_report: nullable Struct<
-  method: non-null Utf8,
-  features: non-null Variant,
-  verdict: non-null Utf8
+  method: nullable Utf8,
+  features: nullable Variant,
+  verdict: nullable Utf8
 >
 
 eval_summary: nullable Struct<
-  total_tasks: non-null Int32,
-  passed_tasks: non-null Int32,
-  failed_tasks: non-null Int32,
-  pass_rate: non-null Float64,
-  duration_ms: non-null Int64
+  total_tasks: nullable Int32,
+  passed_tasks: nullable Int32,
+  failed_tasks: nullable Int32,
+  pass_rate: nullable Float64,
+  duration_ms: nullable Int64
 >
 ```
+
+Children of a nullable Struct are nullable. Producers write every child of a
+present Struct and null every child of an absent one, so a field query such as
+`eval_summary['total_tasks']` reads SQL null for a row without that Struct on
+hot and published data alike.
 
 `DriftReport.features` is Variant because feature names are open. The owning
 enum display strings are persisted for `method` and `verdict`. Producers in
@@ -278,14 +292,15 @@ Cancellation before handoff releases the reservation and admits nothing;
 after handoff, the existing stable-batch retry and acknowledgement rules apply.
 No fallible schema or value conversion remains after reservation.
 
-`Bifrost::write_batch(table, batch)` keeps its public signature. At the start
-of the async call it invokes the existing authoritative `describe(table)`
-operation, then normalizes only fields declared Variant in that returned
-logical schema before direct-send admission. A describe or normalization
-failure leaves queue, byte-budget, and direct-send state unchanged. No cache,
-overload, caller-supplied schema, or duplicated inference is added. The server
-accepts only the extension and repeats validation at its trust boundary.
-`wyrd-queue` owns direct Variant JSON/value preparation.
+`Bifrost::write_batch(table, batch)` keeps its public signature and sends the
+batch verbatim. The client neither describes nor conforms it; the server judges
+it at its trust boundary. Before any other check the server conforms the batch
+to the table's registered Iceberg schema in one pass: it matches columns by
+name and puts them in declared order, casts a column whose Arrow type is
+another spelling of the registered Iceberg type, and refuses a column whose
+storage matches but whose Variant identity does not; it then repeats Variant
+value validation there. `wyrd-queue` owns row Variant JSON/value
+preparation.
 
 ### Oracle registration and distributed wire
 
@@ -534,9 +549,7 @@ Iceberg metadata columns remain internal. Forge reads `_row_id` and
 its internal physical batch, and writes those exact values for every surviving
 row. They never enter the public schema or fingerprint. The existing five-field
 Forge rewrite handoff is unchanged; lineage evidence stays in its output
-`DataFile`s. Missing, null, duplicate, or unencodable lineage fails the rewrite
-before commit, publishes no output, and follows the existing retry/recovery
-identity.
+`DataFile`s.
 
 ### Nested-field performance evidence
 
@@ -643,6 +656,13 @@ terminal, including Rust `serde_json::Value`, without serde_json
 `arbitrary_precision`. This matches BigQuery `PARSE_JSON`'s default exact mode;
 callers needing wider integers send them as strings.
 
+Already-encoded Arrow Variant input uses that same domain: its only accepted
+Decimal16 form is scale zero with a coefficient from `i64::MAX + 1` through
+`u64::MAX`. Other decimals are refused with
+`WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`.
+Callers needing an exact fractional decimal or a wider integer send it as a
+string. Wyrd does not add a second arbitrary-precision numeric surface.
+
 #### REQ-005 — Bloom filters sized to the data
 
 Every Bloom column is written with capacity for the configured maximum
@@ -748,6 +768,7 @@ language; no Bifrost-specific schema syntax is needed:
 | Zod `z.record(...)`, `z.unknown()`, `z.any()`, `z.json()` | Variant |
 | Rust `serde_json::Value`, `HashMap<String, T>` (via `schemars`) | Variant |
 | Arrow field with the `arrow.parquet.variant` extension | Variant |
+| Arrow `Map` field, or `DataTypeSpec` Map | Map |
 | `DataTypeSpec` Variant, or `"variant"` in the Python and TypeScript type unions | Variant |
 | Nested model or object with fixed properties | Struct |
 | Typed array | List of the item type |
@@ -767,10 +788,19 @@ string; it is not parsed as JSON.
 
 #### REQ-014 — Arrow writes to Variant columns
 
-`write_batch` in every SDK accepts, for a declared Variant column, either the
-Arrow Variant extension or a Utf8/LargeUtf8 column of JSON text, which the
-shared client converts to Variant before sending. The server wire contract
-accepts only the Variant extension for Variant columns.
+`write_batch` in every SDK sends an Arrow batch verbatim. A declared Variant
+column carries the Arrow Variant extension, as a Bifrost query result does, so
+a query result copies into a table of the same declaration unchanged. Columns
+match by name in any order, as for row `insert`; the server does the matching
+and refuses any other mismatch with its stable code (a stale or wrong
+declaration stays `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`). A column whose
+Arrow type is another spelling of the registered Iceberg type (`Int8` for
+`int`, `LargeUtf8` for `string`, a timestamp in any zone for `TIMESTAMP_LTZ`)
+is cast once by the server to the registered type. A column whose storage
+matches but whose Variant identity does not (a bare storage Struct for a
+Variant, a Variant for a Struct, or a Variant extension with parameters, at
+any depth) is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`. No SDK converts,
+reorders, or fills columns, and an omitted column is not filled with nulls.
 
 #### REQ-015 — No silent key loss
 
@@ -784,11 +814,44 @@ field for open data.
 #### REQ-016 — Unsupported types refused up front
 
 Registering a table with a type Iceberg cannot store (UInt64, Date64, Time32,
-second- or millisecond-precision timestamps, a timestamp with a non-UTC zone,
-or any other type the canonical schema model does not support) is refused with
-`WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at the SDK
-before any request and again at the server. SDK documentation lists exactly
-the supported types.
+second- or millisecond-precision timestamps, nanosecond `Time64`, or any other
+type the canonical schema model does not support, at any depth) is refused
+with `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, naming the field and type, at
+every SDK declaration boundary capable of representing that type before any
+request, and again at the server. One decision,
+`wyrd_types::schema::check_supported`, makes both refusals. A timestamp in any
+zone is not refused: it declares `TIMESTAMP_LTZ` (REQ-028). The Rust, Python,
+and TypeScript Arrow declaration boundaries (`TableConfig::from_arrow`,
+`TableConfig.from_arrow`, `TableConfig.fromArrow`) cover every listed Arrow
+type. SDK documentation lists exactly the types its public declaration formats
+support.
+
+#### REQ-028 — Timestamp columns
+
+A Bifrost timestamp column has one of three types, named as Snowflake names
+them. `wyrd_types::TimestampKind` owns each type's JSON Schema format and its
+RFC 3339 text; the Python and TypeScript SDKs read both from the native
+binding.
+
+| Declaration | Column | Stored as |
+|---|---|---|
+| Pydantic `NaiveDatetime` or `wyrd.types.TimestampNTZ`; TypeScript `TimestampNTZ.schema(z)`; Rust `TimestampNtz`; JSON Schema `format: timestamp-ntz` or `partial-date-time`; a naive Arrow timestamp | `TIMESTAMP_NTZ` | the naive Arrow timestamp |
+| Pydantic `datetime`, `AwareDatetime`, `PastDatetime`, `FutureDatetime`, or `wyrd.types.TimestampLTZ`; TypeScript `TimestampLTZ.schema(z)`; Rust `TimestampLtz`; JSON Schema `format: date-time`; an Arrow timestamp in any zone | `TIMESTAMP_LTZ` | an Arrow timestamp zoned `+00:00` |
+| `wyrd.types.TimestampTZ`; TypeScript `TimestampTZ.schema(z)`; Rust `TimestampTz`; JSON Schema `format: timestamp-tz`; the Arrow Struct of a zoned `utc` and a naive `local` microsecond timestamp | `TIMESTAMP_TZ` | that Struct |
+
+`insert` converts each value to its column's type: an instant in any offset is
+stored as its UTC instant, and a `TIMESTAMP_TZ` keeps the writer's wall-clock
+reading beside it. The typed row terminal returns each type's own value: the
+Python Wyrd timestamp types and the TypeScript branded text, with a
+`TIMESTAMP_TZ` read back in the writer's offset.
+
+#### REQ-029 — One schema per table
+
+`wyrd-types` owns the one mapping from a declared model or Arrow schema to wire
+columns. A table's registered Iceberg schema is its one schema: registration
+stores each declared column in its Iceberg form, so a repeat registration that
+spells the same Iceberg types finds the existing table rather than conflicting,
+and every write is conformed to that schema (REQ-014).
 
 ### Query
 
@@ -1098,16 +1161,27 @@ column of REQ-010 is queried with `->>`.
 #### AC-004 — User tables with open and nested data
 
 In each SDK, a table registered from a model with a free-form field, a union
-field, and a nested model accepts `insert` rows and Arrow batches (Variant
-extension and JSON text), and the values are queried by `->`, `->>`, and Struct
+field, and a nested model accepts `insert` rows and Arrow batches carrying the
+Variant extension, and the values are queried by `->`, `->>`, and Struct
 field access and decoded into native values by the typed row terminal.
 
 #### AC-005 — Refusals
 
-In each SDK, an undeclared row key, a model allowing extra keys, and each
-unsupported type of REQ-016 are refused with their exact catalog codes, and no
-row is queued for a refused write. Invalid JSON in `parse_json` returns a
-stable query error; `try_parse_json` returns null.
+In each SDK, an undeclared row key and a model allowing extra keys are refused
+with their exact catalog codes, and no row is queued for a refused write.
+Each SDK additionally declares and refuses every Arrow type listed in REQ-016
+through its Arrow declaration boundary before any request. Invalid JSON in
+`parse_json` returns a stable query error; `try_parse_json` returns null.
+
+#### AC-011 — Timestamp columns and one schema
+
+In each SDK, a table declared with all three timestamp types registers and
+its inserted values read back as each type's own value, with `TIMESTAMP_TZ` in
+the writer's offset. Through its Arrow declaration boundary each SDK declares
+an Arrow timestamp zoned `America/New_York`, which is stored `+00:00`, and a
+registration in narrower spellings of the same Iceberg types finds the
+existing table when re-declared as the server describes it. A server test proves that a same-Iceberg-type spelling is cast
+and a Variant identity mismatch is refused.
 
 #### AC-006 — Shredding equivalence
 
@@ -1167,6 +1241,63 @@ None.
 
 ## Revision history
 
+- **Revision 18 (2026-10-06, approved):** By explicit human direction (merge
+  decisions D1–D4), specifies the scope TASK-003 added. REQ-028 adds the three
+  timestamp types. REQ-029 makes `wyrd-types` the owner of the declared-type
+  mapping and the registered Iceberg schema the table's one schema. REQ-014
+  adds the server's one-pass conform: a same-Iceberg-type spelling is cast and
+  a Variant identity mismatch is refused. REQ-016 drops "a timestamp with a
+  non-UTC zone", because any zone declares `TIMESTAMP_LTZ`, and names
+  `check_supported` as the one refusal decision. TypeScript gains
+  `TableConfig.fromArrow`, so the non-goal excluding it is removed and REQ-016
+  and AC-005 cover every listed Arrow type in all three SDKs, superseding
+  revision 16's TypeScript scoping. REQ-012 adds Map. AC-011 covers REQ-028
+  and REQ-029.
+- **Revision 17 (2026-10-06, approved):** By explicit human direction,
+  `write_batch` sends its batch verbatim and the server judges it. The
+  client-side describe-then-conform step of revisions 7 and 15 (JSON text for
+  Variant columns, by-name matching, null-filling omitted columns) is removed:
+  it duplicated the server's contract, and its describe call failed for
+  write-only and gRPC-only callers. The server matches written columns to the
+  registered table by name, so `insert` and `write_batch` share one column
+  rule enforced once; the built-in positional order check is removed.
+  REQ-014, AC-004, and AC-005 are narrowed to match.
+- **Revision 16 (2026-10-06, approved):** Resolves TASK-002 repeat-review
+  `FIND-TASK-002-6` without adding the explicitly excluded TypeScript
+  `TableConfig.fromArrow`. REQ-016 and AC-005 now require exhaustive
+  unsupported-type declaration proof only at public SDK declaration boundaries
+  capable of representing those types. Rust and Python retain the full Arrow
+  matrix; TypeScript retains JSON Schema/Zod refusals, while write-time wire
+  mismatches remain REQ-014 evidence rather than a substitute for declaration
+  evidence. No runtime behavior or supported type changes.
+- **Revision 15 (2026-10-06, approved):** From TASK-002 implementation. Arrow
+  `write_batch` follows the same column rules as row `insert`: columns match by
+  name in any order and take their declared nullability, an omitted nullable
+  column is written as nulls, an omitted required column or a null in one is
+  `SCHEMA_PARSE`, and an undeclared column is
+  `UNDECLARED_FIELD`. The shared client conforms the batch in the same
+  describe-then-normalize step, so every SDK has one behavior; the server wire
+  contract is unchanged and stays exact.
+- **Revision 14 (2026-10-06, approved):** By explicit human direction, Forge
+  copies rewrite lineage through without a missing/null check, as Java and
+  Spark v3 rewrites do. Bifrost writes only v3 tables whose manifest lists
+  always assign row ids, so the refusal guarded an unreachable state; it and
+  its injection proof are removed.
+- **Revision 13 (2026-10-06, approved):** From TASK-001 review r5 and explicit
+  human direction to choose the smallest user-facing contract. Canonical Arrow
+  Variant input now uses the same exact numeric domain as JSON: integer
+  primitives fit `i64`; Decimal16 is accepted only as the scale-zero encoding
+  of `i64::MAX + 1..=u64::MAX`; every other Decimal16 is refused before ACK
+  with `VARIANT_NUMERIC_OUT_OF_RANGE` and `numeric_kind: "decimal"`. Exact
+  fractional or wider numbers travel as strings; no arbitrary-precision public
+  terminal is added.
+- **Revision 12 (2026-10-06, approved):** From TASK-001 review r4. The
+  children of the nullable `drift_report` and `eval_summary` Structs become
+  nullable. A non-null child is a required Parquet leaf, whose parent-masked
+  nulls the pinned Parquet reader drops while DataFusion `get_field` returns
+  the child without the parent's nulls, so published field queries read
+  another row's values for an absent Struct (FIND-TASK-001-14). Nullable
+  children keep their own nulls through Parquet with no read layer.
 - **Revision 11 (2026-10-06, approved):** From TASK-001 review r2. JSON
   integers outside the signed/unsigned 64-bit ranges are refused with
   `NUMERIC_OUT_OF_RANGE` instead of stored as wide decimals, so every accepted

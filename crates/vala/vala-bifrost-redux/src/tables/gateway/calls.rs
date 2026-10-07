@@ -26,19 +26,13 @@ pub const REQUEST_PAYLOAD: &str = "request_payload";
 /// Redacted response payload Variant column, readable only with payload authority.
 pub const RESPONSE_PAYLOAD: &str = "response_payload";
 
+/// Optional resolved `ModelRef` Struct column; present exactly when routing resolved a model.
+pub const RESOLVED_MODEL: &str = "resolved_model";
+
 /// Built-in definition of `vala.gateway.calls`.
 pub struct CallsTable;
 
 impl CallsTable {
-    /// Arrow type of one `ModelRef`: its provider and provider-native model.
-    #[must_use]
-    pub fn model_ref_type() -> DataType {
-        DataType::Struct(Fields::from(vec![
-            utf8("provider", false),
-            utf8("model", false),
-        ]))
-    }
-
     /// Arrow type of one normalized usage list.
     ///
     /// Each element is one `GatewayUsageAmount`; the quantity keeps its exact
@@ -93,6 +87,8 @@ impl DomainTable for CallsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// Both Variant payload columns require payload-read authority.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
+    /// A resolved model carries both its provider and model, or neither.
+    const WHOLE_STRUCTS: &'static [&'static str] = &[RESOLVED_MODEL];
 
     /// The `GatewayCallPayloadV1` fields in contract order.
     ///
@@ -106,8 +102,26 @@ impl DomainTable for CallsTable {
             utf8("caller_principal_id", false),
             utf8("operation", false),
             utf8("ingress_dialect", false),
-            Field::new("requested_model", Self::model_ref_type(), false),
-            Field::new("resolved_model", Self::model_ref_type(), true),
+            // A `ModelRef`: its provider and provider-native model.
+            Field::new(
+                "requested_model",
+                DataType::Struct(Fields::from(vec![
+                    utf8("provider", false),
+                    utf8("model", false),
+                ])),
+                false,
+            ),
+            // Optional, so both children are nullable: a required Parquet leaf
+            // under a null Struct reads back padded values that a field query
+            // would expose. The table validator still refuses a partial model.
+            Field::new(
+                RESOLVED_MODEL,
+                DataType::Struct(Fields::from(vec![
+                    utf8("provider", true),
+                    utf8("model", true),
+                ])),
+                true,
+            ),
             utf8("resolved_deployment", true),
             boolean("streaming", false),
             ts_us_utc("started_at", false),
@@ -143,13 +157,14 @@ impl DomainTable for CallsTable {
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::CallsTable;
+    use super::{CallsTable, RESOLVED_MODEL};
     use crate::tables::{DomainTable, builtin_table};
     use wyrd_spec::vala::{
         CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
-    /// Pins the exact contract columns, their nullability, and the envelope.
+    /// Pins the exact contract columns, their nullability, the two model
+    /// Structs' child nullability, and the envelope.
     ///
     /// # Panics
     ///
@@ -205,6 +220,24 @@ mod tests {
             schema.field_with_name("usage").expect("usage").data_type(),
             DataType::List(_)
         ));
+        // A required model has required children; only the optional resolved
+        // model's children are nullable.
+        for (model, nullable) in [("requested_model", false), (RESOLVED_MODEL, true)] {
+            let DataType::Struct(children) =
+                schema.field_with_name(model).expect(model).data_type()
+            else {
+                panic!("{model} is a Struct");
+            };
+            let layout = children
+                .iter()
+                .map(|child| (child.name().as_str(), child.is_nullable()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                layout,
+                [("provider", nullable), ("model", nullable)],
+                "{model}"
+            );
+        }
         assert!(CallsTable::canonical_fields().is_none());
     }
 }

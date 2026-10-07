@@ -1226,7 +1226,7 @@ impl QueryIpcDecoder {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -1690,9 +1690,7 @@ pub(super) mod tests {
     /// The recorded lines are the proof of a typed method's HTTP contract: the
     /// exact verb, path, and query string a caller's request produced. Each
     /// connection is answered once and closed so the recording stays ordered.
-    pub(in crate::bifrost) fn recording_server(
-        body: &'static str,
-    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    fn recording_server(body: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
         let address = listener.local_addr().expect("listener has an address");
         listener

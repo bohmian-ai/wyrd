@@ -31,7 +31,9 @@ collection repeats a key, the final occurrence is stored.
 JSON input converts an integer in the signed 64-bit range to an integer, an
 integer above that but within the unsigned 64-bit range to a scale-zero
 decimal, and a non-integer number to a double, so every accepted integer reads
-back exactly. Send a wider integer as a string. A value is refused before acknowledgement with a stable code:
+back exactly. Send a wider integer or an exact fractional decimal as a
+string. A raw Variant decimal is accepted only in that same scale-zero
+unsigned range. A value is refused before acknowledgement with a stable code:
 
 | Condition | Code |
 |---|---|
@@ -39,7 +41,7 @@ back exactly. Send a wider integer as a string. A value is refused before acknow
 | Encoded metadata plus value over 8,388,608 bytes | `WYRD_VALA_413_VARIANT_TOO_LARGE` |
 | Invalid JSON or Variant encoding | `WYRD_VALA_400_VARIANT_INVALID_JSON` |
 | Nesting deeper than 64 containers | `WYRD_VALA_400_VARIANT_TOO_DEEP` |
-| Integer outside the signed and unsigned 64-bit ranges | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
+| Integer outside the signed and unsigned 64-bit ranges, or any other decimal | `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE` |
 
 Query a Variant with these operators and functions:
 
@@ -86,8 +88,8 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 | `card_uid` | `Utf8` (nullable) | Correlation: owning Card |
 | `principal_id` | `Utf8` | Correlation: emitting principal |
 | `wyrd_request_id` | `Utf8` | Admitting request identity |
-| `wyrd_event_time` | `Timestamp(µs, UTC)` | When the observed thing happened: the caller's value, or `wyrd_ingested_at` when absent; partitions and windows the table |
-| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
+| `wyrd_event_time` | `Timestamp(µs, +00:00)` | When the observed thing happened: the caller's value, or `wyrd_ingested_at` when absent; partitions and windows the table |
+| `wyrd_ingested_at` | `Timestamp(µs, +00:00)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
 
 Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_event_time` and `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
 
@@ -210,8 +212,10 @@ null.
 | `deployment_environment` | `Utf8` nullable | Resource `deployment.environment.name`, else `deployment.environment` |
 | + system columns | | |
 
-`positive_buckets` and `negative_buckets` carry `offset` (`Int32`) and
-`bucket_counts` (`List<Int64>`). Each `quantile_values` element carries
+`positive_buckets` and `negative_buckets` carry nullable `offset` (`Int32`)
+and `bucket_counts` (`List<Int64>`); both read SQL null when the collection is
+absent, and a collection with only some fields set is refused. Each
+`quantile_values` element carries
 `quantile` and `value`. Each `exemplars` element carries `time_unix_nano`,
 nullable `int_value` and `double_value`, Variant `filtered_attributes`, and
 nullable `trace_id` and `span_id`. `resource_entity_refs` is as on
@@ -265,7 +269,7 @@ Source type: `DriftRecordObservation`.
 | `num_value` | `Float64` nullable |
 | `str_value` | `Utf8` nullable |
 | `session_id` | `Utf8` nullable |
-| `created_at` | `Timestamp(µs, UTC)` |
+| `created_at` | `Timestamp(µs, +00:00)` |
 | + system columns | |
 
 One row per observed feature; rows from one observation share `record_id`. The
@@ -285,7 +289,7 @@ matching `observations_ready` binding. The observed subject is the managed
 | `context` | `Variant`, **payload-gated** |
 | `trace_id` | `FixedSizeBinary(16)` nullable |
 | `span_id` | `FixedSizeBinary(8)` nullable |
-| `created_at` | `Timestamp(µs, UTC)` |
+| `created_at` | `Timestamp(µs, +00:00)` |
 | `media` | `Variant` nullable, **payload-gated** |
 | + system columns | |
 
@@ -307,10 +311,10 @@ and the managed `card_uid` is the Verifier Card.
 | `binding_id` | `Utf8` nullable |
 | `trigger_identity` | `Utf8` nullable |
 | `source_record_id` | `Utf8` nullable |
-| `window_start` | `Timestamp(µs, UTC)` nullable |
-| `window_end` | `Timestamp(µs, UTC)` nullable |
-| `started_at` | `Timestamp(µs, UTC)` |
-| `ended_at` | `Timestamp(µs, UTC)` |
+| `window_start` | `Timestamp(µs, +00:00)` nullable |
+| `window_end` | `Timestamp(µs, +00:00)` nullable |
+| `started_at` | `Timestamp(µs, +00:00)` |
+| `ended_at` | `Timestamp(µs, +00:00)` |
 | `drift_report` | `Struct` nullable, **payload-gated** |
 | `eval_summary` | `Struct` nullable, **payload-gated** |
 | + system columns | |
@@ -319,8 +323,10 @@ A scored Drift result sets only `drift_report`: `method` (`Utf8`), `features`
 (`Variant`, keyed by feature name), and `verdict` (`Utf8`). A scored Eval
 result sets only `eval_summary`: `total_tasks`, `passed_tasks`, and
 `failed_tasks` (`Int32`), `pass_rate` (`Float64`), and `duration_ms`
-(`Int64`). A completed Drift execution that could not score valid input sets
-neither. There is no `details` column.
+(`Int64`). Every field inside either Struct is nullable and reads SQL null
+when its Struct is absent; a write that sets some fields of a present Struct
+but not others is refused. A completed Drift execution that could not score
+valid input sets neither. There is no `details` column.
 
 ## vala.drift.result_features
 
@@ -332,8 +338,8 @@ One row per scored feature of one Drift result.
 | `owner_card_uid` | `Utf8` nullable |
 | `subject_card_uid` | `Utf8` |
 | `binding_id` | `Utf8` nullable |
-| `window_start` | `Timestamp(µs, UTC)` |
-| `window_end` | `Timestamp(µs, UTC)` |
+| `window_start` | `Timestamp(µs, +00:00)` |
+| `window_end` | `Timestamp(µs, +00:00)` |
 | `method` | `Utf8` |
 | `feature` | `Utf8` |
 | `score` | `Float64` nullable |
@@ -362,7 +368,7 @@ are set only for a skip.
 | `operator` | `Utf8` nullable |
 | `message` | `Utf8` nullable, **payload-gated** |
 | `stage` | `Int32` nullable |
-| `started_at` | `Timestamp(µs, UTC)` nullable |
+| `started_at` | `Timestamp(µs, +00:00)` nullable |
 | `duration_ms` | `Int64` nullable |
 | `skip_reason` | `Utf8` nullable |
 | `upstream_task_id` | `Utf8` nullable |
@@ -386,8 +392,8 @@ Source type: `AgentTraceRecord`.
 | `provider` | `Utf8` |
 | `messages` | `Variant`, **payload-gated** |
 | `tool_io` | `Variant` nullable, **payload-gated** |
-| `started_at` | `Timestamp(µs, UTC)` |
-| `ended_at` | `Timestamp(µs, UTC)` |
+| `started_at` | `Timestamp(µs, +00:00)` |
+| `ended_at` | `Timestamp(µs, +00:00)` |
 | + system columns | |
 
 ## Type mapping
@@ -396,7 +402,7 @@ Source type: `AgentTraceRecord`.
 |---|---|---|
 | `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id |
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
-| `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
+| `Timestamp(µs, +00:00)` | `DateTime<Utc>` (RFC3339) | `TIMESTAMP_LTZ`; every system and built-in timestamp |
 | `Utf8` | `String` | |
 | `Variant` | JSON value | The `arrow.parquet.variant` extension over a `metadata`/`value` binary Struct; typed row terminals decode it to the language's native open value |
 | `List<T>`, `Struct` | Array, object | Nested typed collections |

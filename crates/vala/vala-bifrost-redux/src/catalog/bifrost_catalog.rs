@@ -836,8 +836,9 @@ impl BifrostCatalog {
     ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// compaction target or type, control row, or audit event is invalid, and
-    /// `UnsupportedType` naming the field when a column has no Iceberg type.
+    /// compaction target or type, control row, or audit event is invalid. A
+    /// column with no Iceberg type is an Iceberg error: the caller refuses it
+    /// first with `wyrd_types::schema::check_supported`.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
@@ -943,8 +944,9 @@ impl BifrostCatalog {
     /// # Errors
     /// Returns [`BifrostCatalogError::Registration`] for an invalid or
     /// conflicting layout, compaction target, or compaction type,
-    /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict, and
-    /// metadata, Iceberg, SQL, or audit errors otherwise.
+    /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict,
+    /// [`BifrostCatalogError::Iceberg`] for a caller column with no Iceberg
+    /// form, and metadata, SQL, or audit errors otherwise.
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
@@ -957,16 +959,7 @@ impl BifrostCatalog {
             request.user_fields = request
                 .user_fields
                 .iter()
-                .map(|field| {
-                    crate::tables::iceberg_form(field).map_err(|_| {
-                        BifrostCatalogError::Registration(
-                            wyrd_spec::vala::BifrostError::UnsupportedType {
-                                field: field.name().clone(),
-                                data_type: field.data_type().to_string(),
-                            },
-                        )
-                    })
-                })
+                .map(crate::tables::iceberg_form)
                 .collect::<Result<_, _>>()?;
         }
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
@@ -1159,9 +1152,7 @@ impl BifrostCatalog {
         }
         let actual_schema =
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?;
-        if SchemaFingerprint::from_arrow_schema_exact(expected_schema)
-            != SchemaFingerprint::from_arrow_schema_exact(&actual_schema)
-        {
+        if !physical_schema_matches(expected_schema, &actual_schema) {
             return Err(BifrostCatalogError::MetadataMismatch(format!(
                 "physical table schema mismatch: expected {expected_schema:?}, actual {actual_schema:?}"
             )));
@@ -1821,6 +1812,102 @@ fn provider_error(error: IcebergError) -> BifrostCatalogError {
     BifrostCatalogError::DataFusion(datafusion::error::DataFusionError::External(Box::new(
         error,
     )))
+}
+
+/// Reports whether a physical Iceberg table's schema is the expected one.
+///
+/// The exact layout fingerprint — names, order, nullability, and Arrow types
+/// at every depth — must match, and each column must be the same Iceberg type
+/// through [`crate::tables::same_iceberg_type`], which tells a Variant from
+/// its storage Struct at any depth where the metadata-free fingerprint
+/// cannot. The fingerprint itself stays unchanged because sealed footers
+/// persist it.
+pub(crate) fn physical_schema_matches(expected: &Schema, actual: &Schema) -> bool {
+    SchemaFingerprint::from_arrow_schema_exact(expected)
+        == SchemaFingerprint::from_arrow_schema_exact(actual)
+        && expected
+            .fields()
+            .iter()
+            .zip(actual.fields())
+            .all(|(expected, actual)| crate::tables::same_iceberg_type(expected, actual))
+}
+
+#[cfg(test)]
+mod physical_schema_tests {
+    //! The physical-table schema comparison registration reconciles against.
+
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use wyrd_types::variant::{variant_field, variant_storage_type};
+
+    use super::physical_schema_matches;
+
+    /// A Variant and an ordinary Struct with its storage children are
+    /// different physical schemas in both directions, at the top level and
+    /// nested under a Struct or a List.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any placement compares a Variant equal to its storage
+    /// Struct, or a Variant stops matching itself.
+    #[test]
+    fn physical_schema_keeps_variant_identity_at_any_depth() {
+        let variant = variant_field("payload", true);
+        let storage = Field::new("payload", variant_storage_type(), true);
+        let struct_child = |field: &Field| {
+            Field::new(
+                "outer",
+                DataType::Struct(Fields::from(vec![field.clone()])),
+                true,
+            )
+        };
+        let list_element =
+            |field: &Field| Field::new("outer", DataType::List(Arc::new(field.clone())), true);
+        let placements = [
+            ("top level", variant.clone(), storage.clone()),
+            (
+                "struct child",
+                struct_child(&variant),
+                struct_child(&storage),
+            ),
+            (
+                "list element",
+                list_element(&variant),
+                list_element(&storage),
+            ),
+        ];
+        for (placement, variant, storage) in placements {
+            let variant = Schema::new(vec![variant]);
+            let storage = Schema::new(vec![storage]);
+            assert!(physical_schema_matches(&variant, &variant), "{placement}");
+            assert!(!physical_schema_matches(&variant, &storage), "{placement}");
+            assert!(!physical_schema_matches(&storage, &variant), "{placement}");
+        }
+    }
+
+    /// The same columns in a different order are a different physical schema.
+    ///
+    /// Position is the whole comparison: nothing consults a declared Iceberg
+    /// field id to call two orderings the same table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reordered schema compares equal in either direction.
+    #[test]
+    fn physical_schema_rejects_reordered_columns() {
+        let declared = Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("entry_hash", DataType::Utf8, false),
+        ]);
+        let reordered = Schema::new(vec![
+            Field::new("entry_hash", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, false),
+        ]);
+
+        assert!(!physical_schema_matches(&declared, &reordered));
+        assert!(!physical_schema_matches(&reordered, &declared));
+    }
 }
 
 /// Validates every reconciled hot row against its binding and adds its bytes.

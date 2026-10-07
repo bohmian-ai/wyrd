@@ -51,7 +51,7 @@ bifrost.register()
 # Buffered rows; durable after flush().
 bifrost.insert({"model": "gpt-4o", "score": 0.93}, {"run_id": "run-abc"})
 
-# A canonical Arrow batch, sent directly.
+# An Arrow batch, sent directly; columns match the table by name.
 bifrost.write_batch("genai.predictions", batch)
 
 bifrost.flush()
@@ -88,7 +88,12 @@ Callers cannot override the other system columns. Any batch that contains rows w
 
 ## Schema validation
 
-Gate validates the batch against the stored `SchemaFingerprint` before Scribe accept. A fingerprint mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH`. The fingerprint is computed over the canonical Arrow schema (field names, types, nullability, sorted metadata keys).
+The table's registered Iceberg schema is its one schema. Scribe matches each batch to it before acknowledging:
+
+- Columns match by name, in any order.
+- A column whose Arrow type is another spelling of the registered Iceberg type is cast to the registered type: `Int8` or `Int16` for `int`, `LargeUtf8` for `string`, a timestamp in any zone for a `TIMESTAMP_LTZ` column (stored as `+00:00`).
+- A Variant column must carry the `arrow.parquet.variant` extension with no parameters, at any depth. A bare storage Struct sent for a Variant, or a Variant sent for a Struct, returns `400 WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`.
+- Any other difference (a missing or differently typed column, or different nullability) returns `409 WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
 
 ## Direct Arrow writes (Rust)
 

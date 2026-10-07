@@ -3,8 +3,8 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-variant
-spec_revision: 11
-requirements: [REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, INV-003, INV-004, INV-006, INV-007, INV-008, AC-006, AC-007, AC-008, AC-009, AC-010]
+spec_revision: 18
+requirements: [REQ-012, REQ-014, REQ-016, REQ-028, REQ-029, AC-011, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, INV-003, INV-004, INV-006, INV-007, INV-008, AC-006, AC-007, AC-008, AC-009, AC-010]
 depends_on: [TASK-001]
 parent_task:
 remediates: [BVR-FRESH-001, BVR-FRESH-002, BVR-FRESH-003, BVR-RR2-001, BVR-RR2-002, BVR-RR2-003, BVR-RR3-001, BVR-RR3-002, BVR-RR3-003]
@@ -28,11 +28,11 @@ for both and runs `mise run verify:bifrost` once, as TASK-003's last command.
 ## Added Scope and Progress (record for resuming shredding)
 
 This branch carries two pieces of work beyond the shredding outcome above.
-Both were done before shredding resumed. Their requirements go into spec
-revision 18+ (merge plan decision D4,
+Both were done before shredding resumed. Spec revision 18 specifies them
+(REQ-028, REQ-029, REQ-014's server cast, REQ-016, REQ-012's Map, AC-011;
+merge plan decision D4,
 `changes/active/bifrost-variant/merge-integration-into-task-003.md`), and this
-task file records them. Spec revision 18 must also update `spec_revision` and
-`requirements` above.
+task file records them.
 
 ### Added A: three timestamp types — implemented, uncommitted
 
@@ -63,7 +63,8 @@ Each user column picks one of three Snowflake-named types:
   - Rust owns parsing, rendering and the format table
     (`crates/shared/wyrd-types/src/timestamp.rs`, `TimestampKind`).
   - Python: `wyrd.types.TimestampNTZ/LTZ/TZ`, plus the Pydantic mapping in
-    `bifrost/_pydantic.py`.
+    `bifrost/_pydantic.py`, backed by the native `timestamp_format`,
+    `timestamp_kinds` and `QueryResult.timestamp_tz_texts`.
   - TS: the checked-text types `TimestampNTZ/LTZ/TZ` (`parse`, `schema(z)`),
     backed by the native `timestamp_format`, `timestamp_text`,
     `stored_timestamp_text` and `timestamp_kinds`.
@@ -113,30 +114,34 @@ Each user column picks one of three Snowflake-named types:
     `every_iceberg_type_round_trips_with_nested_nulls`,
     `a_narrower_type_reads_back_the_same_values`,
     `a_narrower_declaration_is_the_table_it_describes`,
-    `a_type_with_no_iceberg_column_is_refused_at_registration`,
-    `a_refused_registration_creates_no_table`.
+    `a_type_bifrost_cannot_store_is_refused_when_declared`.
   - Rust journey `register_a_table_from_a_model.rs`: six tests.
-  - Python `test_every_iceberg_column_type.py` (six tests) and
+  - Python `test_every_iceberg_column_type.py` (four tests) and
     `test_register_a_table_from_a_model.py` (five tests).
-  - TS `every-iceberg-column-type.test.ts` (four tests) and
+  - TS `every-iceberg-column-type.test.ts` (three tests) and
     `register-a-table-from-a-model.test.ts` (five tests).
 
-### Changes the merge applies to A and B
+### Changes the merge applied to A and B
 
-These are merge-plan decisions D1–D3:
+These are merge-plan decisions D1–D3, applied in the merge:
 
 - **D1.** `check_supported` is restored in `wyrd-types` as the single
   unsupported-type decider, for the SDK declaration and server registration.
-  It has no zone clause. The catalog `iceberg_form` refusal becomes an internal
-  invariant.
-- **D2.** As implemented, any zone declares `TIMESTAMP_LTZ`. REQ-016 drops "a
-  timestamp with a non-UTC zone".
+  It has no zone clause. The catalog `iceberg_form` failure is an internal
+  Iceberg error. The registration-refusal journeys merged into one per
+  surface, `a_type_bifrost_cannot_store_is_refused_when_declared`.
+- **D2.** As implemented, any zone declares `TIMESTAMP_LTZ`, at registration as
+  on writes (`tables::as_stored`). REQ-016 drops "a timestamp with a non-UTC
+  zone".
 - **D3.** TS typed reads keep Int64 as `bigint`.
   - The TS test "a 64-bit integer reads back as a number when it is safe" and
     `register-a-table-from-a-model.test.ts` change to `bigint`.
   - The three TS journeys above join `test:bifrost:journey:typescript`.
 - **Cast pass.** Scribe's cast and the integration branch's by-name reorder
-  become one pass (`conform_to_registered`).
+  became one pass (`conform_to_registered`), which also refuses a Variant
+  identity mismatch.
+- **Python dedup.** The Python `_FORMAT` table and `TimestampTZ.from_stored`
+  arithmetic were removed; Python reads both from Rust as TS does.
 
 ### Shredding progress (this task's own scenarios)
 
@@ -151,6 +156,11 @@ Each status was found by searching the tree for that scenario's named tests.
 | Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
 
 After the merge, resume shredding at Scenario 1.
+
+Open follow-up (recorded at the merge, not done): JSON-row → Arrow value
+conversion (`build_list`, `build_map`, timestamp parsing run by
+`RowPreflight`) still lives in `wyrd-queue/src/batch_builder.rs`. Type
+conversion belongs in `wyrd-types`; moving it needs the user's go-ahead.
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 

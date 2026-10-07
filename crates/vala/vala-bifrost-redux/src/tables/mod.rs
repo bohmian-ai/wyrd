@@ -3,9 +3,13 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
+use arrow::datatypes::{
+    DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit,
+};
 use arrow::record_batch::RecordBatch;
+use arrow_schema::extension::ExtensionType;
 use iceberg::spec::{self, NestedField, Type};
+use parquet_variant_compute::VariantType;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_queue::variant::EncodedVariant;
@@ -198,52 +202,33 @@ pub struct BuiltinTableDefinition {
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
 ///
 /// Clients prepare Variant values before sending, but a raw Arrow IPC writer
-/// can skip that, and the schema fingerprint compares storage types only.
-/// Every table validator runs this walk over its declared fields, top level
-/// and nested inside Structs and Lists: every field holding a Variant must
-/// match its declaration on the wire, where `wyrd_types::field_to_spec` keeps
-/// the `arrow.parquet.variant` extension that storage types drop, and every
-/// present Variant value must pass [`EncodedVariant::from_bytes`]. Fields are
-/// checked in logical order first, then values row by row in input order and
+/// can skip that. Variant identity — the `arrow.parquet.variant` extension
+/// that storage types drop — is enforced before this by Scribe, which
+/// conforms every batch to the table's registered Iceberg schema. `declared`
+/// is the trusted logical declaration — a built-in's own fields, or a dynamic
+/// table's registered Iceberg schema converted to Arrow — never the supplied
+/// schema. Every present value of a declared field that is or nests a Variant
+/// must pass [`EncodedVariant::from_bytes`], row by row in input order and
 /// field order, so the first failure follows the locked precedence. A
 /// declared field the batch does not supply is left to the fingerprint check.
 /// It reads the batch only and has no side effects.
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::UnsupportedType`] naming the top-level field when
-/// a field holding a Variant arrives without the extension or in a storage
-/// layout other than the declared one, and the catalogued Variant error
-/// (size, encoding, or depth) for the first stored value that fails.
+/// Returns [`BifrostError::UnsupportedType`] naming the field when a declared
+/// Variant's stored column is not the canonical storage struct, and the
+/// catalogued Variant error (size, encoding or canonical form, numeric range,
+/// or depth, in that order) for the first stored value that fails.
 pub(crate) fn validate_declared_variants(
     declared: &[Field],
     batch: &RecordBatch,
 ) -> Result<(), BifrostError> {
     let schema = batch.schema();
-    let wire = |field: &Field| {
-        wyrd_types::field_to_spec(field)
-            .ok()
-            .map(|spec| wyrd_types::spec_to_field(&spec, false))
-    };
     let mut variant_columns = Vec::new();
-    for declared in declared {
-        if !holds_variant(declared) {
-            continue;
+    for declared in declared.iter().filter(|declared| holds_variant(declared)) {
+        if let Ok(index) = schema.index_of(declared.name()) {
+            variant_columns.push((declared, Arc::clone(batch.column(index))));
         }
-        let Ok(index) = schema.index_of(declared.name()) else {
-            continue;
-        };
-        let supplied = schema.field(index);
-        let matches = matches!(
-            (wire(declared), wire(supplied)),
-            (Some(declared), Some(supplied))
-                if declared.data_type() == supplied.data_type()
-                    && is_variant(&declared) == is_variant(&supplied)
-        );
-        if !matches {
-            return Err(unsupported_variant(declared.name(), supplied.data_type()));
-        }
-        variant_columns.push((declared, Arc::clone(batch.column(index))));
     }
     for index in 0..batch.num_rows() {
         let row = u64::try_from(index).unwrap_or(u64::MAX);
@@ -254,20 +239,107 @@ pub(crate) fn validate_declared_variants(
     Ok(())
 }
 
-/// The value validator of a pre-declared built-in: its Variant contract.
+/// The value validator of a pre-declared built-in: its schema, then its
+/// Variant contract.
 ///
-/// A pre-declared table's fingerprint already fixes every other column's
-/// storage type, so the Variant walk over its declared fields is its only
-/// value rule. The batch is returned unchanged.
+/// Checks run in the locked write order, so a request with several defects
+/// reports the earliest. An undeclared column is refused first. A user block
+/// that otherwise differs from the declaration — a missing, reordered, or
+/// differently nullable column, or a non-Variant storage type — is returned
+/// unwalked, so the later schema fingerprint refuses it before any Variant
+/// value is read. Only a block whose names, order, nullability, and storage
+/// types all match goes through [`validate_declared_variants`] and then
+/// [`refuse_partial_structs`] over the table's [`DomainTable::WHOLE_STRUCTS`].
+/// The batch is returned unchanged.
 ///
 /// # Errors
 ///
-/// Returns the refusal of [`validate_declared_variants`].
+/// Returns [`BifrostError::UndeclaredField`] for an undeclared column and the
+/// refusals of [`validate_declared_variants`] and [`refuse_partial_structs`].
 fn validate_predeclared<T: DomainTable + ?Sized>(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
-    validate_declared_variants(&T::arrow_fields(), batch)?;
+    let declared = T::arrow_fields();
+    let schema = batch.schema();
+    refuse_undeclared(&declared, &schema)?;
+    let shaped = schema.fields().len() == declared.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(&declared)
+            .all(|(supplied, declared)| {
+                supplied.name() == declared.name()
+                    && supplied.is_nullable() == declared.is_nullable()
+                    && supplied.data_type().equals_datatype(declared.data_type())
+            });
+    if shaped {
+        validate_declared_variants(&declared, batch)?;
+        refuse_partial_structs(batch, T::WHOLE_STRUCTS)?;
+    }
     Ok(batch.clone())
+}
+
+/// Refuse a row in which a nullable Struct is only partly present.
+///
+/// A nullable built-in Struct's children are physically nullable so a Parquet
+/// read keeps an absent parent's children null, yet the domain value it stores
+/// is wholly present or wholly absent. So in each named Struct column every
+/// child must be valid exactly where the parent is. Callers run this after the
+/// schema check, so a named column that is missing or not a Struct is left to
+/// the schema refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] naming the first row, column, and
+/// child whose validity differs from its parent's.
+pub(crate) fn refuse_partial_structs(
+    batch: &RecordBatch,
+    columns: &[&str],
+) -> Result<(), BifrostError> {
+    for &name in columns {
+        let Some(parent) = batch.column_by_name(name).and_then(|c| c.as_struct_opt()) else {
+            continue;
+        };
+        for row in 0..parent.len() {
+            let present = parent.is_valid(row);
+            if let Some((child, _)) = parent
+                .fields()
+                .iter()
+                .zip(parent.columns())
+                .find(|(_, values)| values.is_valid(row) != present)
+            {
+                return Err(BifrostError::SchemaParse {
+                    detail: format!(
+                        "row {row}: {name}.{} must be null exactly when {name} is null",
+                        child.name()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the first supplied column a built-in does not declare.
+///
+/// Every built-in validator runs this first, because an undeclared field
+/// outranks every other write refusal.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::UndeclaredField`] naming the first such column.
+pub(crate) fn refuse_undeclared(declared: &[Field], schema: &Schema) -> Result<(), BifrostError> {
+    match schema
+        .fields()
+        .iter()
+        .find(|supplied| !declared.iter().any(|field| field.name() == supplied.name()))
+    {
+        Some(undeclared) => Err(BifrostError::UndeclaredField {
+            field: undeclared.name().clone(),
+            row: 0,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Report whether a declared field is or nests a Variant.
@@ -391,6 +463,12 @@ pub trait DomainTable: Send + Sync + 'static {
     /// ledger and value-level rules; a pre-declared table keeps the Variant
     /// contract over its declared Arrow fields.
     const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
+
+    /// Nullable Struct columns whose value is wholly present or wholly absent.
+    ///
+    /// The pre-declared validator refuses a row that sets only some children
+    /// of one of these columns; see [`refuse_partial_structs`].
+    const WHOLE_STRUCTS: &'static [&'static str] = &[];
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -546,11 +624,73 @@ pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceb
     }
 }
 
+/// Returns `field` as Bifrost stores it, or `None` when no column stores it.
+///
+/// Every zoned timestamp, nested ones included, is relabelled with the
+/// stored `+00:00` zone: Arrow stores a zoned timestamp as UTC epoch time
+/// whatever its label, so the label only says how to display it and the
+/// relabelled column holds the same instants. A naive timestamp keeps no
+/// zone; it is a different Iceberg type. A field naming the Variant
+/// extension with parameters is not the canonical Variant, which iceberg-rust
+/// would still accept by name, so it is refused here. Registration
+/// ([`iceberg_form`]) and Scribe's write-path type comparison both convert
+/// through this, so a declaration and a write agree on every zone label.
+pub(crate) fn as_stored(field: &Field) -> Option<Field> {
+    if field.extension_type_name() == Some(VariantType::NAME) && !is_variant(field) {
+        return None;
+    }
+    let child = |child: &FieldRef| as_stored(child).map(Arc::new);
+    let data_type = match field.data_type() {
+        DataType::Timestamp(unit, Some(_)) => {
+            DataType::Timestamp(*unit, Some(iceberg::arrow::UTC_TIME_ZONE.into()))
+        }
+        DataType::List(item) => DataType::List(child(item)?),
+        DataType::LargeList(item) => DataType::LargeList(child(item)?),
+        DataType::FixedSizeList(item, len) => DataType::FixedSizeList(child(item)?, *len),
+        DataType::Struct(children) => {
+            DataType::Struct(children.iter().map(child).collect::<Option<_>>()?)
+        }
+        DataType::Map(entries, sorted) => DataType::Map(child(entries)?, *sorted),
+        other => other.clone(),
+    };
+    Some(field.clone().with_data_type(data_type))
+}
+
+/// Reports whether two Arrow fields convert to the same Iceberg column type.
+///
+/// Each field is converted alone by iceberg-rust with fresh field ids, and
+/// only the column's Iceberg type is compared: nesting, nested nullability,
+/// and Variant identity count, while either side's ids, docs, and top-level
+/// nullability do not. The sent field first goes through [`as_stored`], so a
+/// writer's display zone never decides the column and a parameterized
+/// Variant marker matches nothing. A field Iceberg cannot represent matches
+/// nothing. Scribe's write path and the catalog's physical-table check both
+/// compare through this one function.
+pub(crate) fn same_iceberg_type(sent: &Field, registered: &Field) -> bool {
+    let iceberg = |field: Field| {
+        let schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![field]))
+                .ok()?;
+        schema
+            .as_struct()
+            .fields()
+            .first()
+            .map(|column| column.field_type.clone())
+    };
+    match (
+        as_stored(sent).and_then(iceberg),
+        iceberg(registered.clone()),
+    ) {
+        (Some(sent), Some(registered)) => sent == registered,
+        _ => false,
+    }
+}
+
 /// Return the one Arrow form Bifrost stores for a declared column.
 ///
 /// Iceberg is the schema authority: the declaration is converted to its
 /// Iceberg column and back with iceberg-rust's own conversions, so every
-/// spelling of one Iceberg type — `Int8` and `Int32`, `UTC` and `+00:00`,
+/// spelling of one Iceberg type — `Int8` and `Int32`, any zone and `+00:00`,
 /// `LargeUtf8` and `Utf8`, a list element named `item` and `element` — leaves
 /// as the single Arrow type Iceberg reads it as. Registration stores, describes,
 /// and fingerprints only this form, so a table cannot carry a declared type
@@ -561,12 +701,20 @@ pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceb
 ///
 /// # Errors
 ///
-/// Returns the Iceberg conversion error when the column has no Iceberg type.
+/// Returns the Iceberg conversion error when the column has no Iceberg type,
+/// including a Variant extension marker with parameters.
 pub fn iceberg_form(declared: &Field) -> Result<Field, iceberg::Error> {
+    let declared = as_stored(declared).ok_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            format!(
+                "`{}` names the Variant extension with parameters",
+                declared.name()
+            ),
+        )
+    })?;
     let stored = iceberg::arrow::schema_to_arrow_schema(
-        &iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
-            declared.clone(),
-        ]))?,
+        &iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![declared]))?,
     )?;
     Ok(without_field_id(&stored.fields()[0]))
 }
@@ -1052,11 +1200,15 @@ pub fn builtin_fqns() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BinaryArray, Int64Array, StructArray};
+    use arrow::array::{
+        ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, make_array, new_null_array,
+    };
+    use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use verification::{EVAL_SUMMARY, ResultsTable};
     use wyrd_tonic::otlp::common::v1::any_value::Value;
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
@@ -1300,9 +1452,9 @@ mod tests {
                     "drift_report",
                     DataType::Struct(
                         vec![
-                            utf8("method", false),
-                            variant_field("features", false),
-                            utf8("verdict", false),
+                            utf8("method", true),
+                            variant_field("features", true),
+                            utf8("verdict", true),
                         ]
                         .into(),
                     ),
@@ -1312,11 +1464,11 @@ mod tests {
                     "eval_summary",
                     DataType::Struct(
                         vec![
-                            int32("total_tasks", false),
-                            int32("passed_tasks", false),
-                            int32("failed_tasks", false),
-                            float64("pass_rate", false),
-                            int64("duration_ms", false),
+                            int32("total_tasks", true),
+                            int32("passed_tasks", true),
+                            int32("failed_tasks", true),
+                            float64("pass_rate", true),
+                            int64("duration_ms", true),
                         ]
                         .into(),
                     ),
@@ -2230,8 +2382,9 @@ mod tests {
         assert!(differing.is_empty(), "{}", differing.join("\n"));
     }
 
-    /// Every spelling of one Iceberg type registers as Iceberg's single Arrow
-    /// form, and a type with no Iceberg column is refused.
+    /// Every spelling of one Iceberg type, a timestamp in any zone included,
+    /// registers as Iceberg's single Arrow form, and a type with no Iceberg
+    /// column is refused.
     ///
     /// The stored form carries no field id at any depth, keeps a Variant's
     /// extension type, and is its own form, so registering a stored or described
@@ -2264,6 +2417,10 @@ mod tests {
             (DataType::UInt32, DataType::Int64),
             (
                 DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
+            ),
+            (
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("America/New_York".into())),
                 DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
             ),
             (DataType::LargeUtf8, DataType::Utf8),
@@ -2304,7 +2461,6 @@ mod tests {
             DataType::Time64(ArrowTimeUnit::Nanosecond),
             DataType::Timestamp(ArrowTimeUnit::Second, None),
             DataType::Timestamp(ArrowTimeUnit::Millisecond, Some("UTC".into())),
-            DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("America/New_York".into())),
         ] {
             for declared in [
                 unstorable.clone(),
@@ -2579,6 +2735,142 @@ mod tests {
         );
     }
 
+    /// A nullable Struct is admitted only wholly present or wholly absent.
+    ///
+    /// The helper is driven through all four parent/child validity states,
+    /// then the Results and Calls validators are shown to refuse a partial
+    /// value in their declared Struct columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete or absent value is refused, or a partial value
+    /// reaches a table's durable path.
+    #[test]
+    fn partial_nullable_structs_are_refused() {
+        let children = Fields::from(vec![utf8("provider", true), utf8("model", true)]);
+        let model = |parent: Vec<bool>, child: Vec<Option<&str>>| {
+            let child = Arc::new(StringArray::from(child)) as ArrayRef;
+            let column = StructArray::new(
+                children.clone(),
+                vec![Arc::clone(&child), child],
+                Some(NullBuffer::from(parent)),
+            );
+            RecordBatch::try_from_iter([("m", Arc::new(column) as ArrayRef)]).expect("batch")
+        };
+        refuse_partial_structs(&model(vec![true, false], vec![Some("a"), None]), &["m"])
+            .expect("complete-present and null-absent rows are admitted");
+        for (parent, child) in [(true, None), (false, Some("a"))] {
+            let refusal = refuse_partial_structs(&model(vec![parent], vec![child]), &["m"])
+                .expect_err("a partial value is refused");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{parent} {child:?}"
+            );
+        }
+
+        // One declared row: nullable columns null, required ones filled.
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let refuses_partial = |namespace: &str, name: &str, column: &str, partial: ArrayRef| {
+            let definition = builtin_table(namespace, name).expect("built-in");
+            let fields = (definition.arrow_fields)();
+            let columns = fields
+                .iter()
+                .map(|field| match field.name() == column {
+                    true => Arc::clone(&partial),
+                    false if field.is_nullable() => new_null_array(field.data_type(), 1),
+                    false => match field.data_type() {
+                        DataType::Struct(nested) => Arc::new(StructArray::new(
+                            nested.clone(),
+                            nested.iter().map(|f| filled(f.data_type())).collect(),
+                            None,
+                        )) as ArrayRef,
+                        data_type => filled(data_type),
+                    },
+                })
+                .collect();
+            let batch =
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("declared row");
+            let refusal = (definition.canonical_validator)(&batch)
+                .expect_err("a partial Struct is refused before durable work");
+            assert_eq!(
+                refusal.code(),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+                "{namespace}.{name}"
+            );
+        };
+        let summary = ResultsTable::eval_summary_fields();
+        let mut values: Vec<ArrayRef> = summary.iter().map(|f| filled(f.data_type())).collect();
+        values[0] = new_null_array(&DataType::Int32, 1);
+        refuses_partial(
+            "verification",
+            "results",
+            EVAL_SUMMARY,
+            Arc::new(StructArray::new(summary, values, None)),
+        );
+        refuses_partial(
+            "gateway",
+            "calls",
+            gateway::RESOLVED_MODEL,
+            Arc::new(model(vec![true], vec![None]).column(0).as_struct().clone()),
+        );
+    }
+
+    /// The metric points validator refuses a partly present bucket set.
+    ///
+    /// A projected point with no buckets gets its `offset` child set while the
+    /// collection stays null; the validator must refuse it before durable work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture stops projecting, its first point gains buckets,
+    /// or the partial bucket set is admitted.
+    #[test]
+    fn partial_metric_buckets_are_refused() {
+        let filled = |data_type: &DataType| {
+            let data = new_null_array(data_type, 1).to_data();
+            make_array(data.into_builder().nulls(None).build().expect("unmasked"))
+        };
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
+        let points = crate::tables::signal::without_correlation_columns(&points)
+            .expect("the correlation columns split off cleanly");
+        let buckets = points
+            .column_by_name("positive_buckets")
+            .expect("bucket column")
+            .as_struct();
+        assert!(
+            buckets.is_null(0),
+            "the fixture's first point has no buckets"
+        );
+        let (bucket_fields, mut bucket_children, nulls) = buckets.clone().into_parts();
+        bucket_children[0] = filled(bucket_fields[0].data_type());
+        let bucket_children = bucket_children
+            .into_iter()
+            .map(|child| make_array(child.to_data().slice(0, 1)))
+            .collect();
+        let partial: ArrayRef = Arc::new(StructArray::new(
+            bucket_fields,
+            bucket_children,
+            nulls.map(|nulls| nulls.slice(0, 1)),
+        ));
+        let points = points.slice(0, 1);
+        let mut columns = points.columns().to_vec();
+        let index = points
+            .schema()
+            .index_of("positive_buckets")
+            .expect("bucket index");
+        columns[index] = partial;
+        let partial_points = RecordBatch::try_new(points.schema(), columns).expect("points");
+        let refusal = crate::tables::metrics::validate_metric_points(&partial_points)
+            .expect_err("a partial bucket set is refused");
+        assert_eq!(refusal.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+    }
+
     /// Pins the revision-10 Variant contract and every built-in Variant/Struct layout.
     ///
     /// One test owns the persisted shapes a reader depends on: the `0x0d`
@@ -2693,7 +2985,7 @@ mod tests {
         let owned = |entries: &[(&str, bool)]| -> Vec<(String, bool, bool)> {
             entries
                 .iter()
-                .map(|(name, variant)| ((*name).to_owned(), false, *variant))
+                .map(|(name, variant)| ((*name).to_owned(), true, *variant))
                 .collect()
         };
         assert_eq!(

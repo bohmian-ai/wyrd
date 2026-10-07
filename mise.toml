@@ -595,7 +595,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
 
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership"

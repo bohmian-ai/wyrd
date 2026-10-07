@@ -280,8 +280,9 @@ fn arrow_order(zone: Option<&str>) -> RecordBatch {
     .expect("the order batch builds")
 }
 
-/// An Arrow instant labelled with any zone is stored as the one UTC instant,
-/// and a naive Arrow time is refused for the instant column.
+/// An Arrow instant labelled with any zone, in the declaration or in a
+/// write, is stored as the one UTC instant, and a naive Arrow time is refused
+/// for the instant column.
 ///
 /// # Panics
 ///
@@ -294,7 +295,7 @@ async fn an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused(
     let client = admin_client(&srv, "three-timestamp-types").await;
     let orders = Bifrost::connect_with_table(
         &client,
-        TableConfig::from_arrow(ARROW_ORDERS, arrow_order(Some("UTC")).schema())
+        TableConfig::from_arrow(ARROW_ORDERS, arrow_order(Some("America/New_York")).schema())
             .expect("the schema declares a table"),
     )
     .await

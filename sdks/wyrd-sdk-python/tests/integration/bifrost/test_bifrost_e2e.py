@@ -353,8 +353,9 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
     denied_key = wyrd_server.bootstrap_service([], name="bifrost-write-denied")
     bifrost = _fixture_client(wyrd_server, table_fqn, denied_key)
     bifrost.insert({"id": 999, "value": "denied"}, {"card_ref": CARD_REF})
-    with pytest.raises(WyrdError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
+    with pytest.raises(WyrdError) as denied:
         bifrost.flush()
+    assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
     # A denial is terminal, not ambiguous: the refused batch is not retained for
     # retry, so the caller is told once, at the boundary that carried the write,
     # and the shutdown that follows has nothing left to send.

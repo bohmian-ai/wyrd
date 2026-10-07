@@ -352,6 +352,8 @@ mod pg_tests {
     const VARIANT_LOG_SCOPE: &str = "wyrd.tests.variant.log";
     /// Instrumentation scope of the mixed export carrying an oversized body.
     const VARIANT_REJECTED_LOG_SCOPE: &str = "wyrd.tests.variant.log.rejected";
+    /// Instrumentation scope of the mixed export carrying a NaN body.
+    const VARIANT_NON_FINITE_LOG_SCOPE: &str = "wyrd.tests.variant.log.non_finite";
     /// Text body of the record that proves `body_text` promotion.
     const VARIANT_BODY_TEXT: &str = "order 7 delayed";
 
@@ -486,15 +488,15 @@ mod pg_tests {
     /// body distinct from an absent one, and promotes the exception and text
     /// conventions.
     ///
-    /// A second export over OTLP/gRPC pairs a valid sibling with a
-    /// record whose body exceeds the Variant size limit: the collector reports
-    /// exactly that record rejected under the stable Variant code, and only the
-    /// sibling is stored.
+    /// Two more exports over OTLP/gRPC each pair a valid sibling with a
+    /// record whose body exceeds the Variant size limit or is a NaN double:
+    /// the collector reports exactly that record rejected under its stable
+    /// Variant code, and after publication only the sibling is stored.
     ///
     /// # Panics
     ///
     /// Panics when an export is refused, a stored value differs, or the
-    /// oversized record is not rejected with its code.
+    /// oversized or NaN record is not rejected with its code.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn log_variant_body_attributes_and_promotions_are_queryable() {
@@ -512,23 +514,40 @@ mod pg_tests {
                 .value
                 .and_then(|value| value.value),
         };
-        let partial = export_logs_partially_over_grpc(
-            &journey,
-            variant_resource_logs(
+        let non_finite = AnyValue {
+            value: Some(any_value::Value::DoubleValue(f64::NAN)),
+        };
+        let rejections = [
+            (
                 VARIANT_REJECTED_LOG_SCOPE,
-                vec![
-                    variant_record(time, "sibling", None),
-                    variant_record(time, "oversized", Some(oversized)),
-                ],
+                oversized,
+                support::VARIANT_TOO_LARGE,
             ),
-        )
-        .await
-        .expect("an export with an oversized body reports partial success");
-        assert_eq!(
-            partial.rejected_log_records, 1,
-            "only the oversized record is rejected"
-        );
-        support::assert_too_large_reason(&partial.error_message);
+            (
+                VARIANT_NON_FINITE_LOG_SCOPE,
+                non_finite,
+                support::VARIANT_NUMERIC_OUT_OF_RANGE,
+            ),
+        ];
+        for (scope, body, code) in &rejections {
+            let partial = export_logs_partially_over_grpc(
+                &journey,
+                variant_resource_logs(
+                    scope,
+                    vec![
+                        variant_record(time, "sibling", None),
+                        variant_record(time, "rejected", Some(body.clone())),
+                    ],
+                ),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{scope}: a rejected body reports partial success"));
+            assert_eq!(
+                partial.rejected_log_records, 1,
+                "{scope}: only the invalid record is rejected"
+            );
+            support::assert_variant_reason(&partial.error_message, code);
+        }
 
         journey.publish().await;
         let batches = journey
@@ -543,17 +562,18 @@ mod pg_tests {
         );
         assert_variant_records(&batches);
 
-        let stored = journey
-            .query_one_row(&format!(
-                "SELECT event_name FROM {LOGS_TABLE} \
-                 WHERE scope_name = '{VARIANT_REJECTED_LOG_SCOPE}'"
-            ))
-            .await;
-        assert_eq!(
-            column::<StringArray>(&stored, "event_name").value(0),
-            "sibling",
-            "the valid sibling commits and the oversized record is absent"
-        );
+        for (scope, _, _) in &rejections {
+            let stored = journey
+                .query_one_row(&format!(
+                    "SELECT event_name FROM {LOGS_TABLE} WHERE scope_name = '{scope}'"
+                ))
+                .await;
+            assert_eq!(
+                column::<StringArray>(&stored, "event_name").value(0),
+                "sibling",
+                "{scope}: the valid sibling commits and the invalid record is absent"
+            );
+        }
 
         journey.shutdown().await;
     }

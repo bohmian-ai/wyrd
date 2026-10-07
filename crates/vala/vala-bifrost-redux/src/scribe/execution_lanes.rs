@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, FieldRef, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::spec::Schema as IcebergSchema;
@@ -29,6 +29,7 @@ use std::str::FromStr;
 use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
     CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
@@ -517,6 +518,12 @@ pub(crate) struct DecodeContext<'a> {
 
 /// Applies source-contract validation and server-managed stamping to one batch.
 ///
+/// With a registered schema, the batch is first conformed to it
+/// ([`conform_to_registered`]): columns are matched by name and put in the
+/// registered order, equivalent spellings are cast to the registered type,
+/// and a Variant identity mismatch is refused, so the writer's column order
+/// and Arrow spelling never matter.
+///
 /// The final step stamps the registered Iceberg table's field ids onto every
 /// field when the context carries that schema, so the WAL, staged runs, and
 /// sealed objects all number their columns exactly as the table does.
@@ -528,8 +535,8 @@ pub(crate) struct DecodeContext<'a> {
 /// time, or managed column construction failure, a fingerprint mismatch
 /// when a stamped field has no registered counterpart, and
 /// [`ScribeError::ContractViolation`] carrying the catalogued error when a
-/// built-in's declared Variant arrives without its extension or holds a value
-/// that cannot be stored.
+/// built-in's declared Variant arrives without its extension, or when any
+/// table's Variant holds a value that cannot be stored.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -556,7 +563,14 @@ fn decode_rows(
             return Err(ScribeError::InvalidFrame);
         }
     }
-    let rows = &*cast_to_registered(rows, context.registered_schema)?;
+    let conformed;
+    let rows = match context.registered_schema {
+        Some(registered) => {
+            conformed = conform_to_registered(rows, registered)?;
+            &conformed
+        }
+        None => rows,
+    };
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition)?;
     }
@@ -566,6 +580,9 @@ fn decode_rows(
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
+    }
+    if let (None, Some(registered)) = (context.definition, context.registered_schema) {
+        enforce_dynamic_variants(rows, registered)?;
     }
     validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
@@ -578,122 +595,146 @@ fn decode_rows(
     }
 }
 
-/// Casts each caller column to its registered Arrow type when both are the
-/// same Iceberg type.
+/// Conforms a batch to its table's registered Iceberg schema in one pass.
 ///
-/// Registration stores Iceberg's own Arrow form of every column, for example
-/// `Int32` for a declared `Int8`, `+00:00` for a `UTC` zone, and `element` for
-/// a list element named `item`, so a writer
-/// holding the narrower or alternative spelling would otherwise fail the
-/// fingerprint check. iceberg-rust's Arrow conversion decides the equivalence
-/// and Arrow's `cast` converts the values once, so every later check, the WAL,
-/// and storage see only the registered type. A column with no registered
-/// counterpart, or a different Iceberg type, is left for the fingerprint check
-/// to refuse. Without a registered schema the batch is returned as is.
+/// The registered Iceberg schema is the table's source of truth, so every
+/// later check, the WAL, and storage see its Arrow form. Columns are matched
+/// by name, never position, and put in the registered order; a column the
+/// table does not register — a server-owned input such as `card_ref`, or a
+/// column from a stale or wrong declaration — keeps its relative place after
+/// the registered columns. Each matched column is then judged by
+/// iceberg-rust's own Arrow conversion through
+/// [`crate::tables::same_iceberg_type`]:
+///
+/// - the same Iceberg type already in the registered layout is kept exactly
+///   as sent, field included, since the registered form differs only in
+///   nested field metadata (Iceberg's field ids) that the layout ignores and
+///   Arrow would refuse to relabel;
+/// - the same Iceberg type in another Arrow spelling (`Int8` for `int`, a
+///   `UTC` zone for `+00:00`, a list element named `item`) is cast once with
+///   Arrow's `cast` to the registered type, keeping the sent field's name,
+///   nullability, and metadata;
+/// - a column whose storage matches but whose Variant identity does not — a
+///   Struct sent for a Variant, a Variant sent for a Struct, or a Variant
+///   marker with parameters, at any depth — is refused as an unsupported type
+///   before any value is read, because the storage-only fingerprint cannot
+///   see the extension;
+/// - any other column is kept as sent, so the fingerprint check refuses it.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::FingerprintMismatch`] when the registered schema has
-/// no Arrow form or Arrow cannot cast an equivalent column.
-fn cast_to_registered<'a>(
-    rows: &'a RecordBatch,
-    registered: Option<&IcebergSchema>,
-) -> Result<std::borrow::Cow<'a, RecordBatch>, ScribeError> {
+/// Returns [`ScribeError::ContractViolation`] carrying
+/// [`BifrostError::UnsupportedType`] for a Variant identity mismatch,
+/// [`ScribeError::FingerprintMismatch`] when the registered schema has no
+/// Arrow form or Arrow cannot cast an equivalent column, and
+/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, which
+/// duplicate-free input cannot cause.
+fn conform_to_registered(
+    rows: &RecordBatch,
+    registered: &IcebergSchema,
+) -> Result<RecordBatch, ScribeError> {
     let mismatch = || ScribeError::FingerprintMismatch {
         table: "resolved ingress table".to_owned(),
     };
-    let Some(registered) = registered else {
-        return Ok(std::borrow::Cow::Borrowed(rows));
-    };
     let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
     let schema = rows.schema();
+    let registered_columns = target
+        .fields()
+        .iter()
+        .filter_map(|wanted| Some((schema.index_of(wanted.name()).ok()?, Some(wanted))));
+    let unregistered = (0..schema.fields().len())
+        .filter(|&index| target.field_with_name(schema.field(index).name()).is_err())
+        .map(|index| (index, None));
     let mut fields = Vec::with_capacity(schema.fields().len());
     let mut columns = Vec::with_capacity(rows.num_columns());
-    let mut cast_any = false;
-    for (field, column) in schema.fields().iter().zip(rows.columns()) {
-        let wanted = target.field_with_name(field.name()).ok().filter(|wanted| {
-            exact_layout(field) != exact_layout(wanted) && same_iceberg_type(field, wanted)
-        });
-        if let Some(wanted) = wanted {
-            columns.push(arrow::compute::cast(column, wanted.data_type()).map_err(|_| mismatch())?);
-            fields.push(
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(wanted.data_type().clone()),
-            );
-            cast_any = true;
-        } else {
+    for (index, wanted) in registered_columns.chain(unregistered) {
+        let (sent, column) = (&schema.fields()[index], rows.column(index));
+        let Some(wanted) = wanted else {
+            fields.push(Arc::clone(sent));
             columns.push(Arc::clone(column));
-            fields.push(field.as_ref().clone());
+            continue;
+        };
+        if crate::tables::same_iceberg_type(sent, wanted) {
+            if layout(sent.data_type()) == layout(wanted.data_type()) {
+                fields.push(Arc::clone(sent));
+                columns.push(Arc::clone(column));
+            } else {
+                columns.push(
+                    arrow::compute::cast(column, wanted.data_type()).map_err(|_| mismatch())?,
+                );
+                fields.push(Arc::new(
+                    sent.as_ref()
+                        .clone()
+                        .with_data_type(wanted.data_type().clone()),
+                ));
+            }
+        } else if SchemaFingerprint::from_fields([sent]) == SchemaFingerprint::from_fields([wanted])
+        {
+            return Err(ScribeError::ContractViolation(
+                BifrostError::UnsupportedType {
+                    field: sent.name().clone(),
+                    data_type: sent.data_type().to_string(),
+                },
+            ));
+        } else {
+            fields.push(Arc::clone(sent));
+            columns.push(Arc::clone(column));
         }
-    }
-    if !cast_any {
-        return Ok(std::borrow::Cow::Borrowed(rows));
     }
     RecordBatch::try_new(
         Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
         columns,
     )
-    .map(std::borrow::Cow::Owned)
-    .map_err(|_| mismatch())
+    .map_err(|_| ScribeError::InvalidFrame)
 }
 
-/// Fingerprints one column's exact Arrow layout, nested names included.
+/// Fingerprints one Arrow type's exact layout, nested names included.
 ///
 /// Metadata is ignored, so a sent column already in the registered form is
 /// left as is while one spelling a list element `item` or map entries
 /// `entries` is cast to Iceberg's names like any other spelling.
-fn exact_layout(field: &Field) -> SchemaFingerprint {
-    SchemaFingerprint::from_arrow_schema_exact(&Schema::new(vec![field.clone()]))
+fn layout(data_type: &DataType) -> SchemaFingerprint {
+    SchemaFingerprint::from_arrow_schema_exact(&Schema::new(vec![Field::new(
+        "",
+        data_type.clone(),
+        true,
+    )]))
 }
 
-/// Reports whether two Arrow fields convert to the same Iceberg column.
+/// Validates a dynamic table's Variant values at the trust boundary.
 ///
-/// Each field is converted alone with fresh field ids, so the comparison sees
-/// only Iceberg type, nesting, and nullability, never either side's ids. The
-/// sent field's zoned timestamps are first relabelled by [`utc_labelled`], so
-/// a writer's display zone never decides the column. A field Iceberg cannot
-/// represent matches nothing.
-fn same_iceberg_type(sent: &Field, registered: &Field) -> bool {
-    let iceberg = |field: Field| {
-        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
-            field.with_metadata(std::collections::HashMap::new()),
-        ]))
-        .ok()
-        .map(|schema| schema.as_struct().clone())
-    };
-    let sent = sent.clone().with_data_type(utc_labelled(sent.data_type()));
-    matches!((iceberg(sent), iceberg(registered.clone())), (Some(sent), Some(registered)) if sent == registered)
-}
-
-/// Relabels every zoned timestamp in `data_type`, nested ones included, with
-/// the stored `+00:00` zone.
+/// A dynamic table has no built-in validator, so this is where its Variant
+/// values are checked before admission; [`conform_to_registered`] has already
+/// refused any Variant identity that differs from the registration. The
+/// registered Iceberg schema, converted to Arrow by iceberg-rust, is the
+/// declaration: never the supplied schema. The batch goes through
+/// [`crate::tables::validate_declared_variants`], the same walk built-in
+/// validators run, so each present Variant value must decode within the
+/// encoding, depth, and size limits. It runs after the fingerprint check and
+/// before card scope, stamping, dispatch, or any WAL mutation, and reads the
+/// batch only.
 ///
-/// Arrow stores a zoned timestamp as UTC epoch time whatever its zone label,
-/// so the label only says how to display it and the relabelled column holds
-/// the same instants. A naive timestamp keeps no zone: it is a wall-clock
-/// reading, a different Iceberg type, and stays refused for a zoned column.
-fn utc_labelled(data_type: &DataType) -> DataType {
-    let field = |field: &FieldRef| {
-        Arc::new(
-            field
-                .as_ref()
-                .clone()
-                .with_data_type(utc_labelled(field.data_type())),
-        )
-    };
-    match data_type {
-        DataType::Timestamp(unit, Some(_)) => {
-            DataType::Timestamp(*unit, Some(iceberg::arrow::UTC_TIME_ZONE.into()))
+/// # Errors
+///
+/// Returns [`ScribeError::FingerprintMismatch`] when the registered schema
+/// has no Arrow form, and [`ScribeError::ContractViolation`] carrying the
+/// Variant refusal for the first failing value in row, then field, order.
+fn enforce_dynamic_variants(
+    rows: &RecordBatch,
+    registered: &IcebergSchema,
+) -> Result<(), ScribeError> {
+    let declared = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
+        ScribeError::FingerprintMismatch {
+            table: "resolved ingress table".to_owned(),
         }
-        DataType::List(item) => DataType::List(field(item)),
-        DataType::LargeList(item) => DataType::LargeList(field(item)),
-        DataType::FixedSizeList(item, len) => DataType::FixedSizeList(field(item), *len),
-        DataType::Struct(children) => DataType::Struct(children.iter().map(field).collect()),
-        DataType::Map(entries, sorted) => DataType::Map(field(entries), *sorted),
-        other => other.clone(),
-    }
+    })?;
+    let declared: Vec<Field> = declared
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    crate::tables::validate_declared_variants(&declared, rows)
+        .map_err(ScribeError::ContractViolation)
 }
 
 /// Enforces one built-in's user contract before the fingerprint check.
@@ -714,9 +755,9 @@ fn utc_labelled(data_type: &DataType) -> DataType {
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
-/// [`ScribeError::ContractViolation`] carrying the validator's catalogued
-/// refusal, and [`ScribeError::FingerprintMismatch`] when a canonical user
-/// block is not in the declared order.
+/// and [`ScribeError::ContractViolation`] carrying the validator's
+/// catalogued refusal. Column order is not judged here: callers reorder by
+/// name first, and the fingerprint check that follows owns the rest.
 fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
@@ -738,18 +779,6 @@ fn enforce_builtin_source_contract(
     )
     .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
-    let declared = (definition.arrow_fields)();
-    let in_order = user
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name())
-        .eq(declared.iter().map(Field::name));
-    if canonical && !in_order {
-        return Err(ScribeError::FingerprintMismatch {
-            table: format!("{}.{}", definition.namespace, definition.name),
-        });
-    }
     Ok(())
 }
 
@@ -2292,8 +2321,9 @@ mod tests {
 
     use super::{
         DecodeContext, ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
-        ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
-        source_schema_fingerprint, stamp_correlation_columns, wait_lane_drained,
+        ScribePersistenceCpuPool, ScribeWalIoPool, conform_to_registered, decode,
+        record_lane_saturation, source_schema_fingerprint, stamp_correlation_columns,
+        wait_lane_drained,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
@@ -2564,8 +2594,8 @@ mod tests {
                 .field_with_name(declared.name())
                 .expect("declared field");
             assert_eq!(
-                super::exact_layout(arrived),
-                super::exact_layout(declared),
+                super::layout(arrived.data_type()),
+                super::layout(declared.data_type()),
                 "`{}` arrives as {:?}",
                 declared.name(),
                 arrived.data_type()
@@ -4712,5 +4742,98 @@ mod tests {
             stamp_card_ref(&principal, SuppliedCardRef::Text(forged)),
             Err(ScribeError::CardUnresolved)
         ));
+    }
+
+    /// A column whose storage matches a registered Variant but whose Variant
+    /// identity does not — the bare storage Struct, or the marker with
+    /// parameters — is refused as an unsupported type naming the column,
+    /// while the canonical Variant conforms unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mismatched identity conforms or is refused with another
+    /// error, or the canonical Variant is refused.
+    #[test]
+    fn a_variant_identity_mismatch_is_an_unsupported_type() {
+        let variant = wyrd_types::variant::variant_field("payload", true);
+        let registered =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&Schema::new(vec![
+                variant.clone(),
+            ]))
+            .expect("a Variant registers");
+        let storage =
+            arrow::array::StructArray::new_null(wyrd_types::variant::variant_storage_fields(), 1);
+        let send = |field: Field| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field])),
+                vec![Arc::new(storage.clone()) as ArrayRef],
+            )
+            .expect("batch builds")
+        };
+        let mut parameters = variant.metadata().clone();
+        parameters.insert(
+            arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.to_owned(),
+            "{\"shredded\":true}".to_owned(),
+        );
+
+        conform_to_registered(&send(variant.clone()), &registered)
+            .expect("the canonical Variant conforms");
+        for sent in [
+            Field::new("payload", variant.data_type().clone(), true),
+            variant.with_metadata(parameters),
+        ] {
+            assert!(matches!(
+                conform_to_registered(&send(sent), &registered),
+                Err(ScribeError::ContractViolation(BifrostError::UnsupportedType { ref field, .. }))
+                    if field == "payload"
+            ));
+        }
+    }
+
+    /// A registered `(a, b)` table: two optional Long columns.
+    fn registered_ab() -> iceberg::spec::Schema {
+        let long = || iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::optional(1, "a", long())),
+                Arc::new(iceberg::spec::NestedField::optional(2, "b", long())),
+            ])
+            .build()
+            .expect("the (a, b) schema builds")
+    }
+
+    /// Columns are matched to the registered schema by name: a batch sent as
+    /// `(card_ref, b, a)` comes back as `(a, b, card_ref)` with each column's
+    /// values intact; the unregistered `card_ref` input keeps its place after
+    /// the registered columns for the later checks to judge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is refused, the order differs, or a value moves.
+    #[test]
+    fn columns_are_put_in_declared_order_by_name() {
+        let rows = RecordBatch::try_from_iter([
+            (
+                CARD_REF,
+                Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            ),
+            ("b", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+            ("a", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ])
+        .expect("batch builds");
+
+        let ordered = conform_to_registered(&rows, &registered_ab()).expect("names all match");
+
+        let names = ordered
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "b", CARD_REF]);
+        assert_eq!(
+            ordered.column(0).as_ref(),
+            &Int64Array::from(vec![1]) as &dyn Array
+        );
     }
 }

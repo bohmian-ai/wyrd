@@ -383,4 +383,42 @@ mod tests {
             .plan_canonical(&[many], 0)
             .expect("many tiny rows fit the default expanded ceiling");
     }
+
+    /// A null under a null Struct parent is valid Arrow even when the child is
+    /// required, so the canonical planner sizes it rather than refusing it.
+    ///
+    /// This pins the regression the hand-written WAL encoder once had: a
+    /// nullable Struct's required child carries a masked placeholder null for
+    /// every absent parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture is invalid Arrow or the planner refuses it.
+    #[test]
+    fn masked_required_struct_child_null_is_planned() {
+        use arrow::array::{ArrayRef, StructArray};
+        use arrow::buffer::NullBuffer;
+        use arrow::datatypes::Fields;
+
+        let children = Fields::from(vec![Field::new("x", DataType::Int64, false)]);
+        let x: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let point = StructArray::new(
+            children.clone(),
+            vec![x],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "point",
+                DataType::Struct(children),
+                true,
+            )])),
+            vec![Arc::new(point) as ArrayRef],
+        )
+        .expect("masked child null is valid Arrow");
+
+        ScribeIngressPlanner::default()
+            .plan_canonical(&[batch], 0)
+            .expect("masked child null is planned");
+    }
 }

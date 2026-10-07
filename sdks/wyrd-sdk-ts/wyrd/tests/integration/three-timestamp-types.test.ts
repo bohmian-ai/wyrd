@@ -145,7 +145,7 @@ describe("three timestamp types", () => {
 
   it("an arrow instant in any zone is one instant and a naive one is refused", async () => {
     const arrow = await Bifrost.connect({
-      table: TableConfig.fromArrow(ARROW_ORDERS, received("UTC").schema),
+      table: TableConfig.fromArrow(ARROW_ORDERS, received("America/New_York").schema),
     });
     await arrow.register();
     for (const zone of ["UTC", "America/Chicago", "Asia/Tokyo"]) {

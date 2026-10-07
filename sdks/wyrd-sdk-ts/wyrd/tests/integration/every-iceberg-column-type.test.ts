@@ -18,7 +18,12 @@ import {
   Map_,
   Schema,
   Struct,
+  TimeMillisecond,
+  TimeNanosecond,
+  TimeSecond,
   TimeUnit,
+  TimestampMillisecond,
+  TimestampSecond,
   Uint64,
   Utf8,
   tableFromIPC,
@@ -90,27 +95,27 @@ describe("every iceberg column type", () => {
   it("a map column reads back as a plain object", async () => {
     const rows = await all.sql(
       "SELECT counts FROM vala.datasets.all_types ORDER BY id",
-      z.object({ counts: z.record(z.string(), z.number().nullable()).nullable() }),
+      z.object({ counts: z.record(z.string(), z.bigint().nullable()).nullable() }),
     );
 
     expect(rows).toEqual([
-      { counts: { a: 1, b: 2 } },
+      { counts: { a: 1n, b: 2n } },
       { counts: null },
       { counts: { k: null } },
       { counts: {} },
     ]);
   });
 
-  it("a 64-bit integer reads back as a number when it is safe", async () => {
+  it("a 64-bit integer reads back as a bigint", async () => {
     const rows = await all.sql(
       "SELECT int64 FROM vala.datasets.all_types ORDER BY id",
-      z.object({ int64: z.union([z.number(), z.bigint()]).nullable() }),
+      z.object({ int64: z.bigint().nullable() }),
     );
 
     expect(rows).toEqual([
-      { int64: 7 },
+      { int64: 7n },
       { int64: null },
-      { int64: 0 },
+      { int64: 0n },
       { int64: 9223372036854775807n },
     ]);
   });
@@ -135,31 +140,17 @@ describe("every iceberg column type", () => {
     new Interval(IntervalUnit.MONTH_DAY_NANO),
     new Float16(),
     mapOf(new Float16()),
-  ])("a type with no wire form is refused when declared: %s", (type) => {
+    new Uint64(),
+    new DateMillisecond(),
+    new TimeSecond(),
+    new TimeMillisecond(),
+    new TimeNanosecond(),
+    new TimestampSecond(),
+    new TimestampMillisecond(),
+    mapOf(new Uint64()),
+  ])("a type Bifrost cannot store is refused when declared: %s", (type) => {
     expect(() => TableConfig.fromArrow("vala.datasets.no_wire_form", oneColumn(type))).toThrow(
       expect.objectContaining({ code: UNSUPPORTED_TYPE }),
     );
-  });
-
-  it.each([new Uint64(), new DateMillisecond(), mapOf(new Uint64())])(
-    "a type with no iceberg column is refused at registration: %s",
-    async (type) => {
-      const refused = await Bifrost.connect({
-        table: TableConfig.fromArrow("vala.datasets.no_column", oneColumn(type)),
-      });
-
-      await expect(refused.register()).rejects.toMatchObject({ code: UNSUPPORTED_TYPE });
-    },
-  );
-
-  it("a refused registration creates no table", async () => {
-    const refused = await Bifrost.connect({
-      table: TableConfig.fromArrow("vala.datasets.never", oneColumn(new Uint64())),
-    });
-    await expect(refused.register()).rejects.toMatchObject({ code: UNSUPPORTED_TYPE });
-
-    await expect(TableConfig.describe("vala.datasets.never")).rejects.toMatchObject({
-      code: "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
-    });
   });
 });

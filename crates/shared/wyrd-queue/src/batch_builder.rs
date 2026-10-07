@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray};
+use arrow::array::AsArray;
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapArray,
@@ -18,20 +18,19 @@ use arrow::array::{
     UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::compute::cast;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec};
+use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
 use crate::sealed_sender::encode_ipc;
 use wyrd_types::timestamp::{TimestampKind, parse_ltz, parse_ntz, parse_tz};
-use wyrd_types::variant::{is_variant, variant_field};
+use wyrd_types::variant::is_variant;
 
 use crate::variant::{EncodedVariant, VariantColumnBuilder};
 
@@ -48,11 +47,13 @@ pub fn is_reserved_column(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX) || name == CARD_REF_COLUMN || name == RUN_ID_COLUMN
 }
 
-/// Converts complete JSON row inputs against one destination schema.
+/// Converts complete row inputs against one destination schema.
 ///
 /// The preflight owns the resolved user-only schema and the output schema
-/// that appends the correlation columns. [`Self::prepare`] is synchronous and
-/// mutates nothing, so every refusal happens before admission.
+/// that appends the correlation columns. It is the one owner of the column
+/// rules for JSON rows: [`Self::prepare`] applies them for `insert`. It is
+/// synchronous and mutates nothing, so every refusal happens before
+/// admission.
 #[derive(Debug, Clone)]
 pub struct RowPreflight {
     /// Declared user columns, in logical-schema order.
@@ -63,8 +64,10 @@ pub struct RowPreflight {
 
 /// A fully converted row input, ready for one reservation and one hand-over.
 ///
-/// Holding a `PreparedRows` means every row passed every check; nothing about
-/// it can fail after the producer reserves its charge.
+/// Holding a `PreparedRows` means every row passed every schema and value
+/// check and its exact charge is known, so admission reserves once without
+/// converting anything. Hand-over, sealing, framing, and sink settlement
+/// remain fallible and report their own errors.
 #[derive(Debug)]
 pub struct PreparedRows {
     /// The converted rows over [`RowPreflight::output_schema`].
@@ -209,89 +212,6 @@ impl RowPreflight {
     }
 }
 
-/// Normalize the columns `declared` as Variant to the canonical extension.
-///
-/// This is the Arrow-batch counterpart of [`RowPreflight::prepare`], driven by
-/// the destination's described user fields. A column the destination declares
-/// as Variant passes unchanged when it already carries the
-/// `arrow.parquet.variant` extension (the server validates its bytes), and is
-/// encoded from JSON text through [`EncodedVariant::from_json_text`] when it is
-/// `Utf8` or `LargeUtf8`; a null text is a null Variant. Text columns are
-/// encoded row by row in input order, then column by column, so the first
-/// refusal follows the locked check order. Every other column, including a
-/// text column the destination does not declare as Variant, is untouched.
-///
-/// # Errors
-///
-/// Returns [`WyrdQueueError::Contract`] with `BIFROST_UNSUPPORTED_TYPE` for a
-/// declared Variant column of any other type, the catalogued Variant error
-/// naming the field and row of the first unstorable text, and
-/// [`WyrdQueueError::SchemaParse`] if Arrow cannot view or reassemble the
-/// columns.
-pub fn normalize_declared_variants(
-    declared: &[FieldSpec],
-    batch: &RecordBatch,
-) -> Result<RecordBatch, WyrdQueueError> {
-    let schema = batch.schema();
-    let mut texts = Vec::new();
-    for (index, field) in schema.fields().iter().enumerate() {
-        let is_declared_variant = declared
-            .iter()
-            .any(|spec| spec.name == *field.name() && spec.data_type == DataTypeSpec::Variant);
-        if !is_declared_variant || is_variant(field) {
-            continue;
-        }
-        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return Err(WyrdQueueError::Contract(BifrostError::UnsupportedType {
-                field: field.name().clone(),
-                data_type: field.data_type().to_string(),
-            }));
-        }
-        let text = cast(batch.column(index), &DataType::Utf8View).map_err(arrow_failure)?;
-        texts.push((
-            index,
-            text,
-            VariantColumnBuilder::with_capacity(batch.num_rows()),
-        ));
-    }
-    if texts.is_empty() {
-        return Ok(batch.clone());
-    }
-    for row in 0..batch.num_rows() {
-        for (index, text, builder) in &mut texts {
-            let text = text.as_string_view();
-            if text.is_null(row) {
-                builder.append_null();
-                continue;
-            }
-            let encoded = EncodedVariant::from_json_text(text.value(row)).map_err(|violation| {
-                WyrdQueueError::Contract(violation.into_error(
-                    schema.field(*index).name(),
-                    u64::try_from(row).unwrap_or(u64::MAX),
-                ))
-            })?;
-            builder.append(&encoded);
-        }
-    }
-    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-    let mut columns = batch.columns().to_vec();
-    for (index, _, builder) in texts {
-        let field = &fields[index];
-        fields[index] = Arc::new(variant_field(field.name(), field.is_nullable()));
-        columns[index] = builder.finish();
-    }
-    RecordBatch::try_new(
-        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-        columns,
-    )
-    .map_err(arrow_failure)
-}
-
-/// Report an Arrow failure while viewing or reassembling normalized columns.
-fn arrow_failure(error: ArrowError) -> WyrdQueueError {
-    WyrdQueueError::SchemaParse(format!("Variant normalization failed: {error}"))
-}
-
 /// One value of one input row on its way into a column.
 #[derive(Debug, Clone, Copy)]
 struct Cell<'a> {
@@ -371,14 +291,12 @@ fn build_column(field: &Field, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRe
     let missing = (!field.is_nullable())
         .then(|| cells.iter().find(|cell| cell.raw.is_none() && !cell.masked))
         .flatten()
-        .map(|cell| {
-            Failure::schema(
-                cell.row,
-                format!(
-                    "row {} field `{path}`: null/absent value on a non-nullable column",
-                    cell.row
-                ),
-            )
+        .map(|cell| Failure {
+            row: cell.row,
+            error: WyrdQueueError::SchemaParse(format!(
+                "row {} field `{path}`: null/absent value on a non-nullable column",
+                cell.row
+            )),
         });
     let built = if is_variant(field) {
         build_variant(path, cells)
@@ -873,6 +791,34 @@ mod batch_builder_tests {
     /// Prepares `rows` against `schema` with no correlation.
     fn prepare(schema: &Schema, rows: &[&str]) -> Result<PreparedRows, WyrdQueueError> {
         RowPreflight::new(schema).prepare(rows, None, None)
+    }
+
+    /// Row preparation refuses a null List item only where the declared items
+    /// are non-null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a null item is refused for nullable items or admitted for
+    /// non-null items.
+    #[test]
+    fn a_null_list_item_is_refused_only_for_non_null_items() {
+        let items = |nullable| {
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                nullable,
+            )))
+        };
+        let schema = Schema::new(vec![
+            Field::new("tags", items(false), true),
+            Field::new("maybe_tags", items(true), true),
+        ]);
+
+        prepare(&schema, &[r#"{"maybe_tags": ["a", null]}"#]).expect("nullable items admit null");
+        let refused = prepare(&schema, &[r#"{"tags": ["a", null]}"#])
+            .expect_err("non-null items refuse null");
+
+        assert_eq!(refused.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
     /// User columns come first, then the nullable correlation columns, and an

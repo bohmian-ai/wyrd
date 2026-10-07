@@ -1423,6 +1423,30 @@ mod tests {
         assert_eq!(spans.num_rows(), 1);
     }
 
+    /// Proves an unresolved call nulls both `resolved_model` children.
+    ///
+    /// DataFusion `get_field` returns a child without its parent's nulls, so
+    /// `resolved_model['provider']` reads SQL null only when the child slot
+    /// itself is null; the nullable children keep that null through Parquet.
+    #[test]
+    fn unresolved_call_nulls_resolved_model_children() {
+        let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
+        facts.resolved = None;
+        let calls = CallCapture::from_facts(facts)
+            .expect("metadata projects")
+            .calls_batch()
+            .expect("calls batch");
+        let resolved = calls
+            .column_by_name("resolved_model")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::StructArray>())
+            .expect("resolved_model Struct");
+        assert!(resolved.is_null(0));
+        for child in ["provider", "model"] {
+            let child = resolved.column_by_name(child).expect(child);
+            assert!(child.is_null(0), "an absent model has no child value");
+        }
+    }
+
     /// Proves a selected payload is redacted, binary content becomes a
     /// digest reference with no base64, and the unselected field stays null.
     #[test]

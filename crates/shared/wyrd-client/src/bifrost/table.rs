@@ -70,8 +70,8 @@ pub struct TableConfig {
 impl TableConfig {
     /// Build a config from an explicit Arrow schema.
     ///
-    /// The precision path: a caller who needs `Int32`, a non-UTC timezone,
-    /// `Decimal128`, or `FixedSizeBinary` supplies Arrow directly, exactly as
+    /// The precision path: a caller who needs `Int32`, `Decimal128`, or
+    /// `FixedSizeBinary` supplies Arrow directly, exactly as
     /// [`wyrd_types::arrow_schema_to_fieldspec`] documents.
     ///
     /// # Errors
@@ -81,9 +81,8 @@ impl TableConfig {
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
     /// `wyrd_*`, `card_ref`, or `run_id` name, and
     /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
-    /// a column's Arrow type has no wire form — before any request is sent.
-    /// Whether a wire type can be stored is decided by the server at
-    /// registration, which refuses one with no Iceberg column.
+    /// a column's Arrow type has no wire form or no Iceberg column
+    /// ([`wyrd_types::schema::check_supported`]) — before any request is sent.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;

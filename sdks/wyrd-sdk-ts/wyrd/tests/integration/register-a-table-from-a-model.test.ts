@@ -51,6 +51,18 @@ const REQUESTS: z.infer<typeof ApiRequest>[] = [
   },
 ];
 
+// Arrow returns a 64-bit integer column as a `bigint`, so the read model
+// widens the `z.int()` fields the declaring model registers as Int64.
+const ApiRequestRow = ApiRequest.extend({
+  outcome: z.bigint(),
+  prediction: Prediction.extend({ result: z.bigint() }),
+});
+const REQUEST_ROWS = REQUESTS.map((request) => ({
+  ...request,
+  outcome: BigInt(request.outcome),
+  prediction: { ...request.prediction, result: BigInt(request.prediction.result) },
+}));
+
 const Importance = z.object({ request_id: z.string(), importance: z.number() });
 const Region = z.object({ request_id: z.string(), region: z.string() });
 
@@ -74,10 +86,10 @@ describe("register a table from a model", () => {
     const rows = await apiRequests.sql(
       "SELECT request_id, outcome, prediction, attributes " +
         "FROM vala.datasets.api_requests ORDER BY request_id",
-      ApiRequest,
+      ApiRequestRow,
     );
 
-    expect(rows).toEqual(REQUESTS);
+    expect(rows).toEqual(REQUEST_ROWS);
   });
 
   it("a nested model field is selected by its path", async () => {

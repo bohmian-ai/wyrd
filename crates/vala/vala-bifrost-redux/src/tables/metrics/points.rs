@@ -33,12 +33,17 @@ pub static POSITIVE_BUCKET_COUNT_ELEMENT: F =
     F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the positive exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `positive_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&POSITIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 
@@ -47,12 +52,17 @@ pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F =
     F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the negative exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `negative_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static NEGATIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&NEGATIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 

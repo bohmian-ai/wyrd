@@ -214,7 +214,9 @@ class TableConfig:
 
         Args:
             model: a Pydantic model class, not an instance. Its
-                ``model_json_schema()`` becomes the declared user columns.
+                ``model_json_schema()`` becomes the declared user columns:
+                a nested model is a Struct, a typed list a List, and a
+                free-form (``Any``, open ``dict``) or union field a Variant.
                 Datetime fields declare the timestamp types in
                 ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
                 other ``datetime`` is ``TIMESTAMP_LTZ``.
@@ -243,6 +245,8 @@ class TableConfig:
         Raises:
             WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` when ``table`` is not
                 ``namespace.name`` or the model schema has no column mapping;
+                ``WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`` for a column type
+                Bifrost cannot store;
                 ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
                 column; ``WYRD_SPEC_400_VALIDATION`` for an unknown
                 granularity, sort-key, or compaction-type spelling. Column,
@@ -285,7 +289,8 @@ class TableConfig:
         """Declare a table from an explicit ``pyarrow.Schema``.
 
         Use this for column types JSON Schema cannot express, such as
-        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        ``int32`` or ``decimal128``. A Variant column is
+        a field carrying the ``arrow.parquet.variant`` extension. ``schema`` holds
         user columns only; every other argument and error is as for
         ``TableConfig()``.
         """
@@ -627,9 +632,9 @@ class Bifrost(_BifrostBase):
         The precision write door, beside ``insert``: it names its destination
         instead of using the active binding, carries correlation as ordinary
         columns, and is durable when it returns, so no ``flush`` follows it.
-        Build the batch against ``TableConfig.describe(...).arrow_schema``; a
-        canonical table compares an incoming block against its declared fields
-        exactly, metadata included.
+        Build the batch against ``TableConfig.describe(...).arrow_schema``.
+        Columns match the table's declared columns by name, in any order; the
+        server judges every column's type and refuses a stale declaration.
 
         Raises:
             WyrdError: the batch exceeded the byte envelope, or the server

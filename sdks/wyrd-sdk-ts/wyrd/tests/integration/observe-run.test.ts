@@ -20,8 +20,10 @@ const SESSION = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f";
 const MEDIA = [
   { id: "screenshot", kind: "image", uri: "s3://bucket/shot.png", mediaType: "image/png" },
 ] as const;
-const MEDIA_TEXT =
-  '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]';
+/** `MEDIA` as stored: a Variant with the wire's snake_case keys. */
+const MEDIA_STORED = [
+  { id: "screenshot", kind: "image", uri: "s3://bucket/shot.png", media_type: "image/png" },
+];
 const FIXED_TABLES = ["vala.drift.observations", "vala.eval.observations"] as const;
 
 const DATASET_SCHEMA = {
@@ -343,15 +345,12 @@ describe("scoped observation journey", () => {
         },
       ]);
 
-      const evals = (
-        await reader.sql(
-          `SELECT context, session_id, trace_id, span_id, media, card_uid, run_id
-             FROM vala.eval.observations WHERE run_id = '${run.runId}'`,
-        )
-      )
-        .toArrow()
-        .toArray()
-        .map((row) => row.toJSON());
+      // The row terminal decodes the Variant `context` and `media` columns.
+      const evals = await reader.sql(
+        `SELECT context, session_id, trace_id, span_id, media, card_uid, run_id
+           FROM vala.eval.observations WHERE run_id = '${run.runId}'`,
+        { parse: (row: unknown) => row as Record<string, unknown> },
+      );
       // One row: neither refused Eval was admitted. It carries the authored
       // session/media, the active span's exact identity, and the Agent view's
       // subject rather than the Model's.
@@ -359,11 +358,11 @@ describe("scoped observation journey", () => {
         evals.map((row) => ({ ...row, trace_id: hex(row.trace_id), span_id: hex(row.span_id) })),
       ).toEqual([
         {
-          context: JSON.stringify({ answer: "yes" }),
+          context: { answer: "yes" },
           session_id: SESSION,
           trace_id: active.traceId,
           span_id: active.spanId,
-          media: MEDIA_TEXT,
+          media: MEDIA_STORED,
           card_uid: agentUid,
           run_id: run.runId,
         },

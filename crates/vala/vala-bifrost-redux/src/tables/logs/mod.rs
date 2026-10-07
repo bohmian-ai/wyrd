@@ -51,7 +51,7 @@ mod tests {
             Value::StringValue("body text".to_owned()),
             Value::BoolValue(true),
             Value::IntValue(-9_007_199_254_740_993),
-            Value::DoubleValue(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::DoubleValue(-0.0),
             Value::BytesValue(vec![0x00, 0xff, 0x7f]),
             Value::ArrayValue(ArrayValue {
                 values: vec![
@@ -150,8 +150,8 @@ mod tests {
 
     /// Borrow the raw `metadata` and `value` bytes of one Variant cell.
     ///
-    /// Comparing bytes rather than JSON keeps values JSON cannot express, such
-    /// as a NaN double with a payload, exact.
+    /// Comparing bytes rather than JSON keeps distinctions JSON equality
+    /// loses, such as `-0.0` versus `0.0`, exact.
     ///
     /// # Panics
     ///
@@ -166,6 +166,41 @@ mod tests {
                 .value(row)
         };
         (child("metadata"), child("value"))
+    }
+
+    /// A non-finite body is outside the Variant numeric domain, so its record
+    /// is rejected with the catalogued code while its siblings still land.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the NaN-bodied record is accepted, its sibling is lost, or
+    /// the rejection does not name `WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE`.
+    #[test]
+    fn non_finite_log_body_rejects_only_its_record() {
+        let record = |body: f64| LogRecord {
+            body: Some(AnyValue {
+                value: Some(Value::DoubleValue(body)),
+            }),
+            ..LogRecord::default()
+        };
+        let request = vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record(f64::NAN), record(1.5)],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let (batch, outcome) =
+            project_resource_logs(&request, None, usize::MAX).expect("logs project");
+        assert_eq!((outcome.accepted_records, outcome.rejected_records), (1, 1));
+        assert_eq!(batch.num_rows(), 1);
+        let reason = outcome.rejection_message.expect("a rejection is reported");
+        assert!(
+            reason.contains("WYRD_VALA_400_VARIANT_NUMERIC_OUT_OF_RANGE"),
+            "{reason}"
+        );
     }
 
     /// Downcast one named column, panicking when its Arrow type differs.

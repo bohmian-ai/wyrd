@@ -574,9 +574,13 @@ export class TableConfig {
    * registration naming a different type is refused with
    * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
    *
-   * @throws when the resulting document does not map to an Arrow schema,
-   * declares a column the write path already owns, the compaction target is
-   * not a non-negative integer, or the compaction type is not a known spelling.
+   * @throws {WyrdError} with the catalog code, status, details, and
+   * remediation when the table name is not `namespace.name`, the document
+   * does not map to an Arrow schema (`WYRD_VALA_400_SCHEMA_PARSE`, including a
+   * model that allows extra keys), or it declares a column the write path
+   * already owns.
+   * @throws when the compaction target is not a non-negative integer or the
+   * compaction type is not a known spelling.
    */
   static fromJsonSchema(
     table: string,
@@ -591,15 +595,14 @@ export class TableConfig {
             override: zodTimestampFormat,
           })
         : schema;
-    return new TableConfig(
-      tableConfigFromJsonSchema(
-        table,
-        JSON.stringify(document),
-        layoutJson(layout),
-        compactionTargetFileSizeBytes,
-        compactionType,
-      ),
+    const declared = tableConfigFromJsonSchema(
+      table,
+      JSON.stringify(document),
+      layoutJson(layout),
+      compactionTargetFileSizeBytes,
+      compactionType,
     );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
   }
 
   /**
@@ -832,13 +835,13 @@ function timestampValue(kind: string, value: unknown): unknown {
 const VARIANT_EXTENSION = "arrow.parquet.variant";
 
 /**
- * One cell as the plain JavaScript value a typed row receives.
+ * Project one row value onto its native JavaScript value.
  *
- * A Variant decodes through the shared Rust owner, a Struct becomes a plain
- * object, a List an array, and a Map an object keyed by its entry keys, at
- * every depth. A 64-bit integer becomes a `number` when it is a safe integer
- * and stays a `bigint` otherwise, the rule Variant integers already follow, so
- * one schema both declares a table and parses its rows.
+ * A Variant cell decodes through the shared Rust owner (objects become plain
+ * objects, arrays arrays, and an integer outside the safe range a `bigint`),
+ * a Struct becomes a plain object, a List an array, and a Map an object keyed
+ * by its entry keys, recursively. Every scalar stays as Apache Arrow produced
+ * it, so 64-bit integers are `bigint`.
  */
 function nativeValue(field: Field, value: unknown): unknown {
   if (value === null || value === undefined) {
@@ -868,9 +871,6 @@ function nativeValue(field: Field, value: unknown): unknown {
         nativeValue(entry[1] as Field, item),
       ]),
     );
-  }
-  if (typeof value === "bigint" && Number.isSafeInteger(Number(value))) {
-    return Number(value);
   }
   return value;
 }
@@ -1071,8 +1071,9 @@ export class Bifrost {
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
    * Build the batch against {@link TableConfig.schema} from
-   * `describeTableConfig` - a canonical table compares an incoming block
-   * against its declared fields exactly, metadata included.
+   * `describeTableConfig`. Columns match the table's declared columns by name,
+   * in any order; the server judges every column's type and refuses a stale
+   * declaration.
    */
   async writeBatch(table: string, batch: RecordBatch): Promise<void> {
     const ipc = tableToIPC(new Table(batch), "stream");
@@ -1102,11 +1103,11 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout. Every cell reaches `rows` as a
-   * plain value: Struct as an object, List as an array, Map as an object,
-   * Variant as its native value, and a safe 64-bit integer as a `number`. A
-   * top-level timestamp column's cell is its Wyrd timestamp type's text:
-   * `TIMESTAMP_NTZ` with no offset, `TIMESTAMP_LTZ` in UTC, and
+   * nothing about the table's stored layout. Every cell reaches `rows` as its
+   * native value: a Struct is a plain object, a List an array, a Map an
+   * object, a Variant its decoded JSON value, and a 64-bit integer a
+   * `bigint`. A top-level timestamp column's cell is its Wyrd timestamp
+   * type's text: `TIMESTAMP_NTZ` with no offset, `TIMESTAMP_LTZ` in UTC, and
    * `TIMESTAMP_TZ` in the writer's offset.
    *
    * @throws whatever `rows.parse` throws for the first row it rejects, so a

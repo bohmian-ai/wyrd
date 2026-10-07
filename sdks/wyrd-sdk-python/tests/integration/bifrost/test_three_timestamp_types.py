@@ -191,7 +191,7 @@ def test_an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused(
             {"received_at": pyarrow.array([RECEIVED], pyarrow.timestamp("us", tz=zone))}
         )
 
-    orders = Bifrost(TableConfig.from_arrow(received("UTC").schema, ARROW_ORDERS))
+    orders = Bifrost(TableConfig.from_arrow(received("America/New_York").schema, ARROW_ORDERS))
     orders.register()
     for zone in ["UTC", "America/Chicago", "Asia/Tokyo"]:
         orders.write_batch(ARROW_ORDERS, received(zone))

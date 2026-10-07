@@ -370,6 +370,11 @@ enum Ctrl {
 /// Admission never waits: a whole record is charged to the shared byte
 /// budget and handed to the background owner as one message, or refused.
 pub struct Producer {
+    /// Destination-bound preflight over the table's user schema; its output
+    /// schema is the one the queue seals every row batch under.
+    ///
+    /// Every JSON row input is converted and charged through it before any
+    /// budget is reserved, so a refused input touches no queue state.
     preflight: RowPreflight,
     tx: mpsc::UnboundedSender<Entry>,
     ctrl_tx: mpsc::Sender<Ctrl>,
@@ -510,9 +515,13 @@ impl Producer {
     /// Admits one prepared record, all or none, without waiting.
     ///
     /// The record's exact charge is reserved once and the record is handed
-    /// over as one message of one-row slices sharing that reservation; nothing
-    /// after the reservation can fail, and a refusal releases it, so a caller
-    /// may resubmit the whole record without duplicating an accepted prefix.
+    /// over as one message of one-row slices sharing that reservation. Schema
+    /// and value conversion already finished in [`RowPreflight::prepare`],
+    /// and building the entry cannot fail; the hand-over can still refuse a
+    /// draining producer, which releases the reservation, so a caller may
+    /// resubmit the whole record without duplicating an accepted prefix.
+    /// Sealing, framing, and sink settlement happen later and report their
+    /// own errors through flush and shutdown.
     ///
     /// # Errors
     ///

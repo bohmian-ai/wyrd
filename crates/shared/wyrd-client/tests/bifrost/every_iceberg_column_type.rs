@@ -206,13 +206,14 @@ async fn a_narrower_declaration_is_the_table_it_describes() {
     srv.shutdown().await.expect("server shutdown");
 }
 
-/// A type with no wire form is refused when the table is declared.
+/// A type with no wire form, or one nested in a Map where Iceberg cannot
+/// store it, is refused when the table is declared.
 ///
 /// # Panics
 ///
 /// Panics when a type is accepted or refused with another code.
 #[test]
-fn a_type_with_no_wire_form_is_refused_when_declared() {
+fn a_type_bifrost_cannot_store_is_refused_when_declared() {
     let union = UnionFields::try_new(vec![0], vec![Field::new("i", DataType::Int32, true)])
         .expect("union fields");
     for column in [
@@ -221,85 +222,13 @@ fn a_type_with_no_wire_form_is_refused_when_declared() {
         Field::new("c", DataType::Interval(IntervalUnit::MonthDayNano), true),
         Field::new("c", DataType::Float16, true),
         map_of(DataType::Float16),
+        map_of(DataType::UInt64),
     ] {
         let data_type = column.data_type().clone();
 
         let refused = one_column("vala.datasets.no_wire_form", column)
-            .expect_err("a type with no wire form is refused");
+            .expect_err("a type Bifrost cannot store is refused");
 
         assert_eq!(refused.code(), UNSUPPORTED_TYPE, "{data_type}");
     }
-}
-
-/// A type with no Iceberg column is refused at registration.
-///
-/// # Panics
-///
-/// Panics when a type registers or is refused with another code.
-#[tokio::test]
-#[ignore = "requires the controlled Postgres journey harness"]
-async fn a_type_with_no_iceberg_column_is_refused_at_registration() {
-    let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "every-iceberg-column-type").await;
-    for column in [
-        Field::new("c", DataType::UInt64, true),
-        Field::new("c", DataType::Date64, true),
-        map_of(DataType::UInt64),
-    ] {
-        let data_type = column.data_type().clone();
-        let refused_table = Bifrost::connect_with_table(
-            &client,
-            one_column("vala.datasets.no_column", column).expect("the type has a wire form"),
-        )
-        .await
-        .expect("the writer connects");
-
-        let refused = refused_table
-            .register()
-            .await
-            .expect_err("a type with no Iceberg column is refused");
-
-        assert_eq!(
-            WyrdError::from(&refused).code(),
-            UNSUPPORTED_TYPE,
-            "{data_type}"
-        );
-    }
-    srv.shutdown().await.expect("server shutdown");
-}
-
-/// A refused registration creates no table.
-///
-/// # Panics
-///
-/// Panics when the refused table can be described.
-#[tokio::test]
-#[ignore = "requires the controlled Postgres journey harness"]
-async fn a_refused_registration_creates_no_table() {
-    let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "every-iceberg-column-type").await;
-    let refused_table = Bifrost::connect_with_table(
-        &client,
-        one_column(
-            "vala.datasets.never",
-            Field::new("c", DataType::UInt64, true),
-        )
-        .expect("the type has a wire form"),
-    )
-    .await
-    .expect("the writer connects");
-    refused_table
-        .register()
-        .await
-        .expect_err("a type with no Iceberg column is refused");
-
-    let missing = TableConfig::describe(&client, "vala.datasets.never")
-        .await
-        .expect_err("no table exists");
-
-    assert_eq!(
-        WyrdError::from(&missing).code(),
-        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"
-    );
-    srv.shutdown().await.expect("server shutdown");
 }

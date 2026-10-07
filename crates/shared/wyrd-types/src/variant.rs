@@ -36,11 +36,45 @@ pub fn variant_field(name: &str, nullable: bool) -> Field {
     Field::new(name, variant_storage_type(), nullable).with_extension_type(VariantType)
 }
 
-/// Report whether a field carries the `arrow.parquet.variant` extension.
+/// Report whether a field carries the canonical `arrow.parquet.variant`
+/// extension.
 ///
-/// The extension name, not the storage struct, is what makes a column a
-/// Variant: a user Struct with `metadata`/`value` children stays a Struct.
+/// The extension, not the storage struct, is what makes a column a Variant: a
+/// user Struct with `metadata`/`value` children stays a Struct. The canonical
+/// extension takes no parameters, so its metadata must be empty; Arrow writes
+/// it as `""` and the Iceberg schema converter omits the key, and both are
+/// accepted. A field naming the extension with any other metadata is not the
+/// canonical Variant, so every wire comparison refuses it rather than
+/// normalizing it away.
 #[must_use]
 pub fn is_variant(field: &Field) -> bool {
     field.extension_type_name() == Some(VariantType::NAME)
+        && matches!(field.extension_type_metadata(), None | Some(""))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The Variant extension marker's identity rule.
+
+    use super::*;
+
+    /// Only the canonical extension with empty or absent metadata is a
+    /// Variant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when foreign extension metadata is accepted as a Variant.
+    #[test]
+    fn variant_extension_requires_empty_metadata() {
+        let field = variant_field("v", false);
+        assert!(is_variant(&field));
+        let mut metadata = field.metadata().clone();
+        metadata.remove(arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY);
+        assert!(is_variant(&field.clone().with_metadata(metadata.clone())));
+        metadata.insert(
+            arrow_schema::extension::EXTENSION_TYPE_METADATA_KEY.to_owned(),
+            "{\"shredded\":true}".to_owned(),
+        );
+        assert!(!is_variant(&field.with_metadata(metadata)));
+    }
 }

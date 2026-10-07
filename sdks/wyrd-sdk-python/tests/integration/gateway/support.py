@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
-from wyrd import WyrdError
+from wyrd import WyrdError, cli
 from wyrd.bifrost import AsyncBifrost
 from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
@@ -276,21 +276,20 @@ def deploy(
 ) -> None:
     """Store a provider's ``Environment`` credential and one built-in deployment of ``model``.
 
-    The deployment goes through the public Python ``Gateway`` as the harness
-    admin. The credential cannot: the SDK has no mutation method, so it uses
-    the same HTTP operation the CLI does, reading the operator binding the
-    test server assigns to ``provider``.
+    The credential goes through in-process ``wyrd gateway credential put`` and
+    the deployment through the public Python ``Gateway``, both as the harness
+    admin, reading the operator binding the test server assigns to ``provider``.
     """
     gateway = Gateway(server_url=server.base_url, credential=server.api_key)
     credential = f"{provider}-key"
-    put_credential(
-        server,
+    cli.put_provider_credential(
         {
             "name": credential,
             "provider": provider,
             "source": {"environment": {"binding": BINDINGS[provider]}},
         },
-    ).raise_for_status()
+        server=server.base_url,
+    )
     header = {"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(provider)
     auth = (
         {"api_key_header": {"header": header, "credential": credential}}

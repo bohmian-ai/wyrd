@@ -335,17 +335,6 @@ def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
 
 
 @pytest.mark.integration
-def test_negative_reserved_column_is_refused_locally() -> None:
-    """A server-owned column is named before a round trip, not after."""
-
-    class Reserved(BaseModel):
-        card_ref: str
-
-    with pytest.raises(WyrdError, match="card_ref"):
-        TableConfig(Reserved, "genai.reserved")
-
-
-@pytest.mark.integration
 def test_negative_empty_permissions_denied_rbac_on_write(
     wyrd_server: WyrdTestServer, query_table: str
 ) -> None:

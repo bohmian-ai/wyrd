@@ -51,7 +51,9 @@ def test_admin_manages_redacted_connections(connections: OperatorConnections, sl
 
 @pytest.mark.integration
 def test_writer_is_refused(wyrd_server: WyrdTestServer) -> None:
-    writer = OperatorConnections(credential=wyrd_server.bootstrap_service(["writer"], name="writer"))
+    writer = OperatorConnections(
+        credential=wyrd_server.bootstrap_service(["writer"], name="writer")
+    )
     with pytest.raises(WyrdError) as raised:
         writer.list()
     assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"

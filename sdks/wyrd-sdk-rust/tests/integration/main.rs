@@ -6,6 +6,7 @@
 //! `-E 'test(/^<module>::/)'`.
 
 mod gateway_admin;
+mod gateway_inference;
 mod observe_a_run;
 mod operator_connections;
 mod query_bifrost;

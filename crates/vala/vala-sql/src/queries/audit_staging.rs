@@ -371,8 +371,9 @@ pub struct AuditPublicationRange {
 /// the bound is durable progress state, not a lease, so no owner token,
 /// deadline, or audit-chain lock travels with it.
 ///
-/// Lock acquisition never waits. When another publisher holds this tenant's
-/// progress row, the locked read fails immediately with PostgreSQL `55P03`
+/// Lock acquisition never waits. The insert skips an existing progress row, so
+/// it never queues behind a transaction updating that row; when another
+/// publisher holds this tenant's progress row, the locked read fails immediately with PostgreSQL `55P03`
 /// (`lock_not_available`) before any publication state changes. The publisher
 /// logs that failure and retries the unchanged tenant on a later sweep.
 ///
@@ -390,6 +391,7 @@ pub async fn freeze_publication_range(
         INSERT INTO vala.audit_publication (data_tenant_id)
         SELECT $1
          WHERE EXISTS (SELECT 1 FROM vala.audit_staging)
+           AND NOT EXISTS (SELECT 1 FROM vala.audit_publication)
         ON CONFLICT (data_tenant_id) DO NOTHING
         ",
     )
@@ -482,6 +484,12 @@ pub async fn list_publication_range(
 /// bound is never released without the watermark. The tenant's progress row is
 /// created here when no freeze created it first.
 ///
+/// The delete runs before the progress upsert, so a settlement that waits on a
+/// staged row lock holds no progress-row lock while it waits and never stalls a
+/// concurrent freeze; every path takes staging rows before the progress row.
+/// Deleting through `seq_hi` alone is complete: a higher stored watermark was
+/// raised by a settlement that deleted its own rows in the same transaction.
+///
 /// Both the advance and the release are guarded so a stale completion is inert:
 /// `GREATEST` refuses to move the watermark backwards, and the bound is cleared
 /// only when it still equals `seq_hi`. A publisher whose acknowledgement was
@@ -493,6 +501,16 @@ pub async fn list_publication_range(
 /// Returns [`SqlError`] when the progress update or the delete fails, or RLS
 /// rejects the range.
 pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Result<u64, SqlError> {
+    let result = sqlx::query(
+        r"
+        DELETE FROM vala.audit_staging
+         WHERE seq <= $1
+        ",
+    )
+    .bind(seq_hi)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
     sqlx::query(
         r"
         INSERT INTO vala.audit_publication AS progress (data_tenant_id, published_seq)
@@ -508,18 +526,6 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
     )
     .bind(seq_hi)
     .bind(conn.data_tenant_id().as_uuid())
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)?;
-    let result = sqlx::query(
-        r"
-        DELETE FROM vala.audit_staging
-         WHERE seq <= (
-               SELECT published_seq
-                 FROM vala.audit_publication
-           )
-        ",
-    )
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;

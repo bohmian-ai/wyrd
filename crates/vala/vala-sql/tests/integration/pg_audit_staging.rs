@@ -479,6 +479,83 @@ mod pg_tests {
             assert_eq!((range.seq_lo, range.seq_hi), (1, 1));
         }
 
+        /// A settlement waiting on a locked staged row never stalls a freeze.
+        ///
+        /// An uncommitted delete fences the staged row, as an in-flight
+        /// competing settlement does, and rolling it back releases it. The settlement deletes staged rows before it touches the progress
+        /// row, so while it waits it holds no progress-row lock, and a
+        /// concurrent freeze reuses the frozen bound at once instead of
+        /// queueing behind the settlement's uncommitted upsert.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the settlement never waits on the staged row, the
+        /// freeze does not return the reused range within five seconds, or
+        /// the released settlement does not delete the row.
+        #[tokio::test]
+        async fn settlement_waiting_on_staged_rows_never_stalls_a_freeze() {
+            let (fixture, superuser, tenant) = setup().await;
+            append(fixture.app_pool(), tenant, "op.a").await;
+            let mut freezer = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            vala_sql::queries::audit_staging::freeze_publication_range(&mut freezer, 512)
+                .await
+                .unwrap()
+                .expect("one staged row is owed");
+            freezer.commit().await.unwrap();
+
+            let mut fence = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM vala.audit_staging")
+                .execute(&mut **fence.transaction())
+                .await
+                .unwrap();
+            let pool = fixture.app_pool().clone();
+            let settler = tokio::spawn(async move {
+                let mut conn = vala_sql::TenantConn::acquire(&pool, tenant).await?;
+                let deleted =
+                    vala_sql::queries::audit_staging::settle_publication(&mut conn, 1).await?;
+                conn.commit().await?;
+                Ok::<u64, vala_sql::SqlError>(deleted)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity \
+                         WHERE wait_event_type = 'Lock' AND query LIKE '%DELETE FROM vala.audit_staging%'",
+                    )
+                    .fetch_one(&superuser)
+                    .await
+                    .unwrap();
+                    if waiting > 0 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the settlement waits on the fenced staged row");
+
+            let mut competitor = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let range = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                vala_sql::queries::audit_staging::freeze_publication_range(&mut competitor, 512),
+            )
+            .await
+            .expect("the freeze never queues behind the waiting settlement")
+            .unwrap()
+            .expect("the frozen bound is still owed");
+            assert_eq!((range.seq_lo, range.seq_hi), (1, 1));
+            competitor.commit().await.unwrap();
+
+            drop(fence);
+            assert_eq!(settler.await.unwrap().unwrap(), 1);
+        }
+
         /// An idle tenant owes nothing and its staging table drains to zero.
         #[tokio::test]
         async fn settled_tenant_drains_to_zero_and_owes_nothing() {

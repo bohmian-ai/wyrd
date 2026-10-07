@@ -174,6 +174,42 @@ Follow `AGENTS.md` §16 for style, and these two rules specifically:
 
 Python tests use top-level `def test_*` only — never `class TestFoo:`.
 
+### Client-facing tests (Rust, Python, TypeScript SDKs)
+
+SDK tests are the product's public examples. Review every client-facing test
+against this checklist:
+
+- [ ] **One story per file, one outcome per test.** The test name states what
+  the user gets (`agent_answer_passes_its_verifier`). A story uses the same
+  file name, test names, and fixtures in all three SDKs.
+- [ ] **Checked-in YAML only.** Cards come from `fixtures/cards/<story>/` at
+  the repository root. Test code never builds or edits YAML, JSON, digests, or
+  URLs.
+- [ ] **Deployment-shaped server.** The session `WyrdTestServer` exports its
+  address and key the way a deployment's environment does; SDK and CLI calls
+  resolve them without arguments. Only a credentials test passes them.
+- [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
+  functions, and the three test controls (`flush_bifrost`,
+  `wait_for_baseline`, `make_binding_due`). No private or extension import,
+  subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
+  JSON parsing of results, sleep, or polling loop.
+- [ ] **Setup is fixtures that return domain objects** (a `WyrdState`, a
+  registered Card), not helper functions in the test file. The body acts on
+  the SDK and asserts on typed results.
+- [ ] **Errors assert one exact catalog code** on the raised `WyrdError`. No
+  message matching, no "any of these codes".
+- [ ] **Fixed, meaningful names.** No uuid or time suffixes; registering a
+  fixture again is idempotent.
+- [ ] **Value tables** use `parametrize` / `it.each` / a table loop with one
+  assertion shape, never branching inside the loop.
+- [ ] **Engine mathematics and internals stay in Rust tests**: PSI bins, SPC
+  limits, judge scoring, cache and fence counters, audit staging.
+- [ ] **Type-only checks are compile-time**: `expectTypeOf` in `*.test-d.ts`,
+  `ty` fixtures outside pytest collection.
+- [ ] **Written to be owned.** Fixtures, fixture YAML, `conftest`, and
+  `tests/support` are minimal, realistic, typed, and named for the domain.
+  Fixture YAML reads as the Card a user would author.
+
 ## Where to look next
 
 - `crates/wyrd/wyrd-testing/tests/README.md` — tier-1 binaries, their modules,

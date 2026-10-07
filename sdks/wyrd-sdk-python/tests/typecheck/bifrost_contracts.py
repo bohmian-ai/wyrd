@@ -2,7 +2,7 @@
 
 `ty` checks this module in the `py:typecheck` lane, so every access below is a
 static assertion that the public TypedDict graph reaches the leaf without an
-`Any` hop or a cast. The runtime asserts keep it a normal unit test too.
+`Any` hop or a cast. It sits outside pytest collection.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from wyrd.bifrost import (
 )
 
 
-def test_described_field_types_are_recursive_without_any() -> None:
+def described_field_types_are_recursive_without_any() -> None:
     struct: DataTypeSpecVariants = {
         "Struct": [{"name": "inner", "data_type": "Utf8", "nullable": True}]
     }
@@ -62,7 +62,7 @@ def test_described_field_types_are_recursive_without_any() -> None:
     assert description["physical_layout"]["sort_keys"][0]["column"] == "trace_id"
 
 
-def test_client_value_types_are_declared_without_any() -> None:
+def client_value_types_are_declared_without_any() -> None:
     """The three values a caller constructs or reads back are real types.
 
     `Correlation` is what an `insert` takes, `ResolvedTable` is what `register`

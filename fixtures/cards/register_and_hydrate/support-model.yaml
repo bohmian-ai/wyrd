@@ -16,10 +16,10 @@ spec:
   signature:
     inputs:
       - name: question
-        dtype: string
+        dtype: utf8
     outputs:
       - name: answer
-        dtype: string
+        dtype: utf8
 artifacts:
   - relative_path: support-model.bin
     content_type: application/octet-stream

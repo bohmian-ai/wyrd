@@ -11654,6 +11654,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-cli",
  "wyrd-client",
+ "wyrd-sdk-rust",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-tonic",

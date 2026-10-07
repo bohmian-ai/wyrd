@@ -24,6 +24,8 @@ wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
+wyrd-sdk-rust = { path = ".", features = ["cli"] }
 arrow = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }

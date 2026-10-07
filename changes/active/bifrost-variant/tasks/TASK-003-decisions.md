@@ -124,11 +124,10 @@ following standard practice.
     Cards is missed. Upgrade path if that shows up: stratify by
     `(principal_id, card_uid)`, falling back to `principal_id` when `card_uid`
     is null, with a stratum-count cap.
-- Sample size follows the algorithm (it scales with the input row count),
-  bounded only by a memory cap. The fixed `max_bytes: 64 MiB` and
-  `max_rows: 4096` in `BIFROST_VARIANT_SHREDDING`
-  (`parquet/writer_properties.rs` ~95) are arbitrary and go away. The memory
-  bound comes from TASK-004's shared-pool prefix reservation instead.
+- Sample size follows the algorithm below, not a fixed row count. The fixed
+  `max_bytes: 64 MiB` and `max_rows: 4096` in `BIFROST_VARIANT_SHREDDING`
+  (`parquet/writer_properties.rs` ~95) are arbitrary and go away with the
+  first-rows buffer they bound (see "Memory" and "Effect on TASK-004").
 - Scribe samples the whole input, not its first rows. A claim reads finished,
   local staged files, so a pre-pass over only the Variant columns picks the
   sample before the writer opens. Cost: one extra local read of those columns.
@@ -176,8 +175,7 @@ Sampling parameters (user-approved values; proposal for the spec revision):
 - Memory: the pre-pass holds only per-stratum key and type counters (bounded
   by the tracked-children cap), never rows. Both writers open with the layout
   known, so the first-rows buffer and its `max_rows` / `max_bytes` caps go
-  away. Whether TASK-004's prefix reservation is still needed on these paths
-  is re-checked in the spec revision.
+  away. No rows are buffered, so there is no buffer memory to account for.
 - Quality metric (statistical process control): record per file the share of
   non-null Variant bytes left in the residual. A rising trend for a table means
   the layout is missing keys, which is the trigger for
@@ -210,6 +208,19 @@ columns twice per rewrite. It does not need to:
 - To verify before building: our writer records null counts for nested
   shredded leaves; the shredder's rule that a layout "is derived from this
   file's rows only and is never shared with another file" changes for Forge.
+
+Effect on TASK-004 (still a follow-up, after the sampling spec revision is
+approved):
+
+- Unchanged: Forge planning parallelism `max(1, effective_cpu * 4)`.
+- Unchanged: delete `ForgeManagedExecutor::reserve_variant_prefixes` and its
+  fixed `4 x 64 MiB` plan-time charge.
+- Dropped: live prefix-byte reservations, their release paths, and the
+  capacity-refusal journey for prefix growth. With no first-rows buffer there
+  is nothing to reserve.
+- Changed: TASK-004 keeps the 4,096-row / 64 MiB bounds and per-output
+  inference (`rolled_outputs_infer_independent_variant_layouts`). Both end:
+  every output of one Forge rewrite uses the combined source layout.
 
 Industry baseline for comparison: Spark (and Hudi, which delegates to it)
 infers from the first 4096 rows / 64 MB a writer buffers, with the same 10%

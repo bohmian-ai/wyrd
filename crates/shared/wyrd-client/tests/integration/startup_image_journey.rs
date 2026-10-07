@@ -25,8 +25,34 @@ use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::api::{BifrostQueryRequest, RegisterOutcome};
 
-/// Bytes of the one artifact the journey registers and reads back.
-const ARTIFACT: &[u8] = b"startup image journey artifact";
+/// The checked-in Card with one artifact the journey registers and reads back.
+const CARD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../fixtures/cards/register_and_hydrate/support-model.yaml"
+);
+
+/// The artifact the fixture Card declares, as its file name and bytes.
+const ARTIFACT_NAME: &str = "support-model.bin";
+
+/// Bytes of the fixture artifact.
+const ARTIFACT: &[u8] =
+    include_bytes!("../../../../../fixtures/cards/register_and_hydrate/support-model.bin");
+
+/// One row of the journey table, as a caller declares it.
+#[derive(serde::Serialize)]
+struct JourneyRow {
+    /// The integer key.
+    id: i64,
+    /// The text value.
+    value: &'static str,
+}
+
+impl JourneyRow {
+    /// The row as the JSON bytes `Bifrost::insert` accepts.
+    fn json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a journey row serializes")
+    }
+}
 
 /// Directory the script provides for state shared across the restart.
 ///
@@ -125,27 +151,8 @@ async fn startup_image_write() {
     assert_eq!(client.grpc_url(), derived, "gRPC derives from server_url");
 
     let dir = state_dir();
-    let card_dir = dir.join("card");
-    std::fs::create_dir_all(&card_dir).expect("card dir");
-    std::fs::write(card_dir.join("prompt.txt"), ARTIFACT).expect("artifact source");
-    // The manifest carries the standard-base64 SHA-256 the client recomputes.
-    let digest = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        <sha2::Sha256 as sha2::Digest>::digest(ARTIFACT),
-    );
-    std::fs::write(
-        card_dir.join("card.yaml"),
-        format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: startup-prompt\n  \
-             version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  \
-             messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    \
-             sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
-            ARTIFACT.len()
-        ),
-    )
-    .expect("card document");
     let receipt = Cards::with_client(client.clone())
-        .register_from_path(&card_dir.join("card.yaml"))
+        .register_from_path(std::path::Path::new(CARD))
         .await
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");
@@ -160,7 +167,11 @@ async fn startup_image_write() {
     );
     bifrost
         .insert(
-            br#"{"id": 1, "value": "derived"}"#.to_vec(),
+            JourneyRow {
+                id: 1,
+                value: "derived",
+            }
+            .json(),
             Correlation::default(),
         )
         .expect("insert over derived gRPC");
@@ -181,7 +192,11 @@ async fn startup_image_write() {
         .expect("Bifrost over explicit gRPC");
     explicit
         .insert(
-            br#"{"id": 2, "value": "explicit"}"#.to_vec(),
+            JourneyRow {
+                id: 2,
+                value: "explicit",
+            }
+            .json(),
             Correlation::default(),
         )
         .expect("insert over explicit gRPC");
@@ -213,7 +228,7 @@ async fn startup_image_verify() {
         .await
         .expect("download the artifact after restart");
     assert_eq!(
-        std::fs::read(download.join("prompt.txt")).expect("downloaded artifact"),
+        std::fs::read(download.join(ARTIFACT_NAME)).expect("downloaded artifact"),
         ARTIFACT
     );
 
@@ -239,7 +254,7 @@ async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusiv
     for id in ids {
         bifrost
             .insert(
-                format!(r#"{{"id": {id}, "value": "kind"}}"#).into_bytes(),
+                JourneyRow { id, value: "kind" }.json(),
                 Correlation::default(),
             )
             .expect("insert on the anchor");

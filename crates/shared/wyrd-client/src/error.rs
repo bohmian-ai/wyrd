@@ -314,6 +314,13 @@ fn bifrost_error_from_code(
         }
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
+        "WYRD_VALA_403_BIFROST_CARD_SCOPE" => BifrostError::CardScopeDenied {
+            card_ref: message
+                .strip_prefix("card_ref outside principal card scope: ")
+                .or_else(|| details.get("card_ref").and_then(serde_json::Value::as_str))
+                .unwrap_or("<unknown>")
+                .to_owned(),
+        },
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
         "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
@@ -515,6 +522,18 @@ mod tests {
         }));
         assert_eq!(invalid_sql.status(), 400);
         assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
+
+        let card_scope = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            "detail": "card_ref outside principal card scope: Model/model@1.0.0",
+            "details": {},
+        }));
+        assert_eq!(card_scope.status(), 403);
+        assert_eq!(card_scope.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
+        assert_eq!(
+            card_scope.to_string(),
+            "card_ref outside principal card scope: Model/model@1.0.0"
+        );
 
         let admission = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",

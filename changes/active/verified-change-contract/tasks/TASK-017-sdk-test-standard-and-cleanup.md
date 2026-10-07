@@ -153,7 +153,7 @@ TASK-017 depends on TASK-016 and merges second. It writes tests against the exac
 
 ## Implementation Evidence
 
-Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language branches merged: Rust `c9a2ced55`, TypeScript `d58579412`, Python `eef1a11ae`).
+Commit range `04d1882dc~1..a97c14f87` (78 commits, 04d1882dc through a97c14f87 inclusive) on `wyrd/verified-change-contract/TASK-017` (language branches merged: Rust `c9a2ced55`, TypeScript `d58579412`, Python `eef1a11ae`).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -194,4 +194,9 @@ Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language 
 ### Verification
 
 - `mise run gate` exited 0 on `aa0aeb52b` (after the follow-ups; 2706 s, zero failures).
-- `git diff --check 04d1882dc~1..HEAD` reported nothing.
+- `mise run -c gate` exited 0 on `a97c14f87`. That run used the gate composition from that commit, with the `verify:python-sdk`, `verify:rust-sdk` and `verify:typescript-sdk` tasks. The commits after `aa0aeb52b` are:
+  - `abfc6f580`: the Python Bifrost journey lane runs the current story files.
+  - `535979176`: test servers wait for a routable Oracle at start.
+  - `3e9b80458`: the drift journey compares median client bytes.
+  - `a97c14f87`: adds the three SDK verify tasks and runs them from gate.
+- `git diff --check 04d1882dc~1..a97c14f87` reported nothing.

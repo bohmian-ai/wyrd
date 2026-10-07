@@ -1,542 +1,216 @@
-import {
-  RecordBatch,
-  Struct,
-  makeBuilder,
-  makeData,
-  tableFromIPC,
-  type Schema,
-  type Table,
-} from "apache-arrow";
-import { z } from "zod";
-import { startTestServer } from "@wyrd/testing";
-import { describe, expect, it } from "vitest";
+import { RecordBatch, Struct, makeBuilder, makeData, tableFromIPC, type Schema } from "apache-arrow";
+import { expect, vi } from "vitest";
+import { ZodError, z } from "zod";
 
-import { Bifrost, TableConfig, WyrdClient, WyrdError, type CompactionType } from "@wyrd/sdk";
+import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient } from "@wyrd/sdk";
 
-const SCHEMA = {
-  type: "object",
-  properties: { value: { type: "integer" } },
-  required: ["value"],
-} as const;
+import { serverTest } from "../support/server.js";
 
-function connect(server: ReturnType<typeof startTestServer>, table?: TableConfig) {
-  return Bifrost.connect({
-    table,
-    serverUrl: server.baseUrl,
-    credential: server.apiKey,
-    grpcUrl: server.grpcUrl,
-  });
-}
+vi.setConfig({ testTimeout: 60_000 });
 
-/**
- * Exchange `apiKey` for an access token through the public token route.
- *
- * Service A's inbound bearer token is what a real Service B receives; the
- * public `/auth/token` route is how Service A obtained it.
- */
-async function accessToken(
-  server: ReturnType<typeof startTestServer>,
-  apiKey: string,
-): Promise<string> {
-  const response = await fetch(`${server.baseUrl}/auth/token`, {
-    method: "POST",
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-      subject_token: apiKey,
-      subject_token_type: "urn:wyrd:oauth:token-type:api_key",
-    }),
-  });
-  expect(response.status).toBe(200);
-  return ((await response.json()) as { access_token: string }).access_token;
-}
+/** One model call, declared the way a TypeScript user already models data. */
+const Inference = z.object({ call_id: z.int(), model: z.string(), tokens: z.int(), latency_ms: z.number() });
+
+const INFERENCES: z.infer<typeof Inference>[] = [
+  { call_id: 1, model: "opus", tokens: 100, latency_ms: 120.5 },
+  { call_id: 2, model: "opus", tokens: 300, latency_ms: 240.0 },
+  { call_id: 3, model: "haiku", tokens: 50, latency_ms: 30.0 },
+];
+
+/** The table every read story queries, holding {@link INFERENCES}. */
+const INFERENCE_TABLE = "vala.datasets.inferences";
+
+/** A one-column table declaration for the write stories. */
+const Value = z.object({ value: z.int() });
 
 /** One single-column batch holding `value`, shaped by the described schema. */
 function valueBatch(schema: Schema, value: bigint): RecordBatch {
   const builder = makeBuilder({ type: schema.fields[0]!.type });
   builder.append(value);
   builder.finish();
-  return new RecordBatch(
-    schema,
-    makeData({ type: new Struct(schema.fields), length: 1, children: [builder.flush()] }),
-  );
+  return new RecordBatch(schema, makeData({ type: new Struct(schema.fields), length: 1, children: [builder.flush()] }));
 }
 
-/** Capture an asynchronous structured catalog error. */
-async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
-  const error = await promise.then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  expect(error).toBeInstanceOf(WyrdError);
-  return error as WyrdError;
+/** Register `fqn` as a {@link Value} table with `options`, then release the writer. */
+async function registerValueTable(fqn: string, options: TableConfigOptions = {}): Promise<string> {
+  const bifrost = await Bifrost.connect({ table: TableConfig.fromJsonSchema(fqn, Value, options) });
+  try {
+    return await bifrost.register();
+  } finally {
+    await bifrost.shutdown();
+  }
 }
-
-describe("Bifrost write journey", () => {
-  it("reads as A but cannot write with B's authority through a delegated client", async () => {
-    const server = startTestServer();
-    try {
-      const seeder = await connect(server);
-      await seeder.useTableByName(server.tableFqn);
-      for (const value of [11, 12]) {
-        seeder.insert({ value }, { cardRef: server.cardRef });
-      }
-      await seeder.flush();
-      await seeder.shutdown();
-      server.flushBifrost();
-      const aKey = server.scopedApiKey("ts_delegation_a", ["bifrost_query:read"]);
-      const bKey = server.scopedApiKey("ts_delegation_b", [
-        "bifrost_query:read",
-        "bifrost_record:write",
-        "bifrost_table:read",
-      ]);
-      const serviceB = WyrdClient.connect({
-        serverUrl: server.baseUrl,
-        credential: bKey,
-        grpcUrl: server.grpcUrl,
-      });
-      const delegated = await serviceB.onBehalfOf(await accessToken(server, aKey), {
-        audience: "bifrost",
-      });
-      const bifrostAsA = await Bifrost.connect({ client: delegated });
-
-      const read = await bifrostAsA.sql(
-        `SELECT value FROM ${server.tableFqn} ORDER BY value`,
-      );
-      expect(Array.from(read.batches[0]?.getChildAt(0)?.toArray() ?? [])).toEqual([
-        11n,
-        12n,
-      ]);
-      const { arrowSchema } = await TableConfig.describe(server.tableFqn, {
-        serverUrl: server.baseUrl,
-        credential: bKey,
-        grpcUrl: server.grpcUrl,
-      });
-      const denied = await rejection(
-        bifrostAsA.writeBatch(server.tableFqn, valueBatch(arrowSchema, 41n)),
-      );
-      expect(denied.status).toBe(403);
-
-      const bifrostAsB = await Bifrost.connect({ client: serviceB });
-      await bifrostAsB.writeBatch(server.tableFqn, valueBatch(arrowSchema, 42n));
-      server.flushBifrost();
-      const written = await bifrostAsB.sql(
-        `SELECT value FROM ${server.tableFqn} WHERE value > 40`,
-      );
-      expect(Array.from(written.batches[0]?.getChildAt(0)?.toArray() ?? [])).toEqual([
-        42n,
-      ]);
-
-      // Without `client`, the environment chain still resolves B unchanged.
-      const saved = ["WYRD_SERVER_URL", "WYRD_GRPC_URL", "WYRD_API_KEY"].map(
-        (name) => [name, process.env[name]] as const,
-      );
-      Object.assign(process.env, {
-        WYRD_SERVER_URL: server.baseUrl,
-        WYRD_GRPC_URL: server.grpcUrl,
-        WYRD_API_KEY: bKey,
-      });
-      try {
-        const fromEnv = await Bifrost.connect();
-        expect(
-          (await fromEnv.sql(`SELECT value FROM ${server.tableFqn} WHERE value > 40`))
-            .numRows,
-        ).toBe(1);
-      } finally {
-        for (const [name, value] of saved) {
-          if (value === undefined) delete process.env[name];
-          else process.env[name] = value;
-        }
-      }
-
-      const conflict = await rejection(
-        // @ts-expect-error `client` is mutually exclusive with every transport option.
-        Bifrost.connect({ client: serviceB, credential: bKey }),
-      );
-      expect(conflict.code).toBe("WYRD_SPEC_400_VALIDATION");
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-
-  it("registers, writes, flushes, swaps tables, and reads back", async () => {
-    const server = startTestServer();
-    try {
-      // `vala.datasets` is the caller-owned namespace, so this is the one
-      // table a user actually registers; the built-ins are server-owned.
-      const ownFqn = `vala.datasets.journey_${Date.now().toString(36)}`;
-      const bifrost = await connect(server, TableConfig.fromJsonSchema(ownFqn, SCHEMA));
-
-      expect(await bifrost.register()).toBe("created");
-      // Re-registering the same columns is a match, not a conflict.
-      expect(await bifrost.register()).toBe("already_exists");
-      expect(bifrost.table?.resolved?.tableUid).toBeTruthy();
-      expect(bifrost.table?.arrowSchema.fields.map((f) => f.name)).toEqual(["value"]);
-
-      const written = [71, 72, 73];
-      for (const value of written) {
-        bifrost.insert({ value }, { cardRef: server.cardRef });
-      }
-      expect(bifrost.producerCount).toBe(1);
-
-      // Swap before flushing: the swapped-away producer must still drain, so
-      // the rows above are not stranded by the rebinding.
-      await bifrost.useTableByName(server.tableFqn);
-      expect(bifrost.table?.fqn).toBe(server.tableFqn);
-      bifrost.insert({ value: 91 }, { cardRef: server.cardRef });
-      expect(bifrost.producerCount).toBe(2);
-
-      await bifrost.flush();
-      await bifrost.shutdown();
-      server.flushBifrost();
-
-      const reader = await Bifrost.connect({
-        serverUrl: server.baseUrl,
-        credential: server.apiKey,
-        grpcUrl: server.grpcUrl,
-      });
-      const result = await reader.sql(`SELECT value FROM ${ownFqn} ORDER BY value`);
-      const values = result.batches.flatMap((batch) =>
-        Array.from(batch.getChildAt(0)?.toArray() ?? []),
-      );
-      expect(values).toEqual(written.map(BigInt));
-      expect(result.terminal.outcome).toBe("success");
-      expect(result.numRows).toBe(written.length);
-
-      const swapped = await reader.sql(
-        `SELECT value FROM ${server.tableFqn} WHERE value = 91`,
-      );
-      expect(swapped.numRows).toBe(1);
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-
-  it("refuses a write with no active table and a bad card reference", async () => {
-    const server = startTestServer();
-    try {
-      const bifrost = await connect(server);
-      expect(() => bifrost.insert({ value: 81 })).toThrow(
-        expect.objectContaining({ code: "WYRD_VALA_412_NO_ACTIVE_TABLE" }),
-      );
-      expect(bifrost.producerCount).toBe(0);
-
-      bifrost.useTable(TableConfig.fromJsonSchema(server.tableFqn, SCHEMA));
-      expect(() =>
-        bifrost.insert({ value: 82 }, { cardRef: "not-a-ref" }),
-      ).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
-      await bifrost.shutdown();
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-
-  it("registers a compaction target, describes it back, and refuses a different one", async () => {
-    const server = startTestServer();
-    try {
-      const fqn = `vala.datasets.target_${Date.now().toString(36)}`;
-      const target = 256 * 1024 * 1024;
-      const register = async (bytes?: number) => {
-        const bifrost = await connect(
-          server,
-          TableConfig.fromJsonSchema(fqn, SCHEMA, { compactionTargetFileSizeBytes: bytes }),
-        );
-        try {
-          return await bifrost.register();
-        } finally {
-          await bifrost.shutdown();
-        }
-      };
-      const describeTarget = async () =>
-        (
-          await TableConfig.describe(fqn, {
-            serverUrl: server.baseUrl,
-            credential: server.apiKey,
-            grpcUrl: server.grpcUrl,
-          })
-        ).compactionTargetFileSizeBytes;
-
-      expect(await register(target)).toBe("created");
-      expect(await describeTarget()).toBe(target);
-      expect(await register(target)).toBe("already_exists");
-      // Omitting the target defers to what the table already recorded.
-      expect(await register()).toBe("already_exists");
-
-      const mismatch = await rejection(register(target * 2));
-      expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH");
-      expect(mismatch.status).toBe(409);
-      expect(await describeTarget()).toBe(target);
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-
-  it("registers a compaction type, describes it back, and refuses a different one", async () => {
-    const server = startTestServer();
-    try {
-      const fqn = `vala.datasets.kind_${Date.now().toString(36)}`;
-      const register = async (compactionType?: CompactionType) => {
-        const bifrost = await connect(
-          server,
-          TableConfig.fromJsonSchema(fqn, SCHEMA, { compactionType }),
-        );
-        try {
-          return await bifrost.register();
-        } finally {
-          await bifrost.shutdown();
-        }
-      };
-      const describeType = async () =>
-        (
-          await TableConfig.describe(fqn, {
-            serverUrl: server.baseUrl,
-            credential: server.apiKey,
-            grpcUrl: server.grpcUrl,
-          })
-        ).compactionType;
-
-      expect(await register("small-files")).toBe("created");
-      expect(await describeType()).toBe("small-files");
-      expect(await register("small-files")).toBe("already_exists");
-      // Omitting the type defers to what the table already recorded.
-      expect(await register()).toBe("already_exists");
-
-      const mismatch = await rejection(register("full"));
-      expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH");
-      expect(mismatch.status).toBe(409);
-      expect(await describeType()).toBe("small-files");
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-
-  it("describes an existing table without restating its schema", async () => {
-    const server = startTestServer();
-    try {
-      const described = await TableConfig.describe(server.tableFqn, {
-        serverUrl: server.baseUrl,
-        credential: server.apiKey,
-        grpcUrl: server.grpcUrl,
-      });
-      expect(described.fqn).toBe(server.tableFqn);
-      expect(described.resolved).toBeDefined();
-
-      const bifrost = await connect(server, described);
-      bifrost.insert({ value: 91 }, { cardRef: server.cardRef });
-      await bifrost.flush();
-      await bifrost.shutdown();
-      server.flushBifrost();
-
-      const reader = await Bifrost.connect({
-        serverUrl: server.baseUrl,
-        credential: server.token,
-        grpcUrl: server.grpcUrl,
-      });
-      const result = await reader.sql(
-        `SELECT value FROM ${server.tableFqn} WHERE value = 91`,
-      );
-      expect(result.numRows).toBe(1);
-    } finally {
-      server.shutdown();
-    }
-  }, 30_000);
-});
-
-// The columns a caller declares, written the way a TypeScript user already
-// models data and handed to `TableConfig` as-is -- the same one-step
-// declaration Pydantic gives the Python client.
-const Inference = z.object({
-  call_id: z.int(),
-  model: z.string(),
-  tokens: z.int(),
-  latency_ms: z.number(),
-  status: z.string(),
-});
-
-const ModelInfo = z.object({
-  model: z.string(),
-  vendor: z.string(),
-});
-
-const INFERENCES: z.infer<typeof Inference>[] = [
-  { call_id: 1, model: "opus", tokens: 100, latency_ms: 120.5, status: "ok" },
-  { call_id: 2, model: "opus", tokens: 300, latency_ms: 240.0, status: "ok" },
-  { call_id: 3, model: "opus", tokens: 200, latency_ms: 180.25, status: "error" },
-  { call_id: 4, model: "haiku", tokens: 50, latency_ms: 30.0, status: "ok" },
-  { call_id: 5, model: "haiku", tokens: 150, latency_ms: 60.75, status: "ok" },
-];
-
-const MODEL_INFO: z.infer<typeof ModelInfo>[] = [
-  { model: "opus", vendor: "anthropic" },
-  { model: "haiku", vendor: "anthropic" },
-];
 
 /**
- * Register a caller-owned table, write `rows`, and publish them for a reader.
- *
- * Rows are only queryable once the client drains and the server-owned Scribe
- * publishes, so both halves live here rather than in each caller.
+ * The published inference table and a reader for it, and the keys of
+ * service A, which may only query, and service B, which may also write.
  */
-async function publishRows(
-  server: ReturnType<typeof startTestServer>,
-  fqn: string,
-  schema: Parameters<typeof TableConfig.fromJsonSchema>[1],
-  rows: readonly Record<string, unknown>[],
-): Promise<void> {
-  const bifrost = await connect(server, TableConfig.fromJsonSchema(fqn, schema));
-  expect(await bifrost.register()).toBe("created");
-  for (const row of rows) {
-    bifrost.insert(row, { cardRef: server.cardRef });
-  }
-  await bifrost.flush();
-  await bifrost.shutdown();
+const test = serverTest().extend<{ reader: Bifrost; a: string; b: string }>({
+  a: [async ({ server }, use) => use(server.scopedApiKey("delegation_a", ["bifrost_query:read"])), { scope: "file" }],
+  b: [
+    async ({ server }, use) =>
+      use(server.scopedApiKey("delegation_b", ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"])),
+    { scope: "file" },
+  ],
+  reader: [
+    async ({ server }, use) => {
+      const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema(INFERENCE_TABLE, Inference) });
+      await writer.register();
+      for (const row of INFERENCES) {
+        writer.insert(row);
+      }
+      await writer.flush();
+      await writer.shutdown();
+      server.flushBifrost();
+      const reader = await Bifrost.connect();
+      await use(reader);
+      await reader.shutdown();
+    },
+    { scope: "file" },
+  ],
+});
+
+test("registering the same columns again matches", async () => {
+  expect(await registerValueTable("vala.datasets.registered")).toBe("created");
+  expect(await registerValueTable("vala.datasets.registered")).toBe("already_exists");
+});
+
+test("swapping tables drains the rows written before the swap", async ({ server, reader }) => {
+  await registerValueTable("vala.datasets.before_swap");
+  await registerValueTable("vala.datasets.after_swap");
+  const writer = await Bifrost.connect();
+
+  await writer.useTableByName("vala.datasets.before_swap");
+  writer.insert({ value: 71 });
+  await writer.useTableByName("vala.datasets.after_swap");
+  writer.insert({ value: 91 });
+  await writer.shutdown();
   server.flushBifrost();
+
+  const read = (table: string) => reader.sql(`SELECT value FROM ${table}`, [], Value.extend({ value: z.bigint() }));
+  expect(await read("vala.datasets.before_swap")).toEqual([{ value: 71n }]);
+  expect(await read("vala.datasets.after_swap")).toEqual([{ value: 91n }]);
+});
+
+/** One insert the client refuses before sending, and the catalog code it raises. */
+type Refusal = readonly [string, (bifrost: Bifrost) => void, string];
+
+test.for<Refusal>([
+  ["no active table", (bifrost) => bifrost.insert({ value: 81 }), "WYRD_VALA_412_NO_ACTIVE_TABLE"],
+  [
+    "malformed card reference",
+    (bifrost) => {
+      bifrost.useTable(TableConfig.fromJsonSchema("vala.datasets.refused", Value));
+      bifrost.insert({ value: 82 }, { cardRef: "not-a-ref" });
+    },
+    "WYRD_SPEC_400_VALIDATION",
+  ],
+])("refused insert raises its catalog code: %s", async ([, insert, code], { server: _ }) => {
+  const bifrost = await Bifrost.connect();
+
+  expect(() => insert(bifrost)).toThrow(expect.objectContaining({ code }));
+
+  await bifrost.shutdown();
+});
+
+test("compaction target is recorded and a different one is refused", async () => {
+  const target = 256 * 1024 * 1024;
+
+  expect(await registerValueTable("vala.datasets.target", { compactionTargetFileSizeBytes: target })).toBe("created");
+  expect(await registerValueTable("vala.datasets.target")).toBe("already_exists");
+  await expect(
+    registerValueTable("vala.datasets.target", { compactionTargetFileSizeBytes: target * 2 }),
+  ).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" });
+  expect((await TableConfig.describe("vala.datasets.target")).compactionTargetFileSizeBytes).toBe(target);
+});
+
+test("compaction type is recorded and a different one is refused", async () => {
+  expect(await registerValueTable("vala.datasets.kind", { compactionType: "small-files" })).toBe("created");
+  expect(await registerValueTable("vala.datasets.kind")).toBe("already_exists");
+  await expect(registerValueTable("vala.datasets.kind", { compactionType: "full" })).rejects.toMatchObject({
+    code: "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
+  });
+  expect((await TableConfig.describe("vala.datasets.kind")).compactionType).toBe("small-files");
+});
+
+test("described table accepts writes without restating its schema", async ({ server, reader }) => {
+  await registerValueTable("vala.datasets.described");
+  const writer = await Bifrost.connect({ table: await TableConfig.describe("vala.datasets.described") });
+
+  writer.insert({ value: 91 });
+  await writer.shutdown();
+  server.flushBifrost();
+
+  expect((await reader.sql("SELECT value FROM vala.datasets.described")).numRows).toBe(1);
+});
+
+test("aggregate sql reads the written rows", async ({ reader }) => {
+  const rows = await reader.sql(
+    `SELECT model, CAST(SUM(tokens) AS BIGINT) AS tokens FROM ${INFERENCE_TABLE} GROUP BY model ORDER BY model`,
+    [],
+    z.object({ model: z.string(), tokens: z.bigint() }),
+  );
+
+  expect(rows).toEqual([{ model: "haiku", tokens: 50n }, { model: "opus", tokens: 400n }]);
+});
+
+test("typed rows parse each row", async ({ reader }) => {
+  const rows = await reader.sql(
+    `SELECT model, latency_ms FROM ${INFERENCE_TABLE} ORDER BY call_id`,
+    [],
+    Inference.pick({ model: true, latency_ms: true }),
+  );
+
+  expect(rows).toEqual(INFERENCES.map(({ model, latency_ms }) => ({ model, latency_ms })));
+});
+
+test("row that does not fit fails the read", async ({ reader }) => {
+  await expect(
+    reader.sql(`SELECT model FROM ${INFERENCE_TABLE}`, [], z.object({ model: z.number() })),
+  ).rejects.toBeInstanceOf(ZodError);
+});
+
+test("empty result keeps the selected schema", async ({ reader }) => {
+  const empty = await reader.sql(`SELECT model, latency_ms FROM ${INFERENCE_TABLE} WHERE call_id = 9999`);
+
+  for (const table of [empty.toArrow(), tableFromIPC(empty.toBytes())]) {
+    expect(table.numRows).toBe(0);
+    expect(table.schema.fields.map((field) => [field.name, String(field.type)])).toEqual([
+      ["model", "Utf8"],
+      ["latency_ms", "Float64"],
+    ]);
+  }
+});
+
+/** Service B's client acting on behalf of A's inbound access token. */
+async function onBehalfOfA(a: string, b: string): Promise<Bifrost> {
+  const token = await WyrdClient.connect({ credential: a }).accessToken();
+  const delegated = await WyrdClient.connect({ credential: b }).onBehalfOf(token, { audience: "bifrost" });
+  return Bifrost.connect({ client: delegated });
 }
 
-/** Flatten one column of an Arrow table into a plain array, nulls preserved. */
-function col(table: Table, name: string): unknown[] {
-  return Array.from(table.getChild(name) ?? []);
-}
+test("delegated client reads with the callers authority", async ({ reader: _, a, b }) => {
+  const asA = await onBehalfOfA(a, b);
 
-describe("Bifrost analytical read journey", () => {
-  it("runs group-by, window, join, and scalar SQL over written tables", async () => {
-    const server = startTestServer();
-    try {
-      const suffix = Date.now().toString(36);
-      const facts = `vala.datasets.inference_${suffix}`;
-      const dims = `vala.datasets.model_info_${suffix}`;
-      await publishRows(server, facts, Inference, INFERENCES);
-      await publishRows(server, dims, ModelInfo, MODEL_INFO);
+  expect((await asA.sql(`SELECT call_id FROM ${INFERENCE_TABLE}`)).numRows).toBe(INFERENCES.length);
+});
 
-      const reader = await Bifrost.connect({
-        serverUrl: server.baseUrl,
-        credential: server.apiKey,
-        grpcUrl: server.grpcUrl,
-      });
+test("delegated client cannot write with the services authority", async ({ a, b }) => {
+  await registerValueTable("vala.datasets.delegated");
+  const { arrowSchema } = await TableConfig.describe("vala.datasets.delegated", { credential: b });
+  const asA = await onBehalfOfA(a, b);
 
-      // Aggregates with a HAVING filter: the per-group summary table.
-      const grouped = (
-        await reader.sql(
-          `SELECT model,
-                  CAST(COUNT(*) AS BIGINT) AS runs,
-                  CAST(SUM(tokens) AS BIGINT) AS total_tokens,
-                  CAST(AVG(tokens) AS DOUBLE) AS avg_tokens,
-                  CAST(MIN(latency_ms) AS DOUBLE) AS fastest,
-                  CAST(MAX(latency_ms) AS DOUBLE) AS slowest
-           FROM ${facts}
-           GROUP BY model HAVING COUNT(*) > 1 ORDER BY total_tokens DESC`,
-        )
-      ).toArrow();
-      expect(col(grouped, "model")).toEqual(["opus", "haiku"]);
-      expect(col(grouped, "runs")).toEqual([3n, 2n]);
-      expect(col(grouped, "total_tokens")).toEqual([600n, 200n]);
-      expect(col(grouped, "avg_tokens")).toEqual([200, 100]);
-      expect(col(grouped, "fastest")).toEqual([120.5, 30]);
-      expect(col(grouped, "slowest")).toEqual([240, 60.75]);
+  await expect(asA.writeBatch("vala.datasets.delegated", valueBatch(arrowSchema, 41n))).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
+  await (await Bifrost.connect({ credential: b })).writeBatch("vala.datasets.delegated", valueBatch(arrowSchema, 42n));
+});
 
-      // Window functions: rank within a partition, a running total, and a lag.
-      const windowed = (
-        await reader.sql(
-          `SELECT call_id,
-                  CAST(ROW_NUMBER() OVER (PARTITION BY model ORDER BY tokens DESC) AS BIGINT) AS rank_in_model,
-                  CAST(SUM(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS running_tokens,
-                  CAST(LAG(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS prev_tokens
-           FROM ${facts} ORDER BY call_id`,
-        )
-      ).toArrow();
-      expect(col(windowed, "rank_in_model")).toEqual([3n, 1n, 2n, 2n, 1n]);
-      expect(col(windowed, "running_tokens")).toEqual([100n, 400n, 600n, 50n, 200n]);
-      expect(col(windowed, "prev_tokens")).toEqual([null, 100n, 300n, null, 50n]);
+test("client and transport options conflict", async ({ b }) => {
+  const client = WyrdClient.connect({ credential: b });
 
-      // Join to the dimension table, with a filtering aggregate on the facts.
-      const joined = (
-        await reader.sql(
-          `SELECT d.vendor, f.model,
-                  CAST(COUNT(*) FILTER (WHERE f.status = 'ok') AS BIGINT) AS successes,
-                  CAST(COUNT(*) AS BIGINT) AS attempts
-           FROM ${facts} AS f INNER JOIN ${dims} AS d ON f.model = d.model
-           GROUP BY d.vendor, f.model ORDER BY f.model`,
-        )
-      ).toArrow();
-      expect(col(joined, "vendor")).toEqual(["anthropic", "anthropic"]);
-      expect(col(joined, "model")).toEqual(["haiku", "opus"]);
-      expect(col(joined, "successes")).toEqual([2n, 2n]);
-      expect(col(joined, "attempts")).toEqual([2n, 3n]);
-
-      // Scalar expressions over a CTE: the reshaping step before a chart.
-      const scalars = (
-        await reader.sql(
-          `WITH labelled AS (
-             SELECT call_id, UPPER(model) AS model_label,
-                    CAST(ROUND(latency_ms) AS DOUBLE) AS latency_whole,
-                    CASE WHEN latency_ms > 100 THEN 'slow' ELSE 'fast' END AS bucket,
-                    CAST(CHARACTER_LENGTH(status) AS BIGINT) AS status_len
-             FROM ${facts}
-           ) SELECT * FROM labelled ORDER BY call_id LIMIT 3`,
-        )
-      ).toArrow();
-      expect(scalars.numRows).toBe(3);
-      expect(col(scalars, "model_label")).toEqual(["OPUS", "OPUS", "OPUS"]);
-      expect(col(scalars, "latency_whole")).toEqual([121, 240, 180]);
-      expect(col(scalars, "bucket")).toEqual(["slow", "slow", "slow"]);
-      expect(col(scalars, "status_len")).toEqual([2n, 2n, 5n]);
-    } finally {
-      server.shutdown();
-    }
-  }, 60_000);
-
-  it("keeps the server's schema on an empty result and parses typed rows", async () => {
-    const server = startTestServer();
-    try {
-      const facts = `vala.datasets.typed_${Date.now().toString(36)}`;
-      await publishRows(server, facts, Inference, INFERENCES);
-
-      const reader = await Bifrost.connect({
-        serverUrl: server.baseUrl,
-        credential: server.apiKey,
-        grpcUrl: server.grpcUrl,
-      });
-
-      // A query that matches nothing still reports the fields it selected.
-      const empty = await reader.sql(
-        `SELECT model, latency_ms FROM ${facts} WHERE call_id = 9999`,
-      );
-      expect(empty.numRows).toBe(0);
-      const emptyArrow = empty.toArrow();
-      expect(emptyArrow.numRows).toBe(0);
-      expect(emptyArrow.schema.fields.map((field) => field.name)).toEqual([
-        "model",
-        "latency_ms",
-      ]);
-      expect(emptyArrow.schema.fields.map((field) => String(field.type))).toEqual([
-        "Utf8",
-        "Float64",
-      ]);
-      const decoded = tableFromIPC(empty.toBytes());
-      expect(decoded.numRows).toBe(0);
-      expect(decoded.schema.fields.map((field) => field.name)).toEqual([
-        "model",
-        "latency_ms",
-      ]);
-
-      // Supplying a schema returns parsed rows; omitting it is unchanged.
-      const Row = z.object({
-        model: z.string(),
-        latency_ms: z.number(),
-      });
-      const select = `SELECT model, latency_ms FROM ${facts} ORDER BY call_id`;
-      const raw = await reader.sql(select);
-      expect(raw.numRows).toBe(INFERENCES.length);
-      const rows = await reader.sql(select, [], Row);
-      expect(rows).toEqual(
-        INFERENCES.map(({ model, latency_ms }) => ({ model, latency_ms })),
-      );
-
-      // A row that does not fit fails the whole read.
-      await expect(
-        reader.sql(select, [], z.object({ model: z.number() })),
-      ).rejects.toThrow();
-    } finally {
-      server.shutdown();
-    }
-  }, 60_000);
+  // @ts-expect-error `client` is mutually exclusive with every transport option.
+  await expect(Bifrost.connect({ client, credential: b })).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_VALIDATION",
+  });
 });

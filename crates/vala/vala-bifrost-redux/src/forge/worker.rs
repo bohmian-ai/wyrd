@@ -67,10 +67,10 @@ pub const DEFAULT_PULL_INTERVAL: Duration = Duration::from_secs(5);
 /// Everything one rewrite publication holds constant across its attempts.
 ///
 /// The derivation, the commit, and the three audit transitions all read the
-/// same identity, group, partition, policy, and deadline. Owning them here is
-/// what keeps a retried attempt provably bound to the same operation as the
-/// first one: nothing in the retry loop can recompute a deadline, re-derive a
-/// partition, or open a second operation identity.
+/// same identity, group, partition, and policy. Owning them here is what keeps
+/// a retried attempt provably bound to the same operation as the first one:
+/// nothing in the retry loop can re-derive a partition or open a second
+/// operation identity.
 struct RewritePublication<'publication> {
     /// Durable task this publication is settling.
     claim: &'publication ForgeTaskClaim,
@@ -86,8 +86,6 @@ struct RewritePublication<'publication> {
     target_file_size_bytes: u64,
     /// Schema identity the plan was authorized against.
     planned_schema_id: i32,
-    /// One commit budget, captured before the first attempt and never renewed.
-    deadline: super::publication::RewritePublicationDeadline,
 }
 
 impl RewritePublication<'_> {
@@ -311,15 +309,6 @@ struct ForgeRewriteAttempt {
     /// Geometry planning resolved once; every plan executes, publishes, and
     /// audits under its file target.
     policy: super::managed::policy::ForgeTablePolicy,
-    /// One absolute publication budget every plan of this attempt shares.
-    ///
-    /// Attempt-scoped, not plan-scoped: the budget bounds how long this claim
-    /// may keep asking the catalog to accept work planned against one table
-    /// read, and a per-plan budget would let an attempt with many plans keep
-    /// submitting for a multiple of the configured window. A plan that finds
-    /// the budget spent refuses before it prepares anything, which is ordinary
-    /// planning debt the next attempt replans.
-    deadline: super::publication::RewritePublicationDeadline,
 }
 
 /// One claimed ownership episode's observation frame.
@@ -5856,9 +5845,7 @@ impl ForgeWorker {
     /// retry is permitted against it, and only after reloading the table and
     /// re-deriving the base and the request against it — replaying the same
     /// replacement against a stale base is what would delete files a concurrent
-    /// writer has already replaced. The deadline is captured once, before the
-    /// first attempt, so a slow first attempt cannot buy the retry more time
-    /// than the original commit budget allowed. Every other failure, including
+    /// writer has already replaced. Every other failure, including
     /// an uncertain one, is returned unchanged so the Prepared operation stays
     /// open for evidence-based recovery.
     ///
@@ -5867,9 +5854,7 @@ impl ForgeWorker {
     /// Returns [`ForgeError::Shutdown`] when the managed attempt drains before
     /// producing a publishable handoff, [`ForgeError::Reconciliation`] when the
     /// core made no progress, when the touched files do not share one time
-    /// partition, or when acceptance becomes unknown,
-    /// [`ForgeError::InvalidConfig`] when the configured Iceberg retry budget
-    /// is not representable as a deadline, and the capacity, audit, fence,
+    /// partition, or when acceptance becomes unknown, and the capacity, audit, fence,
     /// object-store, and catalog failures raised by execution, preparation, and
     /// the commit.
     async fn plan_rewrite_attempt(
@@ -5904,10 +5889,6 @@ impl ForgeWorker {
                 table,
                 evidence,
                 policy,
-                deadline: super::publication::RewritePublicationDeadline::new(
-                    self.forge.core.clock.now()?,
-                    self.forge.core.config.iceberg_total_retry_timeout,
-                )?,
             }),
             plans,
         ))
@@ -6527,8 +6508,8 @@ impl ForgeCompactionPlanRunner {
     /// Rewrites this plan and publishes it under its own operation.
     ///
     /// This is the whole of one plan's work, and it consumes the runner so it
-    /// can happen only once. The publication authority, deadline, and retry
-    /// budget are the single-plan ones: a sibling's refusal or failure neither
+    /// can happen only once. The publication authority and retry budget are
+    /// the single-plan ones: a sibling's refusal or failure neither
     /// cancels nor weakens it. The attempt identity stays shared, because it is
     /// what every object this attempt wrote is named for and what the
     /// unsettled-output ledger is keyed by.
@@ -6592,7 +6573,6 @@ impl ForgeCompactionPlanRunner {
             partition_spec_id: metadata.default_partition_spec_id(),
             target_file_size_bytes: self.shared.policy.target_file_size_bytes,
             planned_schema_id: metadata.current_schema_id(),
-            deadline: self.shared.deadline,
         };
         #[cfg(feature = "test-support")]
         self.record_rewrite_evidence_for_test(&context.identity);
@@ -6813,7 +6793,7 @@ impl ForgeCompactionPlanRunner {
     ///
     /// 1. [`Self::acquire_publication_authority`] reloads the table *after* the
     ///    handoff and decides every knowable authority — lease and fence,
-    ///    cancellation, the absolute deadline, branch, base, ancestry, and the
+    ///    cancellation, branch, base, ancestry, and the
     ///    planned schema/spec/sort policy — against that fresh metadata. The
     ///    pre-execution table is evidence, never authority, so a refusal here
     ///    arrives before any Prepared row and before any catalog mutation.
@@ -6822,13 +6802,11 @@ impl ForgeCompactionPlanRunner {
     ///    file-level authorities (selected inputs still live, delete scope), and
     ///    writes the Prepared audit exactly once — on the first pass only —
     ///    naming the inputs and outputs a successor would reconcile.
-    /// 3. The commit is submitted under `context.deadline`, one absolute budget
-    ///    shared by every pass. A definite conflict — the catalog *answered*,
-    ///    so nothing landed — buys a revalidated retry against the reloaded
-    ///    table: the fixed schedule permits three of them, delayed 1s, 2s and
-    ///    4s, and each one only while that same deadline still has budget for
-    ///    the delay plus a call. No retry renews the deadline, and the schedule
-    ///    is deliberately not configurable. Sibling plans of the same attempt
+    /// 3. The commit is submitted, each call bounded by the catalog request
+    ///    timeout. A definite conflict — the catalog *answered*, so nothing
+    ///    landed — buys a revalidated retry against the reloaded table: the
+    ///    fixed schedule permits three of them, delayed 1s, 2s and 4s, and the
+    ///    schedule is deliberately not configurable. Sibling plans of the same attempt
     ///    publish concurrently and independently while this one retries.
     /// 4. A committed submission settles the operation terminally through
     ///    [`Self::settle_committed_rewrite`], which writes the SQL settlement
@@ -6853,8 +6831,7 @@ impl ForgeCompactionPlanRunner {
     /// carrying the possible outputs as unsettled evidence;
     /// [`ForgeError::Shutdown`] or [`ForgeError::ShutdownRetained`] for a
     /// cancelled attempt, returned bare so the event loop can release the claim;
-    /// [`ForgeError::Timeout`] when the absolute deadline expires with a call
-    /// in flight; [`ForgeError::Invariant`] when a revalidated retry has no
+    /// [`ForgeError::Invariant`] when a revalidated retry has no
     /// reloaded table; and the lease, fence, audit, and SQL failures raised by
     /// the authority decision, the Prepared transition, and the terminal
     /// settlement. An audit or settlement failure replaces the originating
@@ -6901,7 +6878,6 @@ impl ForgeCompactionPlanRunner {
                     super::publication::ForgeRewriteCommit {
                         table: &current,
                         request,
-                        deadline: context.deadline,
                     },
                     stop,
                 )
@@ -6945,11 +6921,12 @@ impl ForgeCompactionPlanRunner {
                 );
                 // Every way that wait can fail is definite non-acceptance, so
                 // each closes the operation here.
-                if let Some(stopped) = self.conflict_backoff(context, retries_spent, stop).await? {
+                if let Err(stopped) =
+                    super::publication::RewriteConflictSchedule::wait(retries_spent, stop).await
+                {
                     let reason = match stopped {
                         super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
-                        super::publication::RewriteRetryStop::Exhausted
-                        | super::publication::RewriteRetryStop::DeadlineTruncated => conflict,
+                        super::publication::RewriteRetryStop::Exhausted => conflict,
                     };
                     return Err(self
                         .abandon_unsubmitted_rewrite(context, Some(request), handoff, reason, lease)
@@ -7023,36 +7000,6 @@ impl ForgeCompactionPlanRunner {
         Err(conflict)
     }
 
-    /// Waits the definite-conflict backoff owed before the next revalidated
-    /// retry.
-    ///
-    /// The wait belongs before the revalidation, not after it: a plan that
-    /// reloaded metadata and then slept would resubmit against a picture of the
-    /// table that is already as old as the backoff.
-    ///
-    /// Returns the stop that ended the wait, or `None` when the retry may
-    /// proceed. Every stop is definite non-acceptance, so the caller closes the
-    /// operation rather than resubmitting.
-    ///
-    /// # Errors
-    ///
-    /// Returns the clock failure the deadline comparison raises.
-    async fn conflict_backoff(
-        &self,
-        context: &RewritePublication<'_>,
-        retries_spent: u32,
-        stop: &CancellationToken,
-    ) -> Result<Option<super::publication::RewriteRetryStop>, ForgeError> {
-        Ok(super::publication::RewriteConflictSchedule::wait(
-            retries_spent,
-            context.deadline,
-            self.forge.core.clock.now()?,
-            stop,
-        )
-        .await
-        .err())
-    }
-
     /// Reports the one authority a fresh publication pass fails, if any.
     ///
     /// Split out so the refusal is decided against `current` — metadata loaded
@@ -7065,8 +7012,8 @@ impl ForgeCompactionPlanRunner {
     /// # Errors
     ///
     /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
-    /// cannot be renewed, the clock failures the deadline comparison raises,
-    /// and the catalog failures the current-head live-set read raises.
+    /// cannot be renewed, and the catalog failures the current-head live-set
+    /// read raises.
     async fn rewrite_publication_refusal(
         &self,
         context: &RewritePublication<'_>,
@@ -7248,7 +7195,6 @@ impl ForgeCompactionPlanRunner {
             super::publication::RewriteAcceptance::Ambiguous => Ok((
                 acceptance.next_action(
                     retries_spent,
-                    false,
                     super::publication::RewriteCommitDecision::Proceed,
                 ),
                 None,
@@ -7286,11 +7232,7 @@ impl ForgeCompactionPlanRunner {
                         stop,
                     )
                     .await?;
-                let action = acceptance.next_action(
-                    retries_spent,
-                    context.deadline.passed(self.forge.core.clock.now()?),
-                    authority.decide(),
-                );
+                let action = acceptance.next_action(retries_spent, authority.decide());
                 Ok((action, Some(refreshed)))
             }
         }
@@ -7325,8 +7267,7 @@ impl ForgeCompactionPlanRunner {
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the lease cannot be renewed against the
-    /// operator pool, the clock failures the deadline comparison raises, and
-    /// the catalog and manifest failures the current-head live-set read raises.
+    /// operator pool, and the catalog and manifest failures the current-head live-set read raises.
     async fn rewrite_authority(
         &self,
         lease: &mut ForgeLease,
@@ -7349,7 +7290,6 @@ impl ForgeCompactionPlanRunner {
             },
             attempt: super::publication::RewriteAttemptAuthority {
                 cancelled: stop.is_cancelled(),
-                deadline_passed: context.deadline.passed(self.forge.core.clock.now()?),
             },
             table: super::publication::RewriteTableAuthority {
                 base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
@@ -7423,17 +7363,13 @@ impl ForgeWorker {
     /// retry is permitted against it, and only after reloading the table and
     /// revalidating the durable demand again — replaying the same plan against
     /// a stale base is what would promote a file set that no longer exists.
-    /// The deadline is captured once, before the first attempt, so a slow
-    /// first attempt cannot buy the retry more time than the original commit
-    /// budget allowed. Every other failure, including an uncertain one, is
+    /// Every other failure, including an uncertain one, is
     /// returned unchanged for evidence-based recovery.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the persisted parameters do not
-    /// decode into an exact plan, [`ForgeError::InvalidConfig`] when the
-    /// configured Iceberg retry budget is not representable as a deadline, and
-    /// the audit, fence, object-store, and catalog failures raised by
+    /// decode into an exact plan, and the audit, fence, object-store, and catalog failures raised by
     /// preparation, revalidation, and the commit.
     async fn dispatch_scribe_promotion(
         &self,
@@ -7462,11 +7398,6 @@ impl ForgeWorker {
                 },
             )
             .await?;
-        let deadline = self.forge.core.clock.now()?
-            + chrono::Duration::from_std(self.forge.core.config.iceberg_total_retry_timeout)
-                .map_err(|_| ForgeError::InvalidConfig {
-                    detail: "Forge Iceberg retry timeout is not representable".to_owned(),
-                })?;
         let mut reloaded: Option<Table> = None;
         let mut retried = false;
         loop {
@@ -7531,7 +7462,7 @@ impl ForgeWorker {
                         .to_owned(),
                 });
             }
-            if retried || self.forge.core.clock.now()? >= deadline {
+            if retried {
                 // A definite conflict is certain non-acceptance, so this
                 // operation is closed here rather than left open for a
                 // successor to reconcile a commit that never happened. No row

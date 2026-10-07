@@ -147,7 +147,6 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     for mutation in [
         HeldAuthorityMutation::LeaseExpired,
         HeldAuthorityMutation::AttemptCancelled,
-        HeldAuthorityMutation::DeadlineElapsed,
     ] {
         assert_held_authority_change_refuses(&telemetry, mutation).await;
     }
@@ -448,11 +447,9 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     })
     .await;
 
-    // The retry the rule grants is bounded by the same absolute deadline the
-    // initial call started under, so the two phases below take that budget away
-    // in the only two ways it can end: entirely, and almost entirely.
-    assert_expired_deadline_makes_no_second_call().await;
-    assert_retry_inherits_only_the_remaining_budget().await;
+    // A call the catalog never answers is ended by the request timeout, and
+    // that end is ambiguity, never a refusal.
+    assert_unanswered_call_ends_at_the_request_timeout().await;
 }
 
 /// Everything the spent-retry phase needs from the run that preceded it.
@@ -546,105 +543,31 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
     );
 }
 
-/// One publication whose deadline elapses while its first call is in flight.
+/// One publication whose catalog call is never answered.
 ///
-/// The retry a definite conflict buys is not unconditional: it is permitted
-/// only while the publication's one absolute deadline still has budget left.
-/// Advancing the manual clock past that deadline while the first call is parked
-/// makes this exact: the catalog then answers with a definite refusal — proof
-/// nothing landed — and the follow-up must still refuse to submit again,
-/// recording the operation as definitely uncommitted rather than spending a
-/// retry the deadline no longer covers.
+/// Each catalog call is bounded by the configured request timeout, so a parked
+/// call that is never released is ended by that timeout alone. A submitted call
+/// that timed out claims no outcome: its operation stays Prepared for durable
+/// recovery and is never resubmitted, while every sibling plan the catalog then
+/// refuses spends exactly its bounded retry schedule and is reset.
 ///
 /// # Panics
 ///
-/// Panics when the fixture cannot start, a deterministic bound is missed, or a
-/// second catalog call was made.
-async fn assert_expired_deadline_makes_no_second_call() {
-    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_spent").await;
+/// Panics when the fixture cannot start, the timed-out plan was resubmitted or
+/// settled, a sibling made a call past its schedule, or anything was published.
+async fn assert_unanswered_call_ends_at_the_request_timeout() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("rewrite_request_timeout").await;
+    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let (clock, control) = manual_clock();
     let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        clock,
-    );
-    supervisor.run_one_success().await;
-    let standing = live_data_paths(&promoted).await;
-
-    let attempts_before = catalog.attempts();
-    catalog.park_next_commit();
-    supervisor.restart_worker();
-    let supervisor = supervisor
-        .run_one_failure_while(async {
-            catalog.wait_for_parked_commit().await;
-            control
-                .set(expired_publication_deadline(&promoted, &control))
-                .expect("manual Forge clock advances");
-            catalog.reject_parked_commit();
-            // The plans this one does not represent must not publish either,
-            // or the attempt would report their success instead of this
-            // plan's refusal.
-            catalog.reject_remaining_commits();
-        })
-        .await;
-    supervisor.shutdown().await;
-
-    let phases = promoted.fixture.rewrite_phases().await;
-    assert_eq!(
-        catalog.attempts() - attempts_before,
-        1,
-        "a conflict answered past the publication deadline buys no second call, \
-         and a sibling plan under the same spent budget never submits at all: \
-         {phases:?}"
-    );
-    assert_eq!(
-        phases,
-        vec!["reset".to_owned(); phases.len()],
-        "the refused publication is recorded as definitely uncommitted"
-    );
-    assert_eq!(
-        live_data_paths(&promoted).await,
-        standing,
-        "no replacement was published past the deadline"
-    );
-}
-
-/// The permitted retry inherits only what the first call left of the deadline.
-///
-/// A retry that restarted the configured budget would be a second publication
-/// wearing the first one's identity: it could still be in flight long after the
-/// window its Prepared record promised. So the clock is advanced to just short
-/// of the deadline while the first call is parked. The retry that follows then
-/// has about a second of budget, and the parked second call is never released —
-/// only the production deadline can end it. It does, leaving acceptance
-/// unknown, which is the honest answer for a call that was submitted: the
-/// attempt is released with its operation still Prepared for durable recovery,
-/// and no third call is made.
-///
-/// # Panics
-///
-/// Panics when the fixture cannot start, a deterministic bound is missed — a
-/// renewed budget would miss it by minutes — or the publication claimed an
-/// outcome it could not know.
-async fn assert_retry_inherits_only_the_remaining_budget() {
-    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_remainder").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        promoted.fixture.catalog.iceberg_catalog(),
-        object_store.read_counter(),
-    );
-    let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start_serial(
-        &promoted.fixture,
-        Arc::clone(&catalog) as Arc<dyn Catalog>,
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        clock,
+        ForgeClock::system(),
     );
     supervisor.run_one_success().await;
     let standing = live_data_paths(&promoted).await;
@@ -655,17 +578,6 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     let supervisor = supervisor
         .run_one_release_while(async {
             catalog.wait_for_parked_commit().await;
-            // Three seconds short of the deadline, not one: the retry the
-            // conflict buys is owed a one-second backoff first, and a margin
-            // that only just covers it would leave whether the retry is
-            // submitted or truncated to rounding.
-            let nearly_spent =
-                expired_publication_deadline(&promoted, &control) - chrono::Duration::seconds(3);
-            control
-                .set(nearly_spent)
-                .expect("manual Forge clock advances");
-            catalog.reject_parked_commit_and_park_next();
-            catalog.wait_for_parked_commit().await;
             catalog.wait_for_parked_commit_drop().await;
             catalog.reject_remaining_commits();
         })
@@ -673,42 +585,28 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     supervisor.shutdown().await;
 
     let phases = promoted.fixture.rewrite_phases().await;
+    let reset = phases.iter().filter(|phase| *phase == "reset").count();
+    assert_eq!(
+        phases.iter().filter(|phase| *phase == "prepared").count(),
+        1,
+        "the timed-out call claims no outcome and stays Prepared: {phases:?}"
+    );
+    assert_eq!(
+        phases.len(),
+        1 + reset,
+        "every sibling the catalog refused is definitely uncommitted: {phases:?}"
+    );
     assert_eq!(
         catalog.attempts() - attempts_before,
-        2 * phases.len(),
-        "the publication made its initial call and exactly one retry, and every \
-         sibling plan got the same two calls out of what the attempt's one \
-         shared budget still had left: {phases:?}"
-    );
-    // A submitted call that ran out of budget claims no outcome. The attempt is
-    // released rather than settled, and the row stays open until the durable
-    // takeover proves what happened to that exact operation. Nothing here may
-    // report the commit as accepted.
-    assert!(
-        phases
-            .iter()
-            .all(|phase| phase == "prepared" || phase == "reset"),
-        "a submitted call that ran out of budget claims no outcome: {phases:?}"
+        1 + 4 * reset,
+        "the timed-out call is never resubmitted, and each refused sibling \
+         spends exactly its bounded retry schedule: {phases:?}"
     );
     assert_eq!(
         live_data_paths(&promoted).await,
         standing,
-        "the abandoned retry published nothing"
+        "the unanswered publication published nothing"
     );
-}
-
-/// The first instant at which one publication's deadline has certainly passed.
-///
-/// Derived from the configured Iceberg budget rather than a literal, so the
-/// scenario stays correct if that budget is retuned.
-fn expired_publication_deadline(
-    promoted: &PromotedRewriteFixture,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
-) -> chrono::DateTime<chrono::Utc> {
-    control.now().expect("manual Forge clock")
-        + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
-            .expect("the Iceberg retry budget is representable")
-        + chrono::Duration::seconds(1)
 }
 
 /// Asserts a cancelled in-flight commit left no claim on any outcome.
@@ -872,8 +770,6 @@ enum HeldAuthorityMutation {
     LeaseExpired,
     /// The worker's own cancellation token is cancelled.
     AttemptCancelled,
-    /// The manual Forge clock passes the publication's absolute deadline.
-    DeadlineElapsed,
 }
 
 impl HeldAuthorityMutation {
@@ -886,7 +782,6 @@ impl HeldAuthorityMutation {
         match self {
             Self::LeaseExpired => "rewrite_hold_lease",
             Self::AttemptCancelled => "rewrite_hold_cancel",
-            Self::DeadlineElapsed => "rewrite_hold_deadline",
         }
     }
 
@@ -900,7 +795,6 @@ impl HeldAuthorityMutation {
         match self {
             Self::LeaseExpired => "LeaseLost",
             Self::AttemptCancelled => "Cancelled",
-            Self::DeadlineElapsed => "Deadline",
         }
     }
 }
@@ -958,7 +852,7 @@ async fn assert_held_authority_change_refuses(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let (clock, control) = manual_clock();
+    let (clock, _control) = manual_clock();
     let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
@@ -981,7 +875,7 @@ async fn assert_held_authority_change_refuses(
     let worker_stop = supervisor.worker_stop();
     let error = supervisor
         .run_one_failure_holding_handoff(async {
-            apply_held_authority_mutation(mutation, &promoted, &control, &worker_stop).await;
+            apply_held_authority_mutation(mutation, &promoted, &worker_stop).await;
         })
         .await;
     let possible_outputs = supervisor.last_possible_rewrite_outputs();
@@ -1038,12 +932,10 @@ async fn assert_held_authority_change_refuses(
 ///
 /// # Panics
 ///
-/// Panics when the fixture cannot apply the mutation or the manual clock
-/// cannot represent the phase's deadline.
+/// Panics when the fixture cannot apply the mutation.
 async fn apply_held_authority_mutation(
     mutation: HeldAuthorityMutation,
     promoted: &PromotedRewriteFixture,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
     worker_stop: &tokio_util::sync::CancellationToken,
 ) {
     match mutation {
@@ -1052,13 +944,6 @@ async fn apply_held_authority_mutation(
         }
         HeldAuthorityMutation::AttemptCancelled => {
             worker_stop.cancel();
-        }
-        HeldAuthorityMutation::DeadlineElapsed => {
-            let elapsed = control.now().expect("manual Forge clock")
-                + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
-                    .expect("the Iceberg retry budget is representable")
-                + chrono::Duration::seconds(1);
-            control.set(elapsed).expect("manual Forge clock advances");
         }
     }
 }

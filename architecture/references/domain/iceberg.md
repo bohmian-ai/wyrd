@@ -89,9 +89,9 @@ input, and preserves the lease and fence. A changed branch head alone is not a
 refusal. Concurrent sibling plans may therefore race optimistically and incur
 expected catalog conflicts. After a definite conflict, reacquire metadata and
 repeat the same validation before the same plan operation may retry after fixed
-1s/2s/4s delays, for at most three retries within its original deadline. Reuse
-the same operation ID, output generation, and objects. Exhausted retries,
-deadline, or a changed required condition ends that plan as definitely
+1s/2s/4s delays, for at most three retries. Reuse
+the same operation ID, output generation, and objects. Exhausted retries or a
+changed required condition ends that plan as definitely
 uncommitted; successful siblings remain committed and remaining debt is
 replanned from the current head. Never hide revalidation inside a generic
 retry. Promotion retains its separate one-retry protocol.

@@ -760,12 +760,11 @@ branch. It then performs one fenced duplicate-checking fast-append
 On a definite compare-and-swap conflict, Forge refreshes the branch head and
 revalidates the exact `file_list` rows, object/footer evidence, absence of an
 equivalent promoted entry, branch, lease, and fence. When all assumptions hold,
-the same attempt and operation ID may make at most one additional `commit_once`
-within the original deadline. Another conflict, changed assumption, or expired
-deadline settles the attempt as definitely uncommitted and leaves the rows as
-`file_list` promotion debt that a later leader sweep retries under a new
-attempt. No retry rewrites or reuploads
-the Scribe object.
+the same attempt and operation ID may make at most one additional `commit_once`.
+Another conflict or changed assumption settles the attempt as definitely
+uncommitted and leaves the rows as `file_list` promotion debt that a later
+leader sweep retries under a new attempt. No retry rewrites or reuploads the
+Scribe object.
 
 An ambiguous catalog result keeps the same attempt and operation ID. Forge
 refreshes metadata and reconciles exact snapshot properties and manifest
@@ -867,11 +866,11 @@ conflict, Forge refreshes the branch head and revalidates the retained planning
 snapshot, current schema identity, selected-input existence, lease, and fence.
 When those assumptions remain true, the same plan operation, output generation,
 and objects may make at most three further `commit_once` calls after fixed
-1s/2s/4s delays within the original deadline. Exhausted retries, an expired
-deadline, or a changed assumption settles only that plan as definitely
-uncommitted. Successful sibling snapshots remain visible; the task succeeds
-when any admitted plan publishes, and later discovery replans remaining debt
-from the current head. No conflict retry creates new output objects.
+1s/2s/4s delays. Each call is bounded by the catalog request timeout; a call it
+ends is ambiguous, never a refusal. Exhausted retries or a changed assumption
+settles only that plan as definitely uncommitted. Successful sibling snapshots
+remain visible; the task succeeds when any admitted plan publishes, and later
+discovery replans remaining debt from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports

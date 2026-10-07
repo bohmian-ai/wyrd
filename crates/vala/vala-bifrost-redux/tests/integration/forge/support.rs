@@ -543,26 +543,11 @@ impl PromotionCatalogSeam {
         }
     }
 
-    /// Wait until cancellation dropped the parked commit.
+    /// Wait until cancellation or the request timeout dropped the parked commit.
     pub(crate) async fn wait_for_parked_commit_drop(&self) {
         while !self.parked_dropped.load(Ordering::Acquire) {
             self.parked_drop_ready.notified().await;
         }
-    }
-
-    /// Release the parked commit as a definite conflict and park the next one.
-    ///
-    /// Arming the follow-up park before the release is what makes the retry
-    /// observable: the conflicted call returns, production re-derives and
-    /// submits once more, and that second call stops here instead of racing the
-    /// test to the real catalog. The parked second call is never released, so
-    /// only the production budget can end it.
-    pub(crate) fn reject_parked_commit_and_park_next(&self) {
-        self.parked.store(false, Ordering::Release);
-        self.parked_dropped.store(false, Ordering::Release);
-        self.park_next.store(true, Ordering::Release);
-        self.reject_parked.store(true, Ordering::Release);
-        self.parked_release.notify_waiters();
     }
 
     /// Arm or disarm losing every accepted commit's response.
@@ -584,7 +569,7 @@ impl PromotionCatalogSeam {
     /// call is refused by the real catalog because the first one landed, so the
     /// caller ends up with a *definite* conflict rather than an unknown
     /// acceptance. Withholding the answer instead leaves the call in flight
-    /// until the publication budget ends it, which is the one shape that
+    /// until the catalog request timeout ends it, which is the one shape that
     /// delivers a landed replacement and an unknowable outcome together.
     pub(crate) fn stall_next_commit_responses(&self, count: usize) {
         self.stall_response_budget.store(count, Ordering::Release);
@@ -739,7 +724,7 @@ impl Catalog for PromotionCatalogSeam {
             // The call is handed to a task the caller cannot cancel, so the
             // replacement lands exactly as it would have while this call never
             // answers. Awaiting the commit here instead would let the caller's
-            // publication budget cancel the commit itself, which is a different
+            // catalog request timeout cancel the commit itself, which is a different
             // fault entirely: nothing landed.
             let inner = Arc::clone(&self.inner);
             tokio::spawn(async move {

@@ -668,68 +668,6 @@ async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
     );
 }
 
-/// The operation deadline bounds the conflict retry to zero second attempts.
-///
-/// The commit is parked at the real catalog seam, the Forge clock is moved
-/// past the operation's own retry budget, and only then is the parked commit
-/// refused. The deadline captured before the first attempt must therefore
-/// already be spent, so the definite conflict closes the operation instead of
-/// buying a second catalog call. One delegated update — against two in the
-/// retry scenario — is what proves the barrier held.
-///
-/// # Panics
-///
-/// Panics when the manual Forge clock cannot advance past the retry budget,
-/// the catalog sees more than one update attempt, the operation does not
-/// close as `reset`, or any sealed row is settled.
-#[tokio::test]
-#[ignore = "requires Postgres"]
-async fn scribe_promotion_deadline_expires_before_conflict_retry() {
-    let server = start_engine_fixture_server().await;
-    let clock = server.forge_clock();
-    let fixture = seed_forge_group(&server, "promotion_deadline").await;
-    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-    catalog.pause_before_commit();
-
-    let forge = SupervisedForge::start_with_seams(
-        &fixture,
-        fixture.config.clone(),
-        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&fixture.object_store),
-    );
-    let forge = forge
-        .run_one_failure_while(async {
-            catalog.wait_for_before_commit().await;
-            let expired = clock.now().expect("manual Forge clock")
-                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
-                    .expect("retry budget is representable")
-                + chrono::Duration::seconds(1);
-            clock.set(expired).expect("manual Forge clock advances");
-            catalog.reject_paused_before_commit();
-        })
-        .await;
-
-    assert_eq!(
-        catalog.update_attempts(),
-        1,
-        "the expired deadline permitted no second catalog call: {:?}",
-        forge.returned_errors()
-    );
-    assert_eq!(
-        promotion_phases(&fixture).await,
-        vec!["reset".to_owned()],
-        "a conflict past the deadline closes the operation"
-    );
-    let unsettled = file_rows(&fixture).await;
-    assert!(
-        unsettled
-            .iter()
-            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
-        "nothing was settled by a refused promotion: {unsettled:?}"
-    );
-    forge.shutdown().await;
-}
-
 /// Cancellation drains a parked promotion without settling anything.
 ///
 /// The coordinator is cancelled while its inline promotion commit is parked

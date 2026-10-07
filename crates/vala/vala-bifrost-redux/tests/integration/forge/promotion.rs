@@ -13,7 +13,6 @@ use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
 
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
-    manual_clock,
 };
 
 /// Promotion appends the writer's own objects and never writes a data object.
@@ -224,64 +223,6 @@ async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operat
         vec![("succeeded", 1)],
         "the one task succeeded on its first retry: {tasks:?}"
     );
-}
-
-/// The operation deadline bounds the conflict retry to zero second attempts.
-///
-/// The commit is parked at the real catalog seam, the Forge clock is moved past
-/// the operation's own retry budget, and only then is the parked commit
-/// refused. The deadline captured before the first attempt is therefore already
-/// spent, so the definite conflict closes the operation instead of buying a
-/// second catalog call. One delegated update — against two in the retry
-/// scenario — is what proves the barrier held.
-#[tokio::test]
-async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
-    let fixture = PromotionIntegrationFixture::start("promotion_deadline").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        fixture.catalog.iceberg_catalog(),
-        object_store.read_counter(),
-    );
-    catalog.park_next_commit();
-    let (clock, control) = manual_clock();
-
-    let forge = SupervisedPromotion::start(
-        &fixture,
-        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        clock,
-    );
-    let forge = forge
-        .run_one_failure_while(async {
-            catalog.wait_for_parked_commit().await;
-            let expired = control.now().expect("manual Forge clock")
-                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
-                    .expect("retry budget is representable")
-                + chrono::Duration::seconds(1);
-            control.set(expired).expect("manual Forge clock advances");
-            catalog.reject_parked_commit();
-        })
-        .await;
-
-    assert_eq!(
-        catalog.attempts(),
-        1,
-        "the expired deadline permitted no second catalog call: {:?}",
-        forge.returned_errors()
-    );
-    assert_eq!(
-        fixture.promotion_phases().await,
-        vec!["reset".to_owned()],
-        "a conflict past the deadline closes the operation"
-    );
-    let unsettled = fixture.file_rows().await;
-    assert!(
-        unsettled
-            .iter()
-            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
-        "nothing was settled by a refused promotion: {unsettled:?}"
-    );
-    forge.shutdown().await;
 }
 
 /// Cancellation drains a parked promotion without settling anything.

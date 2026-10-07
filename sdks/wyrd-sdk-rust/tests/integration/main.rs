@@ -9,6 +9,7 @@ mod gateway_admin;
 mod gateway_inference;
 mod observe_a_run;
 mod operator_connections;
+mod otel_export;
 mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;

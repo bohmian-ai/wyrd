@@ -1,7 +1,7 @@
 ---
 id: TASK-016
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-verified-change-contract
 spec_revision: 64
 requirements: [REQ-188, REQ-189, REQ-190, REQ-191, REQ-193, REQ-194, REQ-195, REQ-196, REQ-197, REQ-198, REQ-199, REQ-200, REQ-201, REQ-202, REQ-203, REQ-205, REQ-206, AC-045, AC-046, AC-047, AC-049, AC-050, AC-051, AC-052, AC-053, AC-054, AC-055, AC-056, AC-058]
@@ -206,6 +206,12 @@ TASK-016 has no dependency on TASK-017. Merge TASK-016 first; TASK-017 then buil
 ## Implementation Evidence
 
 Commits: `4d17b274b`, `ea13a8824`, `eaf24f690`, `fabe5005e`, `82972f9f9`, `91db2d817`, `51baa7f21`, `1d42a1e1b`, `1090580f2`, `f1a6d4d11`, `c64294b1d`, `41ae7eb91`, `71fe71c35` (`53d044191` reverted by `41ae7eb91`).
+
+Commit range: `4d17b274b^..71fe71c35` (the commits above plus the evidence record `0676b763d`).
+
+Post-merge fixes on TASK-016 surfaces after the Forge merge: `41065b39b` drops testing hooks the merge resurrected (S11), reads `CallbackContext` as attributes (S5), and passes the TypeScript compaction type through `TableConfigOptions` (S4).
+
+Approved on user direction without a task review; review pending.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|

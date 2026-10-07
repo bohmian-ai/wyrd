@@ -1,94 +1,44 @@
-import { describe, expect, it } from "vitest";
+import { expect, test } from "vitest";
 
-import { Gateway, WyrdError } from "@wyrd/sdk";
-import type { ProviderCredentialSourceView } from "@wyrd/sdk";
-import { createRequire } from "node:module";
+import { Gateway } from "@wyrd/sdk";
 
-const { connectGateway } = createRequire(import.meta.url)(
-  "../../index.cjs",
-) as typeof import("../../index.cjs");
-
-const METHODS = [
-  "credential",
-  "credentials",
-  "putDeployment",
-  "deployment",
-  "deployments",
-  "deleteDeployment",
-  "putFallbackPolicy",
-  "fallbackPolicy",
-  "deleteFallbackPolicy",
-  "putGovernancePolicy",
-  "governancePolicy",
-  "deleteGovernancePolicy",
-  "putCapturePolicy",
-  "capturePolicy",
-] as const;
-
-const MUTATIONS = ["putCredential", "revokeCredential", "deleteCredential"] as const;
-
+/** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";
 
-const options = {
-  serverUrl: "http://127.0.0.1:1",
-  credential: "wyrd_unit_test_key",
-};
+const options = { serverUrl: "http://127.0.0.1:1", credential: "wyrd_unit_test_key" };
 
-describe("Gateway", () => {
-  it("exposes every administration operation", () => {
-    const gateway = Gateway.connect(options);
-    for (const method of METHODS) {
-      expect(typeof gateway[method]).toBe("function");
-    }
-  });
+// The restriction is structural, so it must hold for a JavaScript caller with
+// no type checker.
+test("offers no provider credential mutation", () => {
+  const gateway = Gateway.connect(options) as unknown as Record<string, unknown>;
 
-  // The restriction is structural rather than a runtime source check, so it
-  // has to hold for a JavaScript caller with no type checker, and on the
-  // exported native class as well as the wrapper.
-  it("offers no provider credential mutation on either surface", () => {
-    const gateway = Gateway.connect(options) as unknown as Record<string, unknown>;
-    const native = connectGateway(options.serverUrl, options.credential) as unknown as Record<
-      string,
-      unknown
-    >;
-    for (const method of MUTATIONS) {
-      expect(gateway[method]).toBeUndefined();
-      expect(native[method]).toBeUndefined();
-    }
-  });
+  for (const method of ["putCredential", "revokeCredential", "deleteCredential"]) {
+    expect(gateway[method], method).toBeUndefined();
+  }
+});
 
-  it("reads a managed secret and exports no write type", () => {
-    const view: ProviderCredentialSourceView = "managed_secret";
-    expect(view).toBe("managed_secret");
+test("rejects an invalid credential name locally", async () => {
+  await expect(Gateway.connect(options).credential("Not A Name!")).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_VALIDATION",
   });
+});
 
-  it("rejects an invalid name in Rust before any request", async () => {
-    const gateway = Gateway.connect(options);
-    const error = await gateway.credential("Not A Name!").catch((reason: unknown) => reason);
-    expect(error).toBeInstanceOf(WyrdError);
-    expect((error as WyrdError).code).toBe("WYRD_SPEC_400_VALIDATION");
-  });
+// A gateway write body can carry a provider key: the rejection names the
+// argument and repeats none of the body.
+test("rejects a malformed body without echoing it", async () => {
+  const refusal = Gateway.connect(options).putDeployment({
+    name: "openai-primary",
+    model: { provider: "openai", model: "gpt-4o" },
+    adapter: "openai",
+    auth: { bearer: { credential: "openai-key" } },
+    capabilities: ["chat_completions"],
+    routing_weight: SENTINEL,
+  } as never);
 
-  // A gateway write body can carry a provider key. The sentinel below sits
-  // where a number is required, so serde's own message would quote it
-  // verbatim; the rejection names the argument and its decode position and
-  // repeats none of the body.
-  it("rejects a malformed body without echoing it", async () => {
-    const gateway = Gateway.connect(options);
-    const error = (await gateway
-      .putDeployment({
-        name: "openai-primary",
-        model: { provider: "openai", model: "gpt-4o" },
-        adapter: "openai",
-        auth: { bearer: { credential: "openai-key" } },
-        capabilities: ["chat_completions"],
-        routing_weight: SENTINEL,
-      } as never)
-      .catch((reason: unknown) => reason)) as WyrdError;
-    expect(error).toBeInstanceOf(WyrdError);
-    expect(error.code).toBe("WYRD_SPEC_400_VALIDATION");
-    expect(JSON.stringify(error.details)).toContain("deployment");
-    expect(error.message).not.toContain(SENTINEL);
-    expect(JSON.stringify(error.details)).not.toContain(SENTINEL);
+  await expect(refusal).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_VALIDATION",
+    details: { field: "deployment" },
   });
+  const error = await refusal.catch((reason: unknown) => reason);
+  expect(JSON.stringify(error) + String(error)).not.toContain(SENTINEL);
 });

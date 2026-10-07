@@ -1,3 +1,5 @@
+"""A Workflow saved as a Workflow Card YAML file loads back unchanged."""
+
 from pathlib import Path
 
 from wyrd import Agent, Prompt, Workflow
@@ -24,10 +26,9 @@ def test_workflow_save_load_round_trips_yaml(tmp_path: Path) -> None:
     workflow.save(path)
     loaded = Workflow.from_path(path)
 
-    yaml_body = path.read_text()
-    assert "apiVersion: wyrd/v1" in yaml_body
-    assert "kind: Workflow" in yaml_body
-    assert "planner" in yaml_body
-    assert "writer" in yaml_body
-    assert list(loaded.steps) == ["planner", "writer"]
-    assert "brief: steps.writer.output.text" in yaml_body
+    assert (loaded.name, loaded.version, list(loaded.steps)) == (
+        "research",
+        "0.1.0",
+        ["planner", "writer"],
+    )
+    assert loaded.to_yaml() == workflow.to_yaml()

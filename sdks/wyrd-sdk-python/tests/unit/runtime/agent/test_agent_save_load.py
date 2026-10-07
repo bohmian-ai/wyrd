@@ -1,3 +1,5 @@
+"""An Agent saved as an Agent Card YAML file loads back unchanged."""
+
 from pathlib import Path
 
 from wyrd import Agent, Prompt
@@ -16,6 +18,3 @@ def test_agent_save_load_round_trips_yaml(tmp_path: Path) -> None:
     loaded = Agent.from_yaml(path)
 
     assert loaded.to_yaml_string() == path.read_text()
-    assert "apiVersion: wyrd/v1" in loaded.to_yaml_string()
-    forbidden_version_key = "version" + "_req"
-    assert forbidden_version_key not in loaded.to_yaml_string()

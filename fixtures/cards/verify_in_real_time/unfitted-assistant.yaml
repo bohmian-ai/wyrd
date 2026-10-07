@@ -1,17 +1,18 @@
 apiVersion: wyrd/v1
 kind: Service
 metadata:
-  name: observed-service
+  name: unfitted-assistant
   version: 1.0.0
   space: default
 spec:
   service_type: agent
   components:
-    - alias: agent
-      ref: ./observed-agent.yaml
     - alias: model
       ref:
         kind: Model
-        name: observed-model
+        name: latency-model
         version: 1.0.0
         space: default
+      verified_by:
+        - verifier: ./tier-drift.yaml
+          runs_on: {kind: schedule, cron: "0 0 * * *"}

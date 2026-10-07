@@ -20,3 +20,6 @@ spec:
     outputs:
       - name: score
         dtype: float64
+artifacts:
+  - relative_path: observed-model.bin
+    content_type: application/octet-stream

@@ -1,0 +1,25 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: tier-drift
+  version: 1.0.0
+  space: default
+spec:
+  description: Control-chart the text-valued tier column, which SPC cannot fit, so its baseline never becomes ready.
+  implementation:
+    kind: drift
+    spec:
+      method: Spc
+      signal:
+        kind: Distribution
+        baseline_ref:
+          kind: Data
+          name: latency-baseline
+          version: 1.0.0
+          space: default
+        features: [tier]
+      condition:
+        kind: Statistical
+      profile:
+        kind: Spc
+        sample_size: 5

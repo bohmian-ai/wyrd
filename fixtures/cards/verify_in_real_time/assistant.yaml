@@ -15,7 +15,11 @@ spec:
         - verifier: ./answer-is-judged.yaml
           runs_on: {kind: observations_ready}
     - alias: model
-      ref: ./latency-model.yaml
+      ref:
+        kind: Model
+        name: latency-model
+        version: 1.0.0
+        space: default
       verified_by:
         - verifier: ./latency-drift.yaml
           runs_on: {kind: schedule, cron: "0 0 * * *"}

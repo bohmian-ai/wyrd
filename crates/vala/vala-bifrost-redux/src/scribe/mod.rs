@@ -5,6 +5,7 @@ pub mod assembly;
 pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
+pub mod claim_sample;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;

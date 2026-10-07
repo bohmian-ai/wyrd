@@ -149,7 +149,7 @@ Each status was found by searching the tree for that scenario's named tests.
 
 | Scenario | Status | Evidence |
 |---|---|---|
-| 1. Only final output files infer a bounded standard layout | **Committed locally (`509f972c6`), not pushed; Forge memory part superseded by spec revision 19** | iceberg-rust `c41cbd0ca8a2e4ca34ffc994c553682206908f70`, iceberg-compaction `c04c45f89e335c82d6f447c01f9ceb9292943969`. `reserve_variant_prefixes` (a fixed `RUNNER_MAX_PARALLELISM` × 64 MiB task reservation) contradicts revision 19 REQ-030, REQ-031, INV-009 and AC-012/AC-013, which require charging live retained prefix bytes to the attempt's DataFusion pool and a `max(1, effective_cpu * 4)` planning maximum. TASK-004 owns that rework after TASK-003 integrates |
+| 1. Only final output files infer a bounded standard layout | **Replaced by spec revision 21 (sampling)** | The first-rows prefix, its 4,096-row / 64 MiB bounds, its Scribe lease and Forge's `reserve_variant_prefixes` are deleted. Scribe samples each claim; Forge combines source footers. Evidence under "Sampling evidence (spec revision 21)" below. TASK-004 keeps only the parallelism change |
 | 2. Recovery and compaction preserve standard logical values | **Implemented, not pushed** | iceberg-rust `fdc02e0a0847f3219e234f81ee6b7a2ff0d67418` (reader unshreds), iceberg-compaction `28f35fc9fd39b1e4879e7652f074f1630ca417cb` (test) and `a52462a2114e6912b0c7fdf903abcbb31b7d7136` (repin). Evidence below |
 | 3. Distinct logical semantics share physical pushdown | **Implemented (spec revision 20)** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`, plus the revision-20 read-core commit. Published files go through `FileReadPlan` via the iceberg fork's per-file hook (iceberg-rust `b0a88c310`). Journey `published::struct_and_variant_share_physical_pushdown` passes. Output leaf projection is still open (see the evidence below). |
 | 4. Unsigned distributed predicates preserve authority | **Implemented** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). MCP `query::pg_tests::sensitive_variant_leaf_is_denied_before_io` and peer `peer_network::security::unsigned_leaf_predicates_round_trip_and_execute` implemented (evidence below). |
@@ -316,6 +316,62 @@ batch frame is its own Arrow IPC stream (`oracle/live.rs` reads it with
 |---|---|---|
 | `PeerCluster::register_table_with`, `PeerCluster::ingest_live_batch` | `register_table`, `ingest_live_rows` (now delegate) | the fixture's schema was fixed; one registration and one IPC encode now serve both |
 | `ScribeFragment::over`, `ScribeFragment::request_with` | `ScribeFragment::live`, `request` (now delegate) | columns, predicates and claims were fixed |
+
+#### Sampling evidence (spec revision 21)
+
+Scribe picks each claim's layout from a seeded sample stratified by
+`principal_id` (`scribe/claim_sample.rs` `ClaimVariantSample`, over the
+fork's `VariantSampler`). Forge combines its sources' footer counts
+(compaction `combined_variant_layout` → fork `VariantLayout::combine`). Both
+writers open with the layout known; nothing is buffered.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-015.1 Reproducible: same sample, same layout, byte-identical objects | seed = first 8 bytes of `StagingClaimId`; position = row index across runs in claim order | `scribe::parquet_writer::tests::rerun_claim_writes_byte_identical_objects`; fork `sampling_is_seeded_and_reproducible` | PASS |
+| AC-015.2 Small writers count (own stratum ≥ 30 rows; merged shared stratum) | `VariantSampler::new` merges strata under `min_stratum_rows` | `scribe::claim_sample::tests::writer_with_its_own_stratum_keeps_its_key` (40 of 20,040 rows), `writers_in_the_shared_stratum_keep_their_key` (10 of 20,030 rows); fork `small_writers_keep_their_fields` | PASS |
+| AC-015.3 Cochran sizes with FPC | `VariantShreddingPolicy::stratum_sample_size`; `BIFROST_VARIANT_SHREDDING` (`z = 2.5758`, `e = 0.02`, 30, 10%) | `scribe::claim_sample::tests::bifrost_policy_follows_cochran` (4,147 / 98 / 30); fork `stratum_sample_size_follows_cochran` | PASS |
+| AC-015.4 Ranking at the cap by rows covered, then name | fork `VariantSampler::layout` weights rows/kept | fork `cap_ranks_by_rows_covered`, `children_are_capped_by_frequency_then_name` | PASS |
+| AC-015.5 No buffer, bounds, or memory charge | `VariantPrefix`, `PrefixStep`, `ReadyPrefix`, `RollingArtifactWriter::pending`, `open_inferred`, `reserve_variant_prefixes` deleted; `max_rows`/`max_bytes` gone from the policy | compiles without them; `variant_inference_memory_releases_on_every_terminal` deleted with the prefix it tested | PASS |
+| AC-015.6 Residual metric recorded | `parquet/variant_residual.rs` (`variant_residual_share`, `VariantWriter::record`); Scribe seal; Forge `record_variant_residual_shares` | `parquet::variant_residual::tests::residual_share_measures_unshredded_bytes`; `scribe::parquet_writer::tests::final_objects_record_residual_share_and_recovery_runs_do_not`; Forge sample count asserted in the AC-013 journey | PASS |
+| Recovery runs unshredded; final objects take the claim's sample | `RollingArtifactWriter::variant_layout: Option<VariantLayout>` (`None` = recovery run) | `scribe::parquet_writer::tests::recovery_runs_are_unshredded_and_the_claim_sample_shreds` | PASS |
+| AC-013 Forge outputs use the combined source layout; threshold; type conflict; values unchanged | compaction `combined_variant_layout` (footers only, 16 at a time); `VariantParquetWriterBuilder::new(inner, layout)` | `forge::managed_rewrite::rewrite_outputs_share_the_combined_source_layout` (`z` shredded by one source, 1 of 13 rows, dropped; `t` keeps the integer type); fork `combine_counts_footer_leaves`, `combine_keeps_the_type_covering_more_rows`; compaction `rolled_outputs_share_the_combined_source_layout` | PASS |
+| AC-013 no prefix reservation | `reserve_variant_prefixes` and its call deleted; `RUNNER_MAX_PARALLELISM` private again | redux lib 867 passed | PASS |
+| Neighbors and journeys | — | redux lib (Postgres) 867/867; redux `integration --run-ignored all` 73/73; `wyrd-testing --test scribe` `recovery::variant_staging_restores_and_publishes_once` 1/1; `wyrd-testing --test oracle -P journey --run-ignored all` 53/53 (includes `published::struct_and_variant_share_physical_pushdown`); fork iceberg lib 1797/1797; compaction core lib 153/153. After repinning: redux lib 867/867, `forge::managed_rewrite` 12/12, `check:workspace-hack` clean, one `iceberg` in `Cargo.lock` | PASS |
+| Lints | — | nightly fmt (Wyrd, fork, compaction); clippy `-D warnings` on `vala-bifrost-redux --all-features --all-targets`, fork `iceberg --all-targets`, `iceberg-compaction-core --all-targets` | PASS |
+
+Pins: iceberg-rust `087c430df865c2fd78738eec9f149cc5a6749fd6`, iceberg-compaction `5579ea3c9431a619212788ebca2059bc81da9d10` (both pushed).
+
+Corrections recorded in `spec-revision-21-sampling.md`:
+
+- Pass 2 re-reads `principal_id`, which gives each row its stratum without
+  holding one entry per row.
+- The metric is labelled by writer role, not by table:
+  `architecture/bifrost-design.md` forbids table labels.
+- Forge reads each output footer once to measure it. Iceberg's `DataFile`
+  keeps only the whole Variant column's size.
+
+Diagnosis (first run of the AC-013 journey):
+
+- **Symptom:** the hot-object assertion failed.
+- **Evidence:** the expected rows had `{"t":1,"a":1}` and the actual rows had
+  `{"a":1,"t":1}`.
+- **Cause:** the fixture used `serde_json` insertion order, while Variant
+  objects read back with their keys sorted.
+- **Fix site:** the fixture now writes its keys in sorted order. No
+  production change.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `scribe::claim_sample::ClaimVariantSample` | `claim_merge::StagedRunMerge` (merge order, all columns), `claim_assembly::ClaimAssembler` | one owner of the claim's two projected passes; the merge reads every column in merge order and cannot give run-order positions |
+| `parquet::variant_residual::{VariantWriter, variant_residual_share}` | `forge/metrics.rs`, Scribe persistence metrics, fork `parquet_to_data_file_builder` (whole-column size only) | one footer measure shared by Scribe and Forge |
+| `record_variant_residual_shares` (Forge executor) | compaction `combined_variant_layout` (sources, private to the fork) | outputs' footers are not loaded anywhere else |
+| fork `VariantSampler::column_names` | `VariantSampler` internals | lets Scribe project only the Variant columns the sampler reads |
+
+Commands:
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib'`;
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/claim_sample::/) | test(/variant_residual::/) | test(/parquet_writer::tests::(recovery_runs|rerun_claim|final_objects)/)'`;
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --test integration --run-ignored all'`;
+fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core --lib`.
 
 ### Hot-reader fix: a key the file did not shred
 

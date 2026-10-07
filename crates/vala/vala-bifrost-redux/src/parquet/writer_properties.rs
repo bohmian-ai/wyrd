@@ -86,16 +86,19 @@ pub fn bifrost_writer_properties_with_metadata(
 
 /// How every final Bifrost object chooses its shredded Variant layout.
 ///
-/// Scribe's final hot objects and every Forge output each retain a prefix of
-/// at most 4,096 rows or 64 MiB of Arrow memory, then shred fields seen in at
-/// least 10% of sampled non-null roots, tracking 1,000 and keeping 300
-/// children per object node to depth 50. These are internal policy constants,
-/// never table, wire, or user configuration. Scribe recovery-stage runs are
-/// never shredded.
+/// Scribe samples each claim stratified by `principal_id`: Cochran's sample
+/// size at 99% confidence (`z = 2.5758`) and a ±0.02 margin, 4,147 rows per
+/// large stratum with the finite-population correction, writers under 30 rows
+/// merged into one stratum. A field is eligible at 10% minus the margin in any
+/// stratum. Forge combines source footers and keeps fields covering 10% of the
+/// rewrite's rows. Both track 1,000 and keep 300 children per object node to
+/// depth 50. These are internal policy constants, never table, wire, or user
+/// configuration. Scribe recovery-stage runs are never shredded.
 pub const BIFROST_VARIANT_SHREDDING: VariantShreddingPolicy = VariantShreddingPolicy {
-    max_rows: 4_096,
-    max_bytes: 64 * 1024 * 1024,
-    min_frequency_percent: 10,
+    confidence_z: 2.5758,
+    margin: 0.02,
+    min_stratum_rows: 30,
+    min_frequency: 0.10,
     max_tracked_children: 1_000,
     max_emitted_children: 300,
     max_depth: 50,

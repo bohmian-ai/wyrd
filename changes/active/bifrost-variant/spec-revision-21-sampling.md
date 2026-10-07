@@ -51,10 +51,13 @@ through "or public memory setting is added." with:
 > - **Selection, in two passes over the claim's local, unshredded staged
 >   runs.**
 >   - Pass 1 reads only `principal_id` and counts the rows in each stratum.
->   - Pass 2 reads only the Variant columns and keeps a row when
->     `hash(seed, row position) < n_h / N_h`.
->   - The seed is the claim identity. Row position is the claim's
->     deterministic merge order. A re-run claim therefore picks the same
+>   - Pass 2 reads `principal_id` and the Variant columns and keeps a row
+>     when `hash(seed, row position) < n_h / N_h`. Re-reading
+>     `principal_id` gives each row its stratum without holding one entry
+>     per row.
+>   - The seed is the claim identity. Row position is the row's position
+>     within the claim's staged runs, taken in run order. A re-run claim
+>     therefore picks the same
 >     sample and writes the same objects. Whole row groups are never sampled.
 > - **Decision.**
 >   - A key is eligible when its sampled frequency among non-null Variant
@@ -69,7 +72,8 @@ through "or public memory setting is added." with:
 > **Forge** does not sample. Every source data file's footer already names the
 > keys that file shredded, with their types. Each shredded leaf's row count
 > minus its null count is the exact number of rows holding that key with that
-> type. Forge reads every source footer anyway, so this adds no read.
+> type. Before writing, Forge loads each source footer once: one small range
+> read per file, with no data pages.
 >
 > - **Counting.** Summing the counts over the rewrite's source files gives
 >   each key's exact share of the combined rows.
@@ -87,9 +91,14 @@ through "or public memory setting is added." with:
 > - **What Forge cannot do.** It only keeps or drops keys; Scribe is where new
 >   keys are discovered.
 >
-> Each written file records the share of its non-null Variant bytes left in
-> the residual `value`, as an existing Bifrost metric labelled by table. A
-> rising share means layouts are missing keys.
+> Each final Scribe object and Forge output records the share of its
+> non-null Variant bytes left in the residual `value`, measured from its
+> footer, in the `bifrost_variant_residual_share` histogram. Its only label is
+> the closed writer role (`scribe` or `forge`): Bifrost metric labels never
+> carry a table. Scribe measures the footer it already reads when it seals an
+> object; Forge reads each output footer once after the rewrite, and a footer
+> it cannot read is logged and never fails the rewrite. Recovery-stage runs
+> are not measured. A rising share means layouts are missing keys.
 
 Replace the paragraph "The 4,096-row and 64-MiB limits are internal
 writer-policy constants, ..." with:
@@ -169,8 +178,8 @@ Retitle from "Forge accounts only retained prefix memory". Replace the body
 with:
 
 > Forge buffers no rows to choose a layout, so it reserves, predicts, or
-> charges no prefix memory. The layout comes from source footers Forge
-> already reads. No pool, ledger, reservation, spill path, or tuning surface
+> charges no prefix memory. The layout comes from the source footers, read
+> before writing. No pool, ledger, reservation, spill path, or tuning surface
 > exists for layout inference.
 
 ### INV-009 — No speculative Forge prefix capacity
@@ -231,7 +240,7 @@ Prepend:
 >     nothing.
 >   - The prefix buffer, its 4,096-row / 64 MiB bounds, and revision 19's
 >     prefix memory accounting (REQ-031, AC-013) are removed.
->   - A per-file residual-share metric is added.
+>   - A per-file residual-share metric, labelled by writer role, is added.
 >   - REQ-020, REQ-021, REQ-031, INV-009, AC-013, the shredding policy
 >     section, and the flow are reworded. AC-015 adds the proofs.
 >   - REQ-030 (Forge parallelism) is unchanged.

@@ -3,6 +3,7 @@
 pub mod footer;
 pub mod object_uploader;
 pub mod promoted_object;
+pub mod variant_residual;
 pub mod writer_properties;
 
 pub use promoted_object::PromotedObjectFooter;

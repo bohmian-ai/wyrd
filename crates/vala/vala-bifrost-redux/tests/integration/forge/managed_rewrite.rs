@@ -1679,7 +1679,7 @@ fn document_keys(rows: &BTreeSet<(i64, String)>) -> Vec<String> {
     keys.into_iter().collect()
 }
 
-/// Asserts every object infers exactly its own layout and keeps its rows.
+/// Asserts every object shreds exactly its own documents' fields and keeps its rows.
 ///
 /// Each object's shredded fields must equal the keys of the documents it
 /// holds: a table-wide union would add keys another object's documents carry.
@@ -1730,12 +1730,139 @@ async fn published_rows(promoted: &PromotedRewriteFixture) -> BTreeSet<(i64, Str
     logical_rows(&batches)
 }
 
+/// Returns the `typed_value` type of shredded field `field` of column `v`.
+///
+/// # Panics
+///
+/// Panics when `field` is not shredded in the first batch.
+fn shredded_type(batches: &[RecordBatch], field: &str) -> DataType {
+    let column = batches[0].column_by_name("v").expect("the Variant column");
+    let Some(DataType::Struct(fields)) = VariantArray::try_new(column)
+        .expect("Variant storage")
+        .typed_value_column()
+        .map(arrow::array::Array::data_type)
+        .cloned()
+    else {
+        panic!("column v is not shredded");
+    };
+    let (_, child) = fields.find(field).expect("shredded field");
+    let DataType::Struct(slots) = child.data_type() else {
+        panic!("shredded field {field} is not a value/typed_value pair");
+    };
+    slots
+        .find("typed_value")
+        .expect("typed_value slot")
+        .1
+        .data_type()
+        .clone()
+}
+
+/// A rewrite's outputs take the layout combined from its sources' footers.
+///
+/// Two hot objects share one closed day. `A` holds `{"t": int, "a": int}` in
+/// 10 rows. `B` holds `t` as a string in 3 rows, one of which also has `z`,
+/// so `B` alone shreds `t` as a string and `z`. Combined, `a` covers 10 of
+/// 13 rows and is kept; `t` keeps the integer type that covers more rows;
+/// `z` covers 1 of 13 rows, under the 10% threshold, and is dropped even
+/// though a source shredded it. Every output reads back the logical rows and
+/// records one Forge residual-share sample.
+///
+/// # Panics
+///
+/// Panics when an output's layout differs from the combined layout or a
+/// logical row is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn rewrite_outputs_share_the_combined_source_layout() {
+    let telemetry = super::support::ForgeTelemetryCheckpoint::install();
+    let mut docs: Vec<VariantRow> = (1..=10)
+        .map(|key| (key, serde_json::json!({"a": key, "t": key})))
+        .collect();
+    docs.push((11, serde_json::json!({"t": "x", "z": 1})));
+    docs.push((12, serde_json::json!({"t": "y"})));
+    docs.push((13, serde_json::json!({"t": "w"})));
+    let fixture = PromotionIntegrationFixture::start_with(
+        "variant_combined",
+        vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+        ],
+        &[variant_batch(0, &docs[..10]), variant_batch(0, &docs[10..])],
+    )
+    .await;
+    let promoted = PromotedRewriteFixture { fixture };
+    let fixture = &promoted.fixture;
+    let hot: Vec<String> = fixture
+        .file_rows()
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect();
+    assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
+
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+    let mut tables = [LineageTable::new(fixture.binding.clone(), "value")];
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        docs.len(),
+        "the Variant rows are promoted"
+    );
+    supervisor.shutdown().await;
+
+    let run = rewrite_whole_attempt(&promoted).await;
+    let outputs = run.output_paths();
+    assert!(!outputs.is_empty(), "the shared day is rewritten");
+    let mut rows = BTreeSet::new();
+    for path in &outputs {
+        let batches = promoted.object_batches(path).await;
+        assert_eq!(
+            shredded_fields(&batches),
+            ["a", "t"],
+            "output {path} keeps the fields covering 10% of the rewrite's rows"
+        );
+        assert!(
+            shredded_type(&batches, "t").is_integer(),
+            "output {path} keeps the type covering more rows"
+        );
+        rows.extend(logical_rows(&batches));
+    }
+    assert_eq!(
+        rows,
+        expected_rows(&docs),
+        "rewrite outputs keep every logical row"
+    );
+    let forge_samples: u64 = telemetry
+        .snapshot()
+        .histograms
+        .iter()
+        .filter(|(series, _)| {
+            series.starts_with("bifrost_variant_residual_share{")
+                && series.contains("writer=\"forge\"")
+        })
+        .map(|(_, histogram)| histogram.count)
+        .sum();
+    assert_eq!(
+        forge_samples,
+        u64::try_from(outputs.len()).expect("bounded outputs"),
+        "each output records its residual share"
+    );
+}
+
 /// Standard Variant layouts round-trip through Scribe, promotion, and Forge
-/// with one inferred layout per file.
+/// with each file's layout drawn from its own day's documents.
 ///
 /// Two closed days hold documents of different shapes (`a` integers, `b`
-/// strings), so each sealed object, each rewrite plan, and each rewrite output
-/// infers its own layout. Logical rows are compared on the hot objects, the
+/// strings). Each sealed object takes its claim's sampled layout and each
+/// rewrite plan combines only its own day's source footers, so no file
+/// shreds another day's fields. Logical rows are compared on the hot objects, the
 /// published table, one non-committing rewrite's outputs, and after every
 /// original row has been rewritten twice by the production scheduler. Each
 /// handoff's outputs must describe the objects written (row count, size) and

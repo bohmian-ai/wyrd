@@ -14,6 +14,7 @@
 //! resource error, and the attempt's durable task stays unsettled so a retry
 //! replans without publishing anything partial.
 
+use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -302,9 +303,6 @@ impl ForgeManagedRewrite {
             &mut position_deletes,
             &mut equality_deletes,
         );
-        let _variant_prefixes = self
-            .reserve_variant_prefixes()
-            .map_err(|error| self.attach_possible_outputs(error))?;
         let result = match compaction.rewrite(planned.plan, table).await {
             Ok(result) => result,
             Err(error) => return Err(self.classify_core_failure(&error)),
@@ -328,6 +326,7 @@ impl ForgeManagedRewrite {
             }
             output_data_files.push(file);
         }
+        record_variant_residual_shares(table, &output_data_files).await;
         RewriteHandoff::try_new(
             base_snapshot_id,
             rewritten_data_files,
@@ -336,37 +335,6 @@ impl ForgeManagedRewrite {
             output_data_files,
         )
         .map_err(|error| self.attach_possible_outputs(error))
-    }
-
-    /// Charges one Variant layout prefix per output stream before a plan runs.
-    ///
-    /// Each output writer retains up to
-    /// [`BIFROST_VARIANT_SHREDDING`](crate::parquet::BIFROST_VARIANT_SHREDDING)`.max_bytes`
-    /// of rows before it chooses its layout, and a plan runs at most
-    /// [`RUNNER_MAX_PARALLELISM`](super::policy::RUNNER_MAX_PARALLELISM) output
-    /// streams with one open output each. The charge is taken from the attempt's
-    /// governed pool and is released exactly once when the returned reservation
-    /// drops, on success, error, or cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Capacity`] when the shared cap cannot hold the
-    /// prefixes, which releases the attempt without consuming retry budget.
-    fn reserve_variant_prefixes(
-        &self,
-    ) -> Result<datafusion::execution::memory_pool::MemoryReservation, ForgeError> {
-        let reservation =
-            datafusion::execution::memory_pool::MemoryConsumer::new("forge-variant-prefix")
-                .register(&self.context.runtime_env().memory_pool);
-        reservation
-            .try_grow(
-                super::policy::RUNNER_MAX_PARALLELISM
-                    * crate::parquet::BIFROST_VARIANT_SHREDDING.max_bytes,
-            )
-            .map_err(|error| ForgeError::Capacity {
-                detail: format!("Forge cannot hold its Variant layout prefixes: {error}"),
-            })?;
-        Ok(reservation)
     }
 
     /// Classifies one core failure for a single plan runner.
@@ -420,6 +388,52 @@ impl ForgeManagedRewrite {
         ForgeError::RewriteUnsettled {
             source: Box::new(failure),
             possible_outputs,
+        }
+    }
+}
+
+/// Records the Variant residual-share metric for each Forge output.
+///
+/// Reads each output's footer once after the rewrite, only when the table has
+/// a Variant column. A footer that cannot be read is logged and skipped: the
+/// metric is not evidence and never fails a rewrite.
+async fn record_variant_residual_shares(table: &Table, outputs: &[iceberg::spec::DataFile]) {
+    let Ok(logical) = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+    else {
+        return;
+    };
+    if !logical
+        .fields()
+        .iter()
+        .any(|field| wyrd_types::variant::is_variant(field))
+    {
+        return;
+    }
+    for file in outputs {
+        let footer = async {
+            let input = table
+                .file_io()
+                .new_input(file.file_path())
+                .map_err(|error| error.to_string())?;
+            let mut reader = iceberg::arrow::ArrowFileReader::new(
+                iceberg::io::FileMetadata {
+                    size: file.file_size_in_bytes(),
+                },
+                input.reader().await.map_err(|error| error.to_string())?,
+            );
+            parquet::arrow::async_reader::AsyncFileReader::get_metadata(&mut reader, None)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match footer.await {
+            Ok(metadata) => {
+                VariantWriter::Forge.record(variant_residual_share(&metadata, &logical));
+            }
+            Err(error) => tracing::warn!(
+                path = file.file_path(),
+                error,
+                "Forge cannot read an output footer to measure its Variant residual share"
+            ),
         }
     }
 }

@@ -15,9 +15,7 @@ use arrow::compute::lexsort_to_indices;
 use arrow::compute::take;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use iceberg::writer::file_writer::variant_shredding::{
-    PrefixStep, ReadyPrefix, VariantLayout, VariantPrefix, VariantShreddingPolicy,
-};
+use iceberg::writer::file_writer::variant_shredding::VariantLayout;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use sha2::{Digest, Sha256};
@@ -28,6 +26,7 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::parquet::footer::BifrostFooterIdentity;
+use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ScribeClaimScratch;
 use crate::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
@@ -296,7 +295,8 @@ pub struct ArtifactPlan<'a> {
 ///
 /// Unlike a frozen generation, a claim has no candidate boundaries: sealing
 /// happens only at the target and at the end, which is what lets several
-/// members share one object.
+/// members share one object. Every object is shredded with `variant_layout`,
+/// the claim's sampled layout.
 ///
 /// # Errors
 ///
@@ -306,10 +306,10 @@ pub struct ArtifactPlan<'a> {
 pub fn encode_ordered_claim(
     plan: ArtifactPlan<'_>,
     memory: &crate::resources::ScribeResources,
+    variant_layout: VariantLayout,
     ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
 ) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
-    let mut roller =
-        RollingArtifactWriter::new(plan, Some(crate::parquet::BIFROST_VARIANT_SHREDDING));
+    let mut roller = RollingArtifactWriter::new(plan, Some(variant_layout));
     for batch in ordered {
         roller.append_charged_batch(memory, &batch?)?;
     }
@@ -432,8 +432,6 @@ struct OpenArtifact {
     /// The footer identity and fingerprint are taken from this schema, so a
     /// shredded object keeps the identity of its logical table schema.
     schema: Arc<Schema>,
-    /// Variant layout every appended batch is shredded with before encoding.
-    layout: VariantLayout,
     /// Open Parquet encoder owning the buffered sink.
     writer: ArrowWriter<BufWriter<std::fs::File>>,
     /// Rows appended so far across every batch.
@@ -459,31 +457,27 @@ struct RollingArtifactWriter<'a> {
     artifacts: Vec<BoundedParquetArtifact>,
     /// Footer-derived statistics for every sealed row group in write order.
     row_group_stats: Vec<RowGroupStats>,
-    /// Variant shredding bounds for final objects; `None` writes every object unshredded.
-    shredding: Option<VariantShreddingPolicy>,
-    /// Rows retained before the next artifact opens, with the leases charging them.
+    /// Variant layout every final object is opened and shredded with.
     ///
-    /// Dropping the writer on any terminal — success, error, or cancellation —
-    /// drops the leases, so the charge is released exactly once.
-    pending: Option<(VariantPrefix, Vec<crate::resources::ScribeMemoryLease>)>,
+    /// Chosen before the writer opens. `None` writes recovery-stage runs:
+    /// unshredded, and not measured by the residual-share metric.
+    variant_layout: Option<VariantLayout>,
 }
 
 impl<'a> RollingArtifactWriter<'a> {
     /// Starts a rolling writer at the plan's first generation-global ordinal.
     ///
-    /// With a shredding policy, each artifact's first rows are retained until
-    /// a bound is reached, its Variant layout is inferred from them, and the
-    /// artifact opens with that layout. Without one, every artifact is
-    /// written unshredded as soon as its first batch arrives.
-    fn new(plan: ArtifactPlan<'a>, shredding: Option<VariantShreddingPolicy>) -> Self {
+    /// Every artifact opens with `variant_layout` as soon as its first batch
+    /// arrives; no rows are retained to choose it. `None` writes recovery-stage
+    /// runs.
+    fn new(plan: ArtifactPlan<'a>, variant_layout: Option<VariantLayout>) -> Self {
         Self {
             plan,
             next_ordinal: plan.first_ordinal,
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
-            shredding,
-            pending: None,
+            variant_layout,
         }
     }
 
@@ -492,79 +486,23 @@ impl<'a> RollingArtifactWriter<'a> {
     /// The batch is a Wyrd-owned copy (sorted candidate or merge output), so it
     /// holds a Scribe lease for exactly its distinct allocations and no more;
     /// nothing is admitted for encoder or footer bytes it may later need. The
-    /// lease lasts while the encoder writes the batch, or, when the batch is
-    /// retained for Variant layout inference, until the artifact opens and
-    /// the retained rows are written.
+    /// lease lasts while the encoder writes the batch.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when the shared root cannot hold the
-    /// batch, which fails this stage attempt for retry, [`ScribeError::Internal`]
-    /// when a Variant column cannot be sampled, or any
+    /// batch, which fails this stage attempt for retry, or any
     /// [`Self::append_ordered_batch`] error.
     fn append_charged_batch(
         &mut self,
         memory: &crate::resources::ScribeResources,
         batch: &RecordBatch,
     ) -> Result<(), ScribeError> {
-        let held = memory.try_reserve_maintenance(
+        let _held = memory.try_reserve_maintenance(
             crate::scribe::memory::MemoryCategory::Persistence,
             crate::scribe::memory::retained_arrow_bytes(batch),
         )?;
-        let Some(policy) = self.shredding.filter(|_| self.open.is_none()) else {
-            return self.append_ordered_batch(batch);
-        };
-        let (prefix, leases) = self.pending.get_or_insert_with(|| {
-            (
-                VariantPrefix::new(
-                    batch.schema().as_ref(),
-                    policy,
-                    crate::scribe::memory::retained_arrow_bytes,
-                ),
-                Vec::new(),
-            )
-        });
-        if prefix.is_inert() {
-            self.pending = None;
-            return self.append_ordered_batch(batch);
-        }
-        match prefix.push(batch).map_err(|error| variant_error(&error))? {
-            PrefixStep::Retained => {
-                leases.push(held);
-                Ok(())
-            }
-            PrefixStep::Ready(ready) => self.open_inferred(ready),
-        }
-    }
-
-    /// Opens the next artifact with an inferred layout and writes its retained rows.
-    ///
-    /// The retained rows and the remainder are written before the single roll
-    /// check, so an artifact never rolls part-way through its replay and every
-    /// artifact's rows match the layout inferred for it. The pending leases
-    /// are released once the rows are handed to the encoder.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the artifact cannot be opened or a
-    /// batch cannot be shredded or written, or sealing a due artifact fails.
-    fn open_inferred(&mut self, ready: ReadyPrefix) -> Result<(), ScribeError> {
-        let ReadyPrefix {
-            layout,
-            replay,
-            remainder,
-        } = ready;
-        let Some(first) = replay.first().or(remainder.as_ref()) else {
-            return Err(ScribeError::Internal {
-                detail: "Scribe Variant prefix is ready with no rows".to_owned(),
-            });
-        };
-        self.open = Some(self.open_artifact(first, layout)?);
-        for batch in replay.iter().chain(remainder.as_ref()) {
-            self.write_open(batch)?;
-        }
-        self.pending = None;
-        self.roll_if_due()
+        self.append_ordered_batch(batch)
     }
 
     /// Writes one already ordered batch and rolls if the object target is met.
@@ -584,13 +522,13 @@ impl<'a> RollingArtifactWriter<'a> {
     /// artifact fails.
     fn append_ordered_batch(&mut self, ordered_batch: &RecordBatch) -> Result<(), ScribeError> {
         if self.open.is_none() {
-            self.open = Some(self.open_artifact(ordered_batch, VariantLayout::default())?);
+            self.open = Some(self.open_artifact(ordered_batch)?);
         }
         self.write_open(ordered_batch)?;
         self.roll_if_due()
     }
 
-    /// Shreds one batch with the open artifact's layout and hands it to the encoder.
+    /// Shreds one batch with the writer's Variant layout, if any, and hands it to the encoder.
     ///
     /// # Errors
     ///
@@ -607,13 +545,18 @@ impl<'a> RollingArtifactWriter<'a> {
                 detail: "Scribe Parquet rolling writer lost its open artifact".to_owned(),
             });
         };
-        open.writer
-            .write(
-                &open
-                    .layout
+        let shredded;
+        let batch = match &self.variant_layout {
+            Some(layout) => {
+                shredded = layout
                     .shred(ordered_batch)
-                    .map_err(|error| variant_error(&error))?,
-            )
+                    .map_err(|error| variant_error(&error))?;
+                &shredded
+            }
+            None => ordered_batch,
+        };
+        open.writer
+            .write(batch)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("write Scribe Parquet batch: {error}"),
             })?;
@@ -643,19 +586,15 @@ impl<'a> RollingArtifactWriter<'a> {
     /// Opens the next artifact for the batch that is about to be written.
     ///
     /// The artifact keeps the batch's logical schema; its encoder is opened
-    /// on `layout`'s physical schema, which equals the logical schema when
-    /// the layout shreds nothing.
+    /// on the writer's Variant layout's physical schema, or on the logical
+    /// schema for a recovery-stage run.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ordinal exceeds `u16`, the
     /// scratch file cannot be created, the layout cannot shred the schema, or
     /// the Parquet encoder cannot be built.
-    fn open_artifact(
-        &mut self,
-        group: &RecordBatch,
-        layout: VariantLayout,
-    ) -> Result<OpenArtifact, ScribeError> {
+    fn open_artifact(&mut self, group: &RecordBatch) -> Result<OpenArtifact, ScribeError> {
         let ordinal = u16::try_from(self.next_ordinal).map_err(|_| ScribeError::Internal {
             detail: "Scribe Parquet artifact ordinal exceeds u16".to_owned(),
         })?;
@@ -669,11 +608,15 @@ impl<'a> RollingArtifactWriter<'a> {
             detail: format!("create Scribe Parquet scratch artifact: {error}"),
         })?;
         let schema = group.schema();
-        let writer = ArrowWriter::try_new(
-            BufWriter::new(file),
-            layout
+        let physical = match &self.variant_layout {
+            Some(layout) => layout
                 .physical_schema(&schema)
                 .map_err(|error| variant_error(&error))?,
+            None => Arc::clone(&schema),
+        };
+        let writer = ArrowWriter::try_new(
+            BufWriter::new(file),
+            physical,
             Some(bifrost_writer_properties_with_metadata(
                 Vec::new(),
                 self.plan.layout.bloom_columns(),
@@ -687,7 +630,6 @@ impl<'a> RollingArtifactWriter<'a> {
             object_identity,
             scratch_path,
             schema,
-            layout,
             writer,
             rows: 0,
         })
@@ -712,7 +654,6 @@ impl<'a> RollingArtifactWriter<'a> {
             object_identity,
             scratch_path,
             schema,
-            layout: _,
             mut writer,
             rows,
         } = open;
@@ -746,7 +687,11 @@ impl<'a> RollingArtifactWriter<'a> {
             row_group_stats,
             data_file_metrics,
             schema_fingerprint,
+            variant_residual_share,
         } = evidence;
+        if self.variant_layout.is_some() {
+            VariantWriter::Scribe.record(variant_residual_share);
+        }
         self.row_group_stats.extend(row_group_stats.iter().cloned());
         self.artifacts.push(BoundedParquetArtifact {
             ordinal,
@@ -762,19 +707,13 @@ impl<'a> RollingArtifactWriter<'a> {
         Ok(())
     }
 
-    /// Writes any retained prefix, seals any residue, and returns the ordered artifacts.
-    ///
-    /// A prefix still pending at close infers its layout from the rows it
-    /// retained; an empty prefix writes no artifact.
+    /// Seals any residue and returns the ordered artifacts.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the retained rows cannot be
-    /// written or the residual artifact cannot be sealed or validated.
+    /// Returns [`ScribeError::Internal`] when the residual artifact cannot be
+    /// sealed or validated.
     fn finish(mut self) -> Result<(Vec<BoundedParquetArtifact>, Vec<RowGroupStats>), ScribeError> {
-        if let Some(ready) = self.pending.take().and_then(|(prefix, _)| prefix.finish()) {
-            self.open_inferred(ready)?;
-        }
         self.seal_open_artifact()?;
         Ok((self.artifacts, self.row_group_stats))
     }
@@ -851,6 +790,8 @@ struct SealedArtifactEvidence {
     data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
     /// Lowercase hex Wyrd schema fingerprint the footer carries.
     schema_fingerprint: String,
+    /// Share of the object's Variant bytes left in residual `value` leaves.
+    variant_residual_share: Option<f64>,
 }
 
 /// Validates one sealed artifact and returns everything its footer proves.
@@ -903,6 +844,7 @@ fn inspect_sealed_artifact(
         schema_fingerprint: hex::encode(
             crate::schema::SchemaFingerprint::from_arrow_schema_exact(expected_schema).0,
         ),
+        variant_residual_share: variant_residual_share(metadata, expected_schema),
     })
 }
 
@@ -2362,66 +2304,103 @@ mod tests {
         )
     }
 
-    /// The claim plan these tests seal under, with a target no test reaches.
-    fn claim_plan<'a>(scratch: &'a Path, layout: &'a PhysicalLayout) -> ArtifactPlan<'a> {
+    /// The claim plan these tests seal under for `tenant`, with a target no test reaches.
+    fn claim_plan<'a>(
+        scratch: &'a Path,
+        layout: &'a PhysicalLayout,
+        tenant: DataTenantId,
+    ) -> ArtifactPlan<'a> {
         ArtifactPlan {
             scratch_dir: scratch,
             object_base: "s3://bucket/table/day=2026-07-14/scribe-claim-0",
             layout,
             first_ordinal: 0,
             target_object_bytes: u64::MAX,
-            tenant: DataTenantId::new_v7(),
+            tenant,
         }
     }
 
-    /// Recovery-stage runs stay unshredded; the final object merged from them infers its own layout.
-    ///
-    /// The two runs hold values that alone would infer different layouts
-    /// (`a` only, `b` only). Each run's `encode_batch` artifact has no
-    /// `typed_value`, so the runs merge under one exact schema; the final
-    /// claim object merged from both shreds `a` and `b` and reads back every
-    /// value unchanged.
-    #[test]
-    fn recovery_runs_are_unshredded_and_final_objects_infer() {
-        let tenant = DataTenantId::new_v7();
-        let first = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
-        let second = variant_run(3, &[r#"{"b":"x"}"#, r#"{"b":"y"}"#]);
+    /// Encodes `batch` as one recovery-stage run and returns its scratch and artifact paths.
+    fn recovery_run(
+        batch: &RecordBatch,
+        tenant: DataTenantId,
+    ) -> (tempfile::TempDir, Vec<PathBuf>) {
         let binding = TenantTableBinding::resolve((
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
         ))
         .expect("tenant binding");
-        for run in [&first, &second] {
-            let frozen = FrozenMemtable {
-                seal_id: 0,
-                seal_key: SealKey::new(
-                    tenant,
-                    TableRef::new(BifrostNamespace::Bifrost, "events"),
-                    crate::test_support::day_partition(2026, 7, 14),
-                ),
-                shard_id: 0,
-                schema: run.schema(),
-                batches: vec![run.clone()],
-                metas: vec![],
-                opened_at: std::time::Instant::now(),
-                closed_at: std::time::Instant::now(),
-                arrow_bytes: 0,
-            };
-            let (_scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
-            for artifact in &*encoded.artifacts {
-                let (shredded, _) = read_variant_artifact(&artifact.scratch_path);
-                assert!(shredded.is_empty(), "a recovery run is never shredded");
-            }
+        let frozen = FrozenMemtable {
+            seal_id: 0,
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                crate::test_support::day_partition(2026, 7, 14),
+            ),
+            shard_id: 0,
+            schema: batch.schema(),
+            batches: vec![batch.clone()],
+            metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
+        };
+        let (scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+        let paths = encoded
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.scratch_path.clone())
+            .collect();
+        (scratch, paths)
+    }
+
+    /// Samples the claim over `runs` and encodes their rows into final objects.
+    fn encode_sampled_claim(
+        runs: &[PathBuf],
+        batches: &[RecordBatch],
+        scratch: &Path,
+        tenant: DataTenantId,
+    ) -> BoundedParquetArtifactSet {
+        let schema = batches[0].schema();
+        let claim =
+            crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
+        let variant_layout =
+            crate::scribe::claim_sample::ClaimVariantSample::new(claim, runs, &schema)
+                .layout()
+                .expect("claim sample");
+        let layout = test_layout(schema.as_ref());
+        encode_ordered_claim(
+            claim_plan(scratch, &layout, tenant),
+            &crate::resources::ScribeResources::for_test(),
+            variant_layout,
+            batches.iter().cloned().map(Ok),
+        )
+        .expect("claim encodes")
+        .0
+    }
+
+    /// Recovery-stage runs stay unshredded; the final object takes the claim's sampled layout.
+    ///
+    /// The two runs hold values that alone would shred different fields (`a`
+    /// only, `b` only). Each run's `encode_batch` artifact has no
+    /// `typed_value`, so the runs merge under one exact schema; the claim
+    /// sample over both runs shreds `a` and `b`, and the final object reads
+    /// back every value unchanged.
+    #[test]
+    fn recovery_runs_are_unshredded_and_the_claim_sample_shreds() {
+        let tenant = DataTenantId::new_v7();
+        let first = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
+        let second = variant_run(3, &[r#"{"b":"x"}"#, r#"{"b":"y"}"#]);
+        let (_first_scratch, mut runs) = recovery_run(&first, tenant);
+        let (_second_scratch, second_runs) = recovery_run(&second, tenant);
+        runs.extend(second_runs);
+        for run in &runs {
+            let (shredded, _) = read_variant_artifact(run);
+            assert!(shredded.is_empty(), "a recovery run is never shredded");
         }
 
         let scratch = tempfile::tempdir().expect("claim scratch");
-        let layout = test_layout(first.schema().as_ref());
-        let (artifacts, _) = encode_ordered_claim(
-            claim_plan(scratch.path(), &layout),
-            &crate::resources::ScribeResources::for_test(),
-            [Ok(first), Ok(second)].into_iter(),
-        )
-        .expect("claim encodes");
+        let artifacts = encode_sampled_claim(&runs, &[first, second], scratch.path(), tenant);
         assert_eq!(artifacts.len(), 1, "one final hot object");
         let (shredded, values) = read_variant_artifact(&artifacts[0].scratch_path);
         assert_eq!(shredded, ["a", "b"]);
@@ -2431,64 +2410,58 @@ mod tests {
         );
     }
 
-    /// Prefix memory is held while rows are retained and released exactly once on every terminal.
-    ///
-    /// The ordered input checks the Scribe charge after the first batch has
-    /// been retained, then either ends (success) or fails (error). In both
-    /// cases the charge returns to its starting value, and a retry of the
-    /// failed claim succeeds and releases again.
+    /// Re-running the same claim picks the same sample and writes byte-identical objects.
     #[test]
-    fn variant_inference_memory_releases_on_every_terminal() {
-        let resources = crate::resources::ScribeResources::for_test();
-        let charged = || resources.memory_snapshot().scribe_total_bytes;
-        let baseline = charged();
-        let scratch = tempfile::tempdir().expect("claim scratch");
-        let first = variant_run(1, &[r#"{"a":1}"#]);
-        let layout = test_layout(first.schema().as_ref());
-
-        let held_while_retained = std::cell::Cell::new(0);
-        let input = |fail: bool| {
-            let first = first.clone();
-            let second = variant_run(2, &[r#"{"a":2}"#]);
-            let held = &held_while_retained;
-            let charged = &charged;
-            (0..2).map(move |index| {
-                if index == 0 {
-                    return Ok(first.clone());
-                }
-                held.set(charged());
-                if fail {
-                    Err(ScribeError::Internal {
-                        detail: "staged run unreadable".to_owned(),
-                    })
-                } else {
-                    Ok(second.clone())
-                }
+    fn rerun_claim_writes_byte_identical_objects() {
+        let tenant = DataTenantId::new_v7();
+        let json: Vec<String> = (0..5_000)
+            .map(|row| match row % 3 {
+                0 => format!(r#"{{"a":{row}}}"#),
+                1 => format!(r#"{{"b":"{row}","c":{row}}}"#),
+                _ => format!(r#"{{"a":"{row}"}}"#),
             })
+            .collect();
+        let json: Vec<&str> = json.iter().map(String::as_str).collect();
+        let batch = variant_run(1, &json);
+        let (_run_scratch, runs) = recovery_run(&batch, tenant);
+
+        let checksums = || {
+            let scratch = tempfile::tempdir().expect("claim scratch");
+            encode_sampled_claim(&runs, std::slice::from_ref(&batch), scratch.path(), tenant)
+                .iter()
+                .map(|artifact| artifact.checksum.clone())
+                .collect::<Vec<_>>()
         };
+        let first = checksums();
+        assert!(!first.is_empty());
+        assert_eq!(first, checksums(), "a re-run claim writes the same bytes");
+    }
 
-        encode_ordered_claim(
-            claim_plan(scratch.path(), &layout),
-            &resources,
-            input(false),
-        )
-        .expect("claim encodes");
-        assert!(
-            held_while_retained.get() > baseline,
-            "retained rows hold their charge"
-        );
-        assert_eq!(charged(), baseline, "success releases the prefix");
-
-        let failed = tempfile::tempdir().expect("failed scratch");
-        assert!(
-            encode_ordered_claim(claim_plan(failed.path(), &layout), &resources, input(true))
-                .is_err()
-        );
-        assert_eq!(charged(), baseline, "error releases the prefix");
-
-        let retry = tempfile::tempdir().expect("retry scratch");
-        encode_ordered_claim(claim_plan(retry.path(), &layout), &resources, input(false))
-            .expect("retry encodes");
-        assert_eq!(charged(), baseline, "retry releases the prefix");
+    /// Final objects record the residual-share metric; recovery runs do not.
+    #[test]
+    fn final_objects_record_residual_share_and_recovery_runs_do_not() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let tenant = DataTenantId::new_v7();
+        let batch = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
+        metrics::with_local_recorder(&recorder, || {
+            let (_run_scratch, runs) = recovery_run(&batch, tenant);
+            assert!(
+                !recorder
+                    .snapshot()
+                    .contains_family("bifrost_variant_residual_share"),
+                "a recovery run is not measured"
+            );
+            let scratch = tempfile::tempdir().expect("claim scratch");
+            encode_sampled_claim(&runs, std::slice::from_ref(&batch), scratch.path(), tenant);
+        });
+        let snapshot = recorder.snapshot();
+        let samples: Vec<_> = snapshot
+            .histograms
+            .iter()
+            .filter(|(series, _)| series.contains("bifrost_variant_residual_share"))
+            .collect();
+        assert_eq!(samples.len(), 1, "one writer series: {samples:?}");
+        assert!(samples[0].0.contains("scribe"), "{samples:?}");
+        assert_eq!(samples[0].1.count, 1, "one final object");
     }
 }

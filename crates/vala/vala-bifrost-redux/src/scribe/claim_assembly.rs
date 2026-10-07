@@ -22,6 +22,7 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{StagingClaim, StagingClaimId};
 use crate::scribe::claim_merge::StagedRunMerge;
+use crate::scribe::claim_sample::ClaimVariantSample;
 use crate::scribe::hot_stage::{ScribeHotStage, StagedLsnRange, StagedMemberState};
 use crate::scribe::parquet_writer::{
     ArtifactPlan, BoundedParquetArtifactSet, RowGroupStats, encode_ordered_claim,
@@ -246,10 +247,13 @@ impl ClaimAssembler {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the merge cannot open or decode a
-    /// run, encoding refuses a batch or cannot seal an object, or the written
+    /// Returns [`ScribeError::Internal`] when the Variant sample or the merge
+    /// cannot open or decode a run, encoding refuses a batch or cannot seal an object, or the written
     /// rows are not exactly the rows the claim promised.
     pub fn encode(&self, request: AssembleClaimRequest<'_>) -> Result<AssembledClaim, ScribeError> {
+        let variant_layout =
+            ClaimVariantSample::new(request.runs.claim, request.runs.runs(), &request.schema)
+                .layout()?;
         let merge = StagedRunMerge::open(
             request.runs.runs(),
             request.schema,
@@ -266,6 +270,7 @@ impl ClaimAssembler {
                 tenant: request.tenant,
             },
             &request.memory,
+            variant_layout,
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {

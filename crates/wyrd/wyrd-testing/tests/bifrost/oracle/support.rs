@@ -99,11 +99,39 @@ pub(crate) async fn wait_for_spans(
     Err(format!("spans {names:?} never finished").into())
 }
 
-/// Register one tenant-owned Redux table through the server-owned catalog.
+/// Register one tenant-owned Redux table with the [`journey_schema`] fields.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
 pub(crate) async fn register_table(
     server: &wyrd_testing::WyrdTestServer,
     tenant: DataTenantId,
     table: &str,
+) -> Result<(), JourneyError> {
+    let fields = journey_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    register_table_with(server, tenant, table, fields).await
+}
+
+/// Register one tenant-owned Redux table with `user_fields` through the
+/// server-owned catalog.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register_table_with(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+    user_fields: Vec<Field>,
 ) -> Result<(), JourneyError> {
     server
         .state()
@@ -111,11 +139,7 @@ pub(crate) async fn register_table(
         .expect("Scribe composition retains the shared catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
-            user_fields: vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("filter_key", DataType::Utf8, false),
-                Field::new("unused_payload", DataType::Utf8, false),
-            ],
+            user_fields,
             tenant,
             physical_layout: None,
             audit: None,

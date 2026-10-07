@@ -369,7 +369,11 @@ impl ScalarUDFImpl for VariantGet {
             }
             Some(path) => {
                 let path = VariantPath::new(path.into_iter().flatten().collect());
-                VariantArray::try_new(&variant_get(&root, GetOptions::new_with_path(path))?)?
+                // Asking for Variant output keeps a key Arrow proves missing
+                // a null Variant rather than an untyped `NullArray`.
+                let options = GetOptions::new_with_path(path)
+                    .with_as_type(Some(Arc::new(variant_field(VARIANT_GET, true))));
+                VariantArray::try_new(&variant_get(&root, options)?)?
             }
             None => per_row_get(&root, &elements, rows)?,
         };

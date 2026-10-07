@@ -272,6 +272,48 @@ batch frame is its own Arrow IPC stream (`oracle/live.rs` reads it with
 | `PeerCluster::register_table_with`, `PeerCluster::ingest_live_batch` | `register_table`, `ingest_live_rows` (now delegate) | the fixture's schema was fixed; one registration and one IPC encode now serve both |
 | `ScribeFragment::over`, `ScribeFragment::request_with` | `ScribeFragment::live`, `request` (now delegate) | columns, predicates and claims were fixed |
 
+### Hot-reader fix: a key the file did not shred
+
+Diagnosis:
+
+- **Symptom:** on a real Scribe or Forge object, `doc->>'c' = 'x'` failed with
+  `Error evaluating filter predicate ... Invalid VariantArray: requires
+  StructArray as input`. That happened whenever every row's data was in
+  shredded keys and `c` was not one of them.
+- **Evidence:** a dumped Scribe object (shreds only `a`) failed on every
+  unshredded key. Fixtures with other keys left in `value` passed. Arrow
+  `parquet-variant-compute` 60 `variant_get.rs:286-303`: when the key is
+  absent from `typed_value` and `value` is all null, the step is `Missing`.
+  With no `as_type` it returns a `NullArray`.
+- **Cause:** `VariantGet::invoke_with_args` (`oracle/variant_sql.rs`) passed
+  no `as_type`, then `VariantArray::try_new` refused the `NullArray`.
+- **Fix site:** that one call. Every Variant leaf filter and projection on
+  both readers goes through it. It now requests Variant output
+  (`GetOptions::with_as_type(variant_field)`), so Arrow returns an all-null
+  Variant. The result is unshredded right after, as before.
+
+Journey note: Forge's scheduler promotes a published object right away
+(`forge/scheduler.rs` `promote_hinted`), so a plain journey reads it through
+Iceberg and never reaches this code. Without the fix, the Scribe recovery
+journey with these filters passed (`hot_files=0 iceberg_files=1`). The new
+journey parks promotion the way the existing hot-reader journey does.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A filter or projection on an unshredded key reads null, not an error, when every residual is null | `oracle/variant_sql.rs` `VariantGet::invoke_with_args` | `oracle::nested_pushdown::tests::absent_variant_key_reads_null_when_every_residual_is_null`: failed with the production error before the fix, passed after | PASS |
+| The public query over a hot-only object returns exact rows for a shredded and an absent key | journey `oracle/distributed.rs` | `distributed::pg_hot_variant_filter_on_an_unshredded_key_reads_null`: without the fix `QueryExecutionFailed` (`hot_files=1`, `StructArray as input`); with it 1 passed | PASS |
+| Neighbors unchanged | `register_table` delegates to `register_table_with` | `distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`, `published::variant_sql_registry_covers_every_session`: 2 passed; `vala-bifrost-redux --lib` with Postgres: 858 passed | PASS |
+| Lints | — | nightly fmt; clippy `-D warnings` on `vala-bifrost-redux --all-targets --all-features` and `wyrd-testing --test oracle --all-features`; `git diff --check` clean | PASS |
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `register_table_with` (oracle journey support) | `register_table` (now delegates), `PeerCluster::register_table_with` (peer harness, different cluster type) | the journey table needs a Variant column |
+| `prove_hot_variant_absent_key` and its test | `prove_selective_predicate_pruning` (its fixed table has no Variant column) | first journey that reads a shredded Variant object through the hot reader |
+
+Commands:
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::nested_pushdown::tests::absent_variant_key_reads_null_when_every_residual_is_null)'`;
+`scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=distributed::pg_hot_variant_filter_on_an_unshredded_key_reads_null)"'`.
+
 ### Arrow 60 upgrade (user decision, before Scenario 1)
 
 Arrow 59.3 `shred_variant` silently converts values that do not fit the typed

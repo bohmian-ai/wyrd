@@ -438,6 +438,33 @@ mod tests {
         );
     }
 
+    /// A key the file did not shred reads as null even when every row's
+    /// residual `value` is null: Arrow then reports the key missing, and the
+    /// leaf must still be a Variant, so the filter keeps no row and the
+    /// projection is all null instead of failing to decode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan fails to decode or the absent key reads non-null.
+    #[test]
+    fn absent_variant_key_reads_null_when_every_residual_is_null() {
+        let published = write_groups(&[&[r#"{"a":1}"#, r#"{"a":2}"#]]);
+        let absent = || OracleVariantSql::shared().text_at(col("v"), &["c".to_owned()]);
+
+        let filtered = plan(
+            &published,
+            &[("id", col("id"))],
+            Some(&absent().eq(lit("x"))),
+        );
+        assert_eq!(read(&published, filtered).num_rows(), 0);
+
+        let projected = read(&published, plan(&published, &[("v_c", absent())], None));
+        assert_eq!(
+            projected.column(0).as_string::<i32>(),
+            &StringArray::from(vec![None::<&str>, None])
+        );
+    }
+
     /// Writes `groups` of JSON documents as one row group each, with `v`
     /// shredded on `a: Int64` and ids numbered from 1 across groups.
     ///

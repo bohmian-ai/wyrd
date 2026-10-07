@@ -120,6 +120,108 @@ async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads()
     .expect("distributed pruning journey");
 }
 
+/// A Variant filter on a key a sealed hot object did not shred reads that key
+/// as null instead of failing to decode.
+///
+/// Every document holds only `a`, so the hot object shreds `a` and no row
+/// keeps a residual `value`; Arrow then reports any other key as missing.
+/// Promotion is parked before the write so the read goes through
+/// `HotParquetExec`, which is the reader that evaluates the Variant leaf.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, the cut is not hot-only, or either
+/// filter returns other than its exact rows.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_hot_variant_filter_on_an_unshredded_key_reads_null() {
+    prove_hot_variant_absent_key()
+        .await
+        .expect("hot Variant absent-key journey");
+}
+
+/// Drives one hot-only Variant object through a shredded-key and an
+/// absent-key filter on the public query route.
+///
+/// # Errors
+///
+/// Returns a client, catalog, or cluster-lifecycle error surfaced by any
+/// journey step, or a description of the wrong cut or rows.
+async fn prove_hot_variant_absent_key() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the topology wraps its Forge catalog in the commit seam")?;
+    promotion.pause_before_commit();
+    let server = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_hot_variant");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", DataType::Int64, false),
+        wyrd_types::variant::variant_field("doc", true),
+    ]));
+    register_table_with(
+        server,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let table_fqn = format!("vala.bifrost.{table}");
+    writer(server, "hot-variant-writer")
+        .await?
+        .write(
+            &table_fqn,
+            &schema,
+            [1_i64, 2].map(|id| {
+                serde_json::json!({"id": id, "doc": {"a": id}})
+                    .to_string()
+                    .into_bytes()
+            }),
+        )
+        .await?;
+    server.flush_bifrost().await?;
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the promotion never reached the parked commit")?;
+    cluster.refresh_oracle_snapshots().await?;
+    let (compacted_files, hot_files) = file_tier_counts(&cluster, tenant, &table).await?;
+    if hot_files == 0 || compacted_files != 0 {
+        return Err(format!(
+            "the hot reader proof requires a hot-only cut: \
+             hot={hot_files} compacted={compacted_files}"
+        )
+        .into());
+    }
+
+    let reader = client(server, "hot-variant-reader").await?;
+    for (key, text, expected) in [("a", "2", vec![2_i64]), ("c", "x", Vec::new())] {
+        let ids = query_ids(
+            &reader,
+            format!("SELECT id FROM {table_fqn} WHERE doc->>'{key}' = '{text}' ORDER BY id"),
+        )
+        .await?;
+        if ids != expected {
+            return Err(format!("doc->>'{key}' = '{text}' returned {ids:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Drives one topology through a three-file selective-predicate fixture,
 /// proving strictly fewer scanned bytes than an unfiltered scan, the pruning
 /// signal `expectation` names, identical residual-filtered rows, and a

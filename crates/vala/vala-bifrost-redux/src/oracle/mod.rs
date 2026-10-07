@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-use datafusion::common::TableReference;
+use datafusion::common::{ScalarValue, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -36,9 +36,9 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDetail, AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
-    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QuerySchemaFrame, QuerySource,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-    SourceCompletion, SourceCompletionOutcome,
+    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QueryParam, QuerySchemaFrame,
+    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
 };
 
 use crate::catalog::{
@@ -2306,7 +2306,7 @@ impl Oracle {
         } = input;
         let work_units = Self::scannable_work_units(&planned.cuts);
         let retained = self
-            .build_physical_root(context, &request.sql, &planned, &mut roster, deadline)
+            .build_physical_root(context, request, &planned, &mut roster, deadline)
             .await?;
         let query_class = exec::query_class_for_root(retained.root.as_ref());
         tracing::Span::current().record("query_class", query_class_label(query_class));
@@ -3144,7 +3144,7 @@ impl Oracle {
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
-        sql: &str,
+        request: &BifrostQueryRequest,
         planned: &PlannedSqlCut,
         roster: &mut OracleQueryAttemptRoster,
         deadline: Instant,
@@ -3194,7 +3194,7 @@ impl Oracle {
             return Err(BifrostError::QueryExecutionFailed);
         }
         let planning_started = Instant::now();
-        let root = Self::plan_physical(&planning, context, sql)
+        let root = Self::plan_physical(&planning, context, &request.sql, &request.params)
             .await
             .map_err(|OracleExecutionError::Public(error)| error)?;
         QueryPhase::PhysicalPlanning.record(planning_started);
@@ -3361,6 +3361,11 @@ impl Oracle {
 
     /// Lowers one validated statement to its optimized physical plan.
     ///
+    /// `params[i]` replaces placeholder `$(i + 1)` as a literal in the logical
+    /// plan before optimization, so a bound value is data and never SQL text,
+    /// and the optimizer's type coercion widens it to the compared column.
+    /// A placeholder without a value is a planning refusal.
+    ///
     /// # Errors
     ///
     /// Returns a repairable invalid-query refusal for typed SQL, schema, or
@@ -3374,10 +3379,12 @@ impl Oracle {
         session: &SessionContext,
         context: &AuthorizedQueryContext,
         sql: &str,
+        params: &[QueryParam],
     ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
         let frame = session
             .sql(sql)
             .await
+            .and_then(|frame| frame.with_param_values(bind_values(params)))
             .map_err(|error| map_query_planning_error(&error))?;
         let plan = frame
             .into_optimized_plan()
@@ -3390,6 +3397,20 @@ impl Oracle {
             .map_err(|error| map_query_planning_error(&error))
             .map_err(OracleExecutionError::from)
     }
+}
+
+/// Converts the request's typed bind values to DataFusion scalars, in order.
+fn bind_values(params: &[QueryParam]) -> Vec<ScalarValue> {
+    params
+        .iter()
+        .map(|param| match param {
+            QueryParam::Null => ScalarValue::Null,
+            QueryParam::Bool(value) => ScalarValue::Boolean(Some(*value)),
+            QueryParam::Int(value) => ScalarValue::Int64(Some(*value)),
+            QueryParam::Float(value) => ScalarValue::Float64(Some(*value)),
+            QueryParam::String(value) => ScalarValue::Utf8(Some(value.clone())),
+        })
+        .collect()
 }
 
 /// Test-support observation of the one shared physical-build convergence point.
@@ -4604,6 +4625,46 @@ mod tests {
         session
     }
 
+    /// Bound values replace `$n` placeholders as literals, so SQL text inside a
+    /// value stays data, and a placeholder without a value is refused at
+    /// planning with the repairable invalid-query code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound query fails to plan, the bound text is not a plan
+    /// literal, or an unbound placeholder plans.
+    #[tokio::test]
+    async fn bound_values_replace_placeholders_as_data() {
+        let context = payload_context(&[Permission::bifrost_query_read()]);
+        let session = payload_session();
+        let sql = "SELECT call_id FROM vala.gateway.calls WHERE call_id = $1";
+        let hostile = "x'; DROP TABLE t; --";
+        let plan = match Oracle::plan_physical(
+            &session,
+            &context,
+            sql,
+            &[QueryParam::String(hostile.to_owned())],
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => panic!("bound query was refused: {error}"),
+        };
+        let shown = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            shown.contains(hostile),
+            "bound text is not a literal: {shown}"
+        );
+        assert!(matches!(
+            Oracle::plan_physical(&session, &context, sql, &[]).await,
+            Err(OracleExecutionError::Public(
+                BifrostError::QueryInvalidSql { .. }
+            ))
+        ));
+    }
+
     /// Proves metadata reads need only scoped query authority while any SQL or
     /// typed plan reaching gateway payload columns also needs payload-read
     /// authority, and other tables' sensitive columns stay ungated.
@@ -4625,7 +4686,7 @@ mod tests {
             "SELECT count(*) FROM vala.gateway.calls",
             "SELECT * FROM vala.logs.records",
         ] {
-            if let Err(error) = Oracle::plan_physical(&session, &metadata, sql).await {
+            if let Err(error) = Oracle::plan_physical(&session, &metadata, sql, &[]).await {
                 panic!("metadata read {sql} was refused: {error}");
             }
         }
@@ -4638,12 +4699,12 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Oracle::plan_physical(&session, &metadata, sql).await,
+                    Oracle::plan_physical(&session, &metadata, sql, &[]).await,
                     Err(OracleExecutionError::Public(BifrostError::QueryForbidden))
                 ),
                 "{sql} reached payload without authority"
             );
-            if let Err(error) = Oracle::plan_physical(&session, &payload, sql).await {
+            if let Err(error) = Oracle::plan_physical(&session, &payload, sql, &[]).await {
                 panic!("payload authority was refused for {sql}: {error}");
             }
         }

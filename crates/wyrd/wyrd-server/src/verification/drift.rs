@@ -1260,6 +1260,28 @@ mod tests {
         assert!(window().spc("age", 1).is_err());
     }
 
+    /// A missing baseline is not ready, and a profile with no or an earlier
+    /// `format` is legacy and refused before it decodes; neither is scored.
+    ///
+    /// # Panics
+    /// Panics when a stored profile decodes or is refused with another code.
+    #[test]
+    fn decode_refuses_missing_and_legacy_baselines() {
+        let refused = |fitted| match FittedBaselines::decode(fitted) {
+            Err(EngineOutcome::Terminal(_, error)) => error.code,
+            Err(_) => panic!("a refusal is terminal"),
+            Ok(_) => panic!("the baseline decoded"),
+        };
+
+        assert_eq!(refused(None), BASELINE_NOT_READY);
+        for legacy in [
+            serde_json::json!({ "psi": { "features": {} } }),
+            serde_json::json!({ "spc": { "format": FITTED_FORMAT - 1 } }),
+        ] {
+            assert_eq!(refused(Some(legacy)), BASELINE_LEGACY);
+        }
+    }
+
     /// The SPC fold feeds complete subgroups and a partial trailing one to
     /// the scorer, and stops on a null or non-finite complete subgroup.
     ///

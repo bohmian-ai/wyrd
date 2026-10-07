@@ -5,13 +5,13 @@
 //! `fixtures/README.md`; nextest selects a story with
 //! `-E 'test(/^<module>::/)'`.
 
-mod drift_verification;
 mod gateway_admin;
 mod observe_a_run;
 mod operator_connections;
 mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;
+mod scheduled_drift_alerts_operator;
 mod support;
 mod verify_in_real_time;
 mod workflow_loading;

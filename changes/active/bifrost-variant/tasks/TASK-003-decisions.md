@@ -129,9 +129,11 @@ following standard practice.
   `max_rows: 4096` in `BIFROST_VARIANT_SHREDDING`
   (`parquet/writer_properties.rs` ~95) are arbitrary and go away. The memory
   bound comes from TASK-004's shared-pool prefix reservation instead.
-- Sample the whole input, not its first rows. Scribe claims and Forge rewrites
-  read finished inputs, so a pre-pass over only the Variant columns picks the
-  sample before the writer opens. Cost: one extra read of those columns.
+- Scribe samples the whole input, not its first rows. A claim reads finished,
+  local staged files, so a pre-pass over only the Variant columns picks the
+  sample before the writer opens. Cost: one extra local read of those columns.
+- Forge does not sample. It combines its source files' layouts from their
+  footers (see "Forge: combine source layouts" below).
 
 Constraint: a Parquet file has one schema, so each Variant column has one
 layout per file. Per-writer layouts inside one file are impossible. The
@@ -172,7 +174,7 @@ Sampling parameters (user-approved values; proposal for the spec revision):
   identity; row position comes from the deterministic merge order. Never sample
   whole row groups: rows in a sorted row group are alike.
 - Memory: the pre-pass holds only per-stratum key and type counters (bounded
-  by the tracked-children cap), never rows. The writer opens with the layout
+  by the tracked-children cap), never rows. Both writers open with the layout
   known, so the first-rows buffer and its `max_rows` / `max_bytes` caps go
   away. Whether TASK-004's prefix reservation is still needed on these paths
   is re-checked in the spec revision.
@@ -181,9 +183,33 @@ Sampling parameters (user-approved values; proposal for the spec revision):
   the layout is missing keys, which is the trigger for
   `(principal_id, card_uid)` strata.
 - Cost: Scribe claims re-read local staged Variant columns (cheap). Forge
-  re-reads object-storage Variant columns, about doubling Variant reads per
-  rewrite. Fallback if too costly: reuse the source files' layouts for keys
-  the sample confirms.
+  reads nothing extra.
+
+Forge: combine source layouts (user-approved). A Parquet file's columns are
+fixed when it opens, so a sampling Forge would read its object-storage Variant
+columns twice per rewrite. It does not need to:
+
+- Every source footer names the keys that file shredded and their types. Each
+  shredded key's leaf column has a null count, so rows minus nulls is the
+  exact number of rows that held that key with that type. Forge already reads
+  every footer to open the files; this costs no extra read.
+- Summing those counts over the source files gives each key's exact share of
+  the combined rows, weighted by file size. This is a count, not a sample; the
+  Cochran sample and its margin do not apply to Forge.
+- Why it does not miss keys: the combined share is a weighted average of the
+  per-file shares. A key below the threshold in every source is below it in
+  the union, so no source shredding it is the right answer.
+- Rule: candidate keys are those any source shredded. Keep those whose
+  combined share meets the threshold, ranked by rows covered, capped at 300,
+  ties by path. On a type conflict, keep the type with more rows; the other
+  rows go to the residual (correct, slower).
+- Limits: Forge only keeps or drops keys; Scribe discovers new ones. Footer
+  counts are per file, not per `principal_id`; a key common for one writer was
+  already shredded by Scribe, and Forge ranks by rows covered. Keys a source
+  dropped at a cap are invisible to Forge (rare).
+- To verify before building: our writer records null counts for nested
+  shredded leaves; the shredder's rule that a layout "is derived from this
+  file's rows only and is never shared with another file" changes for Forge.
 
 Industry baseline for comparison: Spark (and Hudi, which delegates to it)
 infers from the first 4096 rows / 64 MB a writer buffers, with the same 10%

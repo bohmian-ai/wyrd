@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import { expect, vi } from "vitest";
 
@@ -120,4 +122,17 @@ test("refused cli command raises its catalog code", async ({ server: _ }) => {
   await expect(
     cli.get({ kind: "Service", space: "default", name: "no-such-service", version: "1.0.0" }, bundleDir()),
   ).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
+});
+
+/** The `wyrd` executable the package installs, resolved from its `bin` entry. */
+const WYRD_BIN = (() => {
+  const root = resolve(import.meta.dirname, "../..");
+  const { bin } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { bin: { wyrd: string } };
+  return join(root, bin.wyrd);
+})();
+
+test("installed wyrd executable applies the graph", async ({ desk }) => {
+  const { stdout } = await promisify(execFile)(process.execPath, [WYRD_BIN, "apply", DESK, "--format", "json"]);
+
+  expect(JSON.parse(stdout)).toMatchObject({ root: desk.root });
 });

@@ -209,18 +209,15 @@ columns twice per rewrite. It does not need to:
   shredded leaves; the shredder's rule that a layout "is derived from this
   file's rows only and is never shared with another file" changes for Forge.
 
-Effect on TASK-004 (still a follow-up, after the sampling spec revision is
-approved):
+Effect on TASK-004 (applied: TASK-004 is now `TASK-004-forge-parallelism.md`):
 
-- Unchanged: Forge planning parallelism `max(1, effective_cpu * 4)`.
-- Unchanged: delete `ForgeManagedExecutor::reserve_variant_prefixes` and its
-  fixed `4 x 64 MiB` plan-time charge.
-- Dropped: live prefix-byte reservations, their release paths, and the
-  capacity-refusal journey for prefix growth. With no first-rows buffer there
-  is nothing to reserve.
-- Changed: TASK-004 keeps the 4,096-row / 64 MiB bounds and per-output
-  inference (`rolled_outputs_infer_independent_variant_layouts`). Both end:
-  every output of one Forge rewrite uses the combined source layout.
+- Kept: Forge planning parallelism `max(1, effective_cpu * 4)`.
+- Done in TASK-003: `ForgeManagedExecutor::reserve_variant_prefixes` and its
+  fixed `4 x 64 MiB` plan-time charge are deleted.
+- Dropped: live prefix-byte reservations, their release paths, the
+  capacity-refusal journey, the 4,096-row / 64 MiB bounds and per-output
+  inference. Every output of one Forge rewrite uses the combined source
+  layout.
 
 Industry baseline for comparison: Spark (and Hudi, which delegates to it)
 infers from the first 4096 rows / 64 MB a writer buffers, with the same 10%

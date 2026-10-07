@@ -104,7 +104,9 @@ def observed_bundle(
 @pytest.fixture(scope="module")
 def observed_key(wyrd_server: WyrdTestServer, observed_bundle: Path) -> str:
     """The ``observed-service`` Service's own workload key."""
-    return wyrd_server.credential_registered_service("default/Service/observed-service@1.0.0", [])
+    return cli.issue_key(kind="Service", name="observed-service", version="1.0.0", space="default")[
+        "key"
+    ]
 
 
 @pytest.fixture

@@ -145,7 +145,7 @@ TASK-017 depends on TASK-016 and merges second. It writes tests against the exac
 
 ## Authority Links
 
-- [Approved spec revision 64](../spec.md): REQ-192, REQ-204, AC-048, AC-057.
+- [Approved spec revision 65](../spec.md): REQ-192, REQ-204, AC-048, AC-057.
 - Authoritative inventory: `../review/sdk-test-audit/summary.md`, `rust.md`, `typescript.md`, `python-integration.md`, `python-unit.md`.
 - Ergonomic reference: `/home/thorrester/Documents/GitHub/opsml/py-opsml/tests/agent/test_promptcard.py`, its `conftest.py`, and `/home/thorrester/Documents/GitHub/opsml/py-opsml/python/opsml/cli/__init__.py` (read-only).
 - `AGENTS.md`; `architecture/agent-rules.md`; `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`; `architecture/bifrost-design.md`.
@@ -163,7 +163,7 @@ Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language 
 | Shared stories use checked-in YAML, matching names | `fixtures/cards/<story>/`, `fixtures/README.md` | three-SDK journeys in gate | PASS |
 | Exact catalog codes per error assertion | journey and unit rewrites | gate | PASS |
 | AC-045..058 workflows covered in Rust/Python/TS | `sdks/wyrd-sdk-{rust,python,ts}` integration journeys | gate | PASS |
-| Public surfaces only, no non-sanctioned hooks | see open gaps below | review | PARTIAL |
+| Public surfaces only, no non-sanctioned hooks | Role-bearing keys use the credential fixtures sanctioned by spec revision 65 (REQ-195); the `observed-service` key now comes from `cli.issue_key` | `uv run python -m pytest -q -m "integration and not identity" tests/integration/test_observe_a_run.py` 16 passed; review | PASS (remaining gaps below) |
 
 ### Declared deviations (production code)
 
@@ -172,9 +172,10 @@ Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language 
 - `ffaa142b4` audit settlement deletes staged rows before the progress upsert, and freeze skips during an in-flight settle; this fixes a lock-order stall that a gate surfaced. Test `pg_audit_staging::pg_tests::audit_staging::settlement_waiting_on_staged_rows_never_stalls_a_freeze` was red before the fix and green after.
 - `assemble_stubs.py` docstring lint is the MOVE destination for Python stub-docstring tests; the `Judgment.kind` stub source was fixed.
 
+- Spec revision 65 (user-approved 2026-10-07) sanctions the test server's credential fixtures for keys that need Roles; `TESTING.md` updated to match.
+
 ### Open gaps (not fixed here)
 
-- Python role grants use non-sanctioned test-server hooks.
 - Python `test_workflow_loading_journey` is still multi-story.
 - Rust `workflow_loading` uses `CredentialWriter`.
 - Rust `gateway_inference` uses `reqwest` because no Rust OpenAI SDK exists.

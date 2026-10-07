@@ -189,8 +189,10 @@ against this checklist:
   address and key the way a deployment's environment does; SDK and CLI calls
   resolve them without arguments. Only a credentials test passes them.
 - [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
-  functions, and the three test controls (`flush_bifrost`,
-  `wait_for_baseline`, `make_binding_due`). No private or extension import,
+  functions, the three test controls (`flush_bifrost`,
+  `wait_for_baseline`, `make_binding_due`), and the server's credential
+  fixtures for keys that need Roles; a Card key without added Roles comes
+  from the CLI `issue_key`. No private or extension import,
   subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
   JSON parsing of results, sleep, or polling loop.
 - [ ] **Setup is fixtures that return domain objects** (a `WyrdState`, a

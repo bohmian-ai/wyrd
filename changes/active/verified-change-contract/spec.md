@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 64
+revision: 65
 status: approved
 ---
 
@@ -1564,7 +1564,8 @@ table on `(data_tenant_id, result_id)`.
     calls resolve them without arguments. Only a test about credentials passes
     them explicitly.
   - **Public surfaces only.** A test uses the public SDK modules, the CLI
-    functions (REQ-196), and the three test controls (REQ-195). It uses no
+    functions (REQ-196), the three test controls, and the credential
+    fixtures (REQ-195). It uses no
     private or extension import, subprocess, raw HTTP, SQL against server
     tables, digest computation, YAML or JSON parsing of results, sleep, or
     polling loop.
@@ -1613,6 +1614,13 @@ table on `(data_tenant_id, result_id)`.
     Verifier's baseline is ready, or fail at the deadline with the last
     observed baseline state; and
   - `make_binding_due(...)`: make a schedule due.
+
+  (revised in revision 65) It also provides credential fixtures that return an
+  API key holding named Roles: a machine principal in the session tenant or a
+  named other tenant, and the principal projected by a registered Service
+  Card. They stand in for the operator who grants Roles in a deployment;
+  no public surface grants a Role. A Card-scoped key without added Roles is
+  still issued through the CLI (REQ-199).
 - **REQ-196**: The `wyrd` CLI ships with all three SDKs and its commands are
   callable in-process: Python `wyrd.cli.<command>(...)`, TypeScript
   `cli.<command>(...)` from `@wyrd/sdk`, and Rust `wyrd_sdk::cli::<command>`
@@ -2699,7 +2707,7 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
-Revision 64:
+Revision 65:
 
 - None. The Bifrost storage and query decisions moved to
   `SPEC-bifrost-variant`.
@@ -2738,6 +2746,12 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 65 Credential fixtures (2026-10-07, approved by the user):**
+  Journeys need keys holding Roles (`reader`, `writer`, `agent`, another
+  tenant's `admin`), and no public surface grants a Role. REQ-195 now
+  sanctions the test server's credential fixtures alongside the three
+  controls instead of adding a Role-granting CLI option; Card-scoped keys
+  without added Roles stay on the CLI (REQ-199).
 - **Revision 64 SDK verification ergonomics (2026-10-05, approved by the user
   directing planning into two tasks independent of the Bifrost work):** The
   user found the SDK verification surface and its journeys unusable: a

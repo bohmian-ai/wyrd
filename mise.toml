@@ -99,8 +99,17 @@ run = """
 cargo test --locked -p wyrd-sql --test integration -- pg_cards_register:: --nocapture --test-threads=1
 cargo test --locked -p wyrd-server --test integration -- pg_card_registration_route:: --nocapture --test-threads=1
 cargo test --locked -p wyrd-server --test integration -- pg_verification_routes:: --nocapture --test-threads=1
-cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored all -E 'test(=verification_run::starts_a_keyed_manual_run_and_reads_its_status)'
+cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^register_and_hydrate::/)'
 """
+
+[tasks."test:workflow:journey"]
+description = "Run the Rust SDK Workflow loading journey against a real server"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:workflow:journey:inner'"
+
+[tasks."test:workflow:journey:inner"]
+hide = true
+description = "Run the Rust SDK Workflow loading journey with its lifecycle already provisioned"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(=workflow_loading::workflow_loading_journey)'"
 
 [tasks."test:principals:unit"]
 description = "Run the principal and credential model unit slices"
@@ -161,9 +170,8 @@ hide = true
 description = "Run the real-server CLI and Rust SDK typed WyrdState journeys with their lifecycle already provisioned"
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -E 'test(=cards_state::registers_reads_hydrates_and_loads_offline_state)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored all -E 'test(=gateway_admin::administers_redacted_gateway_configuration)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored all -E 'test(=operator_connections::manages_redacted_connections_with_permission_and_tenant_separation)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(=register_and_hydrate::service_graph_registers_and_hydrates)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
 ]
 
 [tasks."test:gateway:native"]
@@ -223,7 +231,7 @@ env = { WYRD_CLI_E2E = "1" }
 run = [
   "cargo test --locked -p wyrd-cli --test cli -- --ignored gateway_server_journey:: --nocapture --test-threads=1",
   "cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=gateway::pg_tests::agent_administers_redacted_gateway_configuration)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored all -E 'test(=gateway_admin::administers_redacted_gateway_configuration)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|gateway_inference)::/)'",
 ]
 
 [tasks."py:test:gateway:journey:inner"]
@@ -447,16 +455,16 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-sdk-rust observe_run binary, whole"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^observe_run::/)'"
+description = "wyrd-sdk-rust observe_a_run, query_bifrost, and otel_export stories"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export)::/)'"
 
 [tasks."test:bifrost:journey:drift"]
-description = "Tier-1 journeys: PSI, SPC, and Custom Drift Verifiers fitted, scored through Oracle, and dispatched"
+description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
 [tasks."test:bifrost:journey:drift:inner"]
 hide = true
-description = "wyrd-sdk-rust drift_verification binary, whole"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^drift_verification::/)'"
+description = "wyrd-sdk-rust verify_in_real_time and scheduled_drift_alerts_operator stories"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(verify_in_real_time|scheduled_drift_alerts_operator)::/)'"
 
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
@@ -770,7 +778,7 @@ saved_login_journey() {
   fi
   case "$1" in
     cli) rust_journey wyrd-cli cli "$name" ;;
-    rust) rust_journey wyrd-sdk-rust integration "cards_state::$name" ;;
+    rust) rust_journey wyrd-sdk-rust integration "saved_user_auth::$name" ;;
     client) rust_journey wyrd-client integration "pg_auth_e2e_against_fixture::$name" ;;
     python)
       mise run py:setup

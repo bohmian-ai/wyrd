@@ -4,7 +4,6 @@ set -uo pipefail
 
 lanes=(
   unit:rust
-  unit:python
   unit:typescript
   integration:redux
   integration:sql

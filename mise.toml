@@ -299,8 +299,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 
 [tasks."test:bifrost:gate"]
 hide = true
-description = """The gate's share of Bifrost: only the ignored Rust tests plus the Python Bifrost unit
-tests. Every non-ignored Rust test belongs to a family lane, and py:test:integration,
+description = """The gate's share of Bifrost: only the ignored Rust tests. Every non-ignored Rust test belongs to a family lane, and py:test:integration,
 ts:test:integration, and ts:test:unit own the SDK Bifrost files. One `nextest` invocation schedules
 every selected binary together. Run `test:bifrost` for the complete, standalone lane."""
 run = """
@@ -315,8 +314,7 @@ cargo nextest run --locked \
   -p vala-bifrost-redux --test integration \
   --features wyrd-client/test-support \
   -P journey --run-ignored=only \
-  -E "not test(=qualification::scribe_512_mib_physical_object_qualifies) and (not package(wyrd-client) or test(/^pg_bifrost_e2e::/))"
-mise run test:bifrost:unit:python:inner'
+  -E "not test(=qualification::scribe_512_mib_physical_object_qualifies) and (not package(wyrd-client) or test(/^pg_bifrost_e2e::/))"'
 """
 
 [tasks."test:bifrost:inner"]
@@ -330,13 +328,6 @@ description = "Run Bifrost-facing unit tests in shared server, harness, SDK, and
 run = """
 cargo nextest run --locked -p wyrd-testing -p wyrd-server -p wyrd-client --lib --features wyrd-server/test-support -E '(package(wyrd-testing) & (test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/))) | (package(wyrd-server) & (test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/))) | (package(wyrd-client) & (test(/^bifrost::query::/) | test(/^bifrost::sdk::/)))'
 """
-
-[tasks."test:bifrost:unit:python:inner"]
-hide = true
-description = "Run Python Bifrost unit tests."
-dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup"]
-run = "uv run python -m pytest -q tests/bifrost"
 
 [tasks."test:bifrost:unit:typescript:inner"]
 hide = true

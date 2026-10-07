@@ -48,7 +48,7 @@ BIFROST_ONLY = re.compile(
     r"^(architecture/bifrost-design\.md"
     r"|architecture/references/domain/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md"
     r"|crates/vala/vala-bifrost-redux/"
-    r"|crates/shared/wyrd-client/(src/bifrost/|tests/pg_bifrost_e2e\.rs)"
+    r"|crates/shared/wyrd-client/(src/bifrost/|tests/integration/pg_bifrost_e2e\.rs)"
     r"|crates/vala/vala-sql/(src/(queries|row_types)/(forge|oracle|file_list|maintenance|scribe)"
     r"|tests/(oracle_admission|pg_(file_list|forge|maintenance|olap|oracle|stream)))"
     r"|crates/wyrd/wyrd-testing/(src/bifrost/|tests/bifrost/)"
@@ -56,7 +56,7 @@ BIFROST_ONLY = re.compile(
     r"|crates/wyrd/wyrd-server/tests/(pg_eval_v1_protocol|pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs"
     r"|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)"
     r"|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs"
-    r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/bifrost/|tests/test_bifrost\.py|tests/integration/test_bifrost_(e2e|query)\.py)"
+    r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/typecheck/bifrost_contracts\.py|tests/integration/(bifrost/|test_query_bifrost\.py))"
     r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/query-bifrost\.test\.ts))"
 )
 # Trees whose every file must be owned by a workspace package.

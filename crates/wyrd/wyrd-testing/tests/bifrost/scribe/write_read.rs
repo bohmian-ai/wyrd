@@ -1157,6 +1157,10 @@ const MAX_REQUEST_ROWS: i64 = 300_000;
 /// the same data root, and a resend of the acknowledged batch must neither
 /// duplicate the rows nor publish them again.
 ///
+/// The audit publisher stays off. It writes `vala.system.audit_log` through
+/// the same Scribe, so a member it staged before the root fills would also be
+/// refused by that root and fail the flush for a table this case does not own.
+///
 /// # Panics
 ///
 /// Panics when the near-maximum request is refused, when a stage under a full
@@ -1170,6 +1174,7 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let builder = || {
         wyrd_testing::WyrdTestServer::builder()
             .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+            .without_audit_publication_for_test()
     };
     let server = builder()
         .start_bound()

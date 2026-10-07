@@ -3907,7 +3907,7 @@ impl WyrdTestServer {
                 ))
                 .await);
         }
-        if let Err(error) = wait_for_ready(&base_url).await {
+        if let Err(error) = wait_for_ready(&base_url, &self.inner.state).await {
             return Err(self.rollback_bound_startup(error).await);
         }
 
@@ -5358,7 +5358,14 @@ fn bound_loopback_addr(port: u16) -> Result<SocketAddr, WyrdTestServerError> {
         .map_err(|error| WyrdTestServerError::Bind(error.to_string()))
 }
 
-/// Poll a bound test server until its HTTP health endpoint reports readiness.
+/// Poll a bound test server until it answers HTTP and its Oracle can route.
+///
+/// `/healthz` proves only that HTTP serves. A peer-mode Oracle activates later
+/// in the peer serve task, and until that activation publishes membership a
+/// query is refused as unroutable. So the poll also waits for
+/// [`Oracle::is_ready`](wyrd_server::state::Oracle::is_ready), the same check
+/// `/readyz` reports, read in process rather than through the cached readiness
+/// snapshot.
 ///
 /// # Errors
 ///
@@ -5366,7 +5373,7 @@ fn bound_loopback_addr(port: u16) -> Result<SocketAddr, WyrdTestServerError> {
 /// owns the process, or [`WyrdTestServerError::Bind`] when the server does not
 /// become ready within the bounded retry window. Cancellation stops polling
 /// without stopping the independently owned server task.
-async fn wait_for_ready(base_url: &str) -> Result<(), WyrdTestServerError> {
+async fn wait_for_ready(base_url: &str, state: &AppState) -> Result<(), WyrdTestServerError> {
     wyrd_tls::install_crypto_provider()
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     let client = reqwest::Client::new();
@@ -5377,6 +5384,7 @@ async fn wait_for_ready(base_url: &str) -> Result<(), WyrdTestServerError> {
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
+            && state.bifrost_query().is_none_or(|oracle| oracle.is_ready())
         {
             return Ok(());
         }

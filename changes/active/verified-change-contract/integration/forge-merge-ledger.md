@@ -100,6 +100,7 @@ selection.
 | L61 | Linearize Forge leader handlers with the term | forge-delta-missing-from-variant |
 | L62 | Pin the compaction fork without the unconsumed planning surface (superseded) | forge-delta-missing-from-variant |
 | L63 | Forge packet review records and authority docs | forge-delta-missing-from-variant |
+| L64 | Wait for a routable Oracle at test-server start and keep audit publication out of the stage-pressure journey | follow-up-fix |
 
 ## Workspace, dependencies, SQL, and checks
 
@@ -771,6 +772,17 @@ selection.
 - **Why:** The lint and whitespace checks failed on the merged tree.
 - **Replay rule:** Do not reintroduce the `type_complexity` allow on `publish`. The variant does not carry navigation-map.md.
 - **Commit:** 8d98c3ceb, cd7844cd1
+
+### L64. Wait for a routable Oracle at test-server start and keep audit publication out of the stage-pressure journey
+- **Kind:** follow-up-fix (found under the gate's SDK-lane concurrency after the merge)
+- **Files:** crates/wyrd/wyrd-testing/src/server.rs, crates/wyrd/wyrd-testing/tests/bifrost/scribe/write_read.rs
+- **Symptom:** Under gate load, Scribe restart journeys received a 503 (`no ready Oracle advertises both query classes … live_oracles=0`). `acknowledged_rows_survive_stage_pressure_and_restart` failed its flush with `ingest busy for table: memory`.
+- **Cause 1:** `wait_for_ready` polled only `/healthz`, which always answers `ok`. A peer-mode Oracle is activated afterwards, in the peer serve task (`app/server.rs` `activate_peer_roles`). A query sent straight after a start or restart could therefore find no live Oracle.
+- **Cause 2:** Forge's continuous audit publisher (L57) writes `vala.system.audit_log` through the same Scribe. A member it stages before the test fills the root is refused by that full root, and `flush_staged` returns the refusal.
+- **Resolution:**
+  - `wait_for_ready(base_url, state)` also waits for `state.bifrost_query().is_none_or(Oracle::is_ready)`. That is the check `/readyz` reports, read in process. Polling `/readyz` itself was rejected because its snapshot is cached on a 5 s tick and it also gates on Forge, which quiet tests hold back.
+  - The stage-pressure journey opts out with `.without_audit_publication_for_test()`, as the other Scribe isolation journeys do.
+- **Replay rule:** Keep both. Any variant Scribe journey that fills the root, or counts staged work while the audit publisher runs, takes the same opt-out (see also L52).
 
 **Not merge fallout** (verification work after the merge; still carry it through the variant merge): 6e84727c9 (client UTC stamp on observation writes), 5ff25deb6 (Forge commit retries bounded by count, not a deadline), ac327a227 (`WYRD_VALA_403_BIFROST_CARD_SCOPE` maps to `CardScopeDenied`), b620b069f (Oracle `$n` binding via `with_param_values`, REQ-200), d7524b19b (removes the empty `test:bifrost:unit:python:inner` lane and fixes select-ci paths).
 

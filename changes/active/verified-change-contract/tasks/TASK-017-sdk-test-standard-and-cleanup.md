@@ -174,20 +174,24 @@ Commits `04d1882dc..HEAD` on `wyrd/verified-change-contract/TASK-017` (language 
 
 - Spec revision 65 (user-approved 2026-10-07) sanctions the test server's credential fixtures for keys that need Roles; `TESTING.md` updated to match.
 
+- User-directed follow-ups (2026-10-07):
+  - Unknown `PromptReference` kind and every caller `model_validate_json` now refuse with `WYRD_SPEC_400_VALIDATION` (`870f401cf`).
+  - Python registry refusals use `WYRD_REGISTRY_400_INVALID_CARD_SPEC` / `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` (`a24d9099a`).
+  - Retired kind is `WYRD_LOADER_400_INVALID_ENVELOPE` through the CLI, `register_from_path`, and `Workflow.from_path` in all SDKs, via one `From<LoadError> for WyrdError` (`9d4f064be`).
+  - Out-of-range query deadline is `WYRD_VALA_400_QUERY_INVALID_DEADLINE` from client pre-IO validation and the Oracle planner alike (`cb54cbb11`, `aa0aeb52b`); tests `vala::api::query_terminal_tests::query_request_refusals_project_onto_their_catalog_codes`, `oracle::tests::query_floor_refuses_an_out_of_range_deadline`.
+  - Python partials: `ModelCard.artifact_hash` read from the Card (REQ-202, `09273a2ae`); `CardRef.to_dict()` so `Split.materialized(CardRef)` works (`77807c905`); typed `ModelCardMetadata.task_type`/`interface_kind`; `ProviderName::Custom` YAML round-trips so a saved mock Agent loads and runs (`e80775a36`); public `ProviderResponse.text(...)` (`c1ddf38cf`).
+  - Credential fixtures documented in the `WyrdTestServer` stub (`57d571cc4`).
+
 ### Open gaps (not fixed here)
 
 - Python `test_workflow_loading_journey` is still multi-story.
 - Rust `workflow_loading` uses `CredentialWriter`.
 - Rust `gateway_inference` uses `reqwest` because no Rust OpenAI SDK exists.
-- Python-unit partials: trusted artifact hash, `Split.materialized(CardRef)`, typed Split/ModelCardMetadata accessors, mock provider round-trip, and the ModelResponse builder.
-- Tests pin current production codes:
-  - unknown `PromptReference` kind returns `WYRD_SPEC_500_INTERNAL`;
-  - registry refusals return `WYRD_DATA_400_VALIDATION`;
-  - out-of-range deadline returns `QUERY_INVALID_SQL`;
-  - the retired kind returns `WYRD_LOADER_400_INVALID_ENVELOPE` through `cli.apply` but `WYRD_REGISTRY_400_INVALID_CARD_SPEC` through `register_from_path`.
+- Python `Split` has no typed readback (`kind`, `card_ref`): `CardRefPy` lives in `wyrd-cards`, which depends on `wyrd-interfaces` (Split's owner), so a getter needs a crate move. `test_split_materialized_allows_authored_ref_without_space` keeps a dict because `CardRef` requires `space`.
+- Mock-provider Agent run uses the default registry mock; `Agent.from_yaml` takes no `mock_provider=`.
 - The TypeScript "Bifrost not started" refusal is unit-only.
 
 ### Verification
 
-- `mise run gate` exited 0. An earlier run failed with "No space left on device"; this run followed removal of the merged worktrees.
+- `mise run gate` exited 0 on `aa0aeb52b` (after the follow-ups; 2706 s, zero failures).
 - `git diff --check 04d1882dc~1..HEAD` reported nothing.

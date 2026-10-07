@@ -371,13 +371,14 @@ impl PromptReference {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Rebuild a prompt reference from JSON.
+    /// Rebuild a prompt reference from caller-supplied JSON.
     ///
     /// # Errors
-    /// Returns a Wyrd error when JSON parsing or validation fails.
+    /// Returns `WYRD_SPEC_400_VALIDATION` when the JSON is malformed or names
+    /// a reference kind other than `card` or `inline`.
     #[staticmethod]
     pub fn model_validate_json(data: &str) -> CardPyResult<Self> {
-        Ok(Self::from_native(serde_json::from_str(data)?))
+        Ok(Self::from_native(WyrdPyError::parse_json_input(data)?))
     }
 
     /// Return a concise Python representation.
@@ -736,7 +737,7 @@ impl PromptCard {
     #[staticmethod]
     #[pyo3(name = "model_validate_json")]
     pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
-        let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
+        let mut card = Self::from_card(WyrdPyError::parse_json_input(json_string)?)?;
         card.hydrate_prompt(py)?;
         Ok(card)
     }

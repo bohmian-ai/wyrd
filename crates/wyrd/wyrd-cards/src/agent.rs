@@ -181,15 +181,19 @@ impl PyAgentCard {
     pub fn from_draft_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
         Self::from_native(
             py,
-            AgentCard::from_envelope(serde_json::from_str(json_string)?)?,
+            AgentCard::from_envelope(WyrdPyError::parse_json_input(json_string)?)?,
         )
     }
 
     /// Hydrate an Agent Card from a complete JSON envelope.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_VALIDATION` when the JSON is malformed, or the
+    /// envelope validation error when it is not a valid Agent Card.
     #[staticmethod]
     #[pyo3(name = "model_validate_json")]
     pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
-        Self::from_card(py, serde_json::from_str(json_string)?)
+        Self::from_card(py, WyrdPyError::parse_json_input(json_string)?)
     }
 
     /// Return the Agent Card space.

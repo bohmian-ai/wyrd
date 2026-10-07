@@ -88,7 +88,7 @@ def test_wrong_artifact_digest_is_refused(cards: Cards) -> None:
 def test_retired_card_kind_is_refused(cards: Cards) -> None:
     with pytest.raises(WyrdError) as refused:
         cards.register_from_path(str(FIXTURES / "invalid/retired-drift-kind.yaml"))
-    assert refused.value.code == "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
 @pytest.mark.integration

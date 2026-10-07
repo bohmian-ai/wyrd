@@ -73,8 +73,9 @@ impl Workflow {
     /// # Errors
     /// Returns `WYRD_WORKFLOW_500_INTERNAL` when the blocking load task panics
     /// or is cancelled by runtime shutdown;
-    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
-    /// diagnostics when the bundle fails to load or `path` does not define
+    /// `WYRD_LOADER_400_INVALID_ENVELOPE` carrying the loader diagnostics
+    /// when the bundle fails to load;
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when `path` does not define
     /// exactly one Workflow Card; the client configuration error when an
     /// external ref needs a client that cannot be built; the Cards read and
     /// traversal errors for a missing, denied, or mismatched dependency;
@@ -266,14 +267,12 @@ fn blocking_task_failed(boundary: &str, error: &JoinError) -> WyrdError {
 /// file among the loaded tree's sources.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
-/// diagnostics when the bundle fails to load, or naming `path` when it cannot
-/// be canonicalized.
+/// Returns `WYRD_LOADER_400_INVALID_ENVELOPE` carrying the loader
+/// diagnostics when the bundle fails to load, or
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` naming `path` when it cannot be
+/// canonicalized.
 fn load_bundle(path: &Path) -> Result<(LoadedTree, PathBuf), WyrdError> {
-    let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
-        message: format!("workflow bundle failed to load: {error}"),
-        details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
-    })?;
+    let tree = wyrd_loader::load(path)?;
     let entry = path.canonicalize().map_err(|error| {
         WyrdError::registry_invalid_card_spec(format!(
             "workflow path {} cannot be resolved: {error}",

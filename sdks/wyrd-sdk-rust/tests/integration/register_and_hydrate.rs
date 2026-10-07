@@ -209,7 +209,7 @@ async fn retired_card_kind_is_refused() {
     .await
     .expect_err("a retired kind is refused");
 
-    assert_eq!(refused.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+    assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
     deployment.shutdown().await;
 }
 

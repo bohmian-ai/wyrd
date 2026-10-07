@@ -43,8 +43,8 @@ impl<'a> PythonCardRegistry<'a> {
     /// Register a typed Card while enforcing its kind at the boundary.
     ///
     /// # Errors
-    /// Returns the same registration errors as [`Self::register`], plus a
-    /// stable kind-mismatch validation error when the holder is wrong.
+    /// Returns the same registration errors as [`Self::register`], plus
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the holder is another kind.
     pub(super) fn register_typed(
         &self,
         py: Python<'_>,

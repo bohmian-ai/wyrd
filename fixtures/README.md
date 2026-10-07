@@ -26,7 +26,7 @@ Refusals load one deliberately broken Card from `invalid/`:
 |---|---|
 | `invalid/wrong-artifact-digest/support-model.yaml` | `WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH` |
 | `invalid/operator-path-without-connection.yaml` | `WYRD_SPEC_400_INVALID_OPERATOR` |
-| `invalid/retired-drift-kind.yaml` | `WYRD_REGISTRY_400_INVALID_CARD_SPEC` |
+| `invalid/retired-drift-kind.yaml` | `WYRD_LOADER_400_INVALID_ENVELOPE` (registration and `wyrd apply` alike) |
 
 Names are fixed, so registering a fixture again is idempotent. Add a story
 only when a journey needs Cards none of these provide.

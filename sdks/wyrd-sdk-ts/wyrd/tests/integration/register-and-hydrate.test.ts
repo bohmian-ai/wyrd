@@ -92,7 +92,7 @@ test("wrong artifact digest is refused", async ({ cards }) => {
 // Registration reports the loader's refusal under its own catalog code.
 test("retired card kind is refused", async ({ cards }) => {
   await expect(cards.registerFromPath(fixture("invalid/retired-drift-kind.yaml"))).rejects.toMatchObject({
-    code: "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+    code: "WYRD_LOADER_400_INVALID_ENVELOPE",
   });
 });
 

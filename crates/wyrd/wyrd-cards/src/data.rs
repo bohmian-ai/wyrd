@@ -812,7 +812,7 @@ impl DataCard {
         json_string: &str,
         interface: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
-        let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
+        let mut card = Self::from_card(WyrdPyError::parse_json_input(json_string)?)?;
         card.hydrate_interface(py, interface)?;
         Ok(card)
     }

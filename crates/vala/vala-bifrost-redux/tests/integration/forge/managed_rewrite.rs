@@ -51,7 +51,7 @@ use super::support::{
 /// Panics when the attempt fails; every caller here runs against a promoted
 /// small-file set that must select.
 async fn rewrite_whole_attempt(fixture: &PromotedRewriteFixture) -> AttemptRun {
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -177,7 +177,7 @@ async fn drain_at_output(
         ordinal,
         token: cancel.clone(),
     });
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let attempt_id = uuid::Uuid::now_v7();
     let forge = fixture.forge(
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
@@ -222,7 +222,7 @@ async fn drain_at_output(
 async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     let fixture = PromotedRewriteFixture::start("rewrite_identity").await;
     let attempt_id = uuid::Uuid::now_v7();
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -326,7 +326,7 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
 async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
     let fixture = PromotedRewriteFixture::start("rewrite_drain").await;
     let live_before = fixture.fixture.live_data_paths().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let cancel = tokio_util::sync::CancellationToken::new();
     let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::CancelAtOpen {
         ordinal: 2,
@@ -421,7 +421,7 @@ async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
 async fn managed_rewrite_failure_preserves_attempt_global_possible_outputs() {
     let fixture = PromotedRewriteFixture::start("rewrite_failure").await;
     let live_before = fixture.fixture.live_data_paths().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::FailAtClose { ordinal: 2 });
     let forge = fixture.forge(
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
@@ -495,7 +495,7 @@ async fn managed_rewrite_produces_exact_handoff_without_catalog_commit() {
     let fixture = PromotedRewriteFixture::start("rewrite_handoff").await;
     let live_before = fixture.fixture.live_data_paths().await;
     let objects_before = fixture.object_digests().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::new(AtomicUsize::new(0)),
@@ -591,7 +591,7 @@ async fn assert_equality_delete_applies_to_output_rows() {
     );
     fixture.publish_deletes(&target, None, Some(11)).await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -662,7 +662,7 @@ async fn assert_position_delete_applies_to_output_rows() {
 
     deletes.publish_deletes(&target, Some(0), None).await;
     let live_before = deletes.fixture.live_data_paths().await;
-    let store = CountingObjectStore::new(Arc::clone(&deletes.fixture.staging));
+    let store = CountingObjectStore::new(&deletes.fixture.storage);
     let forge = deletes.forge(
         deletes.fixture.catalog.iceberg_catalog(),
         Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
@@ -725,7 +725,7 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
         "the fixture table declares no legacy whole-file ceiling"
     );
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -789,7 +789,7 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
 #[tokio::test]
 async fn compaction_publishes_replacements_without_deleting_inputs() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_nondestructive").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -1009,7 +1009,7 @@ async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
         .fixture
         .seal_partition_files(STAGED_DAY, STAGED_ROWS, 2, 0)
         .await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -1504,7 +1504,7 @@ async fn v3_row_lineage_survives_repeated_rewrite() {
         "the user table is v3"
     );
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         fixture,
         fixture.catalog.iceberg_catalog(),
@@ -1876,7 +1876,7 @@ async fn rewrite_outputs_share_the_combined_source_layout() {
         .collect();
     assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         fixture,
         fixture.catalog.iceberg_catalog(),
@@ -1980,7 +1980,7 @@ async fn standard_variant_layouts_round_trip_per_file() {
         .collect();
     assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         fixture,
         fixture.catalog.iceberg_catalog(),

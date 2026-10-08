@@ -5835,12 +5835,6 @@ mod tests {
         assert!(!is_expected_wal_capacity(&ScribeError::Internal {
             detail: "unexpected failure".to_owned(),
         }));
-        assert!(!is_expected_wal_capacity(
-            &ScribeError::ObjectStorePutFailed(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "object failure"
-            ),)
-        ));
     }
 
     #[derive(Debug)]

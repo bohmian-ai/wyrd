@@ -208,8 +208,8 @@ azure_core = "0.21.0"
 azure_identity = "0.21.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
-# opendal 0.57 pinned as the wyrd-storage substrate (stage0) and the future
-# iceberg substrate (stage1). reqwest-rustls-tls is mandatory:
+# opendal 0.57 is the wyrd-storage substrate for card and artifact storage;
+# Bifrost uses object_store. reqwest-rustls-tls is mandatory:
 # default-features=false drops it, leaving an HTTP-only client that fails all
 # cloud HTTPS requests.
 typetag = "0.2.23"
@@ -227,7 +227,10 @@ lru = "=0.12.5"
 # single native universe (no moving branch, no duplicate Arrow/Parquet package);
 # `[patch.crates-io]` below pins the DataFusion crates to the Wyrd fork.
 datafusion = "=55.1.0"
+# Bifrost's one object store (spec REQ-032); the same release DataFusion 55 uses.
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
 datafusion-proto = "=55.1.0"
+datafusion-datasource = "=55.1.0"
 parquet = "60.0"
 # Arrow-rs Variant model, kernels, and JSON conversion; same release line as `parquet`.
 parquet-variant = "60.0"
@@ -237,9 +240,6 @@ iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0b1a0660a
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0b1a0660a16045289f9820f43454bb0628fcc5e3" }
 iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0b1a0660a16045289f9820f43454bb0628fcc5e3" }
-# Non-blocking local-filesystem Iceberg storage for Scribe staged-run reads;
-# already in the graph through the managed compaction core.
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "0b1a0660a16045289f9820f43454bb0628fcc5e3", default-features = false, features = ["opendal-fs"] }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 60 line as the workspace, so embedding it adds no second native
@@ -259,15 +259,37 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "202c5e101c8edac0f391d22fb0b29993fc19dcce" }
+datafusion = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/core" }
+datafusion-common = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/common" }
+datafusion-datasource = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/datasource" }
+datafusion-datasource-parquet = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/datasource-parquet" }
+datafusion-expr = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/expr" }
+datafusion-functions = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/functions" }
+datafusion-physical-expr = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/physical-expr" }
+datafusion-physical-expr-adapter = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/physical-expr-adapter" }
+datafusion-proto = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/proto" }
+datafusion-pruning = { path = "/tmp/claude-1000/-home-thorrester-Documents-GitHub-wyrd-bifrost-variant-task-003/6cd9bbbe-6204-43d8-a81e-a17344444097/scratchpad/df-snap2/datafusion/pruning" }
+# Local arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix.
+arrow = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow" }
+arrow-arith = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-arith" }
+arrow-array = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-array" }
+arrow-buffer = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-buffer" }
+arrow-cast = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-cast" }
+arrow-cmp = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-cmp" }
+arrow-csv = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-csv" }
+arrow-data = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-data" }
+arrow-flight = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-flight" }
+arrow-ipc = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-ipc" }
+arrow-json = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-json" }
+arrow-ord = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-ord" }
+arrow-row = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-row" }
+arrow-schema = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-schema" }
+arrow-select = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-select" }
+arrow-string = { path = "/home/thorrester/Documents/GitHub/arrow-rs/arrow-string" }
+parquet = { path = "/home/thorrester/Documents/GitHub/arrow-rs/parquet" }
+parquet-variant = { path = "/home/thorrester/Documents/GitHub/arrow-rs/parquet-variant" }
+parquet-variant-compute = { path = "/home/thorrester/Documents/GitHub/arrow-rs/parquet-variant-compute" }
+parquet-variant-json = { path = "/home/thorrester/Documents/GitHub/arrow-rs/parquet-variant-json" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

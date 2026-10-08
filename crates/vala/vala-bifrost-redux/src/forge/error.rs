@@ -77,7 +77,7 @@ pub enum ForgeError {
     Catalog(#[source] iceberg::Error),
     /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
-    ObjectStore(#[source] opendal::Error),
+    ObjectStore(#[source] object_store::Error),
     /// Snapshot-expiry planning or reconciliation failed.
     #[error("Forge snapshot expiry failed: {detail}")]
     SnapshotExpiry { detail: String },
@@ -86,10 +86,10 @@ pub enum ForgeError {
     LiveSet { detail: String },
     /// A table-owned object prefix could not be listed.
     #[error("Forge object listing failed: {0}")]
-    ObjectList(#[source] opendal::Error),
+    ObjectList(#[source] object_store::Error),
     /// A fenced orphan object could not be deleted.
     #[error("Forge object deletion failed: {0}")]
-    ObjectDelete(#[source] opendal::Error),
+    ObjectDelete(#[source] object_store::Error),
     /// A staging batch did not match the registered physical schema.
     #[error("Forge schema validation failed: {detail}")]
     Schema { detail: String },

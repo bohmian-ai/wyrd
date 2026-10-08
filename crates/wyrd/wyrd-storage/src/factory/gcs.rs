@@ -19,6 +19,21 @@ fn credential_for_gcs() -> Option<String> {
     }
 }
 
+/// Returns the service-account JSON from Wyrd's GCS credential variables.
+///
+/// `GOOGLE_ACCOUNT_JSON_BASE64` is decoded, else
+/// `GOOGLE_APPLICATION_CREDENTIALS_JSON` is returned as is. `None` leaves the
+/// caller's own default chain (a credentials file path or ambient identity) in
+/// charge. Bifrost's object store reads the same variables through this.
+#[must_use]
+pub fn service_account_json() -> Option<String> {
+    let encoded = credential_for_gcs()?;
+    STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|json| String::from_utf8(json).ok())
+}
+
 pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
     let mut b = services::Gcs::default().bucket(&cfg.bucket);
     let mut has_credential = false;

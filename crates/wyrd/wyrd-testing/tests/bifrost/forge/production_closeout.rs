@@ -10,8 +10,11 @@ use crate::public_support::{
 };
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use futures_util::TryStreamExt as _;
 use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use object_store::ObjectStoreExt as _;
+use object_store::path::Path as ObjectPath;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
@@ -22,13 +25,13 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
-use vala_bifrost_redux::storage::{StorageOperation, StorageOperationBarrier};
 use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::object_reads::ReadStall;
 use wyrd_testing::bifrost::write::RawIngest;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
@@ -42,26 +45,21 @@ use wyrd_testing::bifrost::{
 /// without adding any production seam.
 struct OracleReadBarriers {
     /// One barrier per Oracle-serving node, paired with that node's identity.
-    entries: Vec<(NodeId, Arc<StorageOperationBarrier>)>,
+    entries: Vec<(NodeId, Arc<ReadStall>)>,
 }
 
 impl OracleReadBarriers {
-    /// Installs one `ReadRange` barrier on every Oracle-serving node.
+    /// Arms one ranged-read stall on every Oracle-serving node.
     ///
     /// # Panics
-    /// Panics if no composed node owns both an Oracle and a storage owner.
+    /// Panics if no composed node serves an Oracle.
     fn arm(cluster: &WyrdTestCluster) -> Self {
         let mut entries = Vec::new();
         for server in cluster.servers() {
             if server.state().bifrost.oracle().is_none() {
                 continue;
             }
-            let Some(storage) = server.state().bifrost_storage() else {
-                continue;
-            };
-            let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
-            storage.install_operation_barrier_for_test(Arc::clone(&barrier));
-            entries.push((server.node_id(), barrier));
+            entries.push((server.node_id(), server.object_reads_for_test().arm_stall()));
         }
         assert!(
             !entries.is_empty(),
@@ -345,9 +343,14 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on a storage error other than absence.
     async fn object_missing(&self, path: &str) -> bool {
-        match self.cluster.storage_operator().stat(path).await {
+        match self
+            .cluster
+            .storage_objects()
+            .head(&ObjectPath::from(path))
+            .await
+        {
             Ok(_) => false,
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => true,
+            Err(object_store::Error::NotFound { .. }) => true,
             Err(error) => panic!("object inspection failed: {error}"),
         }
     }
@@ -456,15 +459,12 @@ impl CloseoutJourney {
     async fn forge_objects(&self, binding: &TenantTableBinding) -> BTreeSet<String> {
         let prefix = format!("{}/data/forge/", binding.object_prefix.as_str());
         self.cluster
-            .storage_operator()
-            .list_with(&prefix)
-            .recursive(true)
+            .storage_objects()
+            .list(Some(&ObjectPath::from(prefix)))
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
             .await
             .expect("Forge output listing")
-            .into_iter()
-            .filter(|entry| entry.metadata().is_file())
-            .map(|entry| entry.path().to_owned())
-            .collect()
     }
 
     /// Asserts the coordinator's production orphan predicate for each object.
@@ -1035,11 +1035,11 @@ impl CloseoutJourney {
         for (path, file) in files {
             let metadata = self
                 .cluster
-                .storage_operator()
-                .stat(path)
+                .storage_objects()
+                .head(&ObjectPath::from(path.as_str()))
                 .await
                 .expect("retained object");
-            assert_eq!(metadata.content_length(), file.file_size_in_bytes());
+            assert_eq!(metadata.size, file.file_size_in_bytes());
         }
     }
 }
@@ -2217,9 +2217,14 @@ impl LeaderJourney {
     /// # Panics
     /// Panics on a storage error other than absence.
     async fn exists(&self, path: &str) -> bool {
-        match self.cluster.storage_operator().stat(path).await {
+        match self
+            .cluster
+            .storage_objects()
+            .head(&ObjectPath::from(path))
+            .await
+        {
             Ok(_) => true,
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
+            Err(object_store::Error::NotFound { .. }) => false,
             Err(error) => panic!("object inspection failed: {error}"),
         }
     }
@@ -2605,8 +2610,11 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
     );
     journey
         .cluster
-        .storage_operator()
-        .write(&orphan, b"never published".to_vec())
+        .storage_objects()
+        .put(
+            &ObjectPath::from(orphan.as_str()),
+            b"never published".to_vec().into(),
+        )
         .await
         .expect("rowless output");
     journey.advance(chrono::Duration::days(2));
@@ -2834,8 +2842,11 @@ async fn empty_maintenance_restart_protects_orphans() {
     );
     journey
         .cluster
-        .storage_operator()
-        .write(&orphan, b"never published".to_vec())
+        .storage_objects()
+        .put(
+            &ObjectPath::from(orphan.as_str()),
+            b"never published".to_vec().into(),
+        )
         .await
         .expect("rowless output");
 

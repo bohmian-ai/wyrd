@@ -148,9 +148,7 @@ impl CaptureDrop {
     pub(crate) fn from_scribe(error: &ScribeError) -> Self {
         match error {
             ScribeError::IngestBusy { .. } | ScribeError::WalDiskFull => Self::Saturated,
-            ScribeError::IngressClosed
-            | ScribeError::ObjectStorePutFailed(_)
-            | ScribeError::Internal { .. } => Self::Unavailable,
+            ScribeError::IngressClosed | ScribeError::Internal { .. } => Self::Unavailable,
             _ => Self::Rejected,
         }
     }

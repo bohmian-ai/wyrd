@@ -58,8 +58,8 @@ pub struct PeerTicketClaims {
     pub permission_digest: String,
     /// Canonical assignment-authority digest (see
     /// [`wyrd_spec::vala::assignment_authority`]) binding every dispatched
-    /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity, files,
-    /// schema fingerprint, and closed predicate/projection closure into one
+    /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity,
+    /// schema fingerprint, provider cut, and projection closure into one
     /// value. The follower recomputes this over its actual received
     /// assignments and rejects any mismatch before resolving a provider or
     /// issuing object I/O.
@@ -794,8 +794,8 @@ pub fn projection_digest(projection: &[String]) -> String {
 ///
 /// Both the leader and the follower call this over the same list, in the same
 /// order, so a matching digest proves the follower's actual assignments are
-/// exactly the ones the leader described — including every file, schema
-/// fingerprint, and closed predicate.
+/// exactly the ones the leader described — including every schema
+/// fingerprint, provider cut, and projection.
 ///
 /// # Errors
 /// Returns [`PeerSecurityError::Encoding`] when a schema fingerprint is not
@@ -812,10 +812,8 @@ pub fn assignment_authority_digest_for(
                 namespace: assignment.binding.namespace.as_str(),
                 table: assignment.binding.table.as_str(),
                 schema_fingerprint_hex: assignment.schema_fingerprint.as_str(),
-                files: &assignment.persisted.files,
                 scribe_cut: assignment.scribe_provider_cut.as_ref(),
                 required_columns: &assignment.required_columns,
-                predicates: &assignment.predicates,
             },
         )
         .collect::<Vec<_>>();

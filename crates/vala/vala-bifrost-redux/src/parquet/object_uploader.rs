@@ -1,15 +1,17 @@
 //! Bounded, content-verifying Parquet object upload shared by data-plane roles.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
-use opendal::{Buffer, ErrorKind, Operator};
+use bytes::Bytes;
+use object_store::buffered::BufWriter;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-#[cfg(test)]
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -81,7 +83,7 @@ pub enum ParquetUploadError {
     LocalIo(#[from] std::io::Error),
     /// Object storage did not converge to the expected bytes.
     #[error("Parquet object storage operation failed: {0}")]
-    ObjectStore(#[from] opendal::Error),
+    ObjectStore(#[from] object_store::Error),
     /// Remote bytes contradict the manifest-fixed identity.
     #[error("remote Parquet content contradicts expected SHA-256 or length")]
     ContentContradiction,
@@ -90,7 +92,7 @@ pub enum ParquetUploadError {
 /// Shared uploader that owns PUT/read-back convergence but no deletion authority.
 pub struct BifrostParquetUploader {
     /// Durable backend used for both upload attempts and authoritative read-back.
-    operator: Operator,
+    objects: Arc<dyn ObjectStore>,
     /// Deterministic ambiguity seams used only by the uploader contract test.
     #[cfg(test)]
     faults: UploadFaults,
@@ -104,18 +106,16 @@ struct UploadFaults {
     fail_before_put: Arc<AtomicBool>,
     /// Fails after close so read-back must recognize the completed object.
     fail_after_close: Arc<AtomicBool>,
-    /// Largest OpenDAL-owned write or read payload observed by the real backend.
+    /// Largest backend-owned write or read payload observed by the real backend.
     max_backend_payload_bytes: Arc<AtomicUsize>,
-    /// Number of conditional creates completed by the real backend.
-    successful_creates: Arc<AtomicUsize>,
 }
 
 impl BifrostParquetUploader {
     /// Creates an uploader over the configured durable object store.
     #[must_use]
-    pub fn new(operator: Operator) -> Self {
+    pub fn new(objects: Arc<dyn ObjectStore>) -> Self {
         Self {
-            operator,
+            objects,
             #[cfg(test)]
             faults: UploadFaults::default(),
         }
@@ -141,13 +141,7 @@ impl BifrostParquetUploader {
             .load(Ordering::Acquire)
     }
 
-    /// Returns the number of conditional object creations completed by this uploader.
-    #[cfg(test)]
-    fn successful_creates(&self) -> usize {
-        self.faults.successful_creates.load(Ordering::Acquire)
-    }
-
-    /// Records one unavoidable OpenDAL-owned payload after bounding its length.
+    /// Records one unavoidable backend-owned payload after bounding its length.
     #[cfg(test)]
     fn record_backend_payload(&self, bytes: usize) {
         self.faults
@@ -158,10 +152,12 @@ impl BifrostParquetUploader {
     /// Streams a local file through a caller-governed chunk and verifies remote bytes.
     ///
     /// A failed or ambiguous PUT is resolved by read-back. Absence is retried once;
-    /// contradictory content fails closed. `OpenDAL` requires one owned payload for
-    /// each write or range read; every such payload is bounded by `chunk.len()`,
-    /// and the caller charges its retained chunk; the backend-owned copy is
-    /// bounded by it. This owner never deletes remote bytes.
+    /// contradictory content fails closed. The key is unpublished until the
+    /// catalog commits it, so a PUT overwrites whatever an earlier attempt left
+    /// there (spec REQ-034). `object_store` takes one owned payload for each
+    /// write or range read; every such payload is bounded by `chunk.len()`,
+    /// and the caller charges its retained chunk. This owner never deletes
+    /// remote bytes.
     ///
     /// # Errors
     ///
@@ -207,7 +203,7 @@ impl BifrostParquetUploader {
         result
     }
 
-    /// Attempts an atomic manifest-fixed create and resolves outcomes by read-back.
+    /// Writes the manifest-fixed object and resolves outcomes by read-back.
     ///
     /// # Errors
     ///
@@ -217,9 +213,9 @@ impl BifrostParquetUploader {
     ///
     /// # Cancellation
     ///
-    /// Cancellation may leave the deterministic remote key absent, partially
-    /// written, or complete. A retry is safe because it verifies the same fixed
-    /// length and digest and never deletes remote content.
+    /// Cancellation may leave the deterministic remote key absent, an aborted
+    /// multipart upload, or complete. A retry is safe because it rewrites the
+    /// same bytes and verifies the same fixed length and digest.
     async fn converge(
         &self,
         identity: &ParquetObjectIdentity,
@@ -239,11 +235,10 @@ impl BifrostParquetUploader {
             {
                 Ok(verified) => return Ok(verified),
                 Err(error @ ParquetUploadError::ContentContradiction) => return Err(error),
-                Err(ParquetUploadError::ObjectStore(error))
-                    if error.kind() == ErrorKind::NotFound && attempt == 0 =>
+                Err(ParquetUploadError::ObjectStore(object_store::Error::NotFound { .. }))
+                    if attempt == 0 =>
                 {
-                    // A failed conditional create can race object removal. The bounded
-                    // retry remains conditional, so it cannot overwrite a later winner.
+                    // A failed PUT left the key absent; the bounded retry rewrites it.
                 }
                 Err(error) if attempt == 0 => last_error = Some(error),
                 Err(error) => return Err(last_error.unwrap_or(error)),
@@ -252,20 +247,23 @@ impl BifrostParquetUploader {
         Err(last_error.expect("two convergence attempts always record a terminal error"))
     }
 
-    /// Streams one atomic local-file create through the caller-governed chunk.
+    /// Streams one local file to its key through the caller-governed chunk.
     ///
-    /// `OpenDAL` takes one owned [`Buffer`] per write. The unavoidable copy is
-    /// bounded by the caller chunk.
+    /// `object_store`'s [`BufWriter`] sends a file smaller than the chunk as
+    /// one PUT and a larger one as a multipart upload with chunk-sized parts.
+    /// One part is in flight at a time, so the backend-owned copy stays
+    /// bounded by the chunk. A failed write aborts the multipart upload.
     ///
     /// # Errors
     ///
-    /// Returns [`ParquetUploadError`] when opening or reading the local stage,
-    /// opening or writing the remote writer, or closing the PUT fails.
+    /// Returns [`ParquetUploadError`] when reading the local stage, writing a
+    /// part, or completing the upload fails.
     ///
     /// # Cancellation
     ///
-    /// Cancellation can leave an ambiguous remote object at the deterministic
-    /// key. The caller must resolve that state through read-back convergence.
+    /// Cancellation can leave an incomplete multipart upload or a complete
+    /// object at the deterministic key. The caller resolves that state
+    /// through read-back convergence.
     async fn put_file(
         &self,
         identity: &ParquetObjectIdentity,
@@ -274,47 +272,62 @@ impl BifrostParquetUploader {
     ) -> Result<(), ParquetUploadError> {
         #[cfg(test)]
         if self.faults.fail_before_put.swap(false, Ordering::AcqRel) {
-            return Err(
-                opendal::Error::new(ErrorKind::Unexpected, "injected PUT absence")
-                    .set_temporary()
-                    .into(),
-            );
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "injected PUT absence".into(),
+            }
+            .into());
         }
         let mut file = File::open(source).await?;
-        let mut writer = self
-            .operator
-            .writer_with(identity.as_str())
-            .if_not_exists(true)
-            .await?;
-        loop {
-            let read = file.read(chunk).await?;
-            if read == 0 {
-                break;
-            }
-            let owned = Buffer::from(chunk[..read].to_vec());
-            #[cfg(test)]
-            self.record_backend_payload(owned.len());
-            writer.write(owned).await?;
+        let mut writer = BufWriter::with_capacity(
+            Arc::clone(&self.objects),
+            ObjectPath::from(identity.as_str()),
+            chunk.len(),
+        )
+        .with_max_concurrency(1);
+        if let Err(error) = self.write_parts(&mut file, &mut writer, chunk).await {
+            // The write already failed; an abort failure only leaves an
+            // incomplete multipart upload for the backend to expire.
+            let _ = writer.abort().await;
+            return Err(error);
         }
-        writer.close().await?;
-        #[cfg(test)]
-        self.faults
-            .successful_creates
-            .fetch_add(1, Ordering::AcqRel);
+        writer.shutdown().await?;
         #[cfg(test)]
         if self.faults.fail_after_close.swap(false, Ordering::AcqRel) {
-            return Err(
-                opendal::Error::new(ErrorKind::Unexpected, "injected ambiguous close")
-                    .set_temporary()
-                    .into(),
-            );
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "injected ambiguous close".into(),
+            }
+            .into());
         }
         Ok(())
     }
 
+    /// Copies the local file into `writer` one chunk at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParquetUploadError`] when a local read or a part write fails.
+    async fn write_parts(
+        &self,
+        file: &mut File,
+        writer: &mut BufWriter,
+        chunk: &mut [u8],
+    ) -> Result<(), ParquetUploadError> {
+        loop {
+            let read = file.read(chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            #[cfg(test)]
+            self.record_backend_payload(read);
+            writer.put(Bytes::copy_from_slice(&chunk[..read])).await?;
+        }
+    }
+
     /// Reads bounded remote ranges and validates content identity.
     ///
-    /// `OpenDAL` returns an owned range buffer rather than filling caller memory.
+    /// `object_store` returns an owned range buffer rather than filling caller memory.
     /// The caller chunk therefore provides the authoritative range bound for the
     /// one backend buffer.
     ///
@@ -335,16 +348,16 @@ impl BifrostParquetUploader {
         expected_len: u64,
         chunk: &mut [u8],
     ) -> Result<VerifiedParquetObject, ParquetUploadError> {
-        let metadata = self.operator.stat(identity.as_str()).await?;
-        if metadata.content_length() != expected_len {
+        let location = ObjectPath::from(identity.as_str());
+        let metadata = self.objects.head(&location).await?;
+        if metadata.size != expected_len {
             return Err(ParquetUploadError::ContentContradiction);
         }
-        let reader = self.operator.reader(identity.as_str()).await?;
         let mut digest = Sha256::new();
         let mut offset = 0_u64;
         while offset < expected_len {
             let end = offset.saturating_add(chunk.len() as u64).min(expected_len);
-            let remote = reader.read(offset..end).await?;
+            let remote = self.objects.get_range(&location, offset..end).await?;
             if remote.is_empty() {
                 return Err(ParquetUploadError::ContentContradiction);
             }
@@ -354,9 +367,7 @@ impl BifrostParquetUploader {
             let remote_len = remote.len();
             #[cfg(test)]
             self.record_backend_payload(remote_len);
-            for bytes in remote {
-                digest.update(&bytes);
-            }
+            digest.update(&remote);
             offset = offset
                 .checked_add(remote_len as u64)
                 .ok_or(ParquetUploadError::ContentContradiction)?;
@@ -383,18 +394,27 @@ const fn role_label(role: BifrostUploadRole) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use opendal::services::Memory;
+    use object_store::memory::InMemory;
 
     use super::*;
 
-    /// Builds the real `OpenDAL` memory backend used by uploader contract tests.
-    fn memory_operator() -> Operator {
-        Operator::new(Memory::default())
-            .expect("memory backend configuration")
-            .finish()
+    /// Builds the real `object_store` memory backend used by uploader contract tests.
+    fn memory_store() -> Arc<dyn ObjectStore> {
+        Arc::new(InMemory::new())
     }
 
-    /// Proves unsafe or normalization-dependent keys never reach `OpenDAL`.
+    /// Reads one remote object back in full for test assertions.
+    async fn remote_bytes(store: &Arc<dyn ObjectStore>, identity: &ParquetObjectIdentity) -> Bytes {
+        store
+            .get(&ObjectPath::from(identity.as_str()))
+            .await
+            .expect("remote object")
+            .bytes()
+            .await
+            .expect("remote bytes")
+    }
+
+    /// Proves unsafe or normalization-dependent keys never reach the object store.
     #[test]
     fn deterministic_identity_validation_rejects_ambiguous_keys() {
         for key in ["", "/a", "a/", "a//b", "a/./b", "a/../b", "a\\b"] {
@@ -413,12 +433,11 @@ mod tests {
         assert_eq!(role_label(BifrostUploadRole::Forge), "forge");
     }
 
-    /// Proves bounded convergence, contradiction detection, and absent delete authority.
+    /// Proves bounded convergence, overwrite of an unpublished key, and contradiction detection.
     #[tokio::test]
-    async fn shared_uploader_resolves_success_timeout_absence_and_digest_contradiction_without_remote_delete()
-     {
-        let operator = memory_operator();
-        let uploader = BifrostParquetUploader::new(operator.clone());
+    async fn shared_uploader_resolves_absence_ambiguity_overwrite_and_digest_contradiction() {
+        let store = memory_store();
+        let uploader = BifrostParquetUploader::new(Arc::clone(&store));
         let identity = ParquetObjectIdentity::new("scribe/tenant/file.parquet").expect("identity");
         let content = b"larger than the caller transfer chunk";
         let directory = tempfile::tempdir().expect("temporary stage");
@@ -460,10 +479,36 @@ mod tests {
         assert_eq!(ambiguous.sha256, expected_sha256);
         assert_eq!(ambiguous.length, content.len() as u64);
 
+        let stale_identity =
+            ParquetObjectIdentity::new("scribe/tenant/stale.parquet").expect("identity");
+        store
+            .put(
+                &ObjectPath::from(stale_identity.as_str()),
+                Bytes::from_static(b"bytes an earlier attempt left").into(),
+            )
+            .await
+            .expect("seed stale unpublished object");
+        let overwritten = uploader
+            .upload_file_verified(
+                &stale_identity,
+                &source,
+                expected_sha256,
+                content.len() as u64,
+                &mut chunk,
+                BifrostUploadRole::Scribe,
+            )
+            .await
+            .expect("an unpublished key is overwritten and verified");
+        assert_eq!(overwritten.sha256, expected_sha256);
+        assert_eq!(
+            remote_bytes(&store, &stale_identity).await.as_ref(),
+            content
+        );
+
         tokio::fs::write(&source, b"different")
             .await
             .expect("replace stage");
-        let unchanged = uploader
+        let error = uploader
             .upload_file_verified(
                 &identity,
                 &source,
@@ -473,46 +518,19 @@ mod tests {
                 BifrostUploadRole::Forge,
             )
             .await
-            .expect("existing immutable object wins over changed local source");
-        assert_eq!(unchanged.sha256, expected_sha256);
-        assert_eq!(
-            operator
-                .read(identity.as_str())
-                .await
-                .expect("original remote bytes")
-                .to_vec(),
-            content
-        );
-
-        let contradiction_identity =
-            ParquetObjectIdentity::new("scribe/tenant/contradiction.parquet").expect("identity");
-        operator
-            .write(contradiction_identity.as_str(), b"different".to_vec())
-            .await
-            .expect("seed conflicting remote object");
-        let error = uploader
-            .upload_file_verified(
-                &contradiction_identity,
-                &source,
-                expected_sha256,
-                content.len() as u64,
-                &mut chunk,
-                BifrostUploadRole::Forge,
-            )
-            .await
-            .expect_err("contradiction fails closed");
+            .expect_err("local bytes that contradict the manifest fail closed");
         assert!(matches!(error, ParquetUploadError::ContentContradiction));
     }
 
-    /// Proves one conditional creator wins and a concurrent loser verifies its bytes.
+    /// Proves concurrent uploads of the same manifest-fixed bytes both verify.
     ///
     /// # Panics
     ///
-    /// Panics if either uploader cannot converge on the same immutable remote object.
+    /// Panics if either uploader cannot converge on the same remote object.
     #[tokio::test]
-    async fn concurrent_same_key_uploads_create_once_and_verify_the_winner() {
-        let operator = memory_operator();
-        let uploader = Arc::new(BifrostParquetUploader::new(operator.clone()));
+    async fn concurrent_same_key_uploads_both_verify_the_same_bytes() {
+        let store = memory_store();
+        let uploader = BifrostParquetUploader::new(Arc::clone(&store));
         let identity =
             ParquetObjectIdentity::new("scribe/tenant/concurrent.parquet").expect("identity");
         let content = b"concurrent immutable Parquet bytes";
@@ -543,21 +561,13 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.expect("first converges").sha256, expected_sha256);
         assert_eq!(second.expect("second converges").sha256, expected_sha256);
-        assert_eq!(uploader.successful_creates(), 1);
-        assert_eq!(
-            operator
-                .read(identity.as_str())
-                .await
-                .expect("remote bytes")
-                .to_vec(),
-            content
-        );
+        assert_eq!(remote_bytes(&store, &identity).await.as_ref(), content);
     }
 
     /// Proves upload cannot allocate without caller-owned governed transfer memory.
     #[tokio::test]
     async fn caller_owned_chunk_must_be_nonempty() {
-        let uploader = BifrostParquetUploader::new(memory_operator());
+        let uploader = BifrostParquetUploader::new(memory_store());
         let identity = ParquetObjectIdentity::new("scribe/file.parquet").expect("identity");
         let error = uploader
             .upload_file_verified(
@@ -573,7 +583,7 @@ mod tests {
         assert!(matches!(error, ParquetUploadError::EmptyChunk));
     }
 
-    /// The real `OpenDAL` writer and reader never own more than one governed chunk.
+    /// The real `object_store` writer and reader never own more than one governed chunk.
     ///
     /// # Panics
     ///
@@ -581,7 +591,7 @@ mod tests {
     /// producer projection omits either simultaneously retained transfer buffer.
     #[tokio::test]
     async fn shared_uploader_bounds_backend_owned_payloads_by_governed_chunk() {
-        let uploader = BifrostParquetUploader::new(memory_operator());
+        let uploader = BifrostParquetUploader::new(memory_store());
         let identity =
             ParquetObjectIdentity::new("scribe/tenant/bounded.parquet").expect("identity");
         let content = b"backend payloads span several governed chunks";

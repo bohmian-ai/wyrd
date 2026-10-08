@@ -343,7 +343,7 @@ pub(crate) fn refuse_undeclared(declared: &[Field], schema: &Schema) -> Result<(
 }
 
 /// Report whether a declared field is or nests a Variant.
-fn holds_variant(field: &Field) -> bool {
+pub(crate) fn holds_variant(field: &Field) -> bool {
     is_variant(field)
         || match field.data_type() {
             DataType::Struct(children) => children.iter().any(|child| holds_variant(child)),

@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
-use wyrd_spec::vala::assignment_authority;
 use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
@@ -503,218 +502,6 @@ impl From<domain::PeerContext> for proto::PeerContext {
     }
 }
 
-impl TryFrom<proto::ScanLiteral> for assignment_authority::ScanLiteral {
-    type Error = PrivateConversionError;
-
-    /// Decodes one closed scalar literal from its protobuf oneof.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError::Missing`] when the oneof carries no
-    /// variant.
-    fn try_from(value: proto::ScanLiteral) -> Result<Self, Self::Error> {
-        use crate::wyrd::v1::scan_literal::Value;
-        match value
-            .value
-            .ok_or(PrivateConversionError::Missing("scan_literal.value"))?
-        {
-            Value::BoolValue(inner) => Ok(Self::Bool(inner)),
-            Value::I64Value(inner) => Ok(Self::I64(inner)),
-            Value::U64Value(inner) => Ok(Self::U64(inner)),
-            Value::F64BitsValue(inner) => Ok(Self::F64Bits(inner)),
-            Value::Utf8Value(inner) => Ok(Self::Utf8(inner)),
-            Value::TimestampMicrosValue(inner) => Ok(Self::TimestampMicros(inner)),
-            Value::BytesValue(inner) => Ok(Self::Bytes(inner)),
-        }
-    }
-}
-
-impl From<assignment_authority::ScanLiteral> for proto::ScanLiteral {
-    /// Encodes one closed scalar literal into its protobuf oneof.
-    fn from(value: assignment_authority::ScanLiteral) -> Self {
-        use crate::wyrd::v1::scan_literal::Value;
-        let value = match value {
-            assignment_authority::ScanLiteral::Bool(inner) => Value::BoolValue(inner),
-            assignment_authority::ScanLiteral::I64(inner) => Value::I64Value(inner),
-            assignment_authority::ScanLiteral::U64(inner) => Value::U64Value(inner),
-            assignment_authority::ScanLiteral::F64Bits(inner) => Value::F64BitsValue(inner),
-            assignment_authority::ScanLiteral::Utf8(inner) => Value::Utf8Value(inner),
-            assignment_authority::ScanLiteral::TimestampMicros(inner) => {
-                Value::TimestampMicrosValue(inner)
-            }
-            assignment_authority::ScanLiteral::Bytes(inner) => Value::BytesValue(inner),
-        };
-        Self { value: Some(value) }
-    }
-}
-
-impl TryFrom<proto::ScanLeafRef> for assignment_authority::ScanLeaf {
-    type Error = PrivateConversionError;
-
-    /// Decodes one predicate leaf from its protobuf oneof.
-    ///
-    /// Column names must be non-blank. A Struct or Variant path must hold at
-    /// least one element, and every element must be non-empty; elements are
-    /// otherwise whole UTF-8 names, so a whitespace key stays a valid key.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError::Missing`] when the oneof is empty and
-    /// [`PrivateConversionError::Invalid`] for a blank column, an empty path,
-    /// or an empty path element.
-    fn try_from(value: proto::ScanLeafRef) -> Result<Self, Self::Error> {
-        use crate::wyrd::v1::scan_leaf_ref::Kind;
-        /// Validates one non-empty path of non-empty elements.
-        fn path(
-            elements: Vec<String>,
-            field: &'static str,
-        ) -> Result<Vec<String>, PrivateConversionError> {
-            if elements.is_empty() || elements.iter().any(String::is_empty) {
-                return Err(PrivateConversionError::Invalid { field });
-            }
-            Ok(elements)
-        }
-        match value
-            .kind
-            .ok_or(PrivateConversionError::Missing("scan_predicate.leaf.kind"))?
-        {
-            Kind::Column(leaf) => {
-                nonempty(&leaf.column, "scan_predicate.leaf.column")?;
-                Ok(Self::Column(leaf.column))
-            }
-            Kind::StructField(leaf) => {
-                nonempty(&leaf.column, "scan_predicate.leaf.struct_field.column")?;
-                Ok(Self::StructField {
-                    column: leaf.column,
-                    fields: path(leaf.fields, "scan_predicate.leaf.struct_field.fields")?,
-                })
-            }
-            Kind::Variant(leaf) => {
-                nonempty(&leaf.column, "scan_predicate.leaf.variant.column")?;
-                Ok(Self::Variant {
-                    column: leaf.column,
-                    keys: path(leaf.keys, "scan_predicate.leaf.variant.keys")?,
-                })
-            }
-        }
-    }
-}
-
-impl From<assignment_authority::ScanLeaf> for proto::ScanLeafRef {
-    /// Encodes one predicate leaf into its protobuf oneof.
-    fn from(value: assignment_authority::ScanLeaf) -> Self {
-        use crate::wyrd::v1::scan_leaf_ref::Kind;
-        let kind = match value {
-            assignment_authority::ScanLeaf::Column(column) => {
-                Kind::Column(proto::ScanColumnRef { column })
-            }
-            assignment_authority::ScanLeaf::StructField { column, fields } => {
-                Kind::StructField(proto::ScanStructRef { column, fields })
-            }
-            assignment_authority::ScanLeaf::Variant { column, keys } => {
-                Kind::Variant(proto::ScanVariantRef { column, keys })
-            }
-        };
-        Self { kind: Some(kind) }
-    }
-}
-
-impl TryFrom<proto::ScanPredicate> for assignment_authority::ScanPredicate {
-    type Error = PrivateConversionError;
-
-    /// Decodes one closed leaf predicate, validating the operator's literal
-    /// cardinality: comparisons carry exactly one literal, `IN` at least one
-    /// literal of a single type, and null-checks none.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] when the operator is unspecified or
-    /// unknown, the leaf is missing or malformed, a literal is malformed, the
-    /// literal count violates the operator's cardinality, or an `IN` list
-    /// mixes literal types.
-    fn try_from(value: proto::ScanPredicate) -> Result<Self, Self::Error> {
-        let op = proto::ScanPredicateOp::try_from(value.op)
-            .map_err(|_| PrivateConversionError::RequiredEnum("scan_predicate.op"))?;
-        if op == proto::ScanPredicateOp::Unspecified {
-            return Err(PrivateConversionError::RequiredEnum("scan_predicate.op"));
-        }
-        let leaf: assignment_authority::ScanLeaf = value
-            .leaf
-            .ok_or(PrivateConversionError::Missing("scan_predicate.leaf"))?
-            .try_into()?;
-        let mut literals = value
-            .literals
-            .into_iter()
-            .map(assignment_authority::ScanLiteral::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        let cardinality = PrivateConversionError::Invalid {
-            field: "scan_predicate.literals",
-        };
-        match op {
-            proto::ScanPredicateOp::IsNull | proto::ScanPredicateOp::IsNotNull => {
-                if !literals.is_empty() {
-                    return Err(cardinality);
-                }
-                Ok(if op == proto::ScanPredicateOp::IsNull {
-                    Self::IsNull(leaf)
-                } else {
-                    Self::IsNotNull(leaf)
-                })
-            }
-            proto::ScanPredicateOp::In => {
-                let Some(first) = literals.first() else {
-                    return Err(cardinality);
-                };
-                let tag = first.digest_tag();
-                if literals.iter().any(|literal| literal.digest_tag() != tag) {
-                    return Err(cardinality);
-                }
-                Ok(Self::In(leaf, literals))
-            }
-            comparison => {
-                let (Some(literal), None) = (literals.pop(), literals.pop()) else {
-                    return Err(cardinality);
-                };
-                Ok(match comparison {
-                    proto::ScanPredicateOp::Eq => Self::Eq(leaf, literal),
-                    proto::ScanPredicateOp::NotEq => Self::NotEq(leaf, literal),
-                    proto::ScanPredicateOp::Lt => Self::Lt(leaf, literal),
-                    proto::ScanPredicateOp::LtEq => Self::LtEq(leaf, literal),
-                    proto::ScanPredicateOp::Gt => Self::Gt(leaf, literal),
-                    proto::ScanPredicateOp::GtEq => Self::GtEq(leaf, literal),
-                    proto::ScanPredicateOp::Unspecified
-                    | proto::ScanPredicateOp::In
-                    | proto::ScanPredicateOp::IsNull
-                    | proto::ScanPredicateOp::IsNotNull => unreachable!(
-                        "comparison arm excludes Unspecified/In/IsNull/IsNotNull by construction"
-                    ),
-                })
-            }
-        }
-    }
-}
-
-impl From<assignment_authority::ScanPredicate> for proto::ScanPredicate {
-    /// Encodes one closed leaf predicate into its protobuf op/leaf/literals
-    /// shape, preserving `IN` literal order.
-    fn from(value: assignment_authority::ScanPredicate) -> Self {
-        use assignment_authority::ScanPredicate as Domain;
-        let (op, leaf, literals) = match value {
-            Domain::Eq(leaf, literal) => (proto::ScanPredicateOp::Eq, leaf, vec![literal]),
-            Domain::NotEq(leaf, literal) => (proto::ScanPredicateOp::NotEq, leaf, vec![literal]),
-            Domain::Lt(leaf, literal) => (proto::ScanPredicateOp::Lt, leaf, vec![literal]),
-            Domain::LtEq(leaf, literal) => (proto::ScanPredicateOp::LtEq, leaf, vec![literal]),
-            Domain::Gt(leaf, literal) => (proto::ScanPredicateOp::Gt, leaf, vec![literal]),
-            Domain::GtEq(leaf, literal) => (proto::ScanPredicateOp::GtEq, leaf, vec![literal]),
-            Domain::In(leaf, literals) => (proto::ScanPredicateOp::In, leaf, literals),
-            Domain::IsNull(leaf) => (proto::ScanPredicateOp::IsNull, leaf, Vec::new()),
-            Domain::IsNotNull(leaf) => (proto::ScanPredicateOp::IsNotNull, leaf, Vec::new()),
-        };
-        Self {
-            op: op as i32,
-            leaf: Some(leaf.into()),
-            literals: literals.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
 impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
     type Error = PrivateConversionError;
 
@@ -728,41 +515,24 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
     /// unprojected (tenant-dropping) closure.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] when identity, binding, persisted
-    /// assignment, schema fingerprint, or `required_columns` is absent, or a
-    /// closed predicate is malformed.
+    /// Returns [`PrivateConversionError`] when identity, binding, schema
+    /// fingerprint, or `required_columns` is absent.
     fn try_from(value: proto::FollowerScanAssignment) -> Result<Self, Self::Error> {
         nonempty(&value.scan_id, "scan_id")?;
         nonempty(&value.schema_fingerprint, "schema_fingerprint")?;
         nonempty_vec(&value.required_columns, "required_columns")?;
-        let persisted = value
-            .persisted
-            .ok_or(PrivateConversionError::Missing("persisted"))?;
-        let predicates = value
-            .predicates
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             scan_id: value.scan_id,
             binding: value
                 .binding
                 .ok_or(PrivateConversionError::Missing("binding"))?
                 .try_into()?,
-            persisted: domain::PersistedFileAssignment {
-                files: persisted
-                    .descriptors
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<Vec<_>, _>>()?,
-            },
             scribe_provider_cut: value
                 .scribe_provider_cut
                 .map(TryInto::try_into)
                 .transpose()?,
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
-            predicates,
         })
     }
 }
@@ -773,107 +543,9 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
         Self {
             scan_id: value.scan_id,
             binding: Some(value.binding.into()),
-            persisted: Some(proto::PersistedFileAssignment {
-                descriptors: value.persisted.files.into_iter().map(Into::into).collect(),
-            }),
             scribe_provider_cut: value.scribe_provider_cut.map(Into::into),
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
-            predicates: value.predicates.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl TryFrom<proto::PersistedFileDescriptor> for domain::PersistedFileDescriptor {
-    type Error = PrivateConversionError;
-
-    /// Decodes one signed persisted-file descriptor.
-    ///
-    /// The wire `source` oneof is the only authority for which variant this is:
-    /// the source decides which reader and which cache identity the object
-    /// gets, so it is never inferred from the path or from a `scan_id` suffix.
-    ///
-    /// Every shape rule is enforced here rather than at the point of use: a
-    /// descriptor that survives this decode is one the follower may resolve
-    /// without consulting the catalog again, so a malformed one must never get
-    /// that far. A zero-row file is well-formed — an empty object still
-    /// participates in residual execution.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError::Missing`] when the source oneof is
-    /// absent, [`PrivateConversionError::InvalidUuid`] when the file-list
-    /// identity is not exactly 16 bytes,
-    /// [`PrivateConversionError::Invalid`] with field `hot_object_checksum`
-    /// when the checksum does not decode to exactly 32 bytes, and
-    /// [`PrivateConversionError::Invalid`] with field
-    /// `persisted_file_descriptor` when the decoded descriptor has an empty
-    /// path, a zero size, a nonpositive pinned snapshot, or an event-time pair
-    /// that is half-present or reversed.
-    fn try_from(value: proto::PersistedFileDescriptor) -> Result<Self, Self::Error> {
-        use proto::persisted_file_descriptor::Source;
-        let descriptor = match value
-            .source
-            .ok_or(PrivateConversionError::Missing("persisted_file_source"))?
-        {
-            Source::Hot(hot) => Self::Hot(domain::HotFileDescriptor {
-                path: hot.path,
-                size_bytes: hot.size_bytes,
-                row_count: hot.row_count,
-                file_list_id: uuid::Uuid::from_slice(&hot.file_list_id)
-                    .map_err(|_| PrivateConversionError::InvalidUuid("hot_file_list_id"))?,
-                sha256: <[u8; 32]>::try_from(hot.sha256.as_slice()).map_err(|_| {
-                    PrivateConversionError::Invalid {
-                        field: "hot_object_checksum",
-                    }
-                })?,
-                min_event_time_micros: hot.min_event_time_micros,
-                max_event_time_micros: hot.max_event_time_micros,
-            }),
-            Source::Iceberg(iceberg) => Self::Iceberg(domain::IcebergFileDescriptor {
-                path: iceberg.path,
-                size_bytes: iceberg.size_bytes,
-                row_count: iceberg.row_count,
-                snapshot_id: iceberg.snapshot_id,
-                min_event_time_micros: iceberg.min_event_time_micros,
-                max_event_time_micros: iceberg.max_event_time_micros,
-            }),
-        };
-        if !descriptor.is_valid() {
-            return Err(PrivateConversionError::Invalid {
-                field: "persisted_file_descriptor",
-            });
-        }
-        Ok(descriptor)
-    }
-}
-
-impl From<domain::PersistedFileDescriptor> for proto::PersistedFileDescriptor {
-    /// Encodes one signed persisted-file descriptor onto the private wire.
-    fn from(value: domain::PersistedFileDescriptor) -> Self {
-        use proto::persisted_file_descriptor::Source;
-        let source = match value {
-            domain::PersistedFileDescriptor::Hot(hot) => Source::Hot(proto::HotFileDescriptor {
-                path: hot.path,
-                size_bytes: hot.size_bytes,
-                row_count: hot.row_count,
-                file_list_id: hot.file_list_id.as_bytes().to_vec(),
-                sha256: hot.sha256.to_vec(),
-                min_event_time_micros: hot.min_event_time_micros,
-                max_event_time_micros: hot.max_event_time_micros,
-            }),
-            domain::PersistedFileDescriptor::Iceberg(iceberg) => {
-                Source::Iceberg(proto::IcebergFileDescriptor {
-                    path: iceberg.path,
-                    size_bytes: iceberg.size_bytes,
-                    row_count: iceberg.row_count,
-                    snapshot_id: iceberg.snapshot_id,
-                    min_event_time_micros: iceberg.min_event_time_micros,
-                    max_event_time_micros: iceberg.max_event_time_micros,
-                })
-            }
-        };
-        Self {
-            source: Some(source),
         }
     }
 }
@@ -1206,142 +878,6 @@ fn bounded(
 mod tests {
     use super::*;
 
-    /// One well-formed hot descriptor for assignment round-trip fixtures.
-    fn test_hot_descriptor() -> domain::PersistedFileDescriptor {
-        domain::PersistedFileDescriptor::Hot(domain::HotFileDescriptor {
-            path: "s3://bucket/logs/a.parquet".to_owned(),
-            size_bytes: 4_194_304,
-            row_count: 128,
-            file_list_id: uuid::Uuid::parse_str("0f0e0d0c-0b0a-0908-0706-050403020100")
-                .expect("fixture file-list identity parses"),
-            sha256: [0x11; 32],
-            min_event_time_micros: Some(1_787_493_600_000_000),
-            max_event_time_micros: Some(1_787_497_200_000_000),
-        })
-    }
-
-    /// Builds one otherwise valid wire Iceberg descriptor for shape rejection.
-    fn wire_iceberg(
-        path: &str,
-        size_bytes: u64,
-        snapshot_id: i64,
-        bounds: (Option<i64>, Option<i64>),
-    ) -> proto::PersistedFileDescriptor {
-        proto::PersistedFileDescriptor {
-            source: Some(proto::persisted_file_descriptor::Source::Iceberg(
-                proto::IcebergFileDescriptor {
-                    path: path.to_owned(),
-                    size_bytes,
-                    row_count: 128,
-                    snapshot_id,
-                    min_event_time_micros: bounds.0,
-                    max_event_time_micros: bounds.1,
-                },
-            )),
-        }
-    }
-
-    /// A follower trusts the descriptor instead of re-querying the catalog, so
-    /// the private wire must round-trip every field of both variants exactly and
-    /// refuse every malformed shape rather than defaulting it.
-    ///
-    /// The rejections matter more than the round-trip: a defaulted source would
-    /// silently reclassify which reader and cache identity an object gets, and a
-    /// descriptor that passed shape validation with a zero size or a
-    /// half-present interval would reach the follower's resolution path.
-    #[test]
-    fn follower_assignment_descriptor_round_trips_and_rejects_malformed_variants() {
-        for descriptor in [
-            test_hot_descriptor(),
-            domain::PersistedFileDescriptor::Iceberg(domain::IcebergFileDescriptor {
-                path: "s3://bucket/logs/published.parquet".to_owned(),
-                size_bytes: 8_388_608,
-                row_count: 0,
-                snapshot_id: 8_675_309,
-                min_event_time_micros: None,
-                max_event_time_micros: None,
-            }),
-        ] {
-            let encoded = proto::PersistedFileDescriptor::from(descriptor.clone());
-            let decoded = domain::PersistedFileDescriptor::try_from(encoded)
-                .expect("a well-formed descriptor round-trips");
-            assert_eq!(
-                decoded, descriptor,
-                "a zero-row file is valid and must survive the round trip"
-            );
-        }
-
-        // An absent source oneof is rejected, never defaulted to a variant.
-        assert!(matches!(
-            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
-                source: None
-            }),
-            Err(PrivateConversionError::Missing("persisted_file_source"))
-        ));
-
-        // A file-list identity that is not 16 bytes is rejected.
-        assert!(matches!(
-            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
-                source: Some(proto::persisted_file_descriptor::Source::Hot(
-                    proto::HotFileDescriptor {
-                        path: "s3://bucket/logs/a.parquet".to_owned(),
-                        size_bytes: 1,
-                        row_count: 1,
-                        file_list_id: vec![0u8; 4],
-                        sha256: vec![0x11; 32],
-                        min_event_time_micros: None,
-                        max_event_time_micros: None,
-                    }
-                )),
-            }),
-            Err(PrivateConversionError::InvalidUuid("hot_file_list_id"))
-        ));
-
-        // A checksum that does not decode to exactly 32 bytes is a different
-        // identity domain, not a truncation to tolerate.
-        assert!(matches!(
-            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
-                source: Some(proto::persisted_file_descriptor::Source::Hot(
-                    proto::HotFileDescriptor {
-                        path: "s3://bucket/logs/a.parquet".to_owned(),
-                        size_bytes: 1,
-                        row_count: 1,
-                        file_list_id: uuid::Uuid::from_u128(7).as_bytes().to_vec(),
-                        sha256: vec![0x11; 16],
-                        min_event_time_micros: None,
-                        max_event_time_micros: None,
-                    }
-                )),
-            }),
-            Err(PrivateConversionError::Invalid {
-                field: "hot_object_checksum"
-            })
-        ));
-
-        // Shape violations the digest cannot catch: an empty path, a zero size,
-        // a nonpositive pinned snapshot, and a half-present or reversed interval.
-        for malformed in [
-            wire_iceberg("", 1, 1, (None, None)),
-            wire_iceberg("s3://bucket/logs/a.parquet", 0, 1, (None, None)),
-            wire_iceberg("s3://bucket/logs/a.parquet", 1, 0, (None, None)),
-            wire_iceberg("s3://bucket/logs/a.parquet", 1, -1, (None, None)),
-            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (Some(10), None)),
-            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (None, Some(10))),
-            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (Some(20), Some(10))),
-        ] {
-            assert!(
-                matches!(
-                    domain::PersistedFileDescriptor::try_from(malformed.clone()),
-                    Err(PrivateConversionError::Invalid {
-                        field: "persisted_file_descriptor"
-                    })
-                ),
-                "{malformed:?} must be refused"
-            );
-        }
-    }
-
-    /// A reservation that names no graph fails before reaching a follower.
     #[test]
     fn reserve_slots_rejects_missing_graph() {
         let request = proto::ReserveNodeSlotsRequest {
@@ -1697,52 +1233,12 @@ mod tests {
     /// v2 wire, or a malformed closed-shape predicate is accepted.
     #[test]
     fn follower_assignment_v2_contract() {
-        let predicates = vec![
-            assignment_authority::ScanPredicate::Eq(
-                assignment_authority::ScanLeaf::Column("service_name".into()),
-                assignment_authority::ScanLiteral::Utf8("api".into()),
-            ),
-            assignment_authority::ScanPredicate::NotEq(
-                assignment_authority::ScanLeaf::Column("status".into()),
-                assignment_authority::ScanLiteral::I64(-1),
-            ),
-            assignment_authority::ScanPredicate::Lt(
-                assignment_authority::ScanLeaf::Column("duration_ms".into()),
-                assignment_authority::ScanLiteral::U64(500),
-            ),
-            assignment_authority::ScanPredicate::LtEq(
-                assignment_authority::ScanLeaf::Column("score".into()),
-                assignment_authority::ScanLiteral::F64Bits(1.5_f64.to_bits()),
-            ),
-            assignment_authority::ScanPredicate::Gt(
-                assignment_authority::ScanLeaf::Column("wyrd_event_time".into()),
-                assignment_authority::ScanLiteral::TimestampMicros(1_000_000),
-            ),
-            assignment_authority::ScanPredicate::GtEq(
-                assignment_authority::ScanLeaf::Column("active".into()),
-                assignment_authority::ScanLiteral::Bool(true),
-            ),
-            assignment_authority::ScanPredicate::Eq(
-                assignment_authority::ScanLeaf::Column("trace_id".into()),
-                assignment_authority::ScanLiteral::Bytes(vec![0xff, 0x00, 0x7f]),
-            ),
-            assignment_authority::ScanPredicate::IsNull(assignment_authority::ScanLeaf::Column(
-                "optional_field".into(),
-            )),
-            assignment_authority::ScanPredicate::IsNotNull(assignment_authority::ScanLeaf::Column(
-                "required_field".into(),
-            )),
-        ];
-
         let expected = domain::FollowerScanAssignment {
             scan_id: "scan-1".into(),
             binding: domain::TenantTableBinding {
                 tenant_id: wyrd_spec::DataTenantId::new_v7(),
                 namespace: "logs".into(),
                 table: "records".into(),
-            },
-            persisted: domain::PersistedFileAssignment {
-                files: vec![test_hot_descriptor()],
             },
             scribe_provider_cut: None,
             schema_fingerprint: "0".repeat(64),
@@ -1751,7 +1247,6 @@ mod tests {
                 "wyrd_event_time".into(),
                 "data_tenant_id".into(),
             ],
-            predicates,
         };
 
         let actual = domain::FollowerScanAssignment::try_from(proto::FollowerScanAssignment::from(
@@ -1759,210 +1254,6 @@ mod tests {
         ))
         .expect("valid v2 assignment round-trips");
         assert_eq!(actual, expected);
-    }
-
-    /// Every leaf kind and operator round-trips through the in-place protobuf
-    /// predicate, and every malformed tag, leaf, path, cardinality, and mixed
-    /// `IN` list is refused at this sole wire/domain boundary.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a valid predicate fails to round-trip or a malformed one is
-    /// accepted.
-    #[test]
-    fn leaf_predicates_round_trip_and_reject_malformed() {
-        use crate::wyrd::v1::scan_leaf_ref::Kind;
-        use assignment_authority::{ScanLiteral, ScanPredicate};
-        let names = |values: &[&str]| values.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
-        let leaves = [
-            assignment_authority::ScanLeaf::Column("service_name".into()),
-            assignment_authority::ScanLeaf::StructField {
-                column: "drift_report".into(),
-                fields: names(&["method"]),
-            },
-            assignment_authority::ScanLeaf::Variant {
-                column: "attributes".into(),
-                keys: names(&["http", "route"]),
-            },
-        ];
-        let utf8 = |value: &str| ScanLiteral::Utf8(value.into());
-        for leaf in leaves {
-            let predicates = [
-                ScanPredicate::Eq(leaf.clone(), utf8("a")),
-                ScanPredicate::NotEq(leaf.clone(), ScanLiteral::I64(-1)),
-                ScanPredicate::Lt(leaf.clone(), ScanLiteral::U64(5)),
-                ScanPredicate::LtEq(leaf.clone(), ScanLiteral::F64Bits(1.5_f64.to_bits())),
-                ScanPredicate::Gt(leaf.clone(), ScanLiteral::TimestampMicros(1)),
-                ScanPredicate::GtEq(leaf.clone(), ScanLiteral::Bool(true)),
-                ScanPredicate::In(leaf.clone(), vec![utf8("b"), utf8("a")]),
-                ScanPredicate::In(leaf.clone(), vec![ScanLiteral::Bytes(vec![0xff])]),
-                ScanPredicate::IsNull(leaf.clone()),
-                ScanPredicate::IsNotNull(leaf.clone()),
-            ];
-            for predicate in predicates {
-                let wire = proto::ScanPredicate::from(predicate.clone());
-                assert_eq!(ScanPredicate::try_from(wire), Ok(predicate));
-            }
-        }
-
-        let literal = |value: &str| proto::ScanLiteral::from(utf8(value));
-        let column = |name: &str| proto::ScanLeafRef {
-            kind: Some(Kind::Column(proto::ScanColumnRef {
-                column: name.into(),
-            })),
-        };
-        let predicate =
-            |op: proto::ScanPredicateOp,
-             leaf: Option<proto::ScanLeafRef>,
-             literals: Vec<proto::ScanLiteral>| proto::ScanPredicate {
-                op: op as i32,
-                leaf,
-                literals,
-            };
-        use proto::ScanPredicateOp as Op;
-        let cases = [
-            (
-                predicate(Op::Unspecified, Some(column("x")), vec![literal("a")]),
-                PrivateConversionError::RequiredEnum("scan_predicate.op"),
-            ),
-            (
-                proto::ScanPredicate {
-                    op: 99,
-                    leaf: Some(column("x")),
-                    literals: vec![literal("a")],
-                },
-                PrivateConversionError::RequiredEnum("scan_predicate.op"),
-            ),
-            (
-                predicate(Op::Eq, None, vec![literal("a")]),
-                PrivateConversionError::Missing("scan_predicate.leaf"),
-            ),
-            (
-                predicate(
-                    Op::Eq,
-                    Some(proto::ScanLeafRef { kind: None }),
-                    vec![literal("a")],
-                ),
-                PrivateConversionError::Missing("scan_predicate.leaf.kind"),
-            ),
-            (
-                predicate(Op::Eq, Some(column(" ")), vec![literal("a")]),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.leaf.column",
-                },
-            ),
-            (
-                predicate(
-                    Op::Eq,
-                    Some(proto::ScanLeafRef {
-                        kind: Some(Kind::StructField(proto::ScanStructRef {
-                            column: String::new(),
-                            fields: names(&["a"]),
-                        })),
-                    }),
-                    vec![literal("a")],
-                ),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.leaf.struct_field.column",
-                },
-            ),
-            (
-                predicate(
-                    Op::Eq,
-                    Some(proto::ScanLeafRef {
-                        kind: Some(Kind::StructField(proto::ScanStructRef {
-                            column: "s".into(),
-                            fields: Vec::new(),
-                        })),
-                    }),
-                    vec![literal("a")],
-                ),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.leaf.struct_field.fields",
-                },
-            ),
-            (
-                predicate(
-                    Op::Eq,
-                    Some(proto::ScanLeafRef {
-                        kind: Some(Kind::Variant(proto::ScanVariantRef {
-                            column: "v".into(),
-                            keys: Vec::new(),
-                        })),
-                    }),
-                    vec![literal("a")],
-                ),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.leaf.variant.keys",
-                },
-            ),
-            (
-                predicate(
-                    Op::Eq,
-                    Some(proto::ScanLeafRef {
-                        kind: Some(Kind::Variant(proto::ScanVariantRef {
-                            column: "v".into(),
-                            keys: names(&["a", ""]),
-                        })),
-                    }),
-                    vec![literal("a")],
-                ),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.leaf.variant.keys",
-                },
-            ),
-            (
-                predicate(Op::Eq, Some(column("x")), Vec::new()),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(Op::Gt, Some(column("x")), vec![literal("a"), literal("b")]),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(Op::IsNull, Some(column("x")), vec![literal("a")]),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(Op::IsNotNull, Some(column("x")), vec![literal("a")]),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(Op::In, Some(column("x")), Vec::new()),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(
-                    Op::In,
-                    Some(column("x")),
-                    vec![literal("a"), proto::ScanLiteral::from(ScanLiteral::I64(1))],
-                ),
-                PrivateConversionError::Invalid {
-                    field: "scan_predicate.literals",
-                },
-            ),
-            (
-                predicate(
-                    Op::In,
-                    Some(column("x")),
-                    vec![proto::ScanLiteral { value: None }],
-                ),
-                PrivateConversionError::Missing("scan_literal.value"),
-            ),
-        ];
-        for (wire, expected) in cases {
-            assert_eq!(ScanPredicate::try_from(wire), Err(expected));
-        }
     }
 
     /// A v1-shaped peer that omits `required_columns` is rejected outright:
@@ -1979,13 +1270,9 @@ mod tests {
                 namespace: "logs".into(),
                 table: "records".into(),
             },
-            persisted: domain::PersistedFileAssignment {
-                files: vec![test_hot_descriptor()],
-            },
             scribe_provider_cut: None,
             schema_fingerprint: "0".repeat(64),
             required_columns: vec!["data_tenant_id".into()],
-            predicates: Vec::new(),
         };
         let mut v1_shaped = proto::FollowerScanAssignment::from(expected);
         v1_shaped.required_columns = Vec::new();

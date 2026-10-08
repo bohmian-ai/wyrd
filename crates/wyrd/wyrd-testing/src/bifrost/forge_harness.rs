@@ -8,18 +8,17 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
+use bytes::Bytes;
 use iceberg::table::Table;
 use iceberg::{Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent};
 use iceberg::{Error as IcebergError, ErrorKind as IcebergErrorKind};
-use opendal::{
-    Buffer, Entry, Error as ObjectStoreError, ErrorKind as ObjectStoreErrorKind, Metadata, Operator,
-};
+use object_store::ObjectMeta;
 use vala_bifrost_redux::catalog::{
-    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding, warehouse_uri,
 };
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeSchedulerTrigger,
-    ForgeWorkerCompletionObserver,
+    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeObjects,
+    ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
 };
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
@@ -29,6 +28,7 @@ use vala_bifrost_redux::resources::{
     SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::{NativeIngressTestFrame, ScribeImpl};
+use vala_bifrost_redux::storage::BifrostStorage;
 use wyrd_spec::DataTenantId;
 
 use super::super::WyrdTestServer;
@@ -79,8 +79,8 @@ pub struct ForgeFixture {
     pub operator_pool: vala_sql::OperatorPool,
     /// Iceberg catalog retained for fault-injection wrappers.
     pub catalog: Arc<dyn Catalog>,
-    /// Staging operator retained for fixture object writes.
-    pub staging: Arc<opendal::Operator>,
+    /// Bifrost object storage retained for fixture object reads and writes.
+    pub storage: Arc<BifrostStorage>,
     /// Forge object-store seam retained for scoped fault injection.
     pub object_store: Arc<dyn ForgeObjectStore>,
     /// Forge-owned spill root kept alive for the fixture lifetime.
@@ -118,8 +118,8 @@ struct ForgeFixtureResources {
     operator_pool: vala_sql::OperatorPool,
     /// Catalog owner used to create the physical test table.
     bifrost_catalog: Arc<BifrostCatalog>,
-    /// Real object store shared by setup and Forge.
-    staging: Arc<Operator>,
+    /// Real Bifrost object storage shared by setup and Forge.
+    storage: Arc<BifrostStorage>,
     /// Forge cleanup/rewrite object-store seam.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Keep the Forge spill root alive for the complete fixture lifetime.
@@ -793,22 +793,14 @@ mod tests {
 /// one selected delete, without changing production Forge behavior.
 #[derive(Debug)]
 pub struct ForgeObjectStoreControl {
-    /// Real production-shaped operator used for every delegated operation.
-    inner: Arc<Operator>,
+    /// Production Forge object seam every operation delegates to.
+    inner: ForgeObjects,
     /// Counts every wrapped object-store call made after fixture construction.
     object_io_calls: AtomicUsize,
     /// Arms one injected failure before the next delegated read.
     fail_next_read: AtomicBool,
     /// Counts delegated reads reached since the read fault was armed.
     read_calls: AtomicUsize,
-    /// One-shot arm flag for the next delegated object listing.
-    pause_next_list: AtomicBool,
-    /// Signals that the armed listing has returned from the real operator.
-    list_returned: AtomicBool,
-    /// Wakes tasks waiting for the armed listing.
-    list_ready: tokio::sync::Notify,
-    /// Releases the armed listing after its deterministic interleaving.
-    list_release: tokio::sync::Notify,
     /// Counts delegated delete attempts.
     delete_count: AtomicUsize,
     /// Exact paths supplied to delegated deletes in call order.
@@ -857,30 +849,23 @@ impl ForgeObjectStoreControl {
     ///
     /// # Errors
     ///
-    /// Returns an OpenDAL `Unexpected` error exactly once per arming.
-    fn take_read_failure(&self) -> opendal::Result<()> {
+    /// Returns an injected generic object-store error exactly once per arming.
+    fn take_read_failure(&self) -> object_store::Result<()> {
         self.read_calls.fetch_add(1, Ordering::AcqRel);
         if self.fail_next_read.swap(false, Ordering::AcqRel) {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "injected Forge object-store read failure",
-            ));
+            return Err(injected("injected Forge object-store read failure"));
         }
         Ok(())
     }
 
-    /// Wrap the real staging operator used by a Forge context.
+    /// Wrap the production Forge object seam over the server's Bifrost storage.
     #[must_use]
-    pub fn new(inner: Arc<Operator>) -> Arc<Self> {
+    pub fn new(storage: &BifrostStorage) -> Arc<Self> {
         Arc::new(Self {
-            inner,
+            inner: ForgeObjects::new(storage),
             object_io_calls: AtomicUsize::new(0),
             fail_next_read: AtomicBool::new(false),
             read_calls: AtomicUsize::new(0),
-            pause_next_list: AtomicBool::new(false),
-            list_returned: AtomicBool::new(false),
-            list_ready: tokio::sync::Notify::new(),
-            list_release: tokio::sync::Notify::new(),
             delete_count: AtomicUsize::new(0),
             delete_paths: Mutex::new(Vec::new()),
             fail_delete_at: AtomicUsize::new(0),
@@ -900,24 +885,6 @@ impl ForgeObjectStoreControl {
     #[must_use]
     pub fn object_io_calls(&self) -> usize {
         self.object_io_calls.load(Ordering::Acquire)
-    }
-
-    /// Pause one list after the real object-store response is available.
-    pub fn pause_next_list(&self) {
-        self.list_returned.store(false, Ordering::Release);
-        self.pause_next_list.store(true, Ordering::Release);
-    }
-
-    /// Wait until the paused list has completed against the real store.
-    pub async fn wait_for_list(&self) {
-        while !self.list_returned.load(Ordering::Acquire) {
-            self.list_ready.notified().await;
-        }
-    }
-
-    /// Resume the paused list call.
-    pub fn release_list(&self) {
-        self.list_release.notify_waiters();
     }
 
     /// Fail the selected one-based delete call with a transient object error.
@@ -993,44 +960,23 @@ impl ForgeObjectStoreControl {
 
 #[async_trait]
 impl ForgeObjectStore for ForgeObjectStoreControl {
-    /// Read exactly the requested byte range through OpenDAL's native reader.
-    ///
-    /// Forge uses bounded reads for Parquet metadata and row-group admission;
-    /// fetching the complete object here would bypass that memory guardrail.
-    ///
-    /// # Errors
-    ///
-    /// Returns the OpenDAL error when the reader cannot open or fetch the
-    /// requested range.
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
-        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
-        self.take_read_failure()?;
-        self.inner.reader(path).await?.read(range).await
-    }
-
-    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+    async fn read(&self, path: &str) -> object_store::Result<Bytes> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         self.take_read_failure()?;
         self.inner.read(path).await
     }
 
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+    fn list_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
-        let entries = self.inner.list_with(prefix).recursive(true).await?;
-        if self.pause_next_list.swap(false, Ordering::AcqRel) {
-            self.list_returned.store(true, Ordering::Release);
-            self.list_ready.notify_waiters();
-            self.list_release.notified().await;
-        }
-        Ok(entries)
+        self.inner.list_pages(prefix, start_after)
     }
 
-    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+    async fn stat(&self, path: &str) -> object_store::Result<ObjectMeta> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.stat(path).await
     }
 
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
+    async fn delete(&self, path: &str) -> object_store::Result<()> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         let call = self.delete_count.fetch_add(1, Ordering::AcqRel) + 1;
         self.delete_paths
@@ -1038,20 +984,14 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
             .expect("Forge delete-path lock must not be poisoned")
             .push(path.to_owned());
         if call == self.fail_delete_at.load(Ordering::Acquire) {
-            return Err(ObjectStoreError::new(
-                ObjectStoreErrorKind::Unexpected,
-                "injected Forge delete failure",
-            ));
+            return Err(injected("injected Forge delete failure"));
         }
         if self.pause_next_delete.swap(false, Ordering::AcqRel) {
             self.delete_reached.store(true, Ordering::Release);
             self.delete_ready.notify_waiters();
             self.delete_release.notified().await;
             if self.reject_delete.load(Ordering::Acquire) {
-                return Err(ObjectStoreError::new(
-                    ObjectStoreErrorKind::Unexpected,
-                    "injected stale Forge lease before delete",
-                ));
+                return Err(injected("injected stale Forge lease before delete"));
             }
         }
         self.inner.delete(path).await?;
@@ -1392,7 +1332,7 @@ impl ForgeFixture {
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
-                staging: Arc::clone(&self.staging),
+                warehouse: warehouse_uri(self.storage.backend()),
                 object_store,
                 hints: inbox,
                 config,
@@ -1772,6 +1712,12 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     schema_variant: bool,
     partition_days: &[chrono::NaiveDate],
 ) -> ForgeFixture {
+    let storage = Arc::clone(
+        server
+            .state()
+            .bifrost_storage()
+            .expect("production server has Bifrost storage"),
+    );
     let resources = ForgeFixtureResources {
         forge: server
             .state()
@@ -1790,10 +1736,8 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
                 .bifrost_catalog()
                 .expect("production server has Bifrost catalog"),
         ),
-        staging: Arc::new(server.state().storage.operator().clone()),
-        object_store: ForgeObjectStoreControl::new(Arc::new(
-            server.state().storage.operator().clone(),
-        )),
+        storage: Arc::clone(&storage),
+        object_store: ForgeObjectStoreControl::new(&storage),
         spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
         memory: server
             .state()
@@ -1925,7 +1869,7 @@ async fn seed_forge_group_with_scribe(
         vala: resources.vala,
         operator_pool: resources.operator_pool,
         catalog,
-        staging: resources.staging,
+        storage: resources.storage,
         object_store: resources.object_store,
         spill_root: resources.spill_root,
         memory: resources.memory,
@@ -1934,5 +1878,13 @@ async fn seed_forge_group_with_scribe(
         tenant,
         scribe: Some(scribe),
         bifrost_catalog: resources.bifrost_catalog,
+    }
+}
+
+/// Build the generic object-store error a scoped fault injection returns.
+fn injected(message: &'static str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "forge-fixture",
+        source: message.into(),
     }
 }

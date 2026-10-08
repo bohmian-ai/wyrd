@@ -9,11 +9,19 @@
 
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use futures_util::future::ready;
+use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
-use opendal::{Buffer, Entry, Metadata};
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt as _};
 use wyrd_spec::DataTenantId;
+use wyrd_storage::BackendConfig;
+
+use crate::storage::BifrostStorage;
 
 use super::Forge;
 use super::error::ForgeError;
@@ -211,134 +219,169 @@ impl ForgeConfig {
     }
 }
 
+/// Number of listing entries one orphan-GC page holds.
+///
+/// Bounds how much of a listing materializes before orphan GC checks its page
+/// cap and run budget at a page boundary. Sized so a steady-state prefix scans
+/// in a handful of pages while a pathological prefix still yields promptly.
+const FORGE_OBJECT_LIST_PAGE_ENTRIES: usize = 1_000;
+
 /// A stream of object-listing pages under one prefix.
 ///
-/// Each item is one bounded page of entries or the backend error that ended
-/// the walk. The stream owns its listing state, so it is `'static` and does not
-/// borrow the object store that produced it. Orphan GC pulls pages one at a
+/// Each item is one bounded page of objects in ascending key order, or the
+/// backend error that ended the walk. The stream owns its listing state, so it
+/// is `'static` and does not borrow the store. Orphan GC pulls pages one at a
 /// time so it can stop at a page boundary once its page cap or run budget is
 /// reached without having materialized the whole prefix.
-pub type ForgeObjectPages = BoxStream<'static, opendal::Result<Vec<Entry>>>;
+pub type ForgeObjectPages = BoxStream<'static, object_store::Result<Vec<ObjectMeta>>>;
 
 /// The object-store operations Forge performs after Scribe has staged a file.
 ///
-/// Keeping this capability narrow lets production use the real `OpenDAL`
-/// operator while integration tests wrap the same seam with deterministic
-/// barriers and failures. Fixture code still uses [`ForgeCore::staging`]
-/// directly for producer writes.
+/// Production uses [`ForgeObjects`] over the node's Bifrost object store.
+/// The trait exists so integration tests can wrap that same implementation
+/// with deterministic barriers and failures.
 #[async_trait]
 pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
-    /// Opens the bounded streaming writer used for one rewritten output.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend error when multipart or streaming upload cannot start.
-    async fn output_writer(
-        &self,
-        operator: &opendal::Operator,
-        path: &str,
-        chunk_bytes: usize,
-    ) -> opendal::Result<opendal::Writer> {
-        operator.writer_with(path).chunk(chunk_bytes).await
-    }
-
-    /// Writes one already-bounded chunk to an open rewrite output.
-    ///
-    /// This narrow continuation of [`Self::output_writer`] lets integration
-    /// stores observe and fail individual chunks without replacing production
-    /// upload behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend error when the chunk cannot be accepted.
-    async fn write_output_chunk(
-        &self,
-        writer: &mut opendal::Writer,
-        chunk: bytes::Bytes,
-    ) -> opendal::Result<()> {
-        writer.write(chunk).await
-    }
-
-    /// Aborts an incomplete rewrite output after a chunk failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend error when multipart cleanup cannot be confirmed.
-    async fn abort_output_writer(&self, writer: &mut opendal::Writer) -> opendal::Result<()> {
-        writer.abort().await
-    }
-
     /// Read one staged or Iceberg-owned object.
     ///
     /// # Errors
     ///
     /// Returns the backend error when the object cannot be read completely.
-    async fn read(&self, path: &str) -> opendal::Result<Buffer>;
+    async fn read(&self, path: &str) -> object_store::Result<Bytes>;
 
-    /// Read one bounded byte range from a staged object.
+    /// List objects below a table-owned prefix as ascending, bounded pages.
     ///
-    /// Implementations must issue a native ranged request. Falling back to a
-    /// whole-object read would defeat Parquet footer/row-group admission and
-    /// can exhaust the rewrite memory budget before `DataFusion` sees a batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend read error when the object cannot be fetched.
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer>;
-
-    /// List all objects below a table-owned prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend error when recursive listing cannot complete.
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>>;
-
-    /// List objects below a table-owned prefix as a stream of bounded pages.
-    ///
-    /// This is the listing path orphan GC uses so it can consume the prefix
-    /// incrementally and stop at a page boundary once its per-run page cap or
-    /// time budget is reached. `start_after` resumes the walk strictly after
-    /// one already-processed key in lexicographic order, which is what keeps a
-    /// leading page of protected objects from starving the pages behind it.
-    ///
-    /// The default body adapts [`Self::list`] into a single page and applies
-    /// the same exclusive ordering itself, which preserves behavior for every
-    /// non-production implementation. The production adapter overrides this
-    /// with true incremental pagination and the backend's own cursor so a large
-    /// prefix never materializes at once; riding this default in production
-    /// would defeat the scan bound.
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend error when recursive listing cannot begin. Errors
-    /// encountered mid-walk surface as a failed item in the returned stream.
-    async fn list_pages(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-    ) -> opendal::Result<ForgeObjectPages> {
-        let mut entries = self.list(prefix).await?;
-        entries.retain(|entry| entry.metadata().is_file());
-        if let Some(cursor) = start_after {
-            entries.retain(|entry| entry.path() > cursor);
-        }
-        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
-        Ok(Box::pin(stream::once(ready(Ok(entries)))))
-    }
+    /// `start_after` resumes the walk strictly after one already-processed
+    /// key, which keeps a leading page of protected objects from starving the
+    /// pages behind it. A backend error surfaces as a failed page.
+    fn list_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages;
 
     /// Read object metadata before a destructive decision.
     ///
     /// # Errors
     ///
-    /// Returns the backend error when metadata cannot be read.
-    async fn stat(&self, path: &str) -> opendal::Result<Metadata>;
+    /// Returns the backend error, `NotFound` for an absent object.
+    async fn stat(&self, path: &str) -> object_store::Result<ObjectMeta>;
 
     /// Delete one object after the final live-set and fence checks.
     ///
     /// # Errors
     ///
     /// Returns the backend error when deletion cannot complete.
-    async fn delete(&self, path: &str) -> opendal::Result<()>;
+    async fn delete(&self, path: &str) -> object_store::Result<()>;
+}
+
+/// Forge's production object operations over the node's Bifrost object store.
+#[derive(Debug, Clone)]
+pub struct ForgeObjects {
+    /// The node's one Bifrost object store.
+    objects: Arc<dyn ObjectStore>,
+    /// Whether the backend lists keys in ascending order. Cloud stores and the
+    /// in-memory store do; the local filesystem walks directories unordered.
+    ordered_listing: bool,
+}
+
+impl ForgeObjects {
+    /// Builds Forge's object operations over the node's storage owner.
+    #[must_use]
+    pub fn new(storage: &BifrostStorage) -> Self {
+        Self {
+            objects: Arc::clone(storage.objects()),
+            ordered_listing: !matches!(storage.backend(), BackendConfig::Local { .. }),
+        }
+    }
+
+    /// Page a prefix in ascending key order on a backend that lists unordered.
+    ///
+    /// Each page is one full walk that keeps only the
+    /// [`FORGE_OBJECT_LIST_PAGE_ENTRIES`] smallest keys strictly after the
+    /// cursor, so memory stays bounded by the page size whatever the walk
+    /// order. The last key of a page becomes the next cursor; a short page
+    /// ends the stream. Pages are produced lazily, so orphan GC stopping at its
+    /// page cap stops the walks.
+    // ponytail: one full walk per page (O(pages × objects)); only the local
+    // filesystem takes this path.
+    fn unordered_pages(
+        &self,
+        prefix: ObjectPath,
+        start_after: Option<ObjectPath>,
+    ) -> ForgeObjectPages {
+        let objects = Arc::clone(&self.objects);
+        Box::pin(stream::try_unfold(Some(start_after), move |cursor| {
+            let objects = Arc::clone(&objects);
+            let prefix = prefix.clone();
+            async move {
+                let Some(cursor) = cursor else {
+                    return Ok(None);
+                };
+                let mut smallest = BTreeMap::new();
+                let mut walk = match &cursor {
+                    Some(cursor) => objects.list_with_offset(Some(&prefix), cursor),
+                    None => objects.list(Some(&prefix)),
+                };
+                while let Some(meta) = walk.try_next().await? {
+                    smallest.insert(meta.location.clone(), meta);
+                    if smallest.len() > FORGE_OBJECT_LIST_PAGE_ENTRIES {
+                        smallest.pop_last();
+                    }
+                }
+                let page = smallest.into_values().collect::<Vec<_>>();
+                let Some(last) = page.last().map(|meta| meta.location.clone()) else {
+                    return Ok(None);
+                };
+                let next = (page.len() == FORGE_OBJECT_LIST_PAGE_ENTRIES).then_some(Some(last));
+                Ok(Some((page, next)))
+            }
+        }))
+    }
+}
+
+#[async_trait]
+impl ForgeObjectStore for ForgeObjects {
+    /// Reads one whole object.
+    ///
+    /// # Errors
+    /// Returns the backend error when the object cannot be read.
+    async fn read(&self, path: &str) -> object_store::Result<Bytes> {
+        self.objects
+            .get(&ObjectPath::from(path))
+            .await?
+            .bytes()
+            .await
+    }
+
+    /// Lists ascending pages, natively on an ordered backend.
+    fn list_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
+        let prefix = ObjectPath::from(prefix);
+        let start_after = start_after.map(ObjectPath::from);
+        if !self.ordered_listing {
+            return self.unordered_pages(prefix, start_after);
+        }
+        let walk = match &start_after {
+            Some(cursor) => self.objects.list_with_offset(Some(&prefix), cursor),
+            None => self.objects.list(Some(&prefix)),
+        };
+        Box::pin(
+            walk.chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES)
+                .map(|chunk| chunk.into_iter().collect::<object_store::Result<Vec<_>>>()),
+        )
+    }
+
+    /// Reads object metadata.
+    ///
+    /// # Errors
+    /// Returns the backend error, `NotFound` for an absent object.
+    async fn stat(&self, path: &str) -> object_store::Result<ObjectMeta> {
+        self.objects.head(&ObjectPath::from(path)).await
+    }
+
+    /// Deletes one object.
+    ///
+    /// # Errors
+    /// Returns the backend error when deletion cannot complete.
+    async fn delete(&self, path: &str) -> object_store::Result<()> {
+        self.objects.delete(&ObjectPath::from(path)).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -416,101 +459,78 @@ impl Forge {
 mod tests {
     use super::*;
 
-    /// Object store whose `list` delegates to a real filesystem operator.
-    ///
-    /// Backs the default `list_pages` adaptation test with genuine
-    /// [`opendal::Entry`] values, which cannot be constructed directly, while
-    /// leaving `list_pages` unimplemented so the trait default is exercised.
-    #[derive(Debug)]
-    struct FsListObjectStore {
-        /// Filesystem operator rooted at a temporary directory.
-        operator: opendal::Operator,
-    }
-
-    #[async_trait]
-    impl ForgeObjectStore for FsListObjectStore {
-        /// Reject reads because this unit exercises only listing adaptation.
-        async fn read(&self, _path: &str) -> opendal::Result<Buffer> {
-            unreachable!("listing unit does not read objects")
-        }
-
-        /// Reject ranged reads because this unit exercises only listing adaptation.
-        async fn read_range(
-            &self,
-            _path: &str,
-            _range: std::ops::Range<u64>,
-        ) -> opendal::Result<Buffer> {
-            unreachable!("listing unit does not read object ranges")
-        }
-
-        /// Delegate the flat recursive listing to the backing filesystem operator.
-        async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
-            self.operator.list_with(prefix).recursive(true).await
-        }
-
-        /// Reject metadata reads because this unit exercises only listing adaptation.
-        async fn stat(&self, _path: &str) -> opendal::Result<Metadata> {
-            unreachable!("listing unit does not inspect objects")
-        }
-
-        /// Reject deletes because this unit exercises only listing adaptation.
-        async fn delete(&self, _path: &str) -> opendal::Result<()> {
-            unreachable!("listing unit does not delete objects")
-        }
-    }
-
-    /// The default `list_pages` body adapts `list` into exactly one page.
-    #[tokio::test]
-    async fn list_pages_default_yields_single_page() {
-        use futures_util::StreamExt;
-
-        let dir = tempfile::tempdir().expect("temporary listing root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(dir.path().to_str().expect("root path")),
-        )
-        .expect("filesystem operator")
-        .finish();
-        for name in ["a.parquet", "b.parquet", "c.parquet"] {
-            operator
-                .write(name, vec![0_u8])
+    /// Writes `count` objects under `prefix` in reverse key order.
+    async fn seed_reversed(
+        objects: &Arc<dyn ObjectStore>,
+        prefix: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let mut keys = (0..count)
+            .map(|index| format!("{prefix}{index:06}.parquet"))
+            .collect::<Vec<_>>();
+        for key in keys.iter().rev() {
+            objects
+                .put(
+                    &ObjectPath::from(key.as_str()),
+                    Bytes::from_static(b"orphan").into(),
+                )
                 .await
-                .expect("seed listing object");
+                .expect("object is written");
         }
-        let store = FsListObjectStore { operator };
+        keys.sort();
+        keys
+    }
 
-        // A flat listing also names the directories it walked; a page carries
-        // addressable objects only, because a resumable scan advances its
-        // cursor over object keys.
-        let mut direct = store
-            .list("")
-            .await
-            .expect("direct listing")
-            .into_iter()
-            .filter(|entry| entry.metadata().is_file())
-            .map(|entry| entry.path().to_owned())
-            .collect::<Vec<_>>();
-        direct.sort();
-
-        let mut pages = store.list_pages("", None).await.expect("paged listing");
-        let first = pages
-            .next()
-            .await
-            .expect("default body yields one page")
-            .expect("page listing succeeds");
-        assert!(
-            pages.next().await.is_none(),
-            "the default adaptation yields exactly one page"
-        );
-        let mut page_paths = first
-            .into_iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<Vec<_>>();
-        page_paths.sort();
-
-        assert_eq!(
-            page_paths, direct,
-            "the single page equals every object of the flat listing"
-        );
+    /// Both listing paths page a prefix in bounded, ascending, exclusive pages.
+    ///
+    /// The local filesystem lists unordered and takes the emulated path; the
+    /// in-memory store lists in key order and takes the native path. Objects
+    /// are written in reverse so walk order and key order disagree, and a
+    /// resume from a mid-page cursor must yield exactly the keys after it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any page is oversized, out of order, or skips or repeats a key.
+    #[tokio::test]
+    async fn forge_listing_pages_are_bounded_ascending_and_resumable() {
+        let root = tempfile::tempdir().expect("listing root");
+        let local = ForgeObjects::new(&BifrostStorage::for_test(root.path(), false));
+        let memory = ForgeObjects {
+            objects: Arc::new(object_store::memory::InMemory::new()),
+            ordered_listing: true,
+        };
+        let prefix = "tenants/t/table/data/forge/v1/";
+        for store in [local, memory] {
+            let keys = seed_reversed(
+                &store.objects,
+                prefix,
+                FORGE_OBJECT_LIST_PAGE_ENTRIES * 2 + 3,
+            )
+            .await;
+            for (cursor, expected) in [(None, &keys[..]), (Some(keys[700].as_str()), &keys[701..])]
+            {
+                let pages = store
+                    .list_pages(prefix, cursor)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("every page lists");
+                assert!(
+                    pages
+                        .iter()
+                        .all(|page| page.len() <= FORGE_OBJECT_LIST_PAGE_ENTRIES),
+                    "every page stays within the page bound"
+                );
+                let listed = pages
+                    .iter()
+                    .flatten()
+                    .map(|meta| meta.location.to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    listed, expected,
+                    "pages are ascending, complete, and exclusive"
+                );
+            }
+        }
     }
 
     /// Forge output encoding uses the shared Bifrost Parquet recipe: the

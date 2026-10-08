@@ -30,7 +30,11 @@ engine and its three cohesive subsystems:
   retention, and garbage collection.
 
 Apache Iceberg-managed Parquet in object storage is the analytical system of
-record. Postgres is the tenant-isolated catalog and durable control plane.
+record. Each node reaches it through one `object_store` client for the
+configured backend behind one node-wide request limit; Scribe, Oracle, Forge,
+and the Iceberg catalog all use it, and timeouts and retries are the cloud
+client's own. `wyrd-storage` keeps its separate client for card and artifact
+storage. Postgres is the tenant-isolated catalog and durable control plane.
 DataFusion is the vectorized execution engine. Managed compaction and Iceberg
 components perform bounded computation behind Vala-owned contracts; they do not
 authenticate callers, serve the network, own tenant authority, or commit
@@ -218,6 +222,35 @@ typed columns:
   `context` and `media`, `vala.eval.result_items` `actual` and `expected`,
   `vala.gateway.calls` `request_payload` and `response_payload`, and
   `vala.system.audit_log` `detail` are Variant.
+
+### Variant shredding
+
+Every Variant field — a table column, a Struct child, or a child of a List
+element's Struct — is stored in the standard Parquet shredded layout:
+`metadata`, a residual `value`, and `typed_value` leaves for the keys the file
+chose. The footer is the only record of a file's layout; Wyrd writes no layout
+metadata, and files with different layouts share one table and one
+fingerprint. Values that do not fit the layout stay in the residual `value`,
+so the layout changes performance only, never a result. Both readers unshred
+at any depth before rows leave the scan.
+
+- **Scribe** recovery-stage runs stay unshredded. Each final hot object's
+  layout is chosen before its writer opens, from one seeded, stratified sample
+  of the claim: strata are `principal_id` values, writers with fewer than 30
+  rows share one stratum, and each stratum samples Cochran's size for 99%
+  confidence and a ±0.02 margin. A key is shredded when at least 8% of a
+  stratum's sampled non-null values hold it with one compatible type. The seed
+  is the claim, so a re-run claim writes the same objects. Each element of a
+  Variant inside a List counts as one observation, and one layout covers every
+  element. The sample holds counters, never rows.
+- **Forge** samples nothing. It sums each source footer's shredded-leaf
+  non-null counts, keeps keys covering at least 10% of the combined rows,
+  gives a type conflict to the type covering more rows, and writes every output
+  of one rewrite with that layout. Forge only keeps or drops keys; Scribe
+  discovers them.
+
+The sampling parameters and the per-node child and depth caps are internal
+writer constants, not public, wire, table, or persisted contracts.
 
 ## Declared types and the registered schema
 
@@ -534,6 +567,31 @@ on the wire. The functions travel in physical plans by name, so the function
 set's version is bound into the plan and stage digests peers verify before
 decoding. Variant failures, like every catalogued query failure, keep their
 stable code and details across interactive and distributed execution.
+
+### Nested-field reads
+
+When every use of a Struct or Variant column in a query's projection and
+filter is a literal path — `s['a']['b']`, `v -> 'a' ->> 'k'`,
+`l[i]['f'] ->> 'k'`, or such a path on an `unnest(l)` output — each Oracle
+reader decodes only that path's leaves. A Struct path reads its field's
+leaves; a shredded Variant path reads its `typed_value` subtree, its
+path-local residual `value`, and the top-level `metadata`; a List element path
+reads those leaves of every element. Sibling leaves are not decoded. A query
+that uses the whole column, or a path a file did not shred, reads the whole
+root, with the same result.
+
+Hot objects and published files read through one per-file read plan built on
+the `DataFusion` fork's nested projection, decoder filter, and statistics
+pruning, so leader, follower, interactive, and analytical scans cannot drift.
+Struct access stays exact `get_field` and Variant access stays semantic
+`variant_get`. A literal comparison, `IN`, or null test on such a path filters
+while decoding. It skips row groups or pages only when a Variant path's
+residual is all-null and its type matches, or a Struct field's statistics are
+complete; otherwise the predicate is evaluated on the decoded values. `mise run bench:bifrost:reads` times
+native DataFusion against Oracle over the same hot file and the same published
+Iceberg snapshot, asserting identical rows before timing. Unshredded against
+shredded Variant reads are DataFusion's behavior, timed by DataFusion's
+`parquet_variant_query` benchmark.
 
 ### Distributed analytical execution
 
@@ -1165,18 +1223,16 @@ across a restart; durable batch, file, and task rows answer that question.
   groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
   exclusions decided from declared bounds; Iceberg pruning happens inside its
   own scan planning and is not re-walked for telemetry.
-- **Storage.** `bifrost_storage_metadata_cache_effects_total{effect,reason}`
-  counts cache decisions (hit, miss, join, bypass, evict) — logical lookups,
-  not backend I/O. `bifrost_storage_metadata_cache_loads_total{outcome}`,
-  `bifrost_storage_metadata_load_seconds`, and
-  `bifrost_storage_metadata_wait_seconds` measure footer decodes and the time
-  callers waited on them. `bifrost_storage_requests_total{operation}`,
-  `bifrost_storage_request_terminals_total{operation,outcome}`,
-  `bifrost_storage_request_seconds`, and
-  `bifrost_storage_request_retries_total` measure governed backend requests; a
-  cache hit adds none. Resident entries/bytes and in-flight loads are set from
-  the cache's own state, and `bifrost_storage_active_requests` moves at request
-  admission and settlement. No telemetry copy of cache or request state exists.
+- **Variant layout.** `bifrost_variant_residual_share{writer}` records, for
+  each final Scribe object and Forge output, the uncompressed bytes of its
+  Variants' root residual `value` leaves as a share of all their
+  non-`metadata` leaves, read from the file's footer; `writer` is `scribe` or
+  `forge`. A file with no Variant bytes records nothing. A rising share means layouts are missing keys. Forge
+  reads each output footer once after the rewrite and logs, never fails on, a
+  footer it cannot read. Recovery-stage runs are not measured.
+- **Storage.** Bifrost emits no storage metrics of its own. Parquet footers
+  are cached in `DataFusion`'s node-wide metadata cache, whose whole budget is
+  charged to the Oracle memory root at composition.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through

@@ -423,7 +423,7 @@ impl Forge {
             let manifest_list_path = catalog_path_to_object_key(
                 table_location,
                 binding,
-                &self.core.staging,
+                &self.core.warehouse,
                 snapshot.manifest_list(),
             )?;
             let operation = snapshot
@@ -461,7 +461,7 @@ impl Forge {
                     let path = catalog_path_to_object_key(
                         table_location,
                         binding,
-                        &self.core.staging,
+                        &self.core.warehouse,
                         entry.file_path(),
                     )?;
                     live_data_paths.insert(path);
@@ -509,7 +509,7 @@ impl Forge {
         table_location: &str,
         path: &StoragePath,
     ) -> Result<String, ForgeError> {
-        catalog_path_to_object_key(table_location, binding, &self.core.staging, path.as_str())
+        catalog_path_to_object_key(table_location, binding, &self.core.warehouse, path.as_str())
     }
 
     /// Return shutdown consistently at every reconciliation cancellation point.

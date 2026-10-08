@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
-use vala_bifrost_redux::storage::{StorageInspection, StorageLifecycle};
 use wyrd_spec::DataTenantId;
 
 pub use vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1;
@@ -687,60 +686,6 @@ pub struct ScribeDrainObservationV1 {
     pub wal_streams: u64,
     /// Supervised tasks still retained when the pod stopped.
     pub supervised_tasks: u64,
-    /// Storage-owner state the pod's production teardown left behind.
-    ///
-    /// Optional because a topology with no composed storage owner still drains;
-    /// present for every real pod. Carried here rather than reduced to a
-    /// boolean so a consumer can assert the owner's lifecycle and each live
-    /// count rather than a summary of them.
-    #[serde(default)]
-    pub storage: Option<ScribeStorageDrainObservationV1>,
-}
-
-/// One pod's terminal storage-owner state, in wire-portable form.
-///
-/// A serializable projection of the owners' own state — the request
-/// settlement teardown waits on and the metadata cache's state lock — read
-/// after production teardown. Rates and totals are not part of it: those are
-/// process-lifetime production metrics, read from the telemetry capture.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScribeStorageDrainObservationV1 {
-    /// The owner's lifecycle label at teardown.
-    pub lifecycle: String,
-    /// Successful metadata entries still retained.
-    pub resident_entries: u64,
-    /// Charged metadata bytes still retained.
-    pub resident_bytes: u64,
-    /// Metadata loads with an owner and no terminal result.
-    pub inflight_loads: u64,
-    /// Callers still joined to an in-flight metadata load.
-    pub waiters: u64,
-    /// Logical governed storage requests still admitted.
-    pub active_requests: u64,
-}
-
-impl ScribeStorageDrainObservationV1 {
-    /// Projects one production owner inspection into the portable record.
-    ///
-    /// A composition with no metadata cache reports every cache count as zero,
-    /// which is exactly what it holds.
-    #[must_use]
-    pub fn from_inspection(inspection: &StorageInspection) -> Self {
-        let cache = inspection.metadata_cache;
-        Self {
-            lifecycle: match inspection.lifecycle {
-                StorageLifecycle::Open => "open",
-                StorageLifecycle::Closing => "closing",
-                StorageLifecycle::Closed => "closed",
-            }
-            .to_owned(),
-            resident_entries: cache.map_or(0, |cache| cache.resident_entries),
-            resident_bytes: cache.map_or(0, |cache| cache.resident_bytes),
-            inflight_loads: cache.map_or(0, |cache| cache.inflight_loads),
-            waiters: cache.map_or(0, |cache| cache.waiters),
-            active_requests: u64::try_from(inspection.active_requests).unwrap_or(u64::MAX),
-        }
-    }
 }
 
 /// One observed lifecycle boundary of a production run.
@@ -1498,12 +1443,14 @@ impl crate::bifrost::WyrdTestCluster {
                     "the running pod composed no Bifrost storage owner".to_owned(),
                 )
             })?
-            .metadata_cache_enabled();
+            .policy()
+            .metadata_cache_bytes()
+            > 0;
         let declared = matches!(cache_mode, ScribeCacheMode::Enabled);
         if composed != declared {
             return Err(crate::WyrdTestServerError::Start(format!(
                 "the run declares {cache_mode:?} but the composed storage owner reports \
-                 metadata_cache_enabled={composed}"
+                 a metadata cache budget={composed}"
             )));
         }
         let node = running_pod(&cluster)?.node_id();
@@ -1666,10 +1613,6 @@ impl crate::bifrost::WyrdTestCluster {
                         queued: inspection.scribe_queued,
                         wal_streams: inspection.scribe_wal_streams,
                         supervised_tasks: inspection.supervised_tasks,
-                        storage: inspection
-                            .storage
-                            .first()
-                            .map(ScribeStorageDrainObservationV1::from_inspection),
                     });
                 }
                 ScribeWorkloadOperationV1::Checkpoint { name } => {
@@ -1907,7 +1850,6 @@ mod tests {
                             queued: 0,
                             wal_streams: 0,
                             supervised_tasks: 0,
-                            storage: None,
                         },
                     ),
                 })
@@ -2130,7 +2072,6 @@ mod tests {
             queued: 0,
             wal_streams: 0,
             supervised_tasks: 0,
-            storage: None,
         };
         for (label, mutation) in [
             (

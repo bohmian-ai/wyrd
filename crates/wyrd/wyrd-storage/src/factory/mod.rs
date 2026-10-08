@@ -43,14 +43,14 @@ const S3_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(feature = "cloud")]
 const MANAGED_POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Choose how long the operator's HTTP client may reuse an idle connection.
+/// Choose how long a storage HTTP client may reuse an idle connection.
 ///
 /// Connections stay pooled as long as the storage server is known to keep
 /// them, so steady Bifrost traffic reuses warm TLS connections, and are
 /// dropped before the server closes them so no request races that close.
 /// Any configured endpoint names a server whose timeout Wyrd does not know,
 /// so it takes the shortest bound.
-fn pool_idle_timeout(backend: &BackendConfig) -> Duration {
+pub fn pool_idle_timeout(backend: &BackendConfig) -> Duration {
     match backend {
         BackendConfig::Local { .. } => ENDPOINT_POOL_IDLE_TIMEOUT,
         #[cfg(feature = "cloud")]

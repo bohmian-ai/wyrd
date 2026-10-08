@@ -7830,7 +7830,7 @@ impl ForgeWorker {
         let expected = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.forge.core.staging,
+            &self.forge.core.warehouse,
             &forge_data_location(table.metadata().location()),
         )?;
         if prefix != expected {
@@ -8168,7 +8168,7 @@ impl ForgeWorker {
         let path = candidate.path.as_str();
         let metadata = match self.forge.core.object_store.stat(path).await {
             Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(object_store::Error::NotFound { .. }) => None,
             Err(error) => return Err(ForgeError::ObjectDelete(error)),
         };
         let evidence = metadata
@@ -8293,9 +8293,7 @@ impl ForgeWorker {
                 ForgeTelemetry::record_deleted_objects(ForgeTaskStrategy::ExpiredCleanup, 1);
                 Ok(ExpiredCleanupOutcome::Deleted)
             }
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
-                Ok(ExpiredCleanupOutcome::Missing)
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(ExpiredCleanupOutcome::Missing),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -8478,7 +8476,7 @@ impl Forge {
         let object_path = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &location,
         )?;
         let raw = self
@@ -8487,7 +8485,7 @@ impl Forge {
             .read(&object_path)
             .await
             .map_err(ForgeError::ObjectStore)?;
-        let digest = format!("sha256:{}", hex::encode(Sha256::digest(raw.to_bytes())));
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&raw)));
         let evidence = ForgeTaskEvidence {
             version: 1,
             committed_snapshot_id: Some(snapshot_id),
@@ -8562,7 +8560,7 @@ impl ForgeWorker {
             let object_path = catalog_path_to_object_key(
                 table.metadata().location(),
                 binding,
-                &forge.core.staging,
+                &forge.core.warehouse,
                 &location,
             )?;
             let raw = forge
@@ -8600,7 +8598,7 @@ impl ForgeWorker {
                 committed_metadata_location: Some(location),
                 committed_metadata_digest: Some(format!(
                     "sha256:{}",
-                    hex::encode(Sha256::digest(raw.to_bytes()))
+                    hex::encode(Sha256::digest(&raw))
                 )),
                 cleanup_candidates: Vec::new(),
                 deleted_candidate_count: 0,
@@ -8650,7 +8648,7 @@ impl ForgeWorker {
         let object_path = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.forge.core.staging,
+            &self.forge.core.warehouse,
             location,
         )?;
         let raw = self
@@ -8660,7 +8658,7 @@ impl ForgeWorker {
             .read(&object_path)
             .await
             .map_err(ForgeError::ObjectStore)?;
-        let actual = format!("sha256:{}", hex::encode(Sha256::digest(raw.to_bytes())));
+        let actual = format!("sha256:{}", hex::encode(Sha256::digest(&raw)));
         if actual != expected {
             return Err(ForgeError::Reconciliation {
                 detail: "Prepared metadata digest does not match exact durable bytes".to_owned(),

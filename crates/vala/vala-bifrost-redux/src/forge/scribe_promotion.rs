@@ -873,7 +873,7 @@ impl Forge {
                 live.insert(super::path::catalog_path_to_object_key(
                     table_location,
                     binding,
-                    &self.core.staging,
+                    &self.core.warehouse,
                     entry.file_path(),
                 )?);
             }
@@ -945,7 +945,7 @@ impl Forge {
                 .map_err(ForgeError::ObjectStore)?;
             let observed_checksum = {
                 use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+                hex::encode(sha2::Sha256::digest(&bytes))
             };
             let file_size = u64::try_from(bytes.len()).map_err(|_| ForgeError::Invariant {
                 detail: format!("hot object {} size exceeds u64", record.object_key),
@@ -959,7 +959,7 @@ impl Forge {
                 .map_err(|error| ForgeError::Invariant {
                     detail: format!("hot object failed promotion revalidation: {error}"),
                 })?;
-            validate_promoted_object(record, &bytes.to_bytes(), file_size, table)?;
+            validate_promoted_object(record, &bytes, file_size, table)?;
             data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
                 detail: format!("promotion evidence does not rebuild a data file: {error}"),
             })?);

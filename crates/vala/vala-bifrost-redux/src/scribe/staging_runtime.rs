@@ -1148,9 +1148,7 @@ mod tests {
         wal_root: &Path,
         node: NodeId,
     ) -> ClaimPublisher {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish();
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         ClaimPublisher::new(
             stage,
             ScribeStageMover::new(wal_root, operator),
@@ -2474,9 +2472,7 @@ mod pg_tests {
         node: NodeId,
         pool: OperatorPool,
     ) -> ClaimPublisher {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish();
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         ClaimPublisher::new(
             stage,
             crate::scribe::persistence::ScribeStageMover::new(wal_root, operator),

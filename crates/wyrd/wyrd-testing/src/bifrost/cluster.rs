@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
-use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +15,6 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::StorageInspection;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
@@ -587,13 +585,6 @@ pub struct ClusterShutdownInspection {
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
-    /// Each stopped node's terminal storage-owner state, in stop order.
-    ///
-    /// Kept per node rather than summed: the storage owner is a per-node
-    /// resource, and adding two nodes' counts together would turn a per-node
-    /// reconciliation into a cluster-wide one that no single owner ever has to
-    /// satisfy.
-    pub storage: Vec<StorageInspection>,
 }
 
 /// One parsed production Prometheus series.
@@ -2386,10 +2377,27 @@ impl WyrdTestCluster {
         &self.fixture
     }
 
-    /// Return the shared object-store operator used by all pods.
+    /// Return the Bifrost object store over the backend every pod shares.
     #[must_use]
-    pub fn storage_operator(&self) -> Operator {
-        self.storage.operator().clone()
+    pub fn storage_objects(&self) -> Arc<dyn object_store::ObjectStore> {
+        Arc::clone(crate::server::test_storage_owner(&self.storage).objects())
+    }
+
+    /// Reports whether `key` exists in the backend every pod shares.
+    ///
+    /// # Errors
+    /// Returns the object store's error for anything other than absence.
+    pub async fn object_exists(&self, key: &str) -> object_store::Result<bool> {
+        use object_store::ObjectStoreExt as _;
+        match self
+            .storage_objects()
+            .head(&object_store::path::Path::from(key))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Iterate independently bound running servers in stable node order.
@@ -2457,7 +2465,6 @@ impl WyrdTestCluster {
         let mut scribe_wal_streams = 0_u64;
         let mut listeners_stopped = true;
         let mut supervised_tasks = 0_u64;
-        let mut storage = Vec::new();
         let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
         let expected_servers = node_ids.len();
         let mut stopped_servers = 0_usize;
@@ -2483,7 +2490,6 @@ impl WyrdTestCluster {
                         listeners_stopped &= server_inspection.listeners_stopped;
                         supervised_tasks =
                             supervised_tasks.saturating_add(server_inspection.supervised_tasks);
-                        storage.extend(server_inspection.storage);
                         if let Some(snapshot) = server_inspection.scribe {
                             scribe_queued =
                                 scribe_queued.saturating_add(snapshot.queued_items as u64);
@@ -2513,7 +2519,6 @@ impl WyrdTestCluster {
                 forge_active_claims: inspection.forge_active_claims,
                 forge_active_attempts: inspection.forge_active_attempts,
                 supervised_tasks,
-                storage,
             }),
         }
     }
@@ -2822,7 +2827,18 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
+        // The footer cache's whole budget is charged once at composition, so
+        // a fresh node holds exactly that and nothing a query left behind.
+        let metadata_cache_bytes = server
+            .state()
+            .bifrost_storage()
+            .expect("restarted storage owner")
+            .policy()
+            .metadata_cache_bytes();
+        assert_eq!(
+            u64::try_from(restarted_resources.governed_memory_used_bytes).expect("fits u64"),
+            metadata_cache_bytes
+        );
         assert!(!restarted_resources.oracle_query_active);
         cluster.shutdown().await.expect("cluster shuts down");
     }

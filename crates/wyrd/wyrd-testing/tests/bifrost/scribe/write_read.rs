@@ -12,9 +12,8 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{
-    BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
-    ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
-    WyrdTestCluster, shared_process_telemetry_for_test,
+    BifrostClusterSpec, ScribeCacheMode, ScribeProductionEvidenceV1, ScribeProductionWorkloadV1,
+    ScribePublishedHotFileV1, WyrdTestCluster, shared_process_telemetry_for_test,
 };
 
 use super::support::{
@@ -74,15 +73,6 @@ async fn scribe_write_flush_read_user_journey() {
     let cached: ScribeProductionWorkloadV1 =
         serde_json::from_slice(&bytes).expect("the same bytes deserialize for the second run");
 
-    // Cache decisions are production counters, so the disabled composition is
-    // judged over its own window: the boot reads, then the whole uncached run,
-    // closed before the cached cluster starts.
-    let (_telemetry_guard, telemetry) =
-        shared_process_telemetry_for_test().expect("process production telemetry");
-    let boot_window = telemetry.checkpoint().expect("boot telemetry window");
-    let uncached_window = telemetry
-        .checkpoint()
-        .expect("uncached run telemetry window");
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Disabled),
     )
@@ -93,18 +83,6 @@ async fn scribe_write_flush_read_user_journey() {
         cluster.server(0).expect("the mixed pod is running"),
     )
     .await;
-    // The span read above opens a freshly flushed hot object on a pod whose
-    // Forge has not yet promoted it, so it is the one read that must decide
-    // hot metadata. The terminal owner is the restarted pod's, and whether its
-    // reads still find hot objects races Forge promotion after boot.
-    let booted = cache_effects(&telemetry.delta_since(&boot_window).expect("boot delta"));
-    assert!(
-        booted
-            .iter()
-            .any(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
-        "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
-    );
-
     let uncached_run = cluster
         .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
         .await
@@ -113,11 +91,6 @@ async fn scribe_write_flush_read_user_journey() {
         .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
         .expect("the uncached run satisfies every normative field of the record");
-    let uncached_effects = cache_effects(
-        &telemetry
-            .delta_since(&uncached_window)
-            .expect("uncached run delta"),
-    );
 
     let cached_cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
@@ -134,40 +107,6 @@ async fn scribe_write_flush_read_user_journey() {
         .expect("the cached run satisfies every normative field of the record");
 
     assert_parity(&uncached_run.evidence, &cached_run.evidence);
-
-    let uncached_storage = terminal_storage(&uncached_run.evidence);
-    let cached_storage = terminal_storage(&cached_run.evidence);
-    assert_settled(&uncached_storage, "cache disabled");
-    assert_settled(&cached_storage, "cache enabled");
-    assert!(
-        !uncached_effects.is_empty()
-            && uncached_effects
-                .iter()
-                .all(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
-        "a disabled composition records only bypasses with reason disabled — no hit, miss, \
-         or join — observed {uncached_effects:?}"
-    );
-}
-
-/// Returns the nonzero metadata-cache decisions one telemetry window recorded.
-///
-/// Keyed by `(effect, reason)`, the family's complete closed label set.
-fn cache_effects(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
-) -> Vec<((String, String), f64)> {
-    delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == "bifrost_storage_metadata_cache_effects_total"
-                && sample.kind == BifrostMetricKind::Counter
-                && sample.value > 0.0
-        })
-        .map(|sample| {
-            let label = |key: &str| sample.labels.get(key).cloned().unwrap_or_default();
-            ((label("effect"), label("reason")), sample.value)
-        })
-        .collect()
 }
 
 /// One complete GenAI span survives this pod's write/flush/read path, and is
@@ -346,44 +285,6 @@ fn int_values(batches: &[RecordBatch], name: &str) -> Vec<i64> {
         }
     }
     values
-}
-
-/// Returns the terminal boundary's storage-owner observation.
-///
-/// # Panics
-/// Panics when the terminal boundary carries no drain or no storage evidence.
-fn terminal_storage(evidence: &ScribeProductionEvidenceV1) -> ScribeStorageDrainObservationV1 {
-    evidence
-        .checkpoint(ScribeCheckpointNameV1::TerminalDrain)
-        .expect("the record reaches its terminal boundary")
-        .drained
-        .as_ref()
-        .expect("the terminal boundary carries drain evidence")
-        .storage
-        .clone()
-        .expect("a composed pod publishes its terminal storage-owner snapshot")
-}
-
-/// Asserts one run's storage owner closed and retained nothing.
-///
-/// Every value is read from the owners themselves at teardown, so a nonzero
-/// count is work the owner still holds rather than a tally that drifted.
-///
-/// # Panics
-/// Panics when the owner is not closed or any live count is nonzero.
-fn assert_settled(storage: &ScribeStorageDrainObservationV1, label: &str) {
-    assert_eq!(storage.lifecycle, "closed", "{label}: {storage:?}");
-    assert_eq!(
-        (
-            storage.resident_entries,
-            storage.resident_bytes,
-            storage.inflight_loads,
-            storage.waiters,
-            storage.active_requests,
-        ),
-        (0, 0, 0, 0, 0),
-        "{label}: a drained owner must retain nothing, observed {storage:?}"
-    );
 }
 
 /// Requires two runs of the same bytes to have produced the same public result.

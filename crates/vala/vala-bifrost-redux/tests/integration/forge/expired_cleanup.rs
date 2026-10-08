@@ -697,10 +697,8 @@ async fn seed_extra_candidates(
         let path = sibling_path(base, file_name);
         table
             .fixture
-            .staging
-            .write(&path, b"seeded expired candidate".to_vec())
-            .await
-            .expect("the extra candidate object seeds");
+            .write_object(&path, b"seeded expired candidate".to_vec())
+            .await;
         seeded.push(ForgeCleanupCandidate {
             category: base.category,
             table: base.table.clone(),
@@ -1548,11 +1546,7 @@ async fn terminal_file_list_row_is_removed_only_after_object_cleanup() {
     payload.cleanup_candidates.extend(seeded);
     payload.cleanup_candidates.sort();
     persist_cleanup_plan(fixture, cleanup_id, &payload).await;
-    fixture
-        .staging
-        .delete(&absent)
-        .await
-        .expect("the absent candidate's object is removed up front");
+    fixture.delete_object(&absent).await;
     let own = fixture.binding.table_ref.name.clone();
     for path in [&present, &absent, &bystander] {
         copy_terminal_row(fixture, path, &own).await;

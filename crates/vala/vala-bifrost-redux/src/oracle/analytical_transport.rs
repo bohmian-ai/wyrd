@@ -2487,10 +2487,6 @@ mod tests {
                     super::super::analytical_supervisor::AnalyticalSupervisor::new(),
                 ),
                 reservations: Arc::clone(&reservations),
-                leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
-                    wyrd_spec::vala::api::ClusterRole::Oracle,
-                    Arc::new(crate::oracle::follower::UnresolvableSource),
-                ),
                 egress: Arc::new(crate::oracle::analytical::AnalyticalStageEgress::new(
                     node_id,
                     7,

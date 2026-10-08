@@ -75,7 +75,7 @@ fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
 async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("rewrite_scheduler").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         &fixture,
         fixture.catalog.iceberg_catalog(),
@@ -132,11 +132,6 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         .expect("leader report");
     supervisor.shutdown().await;
 
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "dispatching a rewrite writes no object"
-    );
     assert!(
         !telemetry
             .spans_named("bifrost.forge.scheduler.pass")
@@ -237,7 +232,7 @@ async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteS
 async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_commit").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -371,7 +366,7 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
 async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_conflict").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -562,7 +557,7 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
 /// second catalog call was made.
 async fn assert_expired_deadline_makes_no_second_call() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_spent").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -634,7 +629,7 @@ async fn assert_expired_deadline_makes_no_second_call() {
 /// outcome it could not know.
 async fn assert_retry_inherits_only_the_remaining_budget() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_remainder").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -756,7 +751,7 @@ async fn assert_drained_attempt_is_unsettled(
 #[tokio::test]
 async fn rewrite_publication_ambiguity_restart_settles_once() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_ambiguity").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -953,7 +948,7 @@ async fn assert_held_authority_change_refuses(
     mutation: HeldAuthorityMutation,
 ) {
     let promoted = PromotedRewriteFixture::start_unpromoted(mutation.table_name()).await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),

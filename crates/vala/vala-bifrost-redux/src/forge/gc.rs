@@ -577,7 +577,7 @@ impl Forge {
         let scan_prefix = catalog_path_to_object_key(
             &location,
             &binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &forge_data_location(&location),
         )?;
         let base_snapshot_id = table

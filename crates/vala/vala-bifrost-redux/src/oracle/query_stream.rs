@@ -1455,39 +1455,6 @@ impl OracleQueryStream {
         self
     }
 
-    /// Builds a test stream through the production telemetry and admission owners.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the IPC encoder cannot encode `schema` into the opening schema
-    /// frame.
-    #[cfg(test)]
-    pub(super) fn test_from_physical(
-        schema: &arrow::datatypes::SchemaRef,
-        batches: datafusion::physical_plan::SendableRecordBatchStream,
-        scan_stats: super::OracleQueryScanStats,
-    ) -> Self {
-        let (admitted, _shared, _request_cancellation) =
-            super::admission::admitted_guard_for_test();
-        let (ipc, schema_frame) = QueryIpcEncoder::new(schema).expect("test schema frame");
-        Self::new(QueryStreamInput {
-            query_class: QueryClass::Interactive,
-            schema_frame,
-            ipc,
-            batches,
-            first: None,
-            admitted,
-            deadline: Instant::now() + Duration::from_secs(1),
-            deadline_ms: 0,
-            degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: OracleTelemetry::start_query(QueryClass::Interactive),
-            scan_stats,
-            gate_lifecycle: None,
-            running_query: None,
-            active_reads: None,
-        })
-    }
-
     /// Creates a lazy stream that owns local admission guards through terminal output.
     ///
     /// The returned future retains all cleanup state until the terminal frame
@@ -1670,9 +1637,10 @@ mod tests {
     /// envelope is in the local chain or crossed from a worker, and the failed
     /// terminal carries that error's complete problem.
     ///
-    /// The remote form is the pinned distributed wire shape: the worker's
-    /// `External` envelope is reduced to its display text and rebuilt as a
-    /// generic `External` under the structurally preserved `Context` frames.
+    /// The remote forms are the pinned distributed wire shapes: the worker's
+    /// `External` envelope, or the Parquet `External` a footer refusal raises,
+    /// is reduced to its display text and rebuilt as a generic external error
+    /// under the structurally preserved frames.
     ///
     /// # Panics
     ///
@@ -1697,10 +1665,18 @@ mod tests {
                 "remote stage".to_owned(),
                 Box::new(DataFusionError::Context(
                     "late batch".to_owned(),
-                    Box::new(DataFusionError::External(text.into())),
+                    Box::new(DataFusionError::External(text.clone().into())),
                 )),
             );
-            for late in [local, forwarded] {
+            let parquet = |inner: Box<dyn std::error::Error + Send + Sync>| {
+                DataFusionError::ParquetError(Box::new(
+                    datafusion::parquet::errors::ParquetError::External(inner),
+                ))
+            };
+            let local_footer = parquet(Box::new(QueryCatalogError(error.clone())));
+            let forwarded_footer =
+                DataFusionError::Context("remote stage".to_owned(), Box::new(parquet(text.into())));
+            for late in [local, forwarded, local_footer, forwarded_footer] {
                 let mapped = crate::oracle::map_datafusion_error(&late);
                 assert_eq!(mapped, error);
                 let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);

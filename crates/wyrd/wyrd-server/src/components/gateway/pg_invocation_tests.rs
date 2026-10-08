@@ -3148,16 +3148,18 @@ async fn replica_with_fixture_catalog(
     let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
         LocalSigner::new(root).expect("local signer creates"),
     )));
-    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::clone(&storage),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            u64::from(u32::MAX),
-            false,
+    let bifrost_storage = Arc::new(
+        vala_bifrost_redux::storage::BifrostStorage::new(
+            storage.backend_config(),
+            vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                u64::from(u32::MAX),
+                false,
+            )
+            .expect("the default storage policy is valid"),
         )
-        .expect("the default storage policy is valid"),
-        None,
-    ));
+        .expect("the local Bifrost store builds"),
+    );
     let catalog = Arc::new(
         vala_bifrost_redux::catalog::BifrostCatalog::new(
             secrecy::ExposeSecret::expose_secret(fixture.catalog_dsn()),

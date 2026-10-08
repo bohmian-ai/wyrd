@@ -82,53 +82,12 @@ pub(crate) struct RemoteScanPayload {
     /// Fingerprint of the expected provider schema.
     #[prost(string, tag = "2")]
     pub(crate) schema_fingerprint: String,
-    /// JSON-encoded [`FollowerScanAssignment`], present only for Analytical.
-    ///
-    /// The Interactive follower receives its assignments alongside the plan in
-    /// a separately signed `ExecuteFragmentRequest`, so its placeholders leave
-    /// this empty. An Analytical stage has no such envelope: upstream ships
-    /// only the serialized plan, and the stage ticket digests that plan, so
-    /// carrying the assignment *inside* the placeholder is what binds it to the
-    /// leader's signature. An empty value means "no assignment", never "an
-    /// assignment selecting nothing".
-    #[prost(bytes, tag = "3")]
-    pub(crate) assignment_json: Vec<u8>,
-    /// Closure schema the placeholder advertises, as `datafusion-proto` bytes.
-    ///
-    /// Only an Analytical placeholder needs this. Its Interactive counterpart
-    /// is replaced by a pre-resolved provider that already carries a schema,
-    /// while the Analytical decode has to publish plan properties before the
-    /// provider is resolved.
-    #[prost(bytes, tag = "4")]
-    pub(crate) closure_schema: Vec<u8>,
-    /// Output partitions the placeholder advertises. Zero is normalized to one.
-    #[prost(uint32, tag = "5")]
-    pub(crate) partitions: u32,
-    /// JSON-encoded [`super::leaf_paths::LeafPaths`] the follower's
-    /// source reads; empty when every column is read whole.
-    #[prost(bytes, tag = "6")]
-    pub(crate) leaf_paths_json: Vec<u8>,
 }
 
-/// The one pinned source occurrence a placeholder was planned against.
+/// Leaf a live Scribe fragment carries in place of the Scribe's own source.
 ///
-/// The provider knows all four facts while it builds the leaf; keeping them
-/// together is what lets the post-admission binder select the exact cut and
-/// tier this occurrence delegates without parsing or recomputing its scan
-/// identity.
-#[derive(Debug, Clone)]
-pub(super) struct PlannedRemoteSource {
-    /// The one frozen participant every task of this leaf's stage routes to.
-    pub(super) destination: super::dispatcher::DispatchCandidate,
-    /// Authenticated data tenant the cut was pinned for.
-    pub(super) tenant: wyrd_spec::DataTenantId,
-    /// Canonical fully-qualified table name of that cut.
-    pub(super) table: String,
-    /// The one persisted tier of the cut this occurrence delegates.
-    pub(super) tier: super::RemotePersistedTier,
-}
-
-/// Leaf placeholder substituted for one Wyrd-owned source before serialization.
+/// The leader encodes it; the Scribe decodes it by substituting the provider
+/// it resolved from the signed assignment with the same `scan_id`.
 #[derive(Debug, Clone)]
 pub struct RemoteSourcePlaceholderExec {
     /// Stable request-local identity.
@@ -137,53 +96,10 @@ pub struct RemoteSourcePlaceholderExec {
     schema_fingerprint: String,
     /// Empty executable carrying the placeholder schema and plan properties.
     empty: datafusion::physical_plan::empty::EmptyExec,
-    /// Closed projection closure computed by the provider's classifier —
-    /// see `oracle::exec::required_columns_closure`. Defaults to empty until
-    /// [`Self::with_closure`] attaches the real value computed during
-    /// `OracleTableProvider::scan`; the caller must never dispatch a wire
-    /// assignment with an empty closure (that would drop the hidden tenant
-    /// column), so an empty value here is a signal to keep the assignment's
-    /// existing safe full-schema default rather than overwrite it.
-    required_columns: Vec<String>,
-    /// Closed leaf predicates computed by the same classifier, in filter order.
-    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    /// Complete Analytical assignment this placeholder carries to its follower.
-    ///
-    /// `None` on the Interactive path, where the dispatcher signs and sends
-    /// assignments beside the plan. `Some` on the Analytical path, where the
-    /// placeholder is the only thing that crosses the wire and the stage
-    /// ticket's digest over the plan is what binds the assignment.
-    assignment: Option<Box<wyrd_spec::vala::api::FollowerScanAssignment>>,
-    /// The pinned cut, tier, and frozen participant of this scan occurrence.
-    ///
-    /// `None` before a source is attached, which is the Interactive
-    /// dispatcher's own leaf. Once attached it is private stage authority: the
-    /// route handler refuses any stage whose remote leaves do not all name this
-    /// exact peer, so a leaf can never be executed by a participant the cut did
-    /// not authorize, and the binder resolves the cut it belongs to from this
-    /// binding rather than by recomputing a scan identity.
-    source: Option<Box<PlannedRemoteSource>>,
-    /// The real leader-readable leaf this placeholder substituted, if any.
-    ///
-    /// Present whenever the provider had a plan the leader can execute itself.
-    /// It is deliberately not exposed through [`ExecutionPlan::children`], so
-    /// the node stays a leaf for the distributed planner's scale-up event and
-    /// keeps receiving one variant per stage task. It never crosses the wire:
-    /// encoding emits the follower assignment instead.
-    local: Option<Arc<dyn ExecutionPlan>>,
-    /// Literal paths the query reads from each trimmed Struct or Variant column,
-    /// carried to the follower and applied to the local leaf.
-    leaf_paths: super::leaf_paths::LeafPaths,
-    /// This variant's ordinal within its stage's final task count.
-    task_index: usize,
-    /// Final task count of the stage this variant belongs to, at least one.
-    task_count: usize,
 }
 
 impl RemoteSourcePlaceholderExec {
-    /// Creates one remote source placeholder with no attached predicate
-    /// closure. Callers that have a real classifier result should chain
-    /// [`Self::with_closure`] immediately.
+    /// Creates one remote source placeholder.
     #[must_use]
     pub fn new(
         scan_id: impl Into<String>,
@@ -194,199 +110,7 @@ impl RemoteSourcePlaceholderExec {
             scan_id: scan_id.into(),
             schema_fingerprint: schema_fingerprint.into(),
             empty: datafusion::physical_plan::empty::EmptyExec::new(schema),
-            required_columns: Vec::new(),
-            predicates: Vec::new(),
-            assignment: None,
-            source: None,
-            local: None,
-            leaf_paths: super::leaf_paths::LeafPaths::default(),
-            task_index: 0,
-            task_count: 1,
         }
-    }
-
-    /// Attaches the leader-readable leaf this placeholder substituted.
-    ///
-    /// Callers pass the plan the provider would otherwise have returned. With
-    /// it attached the same substituted leaf serves both paths, which is what
-    /// lets the planner — not the provider — decide whether this cut is read
-    /// locally or by a follower.
-    #[must_use]
-    pub(super) fn with_local(mut self, local: Arc<dyn ExecutionPlan>) -> Self {
-        // The placeholder must advertise the local plan's partitioning, not the
-        // single partition an `EmptyExec` reports. `DataFusion` executes only
-        // the partitions a node claims, so understating them silently drops
-        // every leaf beyond the first — a union of an empty published scan and
-        // a populated hot scan would return the published side alone.
-        self.empty = self
-            .empty
-            .with_partitions(local.properties().partitioning.partition_count());
-        self.local = Some(local);
-        self
-    }
-
-    /// Reads each Variant column `paths` names through only those paths'
-    /// leaves, here on the local leaf and on the follower that decodes this
-    /// placeholder.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `DataFusion` error raised while applying the paths to the
-    /// local leaf.
-    pub(super) fn with_leaf_paths(mut self, paths: super::leaf_paths::LeafPaths) -> Result<Self> {
-        if let Some(local) = self.local.take() {
-            self.local = Some(super::leaf_paths::LeafPathPushdown::assign(local, &paths)?);
-        }
-        self.leaf_paths = paths;
-        Ok(self)
-    }
-
-    /// Freezes the pinned cut, tier, and participant this occurrence reads.
-    #[must_use]
-    pub(super) fn with_source(mut self, source: PlannedRemoteSource) -> Self {
-        self.source = Some(Box::new(source));
-        self
-    }
-
-    /// Returns the frozen destination, if one was attached.
-    #[must_use]
-    pub(super) fn destination(&self) -> Option<&super::dispatcher::DispatchCandidate> {
-        self.source.as_ref().map(|source| &source.destination)
-    }
-
-    /// Returns the planned source key this leaf binds through, if it is remote.
-    ///
-    /// A placeholder without a frozen source is not a planned Oracle source —
-    /// it is the Interactive dispatcher's own leaf — so it names no key. The
-    /// key is derived from the leaf's own retained facts rather than stored, so
-    /// a closure attached after the source can never leave the two disagreeing.
-    /// Task variants of one occurrence derive an identical key, because a share
-    /// divides work rather than authority.
-    #[must_use]
-    pub(super) fn source_key(&self) -> Option<super::bindings::FollowerSourceKey> {
-        self.source
-            .as_ref()
-            .map(|source| super::bindings::FollowerSourceKey {
-                scan_id: self.scan_id.clone(),
-                destination: source.destination.clone(),
-                tenant: source.tenant,
-                table: source.table.clone(),
-                tier: source.tier,
-                schema_fingerprint: self.schema_fingerprint.clone(),
-                required_columns: self.required_columns.clone(),
-                predicates: self.predicates.clone(),
-            })
-    }
-
-    /// Narrows this leaf to one task's share of its stage.
-    ///
-    /// The split handler produces one variant per final stage task. The share
-    /// is applied to the bound assignment at encode time rather than here,
-    /// because the assignment does not exist until after admission.
-    #[must_use]
-    pub(super) fn with_task_share(mut self, task_index: usize, task_count: usize) -> Self {
-        self.task_count = task_count.max(1);
-        self.task_index = task_index.min(self.task_count - 1);
-        self
-    }
-
-    /// Narrows one bound assignment to this variant's share of its stage.
-    ///
-    /// The split handler records only an index and a count, because the files
-    /// do not exist when a leaf is split. This is where that share becomes
-    /// concrete, so no task ever carries the complete file set and no file
-    /// reaches two tasks. Every other authority and closure field is carried
-    /// through unchanged: the share divides work, never permission.
-    #[must_use]
-    pub(super) fn narrow(
-        &self,
-        mut assignment: wyrd_spec::vala::api::FollowerScanAssignment,
-    ) -> wyrd_spec::vala::api::FollowerScanAssignment {
-        let tasks = self.task_count.max(1);
-        assignment.persisted.files = assignment
-            .persisted
-            .files
-            .into_iter()
-            .skip(self.task_index)
-            .step_by(tasks)
-            .collect();
-        assignment
-    }
-
-    /// Attaches the complete Analytical assignment this leaf carries.
-    ///
-    /// Only the Analytical leader calls this. The assignment names every file
-    /// the stage may read; upstream's scale-up handler narrows it to one task's
-    /// share before the plan is serialized, so what reaches a follower is that
-    /// follower's own slice and nothing wider.
-    #[must_use]
-    pub fn with_assignment(
-        mut self,
-        assignment: wyrd_spec::vala::api::FollowerScanAssignment,
-    ) -> Self {
-        self.assignment = Some(Box::new(assignment));
-        self
-    }
-
-    /// Returns the attached Analytical assignment, if this is an Analytical leaf.
-    #[must_use]
-    pub fn assignment(&self) -> Option<&wyrd_spec::vala::api::FollowerScanAssignment> {
-        self.assignment.as_deref()
-    }
-
-    /// Returns the partition count this placeholder advertises to planning.
-    #[must_use]
-    pub fn partitions(&self) -> usize {
-        self.empty.properties().partitioning.partition_count()
-    }
-
-    /// Advertises the session's target partition count for this source.
-    ///
-    /// Physical planning decides where to parallelize from the partitioning a
-    /// leaf reports. A single-partition leaf makes `DataFusion` insert a
-    /// round-robin repartition directly above it, and that repartition then
-    /// becomes the innermost exchange -- so the split boundary lands under the
-    /// partial aggregate and the follower receives a bare scan instead of a
-    /// reduced one. Reporting the session's target partitions keeps the boundary
-    /// at the exchange above the partial aggregate.
-    ///
-    /// The count is planning-only. On the leader this placeholder is replaced by
-    /// the remote scan, whose partitioning is the selected participant count; on
-    /// a follower it is replaced by the resolved provider's own partitioning.
-    #[must_use]
-    pub fn with_partitions(mut self, partitions: usize) -> Self {
-        self.empty = self.empty.with_partitions(partitions.max(1));
-        self
-    }
-
-    /// Attaches the provider's closed predicate/projection closure computed
-    /// during `scan()`. This is the value the dispatcher reads back off the
-    /// planned physical tree to fill the wire `FollowerScanAssignment`.
-    #[must_use]
-    pub fn with_closure(
-        mut self,
-        required_columns: Vec<String>,
-        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    ) -> Self {
-        self.required_columns = required_columns;
-        self.predicates = predicates;
-        self
-    }
-
-    /// Reports whether this leaf resolves a live Scribe stream rather than a
-    /// set of immutable persisted files.
-    ///
-    /// A Scribe source is a single live memtable cut, so it cannot be split
-    /// across tasks the way a file list can: it resolves exactly once. The
-    /// assignment is authoritative when one is already attached; before
-    /// binding, the deterministic scan identity is, because both sides mint it
-    /// from the same stream identity.
-    #[must_use]
-    pub(super) fn is_scribe(&self) -> bool {
-        self.assignment.as_ref().map_or_else(
-            || self.scan_id.contains(":scribe:"),
-            |assignment| assignment.scribe_provider_cut.is_some(),
-        )
     }
 
     /// Returns the stable scan identity.
@@ -404,33 +128,6 @@ impl RemoteSourcePlaceholderExec {
     #[must_use]
     pub fn schema_fingerprint(&self) -> &str {
         &self.schema_fingerprint
-    }
-
-    /// Returns the attached projection closure, or an empty slice when no
-    /// closure was attached (the caller must treat that as "no update",
-    /// never as "project nothing").
-    #[must_use]
-    pub fn required_columns(&self) -> &[String] {
-        &self.required_columns
-    }
-
-    /// Returns the attached closed predicates, in filter order.
-    #[must_use]
-    pub fn predicates(&self) -> &[wyrd_spec::vala::assignment_authority::ScanPredicate] {
-        &self.predicates
-    }
-
-    /// Returns the leader-readable leaf this placeholder substituted, if any.
-    ///
-    /// The local plan is deliberately hidden from [`ExecutionPlan::children`]
-    /// so the distributed planner keeps treating this node as a leaf and gives
-    /// it one variant per stage task. Any walk over the retained root would
-    /// therefore stop here and see no source at all, which is wrong for
-    /// anything accounting for what the leader actually executed. Scan
-    /// evidence reads the substituted leaf back through this accessor.
-    #[must_use]
-    pub fn local_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
-        self.local.as_ref()
     }
 }
 
@@ -491,7 +188,7 @@ impl ExecutionPlan for RemoteSourcePlaceholderExec {
             ))
         }
     }
-    /// Executes as empty only before role-local follower reconstruction.
+    /// Executes as empty; only the follower's substituted provider reads rows.
     ///
     /// # Errors
     /// Returns the wrapped empty plan's execution error for an invalid partition
@@ -501,63 +198,15 @@ impl ExecutionPlan for RemoteSourcePlaceholderExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        match self.local.as_ref() {
-            Some(local) => local.execute(partition, context),
-            None => self.empty.execute(partition, context),
-        }
+        self.empty.execute(partition, context)
     }
 }
 
 /// Physical extension codec that encodes placeholders and consumes prebuilt providers.
+#[derive(Default)]
 pub struct OraclePhysicalExtensionCodec {
     /// Complete role-local provider registry, consumed once per scan.
     providers: Mutex<HashMap<String, Arc<dyn ExecutionPlan>>>,
-    /// Analytical leaf binding, present only on an Analytical follower session.
-    ///
-    /// Interactive followers resolve every provider before decode and register
-    /// them in `providers`. Analytical followers cannot: their plan arrives
-    /// through upstream's worker, which builds the session before it has the
-    /// plan bytes. This binding lets decode construct a lazily resolving leaf
-    /// instead of demanding a provider that could not yet exist.
-    analytical: Option<AnalyticalLeafBinding>,
-    /// Session lock the leader resolves a planned leaf's bound assignment from.
-    ///
-    /// `None` on every decode-side codec and on the Interactive path, where the
-    /// dispatcher attaches the signed assignment to the placeholder itself.
-    /// `Some` on the single planner's leader session, where the placeholder is
-    /// planned before admission and the assignment only exists after the
-    /// audited drain publishes it.
-    bindings: Option<Arc<super::bindings::OracleExecutionLock>>,
-}
-
-/// Per-session capability an Analytical follower needs to build its own leaves.
-#[derive(Clone)]
-pub struct AnalyticalLeafBinding {
-    /// Role this node executes as, selecting the resolver's source family.
-    role: wyrd_spec::vala::api::ClusterRole,
-    /// Process resolver that turns a signed assignment into a local provider.
-    resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-}
-
-impl AnalyticalLeafBinding {
-    /// Creates the Analytical decode binding for one follower session.
-    #[must_use]
-    pub fn new(
-        role: wyrd_spec::vala::api::ClusterRole,
-        resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-    ) -> Self {
-        Self { role, resolver }
-    }
-}
-
-impl fmt::Debug for AnalyticalLeafBinding {
-    /// Renders only the non-secret role, never resolver internals.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AnalyticalLeafBinding")
-            .field("role", &self.role)
-            .finish_non_exhaustive()
-    }
 }
 
 impl std::fmt::Debug for OraclePhysicalExtensionCodec {
@@ -565,19 +214,7 @@ impl std::fmt::Debug for OraclePhysicalExtensionCodec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OraclePhysicalExtensionCodec")
-            .field("analytical", &self.analytical.is_some())
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for OraclePhysicalExtensionCodec {
-    /// Creates an empty encoding-only codec.
-    fn default() -> Self {
-        Self {
-            providers: Mutex::new(HashMap::new()),
-            analytical: None,
-            bindings: None,
-        }
     }
 }
 
@@ -593,38 +230,7 @@ impl OraclePhysicalExtensionCodec {
     pub fn decoder(providers: HashMap<String, Arc<dyn ExecutionPlan>>) -> Self {
         Self {
             providers: Mutex::new(providers),
-            analytical: None,
-            bindings: None,
         }
-    }
-
-    /// Creates the Analytical codec used on both sides of a stage boundary.
-    ///
-    /// The same value encodes leaves on its way out and decodes them on its way
-    /// in, because upstream installs one user codec per session and a follower
-    /// running a middle stage does both.
-    #[must_use]
-    pub fn analytical(binding: AnalyticalLeafBinding) -> Self {
-        Self {
-            providers: Mutex::new(HashMap::new()),
-            analytical: Some(binding),
-            bindings: None,
-        }
-    }
-
-    /// Attaches the session lock this codec resolves planned leaf sources through.
-    ///
-    /// A leader-side placeholder is planned before admission and therefore
-    /// carries no assignment of its own. The lock is the one place the bound
-    /// assignment arrives, after admission and the audited drain, so encoding
-    /// resolves through it rather than through anything the plan captured.
-    #[must_use]
-    pub(super) fn with_bindings(
-        mut self,
-        bindings: Arc<super::bindings::OracleExecutionLock>,
-    ) -> Self {
-        self.bindings = Some(bindings);
-        self
     }
 
     /// Requires the native decoder to consume every authenticated provider exactly once.
@@ -655,7 +261,7 @@ impl OraclePhysicalExtensionCodec {
         envelopes
             .iter()
             .map(|bytes| {
-                let payload = Self::decode_payload(bytes)?;
+                let payload = Self::preflight_extension(bytes)?;
                 if payload.scan_id.is_empty()
                     || payload.schema_fingerprint.is_empty()
                     || !seen.insert(payload.scan_id.clone())
@@ -669,21 +275,6 @@ impl OraclePhysicalExtensionCodec {
             .collect()
     }
 
-    /// Decodes and validates the fixed extension envelope.
-    ///
-    /// # Errors
-    /// Returns a plan error when the envelope or payload is malformed or unsupported.
-    pub(crate) fn decode_payload(bytes: &[u8]) -> Result<RemoteScanPayload> {
-        let envelope = Self::decode_envelope(bytes)?;
-        if envelope.type_tag != ORACLE_REMOTE_SCAN_TAG {
-            return Err(DataFusionError::Plan(
-                "Oracle extension is not a remote scan".to_owned(),
-            ));
-        }
-        RemoteScanPayload::decode(envelope.payload.as_slice())
-            .map_err(|error| DataFusionError::Plan(format!("invalid remote scan payload: {error}")))
-    }
-
     /// Decodes the one supported extension, a remote scan, for the follower's
     /// IO-free preflight.
     ///
@@ -691,20 +282,6 @@ impl OraclePhysicalExtensionCodec {
     /// Returns a plan error when the envelope or payload is invalid, or the
     /// extension is not a remote scan.
     pub(crate) fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
-        let envelope = Self::decode_envelope(bytes)?;
-        match envelope.type_tag.as_str() {
-            ORACLE_REMOTE_SCAN_TAG => RemoteScanPayload::decode(envelope.payload.as_slice())
-                .map_err(|error| {
-                    DataFusionError::Plan(format!("invalid remote scan payload: {error}"))
-                }),
-            _ => Err(DataFusionError::Plan(
-                "unsupported Oracle physical extension type".to_owned(),
-            )),
-        }
-    }
-
-    /// Decodes the common versioned extension envelope without assuming its closed type.
-    fn decode_envelope(bytes: &[u8]) -> Result<OracleExtensionEnvelope> {
         let envelope = OracleExtensionEnvelope::decode(bytes).map_err(|error| {
             DataFusionError::Plan(format!("invalid Oracle extension envelope: {error}"))
         })?;
@@ -713,114 +290,14 @@ impl OraclePhysicalExtensionCodec {
                 "unsupported Oracle extension version".to_owned(),
             ));
         }
-        Ok(envelope)
+        if envelope.type_tag != ORACLE_REMOTE_SCAN_TAG {
+            return Err(DataFusionError::Plan(
+                "unsupported Oracle physical extension type".to_owned(),
+            ));
+        }
+        RemoteScanPayload::decode(envelope.payload.as_slice())
+            .map_err(|error| DataFusionError::Plan(format!("invalid remote scan payload: {error}")))
     }
-}
-
-/// Projects one placeholder into its wire payload.
-///
-/// An Interactive placeholder carries identity only; the follower already holds
-/// the signed assignment and a pre-resolved provider. An Analytical placeholder
-/// additionally carries its assignment, its closure schema, and its advertised
-/// partition count, because on that path the serialized plan is the *only*
-/// thing that crosses the wire.
-///
-/// # Errors
-///
-/// Returns [`DataFusionError::Plan`] when the assignment cannot be JSON-encoded
-/// or the closure schema cannot be projected into `datafusion-proto` form.
-fn remote_scan_payload(
-    scan: &RemoteSourcePlaceholderExec,
-    bindings: Option<&super::bindings::OracleExecutionLock>,
-) -> Result<RemoteScanPayload> {
-    let leaf_paths_json = if scan.leaf_paths.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::to_vec(&scan.leaf_paths).map_err(|error| {
-            DataFusionError::Plan(format!("Variant path encoding failed: {error}"))
-        })?
-    };
-    let bound = scan
-        .source_key()
-        .zip(bindings.and_then(std::sync::OnceLock::get))
-        .map(|(key, bindings)| bindings.follower_assignment(&key).cloned())
-        .transpose()?;
-    let assignment = bound.as_ref().or_else(|| scan.assignment());
-    let Some(assignment) = assignment else {
-        return Ok(RemoteScanPayload {
-            scan_id: scan.scan_id.clone(),
-            schema_fingerprint: scan.schema_fingerprint.clone(),
-            assignment_json: Vec::new(),
-            closure_schema: Vec::new(),
-            partitions: 0,
-            leaf_paths_json,
-        });
-    };
-    // One narrowing site for both paths: the leader's bound assignment and the
-    // Interactive dispatcher's attached one are divided the same way.
-    let assignment = scan.narrow(assignment.clone());
-    let assignment_json = serde_json::to_vec(&assignment).map_err(|error| {
-        DataFusionError::Plan(format!("analytical assignment encoding failed: {error}"))
-    })?;
-    let schema =
-        datafusion_proto::protobuf::Schema::try_from(scan.schema().as_ref()).map_err(|error| {
-            DataFusionError::Plan(format!(
-                "analytical closure schema encoding failed: {error}"
-            ))
-        })?;
-    Ok(RemoteScanPayload {
-        scan_id: scan.scan_id.clone(),
-        schema_fingerprint: scan.schema_fingerprint.clone(),
-        assignment_json,
-        closure_schema: schema.encode_to_vec(),
-        partitions: u32::try_from(scan.partitions()).unwrap_or(u32::MAX),
-        leaf_paths_json,
-    })
-}
-
-/// Rebuilds the Analytical closure schema and assignment from one wire payload.
-///
-/// # Errors
-///
-/// Returns [`DataFusionError::Plan`] when the payload carries no assignment,
-/// when either encoded field is malformed, or when the closure schema cannot be
-/// projected back into Arrow form.
-fn analytical_leaf_parts(
-    payload: &RemoteScanPayload,
-) -> Result<(
-    wyrd_spec::vala::api::FollowerScanAssignment,
-    SchemaRef,
-    usize,
-)> {
-    if payload.assignment_json.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "analytical remote scan {} carries no assignment",
-            payload.scan_id
-        )));
-    }
-    let assignment: wyrd_spec::vala::api::FollowerScanAssignment =
-        serde_json::from_slice(&payload.assignment_json).map_err(|error| {
-            DataFusionError::Plan(format!("invalid analytical assignment: {error}"))
-        })?;
-    if assignment.scan_id != payload.scan_id
-        || assignment.schema_fingerprint != payload.schema_fingerprint
-    {
-        return Err(DataFusionError::Plan(
-            "analytical assignment identity differs from its placeholder".to_owned(),
-        ));
-    }
-    let schema = datafusion_proto::protobuf::Schema::decode(payload.closure_schema.as_slice())
-        .map_err(|error| {
-            DataFusionError::Plan(format!("invalid analytical closure schema: {error}"))
-        })?;
-    let schema = arrow::datatypes::Schema::try_from(&schema).map_err(|error| {
-        DataFusionError::Plan(format!("invalid analytical closure schema: {error}"))
-    })?;
-    Ok((
-        assignment,
-        Arc::new(schema),
-        usize::try_from(payload.partitions).unwrap_or(1).max(1),
-    ))
 }
 
 impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
@@ -836,60 +313,22 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
         _ctx: &TaskContext,
         _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let envelope = Self::decode_envelope(buf)?;
-        match envelope.type_tag.as_str() {
-            ORACLE_REMOTE_SCAN_TAG => {
-                if !inputs.is_empty() {
-                    return Err(DataFusionError::Plan(
-                        "remote scan extension must be a leaf".to_owned(),
-                    ));
-                }
-                let payload =
-                    RemoteScanPayload::decode(envelope.payload.as_slice()).map_err(|error| {
-                        DataFusionError::Plan(format!("invalid remote scan payload: {error}"))
-                    })?;
-                let pre_resolved = self
-                    .providers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&payload.scan_id);
-                let leaf_paths = if payload.leaf_paths_json.is_empty() {
-                    super::leaf_paths::LeafPaths::default()
-                } else {
-                    serde_json::from_slice(&payload.leaf_paths_json).map_err(|error| {
-                        DataFusionError::Plan(format!("invalid leaf paths: {error}"))
-                    })?
-                };
-                if let Some(provider) = pre_resolved {
-                    return super::leaf_paths::LeafPathPushdown::assign(provider, &leaf_paths);
-                }
-                // An Interactive follower has already registered every provider
-                // it was authorized to read, so an absent entry is a refusal.
-                // An Analytical follower has none: its assignment travels inside
-                // this payload, under the same ticket digest that authorized the
-                // raw message, and its provider is resolved on first execution.
-                let Some(binding) = self.analytical.as_ref() else {
-                    return Err(DataFusionError::Plan(format!(
-                        "missing authenticated provider for scan {}",
-                        payload.scan_id
-                    )));
-                };
-                let (assignment, schema, partitions) = analytical_leaf_parts(&payload)?;
-                Ok(Arc::new(
-                    super::analytical_scan::AnalyticalScanExec::new(
-                        assignment,
-                        binding.role,
-                        Arc::clone(&binding.resolver),
-                        schema,
-                        partitions,
-                    )
-                    .with_leaf_paths(leaf_paths),
-                ))
-            }
-            _ => Err(DataFusionError::Plan(
-                "unsupported Oracle physical extension type".to_owned(),
-            )),
+        let payload = Self::preflight_extension(buf)?;
+        if !inputs.is_empty() {
+            return Err(DataFusionError::Plan(
+                "remote scan extension must be a leaf".to_owned(),
+            ));
         }
+        self.providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&payload.scan_id)
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "missing authenticated provider for scan {}",
+                    payload.scan_id
+                ))
+            })
     }
 
     /// Encodes only the Wyrd remote-scan placeholder in the fixed v1 envelope.
@@ -902,25 +341,19 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        let (type_tag, payload) =
-            if let Some(scan) = node.downcast_ref::<RemoteSourcePlaceholderExec>() {
-                (
-                    ORACLE_REMOTE_SCAN_TAG,
-                    remote_scan_payload(scan, self.bindings.as_deref())?.encode_to_vec(),
-                )
-            } else if node.downcast_ref::<super::live::LiveScribeExec>().is_some() {
-                return Err(DataFusionError::Plan(
-                    "leader-owned live Scribe source cannot cross the wire".to_owned(),
-                ));
-            } else {
-                return Err(DataFusionError::Plan(
-                    "unsupported Oracle physical extension".to_owned(),
-                ));
-            };
+        let Some(scan) = node.downcast_ref::<RemoteSourcePlaceholderExec>() else {
+            return Err(DataFusionError::Plan(
+                "unsupported Oracle physical extension".to_owned(),
+            ));
+        };
         OracleExtensionEnvelope {
             codec_version: ORACLE_PHYSICAL_CODEC_VERSION,
-            type_tag: type_tag.to_owned(),
-            payload,
+            type_tag: ORACLE_REMOTE_SCAN_TAG.to_owned(),
+            payload: RemoteScanPayload {
+                scan_id: scan.scan_id.clone(),
+                schema_fingerprint: scan.schema_fingerprint.clone(),
+            }
+            .encode_to_vec(),
         }
         .encode(buf)
         .map_err(|error| {
@@ -1060,7 +493,6 @@ mod tests {
             payload: RemoteScanPayload {
                 scan_id: scan_id.to_owned(),
                 schema_fingerprint: "sha256:schema".to_owned(),
-                ..RemoteScanPayload::default()
             }
             .encode_to_vec(),
         }
@@ -1223,43 +655,5 @@ mod tests {
         assert!(decoded.is_err());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(executions.load(Ordering::SeqCst), 0);
-    }
-
-    /// Proves a placeholder holding a local plan reads it on the leader.
-    ///
-    /// A placeholder that only ever yields `EmptyExec` forces the planner to
-    /// put a network boundary above every substituted leaf, because the leader
-    /// can no longer read its own cut. Carrying the real leaf lets one
-    /// substitution serve both paths: the leader executes it directly when the
-    /// planner leaves the leaf in the head stage, and the codec still encodes
-    /// the assignment when the stage is dispatched.
-    #[tokio::test]
-    async fn placeholder_executes_its_local_plan_on_the_leader() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![7_i64, 8]))],
-        )
-        .expect("the fixture batch matches its schema");
-        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-            .expect("the fixture table matches its schema");
-        let ctx = SessionContext::new();
-        let local = ctx
-            .read_table(Arc::new(table))
-            .expect("the fixture table registers")
-            .create_physical_plan()
-            .await
-            .expect("the fixture table plans");
-
-        let placeholder = RemoteSourcePlaceholderExec::new("oracle:t:persisted", "fp", schema)
-            .with_local(Arc::clone(&local));
-
-        let rows = collect(Arc::new(placeholder), ctx.task_ctx())
-            .await
-            .expect("the placeholder executes its local plan")
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum::<usize>();
-        assert_eq!(rows, 2, "the leader must read the local plan's rows");
     }
 }

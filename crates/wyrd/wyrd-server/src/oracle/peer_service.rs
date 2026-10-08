@@ -312,7 +312,6 @@ impl ScribeFragmentExecutor {
                         "{}.{}",
                         assignment.binding.namespace, assignment.binding.table
                     ) != claims.binding
-                    || !assignment.persisted.files.is_empty()
                     || assignment.scribe_provider_cut.is_none()
             })
         {
@@ -320,7 +319,7 @@ impl ScribeFragmentExecutor {
             return Err(DispatchError::Terminal);
         }
         // Recomputed last, before any provider or tail I/O: the context names
-        // the closed-predicate/projection closure the leader intended, and
+        // the projection closure the leader intended, and
         // this proves it matches what this Scribe worker actually received.
         match vala_bifrost_redux::oracle::peer::assignment_authority_digest_for(
             &request.assignments,

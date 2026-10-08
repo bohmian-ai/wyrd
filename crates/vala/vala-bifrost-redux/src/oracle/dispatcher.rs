@@ -2008,7 +2008,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::api::{
         AnalyticalGraphRef, ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease,
-        FollowerScanAssignment, OracleCapabilitiesV1, PersistedFileAssignment, TenantTableBinding,
+        FollowerScanAssignment, OracleCapabilitiesV1, TenantTableBinding,
     };
     use wyrd_tonic::tonic::Request;
 
@@ -2057,14 +2057,12 @@ mod tests {
             assignments: vec![FollowerScanAssignment {
                 scan_id: format!("{id}-scan"),
                 binding: binding.clone(),
-                persisted: PersistedFileAssignment { files: Vec::new() },
                 scribe_provider_cut: None,
                 // Canonical 64-lowercase-hex placeholder: the assignment-
                 // authority digest requires this shape even in fixtures that
                 // never exercise object storage.
                 schema_fingerprint: "0".repeat(64),
                 required_columns: vec!["value".to_owned()],
-                predicates: Vec::new(),
             }],
             binding,
             target_role: ClusterRole::Oracle,

@@ -89,7 +89,7 @@ enum PruningExpectation {
 ///
 /// This is the hot-Parquet owner of the projection half. The cut is asserted
 /// to hold hot files and no compacted file immediately before the queries run,
-/// so the broad/narrow byte difference is attributable to `HotParquetExec`'s
+/// so the broad/narrow byte difference is attributable to DataFusion's Parquet scan's
 /// column mask and to nothing else. Predicate, retained rows, retained row
 /// groups, and physical authority are identical across the two queries; only
 /// the requested column set differs.
@@ -126,7 +126,7 @@ async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads()
 /// Every document holds only `a`, so the hot object shreds `a` and no row
 /// keeps a residual `value`; Arrow then reports any other key as missing.
 /// Promotion is parked before the write so the read goes through
-/// `HotParquetExec`, which is the reader that evaluates the Variant leaf.
+/// DataFusion's Parquet scan, which is the reader that evaluates the Variant leaf.
 ///
 /// # Panics
 ///
@@ -237,7 +237,7 @@ async fn prove_selective_predicate_pruning(
     expectation: PruningExpectation,
 ) -> Result<(), JourneyError> {
     // Every proof below reads sealed hot Parquet: files and row groups
-    // scanned, footer statistics, `HotParquetExec`'s projection mask and the
+    // scanned, footer statistics, DataFusion's Parquet scan's projection mask and the
     // footer tenant proof. Scribe's unsealed live tail has none of those, so
     // the fixture flushes. Forge promotes each flushed object to Iceberg as
     // soon as it is published (REQ-002), which would move the measurement
@@ -412,7 +412,7 @@ async fn prove_selective_predicate_pruning(
     // in exactly one respect: it does not request `unused_payload`. Predicate,
     // cut, retained rows, and retained row groups are identical, so a byte
     // difference can only come from the physical reader declining to decode
-    // that column. On a hot-only cut that reader is `HotParquetExec`, and its
+    // that column. On a hot-only cut that reader is DataFusion's Parquet scan, and its
     // name-derived `ProjectionMask` is the only mechanism that can produce it.
     let narrow_checkpoint = cluster
         .telemetry()
@@ -786,14 +786,8 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .delta_since(&selective_checkpoint)
         .map_err(|error| error.to_string())?;
     let selective_bytes = sum_metric(&selective_delta, "oracle_query_bytes_scanned_total");
-    // Bytes, not row groups, is the pruning signal for the compacted leaf, and
-    // the choice is forced rather than preferred.
-    // `oracle_query_row_groups_{scanned,pruned}_total` are fed only by
-    // `OracleScanMetricsHandle::record_row_groups`, which the hot Parquet
-    // reader calls and the Iceberg reader does not; the compacted leaf's
-    // counters come from `iceberg::arrow::ScanMetrics`, which exposes byte
-    // ranges and nothing else. Asserting on row groups here would therefore
-    // measure the hot leaf and report it as coverage of the compacted one.
+    // Bytes are the pruning signal for the compacted leaf: the row-group
+    // counters sum every leaf, so they cannot attribute pruning to it.
     //
     // Attribution still holds: every hot row matches the predicate, so the hot
     // leaf reads identical bytes filtered and unfiltered, and the whole of this
@@ -839,7 +833,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
 /// column, and the narrow closure is a strict subset of the broad one. It does
 /// not claim that the narrow query issued fewer object-store bytes.
 ///
-/// The hot-only journey owns the byte proof for `HotParquetExec`. Neither leg
+/// The hot-only journey owns the byte proof for DataFusion's Parquet scan. Neither leg
 /// is inferred from an aggregate reduction over the mixed-tier cut this journey
 /// later builds.
 ///
@@ -5009,7 +5003,6 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let observer = cluster
         .forge_completion_observer()
         .ok_or("cluster was started without a Forge completion observer")?;
-    let storage = cluster.storage_operator();
 
     let query = held_query_ids(
         &engine,
@@ -5089,7 +5082,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         );
         for original in &originals {
             assert!(
-                storage.exists(original).await?,
+                cluster.object_exists(original).await?,
                 "the held pass's expired and orphan cleanup leave {original}"
             );
             assert_eq!(
@@ -5144,7 +5137,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     // After the last reader, ordinary maintenance destroys only the originals.
     let deleted = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
         for original in &originals {
-            while storage.exists(original).await? {
+            while cluster.object_exists(original).await? {
                 held_query_maintenance_pass(server).await?;
             }
         }
@@ -5176,7 +5169,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         "the replaced snapshot expired after the last reader"
     );
     assert!(
-        storage.exists(&replacement).await?,
+        cluster.object_exists(&replacement).await?,
         "the replacement object survives cleanup"
     );
     for original in &originals {

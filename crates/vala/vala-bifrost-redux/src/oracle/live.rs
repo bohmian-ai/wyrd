@@ -32,10 +32,9 @@ use futures_util::StreamExt as _;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerScanAssignment, NodeId, PersistedFileAssignment, ScribeProviderCut,
-    TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
+    ClusterRole, FollowerScanAssignment, NodeId, ScribeProviderCut, TenantTableBinding,
+    TimePartitionWire, WorkerAttemptFrame,
 };
-use wyrd_spec::vala::assignment_authority::ScanPredicate;
 
 use super::dispatcher::{
     DispatchCandidate, DispatchContext, DispatchError, FragmentDispatcher, LiveFrame,
@@ -43,9 +42,6 @@ use super::dispatcher::{
 };
 use super::exec::RemoteScanMetrics;
 use super::{DegradedPartition, DegradedSourceAccumulator, QueryCatalogError};
-use crate::catalog::event_time::EventTimeStatistics;
-use crate::catalog::layout::TimePartition;
-use crate::oracle::pruning::EventTimeQueryInterval;
 
 /// Stable degraded-reason label for a live source lost before its first row.
 const LIVE_TAIL_UNAVAILABLE: &str = "live_tail_unavailable";
@@ -72,23 +68,6 @@ pub(crate) struct LiveScribeRoute {
     pub(crate) time_partition: TimePartitionWire,
 }
 
-impl LiveScribeRoute {
-    /// Reports whether this route can hold a row the query interval keeps.
-    ///
-    /// Partitions are laid out on `wyrd_event_time`, so a partition's rows all
-    /// lie inside `[start, end)`. That interval is decided exactly as a hot
-    /// file's recorded bounds are: only a proven empty intersection excludes,
-    /// and an unconstrained query retains every route.
-    fn is_selected_by(&self, interval: EventTimeQueryInterval) -> bool {
-        let partition = TimePartition::from_wire(self.time_partition);
-        let statistics = EventTimeStatistics::Bounded {
-            min_micros: partition.start_unix_micros(),
-            max_micros: partition.end_utc().timestamp_micros().saturating_sub(1),
-        };
-        !interval.decide(statistics).excludes()
-    }
-}
-
 /// Every live route discovered for one pinned table, with its signing identity.
 ///
 /// Built once per query, after the published cut is pinned and before the
@@ -99,21 +78,6 @@ pub(crate) struct LiveTableRoutes {
     pub(crate) binding: TenantTableBinding,
     /// Reported routes, in discovery order.
     pub(crate) routes: Vec<LiveScribeRoute>,
-}
-
-impl LiveTableRoutes {
-    /// Returns the routes one scan must read under its closed predicates.
-    ///
-    /// Only `wyrd_event_time` leaves narrow the interval; every other predicate
-    /// is unsafe for partition pruning and retains every reported route.
-    pub(super) fn select(&self, predicates: &[ScanPredicate]) -> Vec<LiveScribeRoute> {
-        let interval = EventTimeQueryInterval::from_predicates(predicates);
-        self.routes
-            .iter()
-            .filter(|route| route.is_selected_by(interval))
-            .cloned()
-            .collect()
-    }
 }
 
 /// Post-admission capability every live partition dispatches through.
@@ -180,8 +144,6 @@ pub(super) struct LiveScribeExec {
     schema_fingerprint: String,
     /// Signed projection closure, in closure order.
     required_columns: Vec<String>,
-    /// Closed predicates the Scribe applies before it streams a batch.
-    predicates: Vec<ScanPredicate>,
     /// Advertised closure schema and the session's target partitions.
     properties: Arc<PlanProperties>,
     /// Scan evidence every validated fragment completion folds in, shared by
@@ -199,7 +161,6 @@ impl LiveScribeExec {
         routes: LiveTableRoutes,
         schema_fingerprint: String,
         required_columns: Vec<String>,
-        predicates: Vec<ScanPredicate>,
         schema: SchemaRef,
         partitions: usize,
     ) -> Self {
@@ -208,7 +169,6 @@ impl LiveScribeExec {
             routes: Arc::new(routes),
             schema_fingerprint,
             required_columns,
-            predicates,
             properties: Arc::new(PlanProperties::new(
                 datafusion::physical_expr::EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(partitions),
@@ -263,7 +223,6 @@ impl LiveScribeExec {
         let assignment = FollowerScanAssignment {
             scan_id,
             binding: binding.clone(),
-            persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(ScribeProviderCut {
                 writer_epoch: route.writer_epoch,
                 start_partition: route.time_partition,
@@ -271,7 +230,6 @@ impl LiveScribeExec {
             }),
             schema_fingerprint: self.schema_fingerprint.clone(),
             required_columns: self.required_columns.clone(),
-            predicates: self.predicates.clone(),
         };
         Ok((
             PhysicalDispatchFragment {
@@ -834,7 +792,6 @@ mod tests {
 
     use super::*;
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
-    use wyrd_spec::vala::assignment_authority::ScanLeaf;
 
     /// Encodes `rows` through the Scribe's own attempt encoder.
     fn frames(fingerprint: &str, rows: &[i64]) -> Vec<WorkerAttemptFrame> {
@@ -1048,7 +1005,6 @@ mod tests {
                 },
                 "f".repeat(64),
                 vec!["v".to_owned()],
-                Vec::new(),
                 Arc::clone(&schema),
                 1,
             )
@@ -1105,46 +1061,5 @@ mod tests {
             stats.physical_bytes_scanned, None,
             "a memtable read scans no Parquet"
         );
-    }
-
-    /// An event-time floor excludes a route whose whole partition precedes
-    /// it, while a predicate on any other column retains every route.
-    #[test]
-    fn live_routes_prune_only_on_event_time() {
-        let hour = |start: i64| {
-            TimePartitionWire::new(
-                wyrd_spec::vala::api::TimeGranularityWire::Hour,
-                chrono::DateTime::from_timestamp_micros(start).expect("instant"),
-            )
-            .expect("hour boundary")
-        };
-        let route = |start| LiveScribeRoute {
-            node_id: NodeId::new(uuid::Uuid::now_v7()),
-            writer_epoch: 1,
-            endpoint: "https://scribe.internal".to_owned(),
-            time_partition: hour(start),
-        };
-        let early = route(1_787_493_600_000_000);
-        let late = route(1_787_497_200_000_000);
-        let table = LiveTableRoutes {
-            binding: TenantTableBinding {
-                tenant_id: wyrd_spec::DataTenantId::new_v7(),
-                namespace: "bifrost".to_owned(),
-                table: "events".to_owned(),
-            },
-            routes: vec![early, late.clone()],
-        };
-        let floor = ScanPredicate::GtEq(
-            ScanLeaf::Column(wyrd_spec::vala::WYRD_EVENT_TIME.to_owned()),
-            wyrd_spec::vala::assignment_authority::ScanLiteral::TimestampMicros(
-                1_787_497_200_000_000,
-            ),
-        );
-        assert_eq!(table.select(std::slice::from_ref(&floor)), vec![late]);
-        let other = ScanPredicate::GtEq(
-            ScanLeaf::Column("id".to_owned()),
-            wyrd_spec::vala::assignment_authority::ScanLiteral::I64(0),
-        );
-        assert_eq!(table.select(&[other]).len(), 2);
     }
 }

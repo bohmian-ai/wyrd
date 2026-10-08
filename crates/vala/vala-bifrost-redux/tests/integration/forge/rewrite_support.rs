@@ -95,7 +95,7 @@ impl PromotedRewriteFixture {
     /// Panics when the fixture cannot start or its promotion does not settle.
     pub(crate) async fn start(table_name: &str) -> Self {
         let fixture = PromotionIntegrationFixture::start(table_name).await;
-        let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+        let object_store = CountingObjectStore::new(&fixture.storage);
         let mut promotion = SupervisedPromotion::start(
             &fixture,
             fixture.catalog.iceberg_catalog(),
@@ -542,13 +542,7 @@ impl PromotedRewriteFixture {
             || path.to_owned(),
             |(_, suffix)| format!("{prefix}/{suffix}"),
         );
-        let bytes = self
-            .fixture
-            .staging
-            .read(&key)
-            .await
-            .expect("produced object read")
-            .to_bytes();
+        let bytes = self.fixture.read_object(&key).await;
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
             .expect("produced object is Parquet")
             .build()

@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wyrd_sql::OperatorPool;
-use wyrd_storage::StorageError;
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -43,7 +42,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::{BifrostStorage, StorageInspection};
+use vala_bifrost_redux::storage::BifrostStorage;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -83,6 +82,7 @@ use wyrd_telemetry::TelemetryGuard;
 use wyrd_types::variant::variant_storage_type;
 
 use crate::bifrost::ForgeObjectStoreControl;
+use crate::bifrost::object_reads::ObjectReadProbe;
 
 use wyrd_spec::auth::{
     ExchangeTokenType, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
@@ -241,6 +241,8 @@ struct WyrdTestServerInner {
     forge_scheduler_trigger: ForgeSchedulerTrigger,
     /// Passive controls retained by the actual production-composed Forge object store.
     forge_object_store: Option<Arc<ForgeObjectStoreControl>>,
+    /// Ranged-read probe wrapping this server's Bifrost object store.
+    object_reads: Arc<ObjectReadProbe>,
     /// Process composition selected for this test server.
     forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
@@ -283,12 +285,6 @@ pub struct ServerShutdownInspection {
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
     pub supervised_tasks: u64,
-    /// Final storage-owner state, read from its owners, when this process had one.
-    ///
-    /// Captured after the bound production serve task joins and before the
-    /// harness drops, so it is the state production teardown actually left
-    /// rather than the state a test-invoked second shutdown produced.
-    pub storage: Option<StorageInspection>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -982,18 +978,11 @@ impl WyrdTestServer {
         let scribe_inflight = self
             .bifrost_scribe()
             .map_or(0, |scribe| scribe.inflight_items_for_test() as u64);
-        let storage = self
-            .inner
-            .state
-            .bifrost
-            .bifrost_storage()
-            .map(|storage| storage.inspect());
         let inspection = ServerShutdownInspection {
             scribe,
             scribe_inflight,
             listeners_stopped,
             supervised_tasks: self.supervised_task_count_for_test() as u64,
-            storage,
         };
         tokio::task::spawn_blocking(move || drop(self))
             .await
@@ -2429,6 +2418,12 @@ impl WyrdTestServer {
     #[must_use]
     pub fn forge_object_store_control_for_test(&self) -> Option<Arc<ForgeObjectStoreControl>> {
         self.inner.forge_object_store.as_ref().map(Arc::clone)
+    }
+
+    /// Return the probe observing ranged reads on this server's Bifrost store.
+    #[must_use]
+    pub fn object_reads_for_test(&self) -> &Arc<ObjectReadProbe> {
+        &self.inner.object_reads
     }
 
     /// Classifies one object through this node's production orphan predicate.
@@ -4284,7 +4279,7 @@ impl WyrdTestServerBuilder {
                     (Some(Arc::new(root)), settings)
                 }
             };
-            let handle = fixture_storage_handle(settings)
+            let handle = StorageHandle::from_settings(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
@@ -4446,16 +4441,29 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         // Same boot order as production: resources, then the one storage owner,
         // then the catalog that runs its Iceberg I/O through it.
-        let bifrost_storage = Arc::new(BifrostStorage::new(
-            Arc::clone(&storage),
+        let mut bifrost_storage = BifrostStorage::new(
+            storage.backend_config(),
             vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
                 self.bifrost_storage_io.to_storage_config(),
                 u64::try_from(bifrost_resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
                 bifrost_resources.oracle().is_some(),
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            bifrost_resources.oracle().map(|oracle| oracle.metadata()),
-        ));
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let mut object_reads = None;
+        bifrost_storage = bifrost_storage.with_objects_for_test(|objects| {
+            let probe = ObjectReadProbe::new(objects);
+            object_reads = Some(Arc::clone(&probe));
+            probe
+        });
+        let object_reads = object_reads.expect("the probe wraps the store it was given");
+        if let Some(oracle) = bifrost_resources.oracle() {
+            bifrost_storage = bifrost_storage
+                .with_metadata_cache(&oracle.metadata())
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        }
+        let bifrost_storage = Arc::new(bifrost_storage);
         let bifrost = test_catalog(&fixture, Arc::clone(&bifrost_storage)).await?;
         let target = self.forge_process_role;
         // Mirrors production: a Scribe-bearing node reclaims the identity stored
@@ -4494,7 +4502,7 @@ impl WyrdTestServerBuilder {
             || self
                 .bifrost_roles
                 .contains(&BifrostRuntimeRole::ForgeWorker))
-        .then(|| ForgeObjectStoreControl::new(Arc::new(storage.operator().clone())));
+        .then(|| ForgeObjectStoreControl::new(&bifrost_storage));
         let composed_forge_object_store = forge_object_store.as_ref().map(|control| {
             Arc::clone(control) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>
         });
@@ -4546,7 +4554,6 @@ impl WyrdTestServerBuilder {
             target,
             deployment_profile: DeploymentProfile::Development,
             postgres: postgres.as_ref().clone(),
-            storage: Arc::clone(&storage),
             bifrost_storage: Arc::clone(&bifrost_storage),
             catalog: Arc::clone(&bifrost),
             resources: bifrost_resources,
@@ -4670,6 +4677,7 @@ impl WyrdTestServerBuilder {
                 forge_clock: forge_clock_control,
                 forge_scheduler_trigger,
                 forge_object_store,
+                object_reads,
                 forge_process_role: self.forge_process_role,
                 node_id,
                 query_stream_fault,
@@ -5012,36 +5020,6 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
     }
 }
 
-/// Opens a test fixture's storage handle, declaring the cursor listing a Local
-/// backend actually has.
-///
-/// The filesystem service resumes a listing from `start_after` correctly but
-/// does not advertise the capability, and Forge workers refuse to start on a
-/// staging backend that cannot resume a bounded orphan scan. A Local fixture
-/// stands in for a production object store, so it declares the support it
-/// actually has; every other backend is opened unchanged, and a caller wanting
-/// the incapable backend supplies its own plain storage handle instead.
-///
-/// # Errors
-///
-/// Returns the [`StorageError`] from building the operator or
-/// opening the handle.
-pub(crate) async fn fixture_storage_handle(
-    settings: StorageSettings,
-) -> Result<Arc<StorageHandle>, StorageError> {
-    if matches!(settings.backend, BackendConfig::Local { .. }) {
-        let operator = wyrd_storage::factory::build_operator(&settings.backend)?.layer(
-            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
-                capability.list_with_start_after = true;
-                capability
-            }),
-        );
-        StorageHandle::from_settings_with_operator(settings, operator).await
-    } else {
-        StorageHandle::from_settings(settings).await
-    }
-}
-
 /// Binds one loopback port, reports the concrete address, and releases it.
 ///
 /// # Errors
@@ -5359,20 +5337,22 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// simulated node still constructs its own Oracle-funded owner when it starts.
 ///
 /// # Panics
-/// Panics when the default storage policy does not resolve, which would mean
-/// the shipped defaults are themselves invalid.
+/// Panics when the default storage policy does not resolve or the backend's
+/// object store cannot be built, which would mean the fixture is unusable.
 #[must_use]
-pub fn test_storage_owner(storage: &Arc<StorageHandle>) -> Arc<BifrostStorage> {
-    Arc::new(BifrostStorage::new(
-        Arc::clone(storage),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            u64::from(u32::MAX),
-            false,
+pub fn test_storage_owner(storage: &StorageHandle) -> Arc<BifrostStorage> {
+    Arc::new(
+        BifrostStorage::new(
+            storage.backend_config(),
+            vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                u64::from(u32::MAX),
+                false,
+            )
+            .expect("the default storage policy is valid"),
         )
-        .expect("the default storage policy is valid"),
-        None,
-    ))
+        .expect("the fixture object store builds"),
+    )
 }
 
 /// Build a [`ServerPostgres`] from an already-started [`PgFixture`].

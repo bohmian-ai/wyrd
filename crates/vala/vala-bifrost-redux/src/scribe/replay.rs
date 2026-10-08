@@ -1948,11 +1948,7 @@ mod tests {
             )
             .expect("writer"),
         );
-        let operator = std::sync::Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory operator")
-                .finish(),
-        );
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         crate::scribe::ScribeImpl::new_for_embedded_with_deps(
             operator,
             wal,

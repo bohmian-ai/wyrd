@@ -227,8 +227,8 @@ impl ScribeLaneConfig {
 /// Exists so the persistence context can be assembled in one named place
 /// instead of inline in the middle of the build; it holds no state of its own.
 struct PersistenceDependencies {
-    /// Object-store operator shared by persistence workers.
-    operator: Arc<opendal::Operator>,
+    /// Bifrost object store shared by persistence workers.
+    operator: Arc<dyn object_store::ObjectStore>,
     /// WAL writer used for manifest location and recovery identity.
     wal: Arc<wal::WalWriter>,
     /// Bounded CPU lane used to encode and merge.
@@ -526,8 +526,8 @@ impl Default for ScribePressureConfig {
 pub struct ScribeBuildConfig {
     /// Catalog owner used by Scribe before physical binding or projection.
     pub catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
-    /// Object-store operator used by the persistence runtime.
-    pub operator: Arc<opendal::Operator>,
+    /// Bifrost object store used by the persistence runtime.
+    pub operator: Arc<dyn object_store::ObjectStore>,
     /// WAL writer used by every fixed shard and persistence worker.
     pub wal: Arc<wal::WalWriter>,
     /// Validated node/epoch identity shared by all child owners.
@@ -742,7 +742,7 @@ impl ScribeImpl {
     }
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
     pub fn new_for_embedded_with_deps(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -760,7 +760,7 @@ impl ScribeImpl {
     /// Panics when the node identifier is not a UUID or the embedded resource
     /// policy cannot satisfy Scribe's fixed ownership floors.
     pub fn new_for_embedded_with_deps_and_catalog(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -798,7 +798,7 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -822,7 +822,7 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -858,7 +858,7 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -918,7 +918,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -941,7 +941,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -966,7 +966,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -1002,7 +1002,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
     /// or when the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -1260,11 +1260,7 @@ impl ScribeImpl {
         wal_io: ScribeWalIoPool,
         admission_config: AdmissionConfig,
     ) -> Self {
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend init")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
 
         let temp_dir = tempfile::tempdir().expect("temp WAL dir");
         let node_id_bytes = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000")
@@ -1860,7 +1856,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
-                    | ScribeError::ObjectStorePutFailed(_)
                     | ScribeError::Internal { .. } => None,
                 };
                 if let Some(reason) = reason {
@@ -1965,11 +1960,7 @@ mod constructor_rotation_tests {
             )
             .expect("nondefault WAL writer"),
         );
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
         let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
             operator,
             Arc::clone(&wal),
@@ -2011,11 +2002,7 @@ mod constructor_rotation_tests {
             )
             .expect("nondefault WAL writer"),
         );
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
         let admission = AdmissionConfig::default();
         let configured_request_bytes = 201 * 1024 * 1024;
         let defaults = crate::gate::limits::IngestLimits::default();

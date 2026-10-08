@@ -44,7 +44,7 @@ mod worker;
 pub use clock::ForgeClock;
 #[cfg(feature = "test-support")]
 pub use clock::ForgeClockControl;
-pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
+pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeObjects};
 pub use error::ForgeError;
 #[cfg(feature = "test-support")]
 pub use leader::ForgeTrackView;
@@ -170,8 +170,9 @@ pub struct ForgeBuildConfig {
     pub operator_pool: vala_sql::OperatorPool,
     /// Iceberg catalog used by maintenance operations.
     pub catalog: Arc<dyn Catalog>,
-    /// Raw staging operator retained for table-owned producer fixtures.
-    pub staging: Arc<opendal::Operator>,
+    /// Warehouse URI every Iceberg table location on this node starts with;
+    /// Forge maps catalog paths to object keys against it.
+    pub warehouse: String,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
     /// Bounded advisory Scribe wake-up inbox.
@@ -224,8 +225,8 @@ pub(crate) struct ForgeCore {
     operator_pool: vala_sql::OperatorPool,
     /// Iceberg catalog used to load tables and commit maintenance actions.
     catalog: Arc<dyn Catalog>,
-    /// Raw staging operator retained for the established Forge composition.
-    staging: Arc<opendal::Operator>,
+    /// Warehouse URI every Iceberg table location on this node starts with.
+    warehouse: String,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Validated maintenance and rewrite limits.
@@ -282,7 +283,7 @@ impl Forge {
             vala: build.vala,
             operator_pool: build.operator_pool,
             catalog: build.catalog,
-            staging: build.staging,
+            warehouse: build.warehouse,
             object_store: build.object_store,
             config: build.config,
             maintenance_interval: build.maintenance_interval,

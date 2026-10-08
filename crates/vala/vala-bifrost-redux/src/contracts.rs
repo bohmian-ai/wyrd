@@ -317,9 +317,6 @@ pub enum ScribeError {
     #[error("ingress dispatcher is closed")]
     IngressClosed,
 
-    #[error("object store PUT failed")]
-    ObjectStorePutFailed(#[source] opendal::Error),
-
     #[error("live-tail stream mismatch: requested={requested}, actual={actual}")]
     StreamMismatch {
         requested: StreamIdentity,
@@ -371,9 +368,6 @@ impl ScribeError {
             Self::CardScopeDenied => Self::CardScopeDenied,
             Self::CardUnresolved => Self::CardUnresolved,
             Self::IngressClosed => Self::IngressClosed,
-            Self::ObjectStorePutFailed(error) => Self::Internal {
-                detail: format!("object store PUT failed: {error}"),
-            },
             Self::StreamMismatch { requested, actual } => Self::StreamMismatch {
                 requested: *requested,
                 actual: *actual,

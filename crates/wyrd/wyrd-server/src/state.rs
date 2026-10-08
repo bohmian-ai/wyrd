@@ -63,13 +63,11 @@ pub struct BifrostBuildInputs {
     pub deployment_profile: DeploymentProfile,
     /// Shared production PostgreSQL handles.
     pub postgres: ServerPostgres,
-    /// Shared object-storage handle used by Scribe and Forge construction.
-    pub storage: Arc<StorageHandle>,
     /// This node's one Bifrost storage owner.
     ///
-    /// Retained so every co-located role shares one pointer-identical owner,
-    /// one request ceiling, and one shutdown, rather than each role composing
-    /// its own view of the same backend.
+    /// Retained so every co-located role shares one pointer-identical object
+    /// store and one request ceiling, rather than each role composing its own
+    /// view of the same backend.
     pub bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared tenant-qualified Bifrost catalog.
     pub catalog: Arc<BifrostCatalog>,
@@ -1983,13 +1981,6 @@ impl Bifrost {
         } else {
             false
         };
-        if let Some(storage) = &self.bifrost_storage
-            && !storage.close(deadline).await
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Bifrost storage did not settle before shutdown deadline".to_owned(),
-            });
-        }
         Ok(BifrostShutdownReport {
             scribe_drained,
             forge_drained,
@@ -2021,9 +2012,6 @@ impl Bifrost {
         }
         if let Some(forge) = &self.forge {
             forge.begin_shutdown();
-        }
-        if let Some(storage) = &self.bifrost_storage {
-            storage.abort().await;
         }
     }
 }

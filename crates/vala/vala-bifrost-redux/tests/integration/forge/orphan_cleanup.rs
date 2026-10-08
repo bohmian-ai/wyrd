@@ -37,13 +37,9 @@ fn forge_root(fixture: &PromotionIntegrationFixture) -> String {
 ///
 /// # Panics
 ///
-/// Panics when the staging operator rejects the write.
+/// Panics when the object store rejects the write.
 async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> String {
-    fixture
-        .staging
-        .write(&path, b"lookalike".to_vec())
-        .await
-        .expect("the fixture object seeds");
+    fixture.write_object(&path, b"lookalike".to_vec()).await;
     path
 }
 
@@ -154,7 +150,7 @@ async fn assert_eligibility(
 #[tokio::test]
 async fn rowless_output_uses_canonical_identity_and_full_protection() {
     let promoted = PromotedRewriteFixture::start_unpromoted("orphan_rowless").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -481,7 +477,7 @@ async fn bounded_retry_resumes_after_cursor_without_starvation() {
     // One entry per page and one page per pass: every pass then classifies
     // exactly one key, which is what makes a leading protected run observable.
     promoted.fixture.config.orphan_gc_max_list_pages = 1;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     store.page_listing_by(1);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -697,7 +693,7 @@ async fn assert_recovered_pass_exhausts_the_prefix(
 #[tokio::test]
 async fn cross_table_plan_refuses_before_lease_or_io() {
     let promoted = PromotedRewriteFixture::start_unpromoted("orphan_cross_table").await;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         store.read_counter(),
@@ -1277,7 +1273,7 @@ struct OrphanBatch {
 /// Panics when the fixture cannot start or the clock cannot advance.
 async fn one_eligible_orphan(name: &str) -> OrphanBatch {
     let promoted = PromotedRewriteFixture::start_unpromoted(name).await;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         store.read_counter(),

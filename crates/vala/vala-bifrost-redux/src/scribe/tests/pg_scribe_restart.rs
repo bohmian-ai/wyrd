@@ -10,7 +10,6 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use opendal::services::Memory;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -86,11 +85,7 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
     }
     drop(writer);
 
-    let operator = Arc::new(
-        opendal::Operator::new(Memory::default())
-            .expect("memory object store")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let restarted_wal = Arc::new(
         WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
             .expect("restarted WAL writer"),
@@ -129,11 +124,7 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
     }
     drop(writer);
 
-    let operator = Arc::new(
-        opendal::Operator::new(Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
             .expect("restarted WAL writer"),
@@ -170,11 +161,7 @@ async fn replay_failure_keeps_scribe_unready() {
         .expect("invalid replay fixture append");
     drop(writer);
 
-    let operator = Arc::new(
-        opendal::Operator::new(Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
             .expect("replay WAL writer"),

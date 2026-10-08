@@ -34,7 +34,7 @@ use crate::catalog::iceberg_sql;
 use crate::catalog::layout::PhysicalLayout;
 use iceberg::io::StorageFactory;
 
-use crate::catalog::iceberg_storage::BifrostIcebergStorageFactory;
+use crate::catalog::iceberg_storage::{BifrostIcebergStorage, BifrostIcebergStorageFactory};
 use crate::catalog::storage::{iceberg_catalog_properties, warehouse_uri};
 use crate::catalog::wire::{
     described_fields_from_stored_schema, entry_from_row, layout_wire_from_row,
@@ -264,8 +264,9 @@ pub struct BifrostCatalog {
     postgres: ValaPostgres,
     warehouse: String,
     file_io: FileIO,
-    /// The node's storage owner, retained for the hot-footer path.
-    storage: Arc<BifrostStorage>,
+    /// The node's storage owner bound to this warehouse, which `DataFusion`'s
+    /// Parquet scan and Iceberg's footer loads read every Oracle object through.
+    objects: Arc<BifrostIcebergStorage>,
     /// Node-wide decoded manifest and manifest-list cache shared by every
     /// read table, so the snapshot pin and `plan_files` decode
     /// each immutable manifest once per node instead of once per consumer per
@@ -739,7 +740,7 @@ impl BifrostCatalog {
         storage: Arc<BifrostStorage>,
         postgres: ValaPostgres,
     ) -> Result<Self, BifrostCatalogError> {
-        let backend = storage.handle().backend_config();
+        let backend = storage.backend();
         let warehouse = warehouse_uri(backend);
         let storage_properties = iceberg_catalog_properties(backend);
         let storage_factory = Arc::new(BifrostIcebergStorageFactory::new(
@@ -759,9 +760,9 @@ impl BifrostCatalog {
         Ok(Self {
             catalog: Arc::new(catalog),
             postgres,
-            warehouse,
             file_io,
-            storage,
+            objects: Arc::new(BifrostIcebergStorage::new(storage, &warehouse)),
+            warehouse,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             table_uids: Arc::default(),
             registered_schemas: Arc::default(),
@@ -769,13 +770,16 @@ impl BifrostCatalog {
     }
 
     /// Borrows the node's one storage owner this catalog binds Iceberg to.
-    ///
-    /// Oracle needs the owner itself, not only the `FileIO` built over it,
-    /// because the hot-footer path asks the owner to decode metadata under its
-    /// cache, admission, and retry policy rather than reading ranges blindly.
     #[must_use]
     pub fn storage(&self) -> &Arc<BifrostStorage> {
-        &self.storage
+        self.objects.storage()
+    }
+
+    /// Borrows this warehouse's object store, the one `DataFusion`'s Parquet scan
+    /// and Iceberg's footer loads read every Oracle object through.
+    #[must_use]
+    pub(crate) fn objects(&self) -> &Arc<BifrostIcebergStorage> {
+        &self.objects
     }
 
     /// Borrow the exact Iceberg catalog used by Redux physical table registration.
@@ -2222,28 +2226,13 @@ mod production_pin_tests {
 
     /// Builds a storage owner over one local warehouse root.
     ///
-    /// The catalog now runs its Iceberg I/O through the node's storage owner,
-    /// so a catalog fixture must compose the same owner production does rather
-    /// than hand the catalog a bare backend description.
+    /// The catalog runs its Iceberg I/O through the node's storage owner, so a
+    /// catalog fixture composes the same owner production does.
     ///
     /// # Panics
-    /// Panics when the signer, resource observation, or storage policy the
-    /// fixture asks for is invalid.
+    /// Panics when the fixture storage policy or local root is invalid.
     pub(super) fn local_storage_owner(root: &Path) -> Arc<BifrostStorage> {
-        let signer = wyrd_storage::signer::BackendSigner::Local(
-            wyrd_storage::local::LocalSigner::new(root.to_path_buf())
-                .expect("fixture local signer"),
-        );
-        Arc::new(crate::storage::BifrostStorage::new(
-            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-            crate::storage::BifrostStoragePolicy::resolve(
-                crate::storage::BifrostStorageConfig::default(),
-                2 * 1024 * 1024 * 1024,
-                false,
-            )
-            .expect("the fixture storage policy is valid"),
-            None,
-        ))
+        BifrostStorage::for_test(root, false)
     }
 
     /// Builds the manifest evidence table one committed cut must reproduce.

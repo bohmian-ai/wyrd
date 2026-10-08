@@ -18,7 +18,6 @@ use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Datelike as _;
-use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -115,11 +114,7 @@ fn scribe(wal_root: &TempDir, node: NodeId) -> (Arc<WalWriter>, crate::scribe::S
         WalWriter::new(wal_root.path(), *node.as_bytes(), 1, WalConfig::default())
             .expect("WAL writer"),
     );
-    let operator = Arc::new(
-        opendal::Operator::new(Memory::default())
-            .expect("memory object store")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let scribe = crate::scribe::ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),

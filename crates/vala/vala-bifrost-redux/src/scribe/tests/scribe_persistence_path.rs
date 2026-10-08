@@ -337,11 +337,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let canonical_request_id = RequestId::now_v7();
     let arrow_request_id = RequestId::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -439,11 +435,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let rows = batch(day);
     let batch_id = Uuid::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -526,11 +518,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let source = batch(day_one);
     let source_value = source.column(1).clone();
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),
@@ -741,11 +729,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");
     let day = fixture_event_day(1);
     let temp_dir = TempDir::new().expect("WAL temp dir");
-    let operator = Arc::new(
-        opendal::Operator::new(opendal::services::Memory::default())
-            .expect("memory operator")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let wal = Arc::new(
         WalWriter::new(
             temp_dir.path(),

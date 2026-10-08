@@ -1303,7 +1303,7 @@ impl Forge {
             committed.metadata().location(),
             expired_files,
             binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &identity,
         )?;
         evidence.validate(false).map_err(ForgeError::Sql)?;
@@ -1464,7 +1464,7 @@ fn expiry_cleanup_candidates(
     table_location: &str,
     expired: &ExpiredFileSet,
     binding: &TenantTableBinding,
-    staging: &opendal::Operator,
+    warehouse: &str,
     identity: &ForgeTaskTableIdentity,
 ) -> Result<Vec<ForgeCleanupCandidate>, ForgeError> {
     let categories = [
@@ -1480,7 +1480,7 @@ fn expiry_cleanup_candidates(
         .flat_map(|(category, paths)| paths.iter().map(move |path| (category, path)))
         .map(|(category, path)| {
             let key =
-                super::path::catalog_path_to_object_key(table_location, binding, staging, path)?;
+                super::path::catalog_path_to_object_key(table_location, binding, warehouse, path)?;
             Ok(ForgeCleanupCandidate {
                 category,
                 table: identity.clone(),

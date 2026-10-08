@@ -41,7 +41,7 @@ use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromot
 #[tokio::test]
 async fn independent_plan_publications_compose_on_current_head() {
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_admission").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -164,7 +164,7 @@ async fn independent_plan_publications_compose_on_current_head() {
 async fn admitted_batch_reports_partial_progress_semantics() {
     let _telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_reduction").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -404,7 +404,7 @@ async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
     // is still watching, so the budget is the seconds a test can wait rather
     // than the production minutes.
     promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -683,7 +683,7 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     // Every stalled plan has to run out of publication budget while the
     // scenario is still watching.
     promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -845,7 +845,7 @@ fn consumed_paths(before: &BTreeSet<String>, after: &BTreeSet<String>) -> usize 
 #[tokio::test]
 async fn stale_planned_input_cannot_be_republished() {
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_stale_input").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -984,17 +984,12 @@ async fn replace_every_live_data_file(promoted: &PromotedRewriteFixture) {
         let replacement = format!("{}.competing.parquet", file.file_path());
         let bytes = promoted
             .fixture
-            .staging
-            .read(&staging_key(promoted, file.file_path()))
-            .await
-            .expect("a live object is readable")
-            .to_bytes();
+            .read_object(&staging_key(promoted, file.file_path()))
+            .await;
         promoted
             .fixture
-            .staging
-            .write(&staging_key(promoted, &replacement), bytes)
-            .await
-            .expect("the competing copy is writable");
+            .write_object(&staging_key(promoted, &replacement), bytes)
+            .await;
         added.push(
             iceberg::spec::DataFileBuilder::default()
                 .content(iceberg::spec::DataContentType::Data)
@@ -1324,7 +1319,7 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
     // one turn needs to claim its allowance so a loaded machine cannot end a
     // plan before the turn that admitted it is even observable.
     promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(20);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -1451,7 +1446,7 @@ async fn released_authority_gates_readiness_and_new_claims() {
     // test happens exactly when this budget expires with the commits still in
     // flight.
     promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -2314,7 +2309,7 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     // is still watching, so the budget is the seconds a test can wait rather
     // than the production minutes.
     promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),

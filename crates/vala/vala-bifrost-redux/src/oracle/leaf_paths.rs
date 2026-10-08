@@ -1,17 +1,18 @@
-//! The literal paths a query reads from each Struct, List, and Variant
-//! column, handed to the Oracle readers so they decode only those paths'
-//! leaves.
+//! The literal paths a query reads from each column holding a Variant,
+//! handed to the Oracle readers so they decode only those paths' leaves.
 //!
 //! [`LeafPathPushdown`] runs last among the physical optimizer rules of
-//! every Oracle session. It walks the plan from the root, works out how each
-//! column reaching an Oracle leaf is used, and gives the leaf the
-//! [`LeafPaths`] of every column used only through literal paths: chains of
-//! `get_field` on a Struct, `array_element` with a literal index on a List,
-//! and literal-key `variant_get` on a Variant, in any order the types
-//! allow, plus the same paths below an `unnest` of a List column. The leaf
-//! reads each such column through [`OracleVariantSql::trimmed`], which
-//! decodes only those paths' leaves. Any other use of a column, or an
-//! operator the walk does not see through, reads it whole.
+//! every Oracle session, and returns a plan with no Variant-holding leaf
+//! column untouched. Otherwise it walks the plan from the root, works out how
+//! each column reaching an Oracle leaf is used, and gives the leaf the
+//! [`LeafPaths`] of every Variant-holding column used only through literal
+//! Variant paths: a literal-key `variant_get`, reached through `get_field` on
+//! a Struct or `array_element` with a literal index on a List, plus the same
+//! paths below an `unnest` of a List column. The leaf reads each such column
+//! through [`OracleVariantSql::trimmed`], which decodes only those paths'
+//! leaves. Any other use of a column, including a Struct or List path that
+//! reads no Variant, or an operator the walk does not see through, reads it
+//! whole: `DataFusion`'s own Parquet projection prunes Struct leaves.
 //!
 //! A remote placeholder carries its paths to the follower in its codec
 //! payload, where [`LeafPathPushdown::assign`] applies them to the
@@ -22,8 +23,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::error::Result;
+use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
@@ -39,14 +42,13 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::unnest::UnnestExec;
-use parquet::arrow::ProjectionMask;
-use parquet::schema::types::SchemaDescriptor;
 use serde::{Deserialize, Serialize};
 use wyrd_types::variant::is_variant;
 
 use super::variant_sql::{OracleVariantSql, VARIANT_GET};
+use crate::tables::holds_variant;
 
-/// The literal paths read from each trimmed Struct or Variant column of one
+/// The literal paths read from each trimmed Variant-holding column of one
 /// scan.
 ///
 /// A column absent from the map is read whole. The map travels to followers
@@ -58,6 +60,41 @@ impl LeafPaths {
     /// Returns whether every column is read whole.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Returns the paths a hot scan's Parquet projection trims each column to,
+    /// wherever a trimmed read sits inside the projection's expressions, or
+    /// `None` when `plan` is not a file scan. Tests assert it as the scan's
+    /// physical field requirement.
+    #[cfg(test)]
+    pub(crate) fn of_scan(plan: &dyn ExecutionPlan) -> Option<Self> {
+        let config = plan
+            .downcast_ref::<DataSourceExec>()?
+            .data_source()
+            .downcast_ref::<FileScanConfig>()?;
+        let mut paths = BTreeMap::new();
+        for projection in config
+            .file_source()
+            .projection()
+            .into_iter()
+            .flat_map(ProjectionExprs::iter)
+        {
+            projection
+                .expr
+                .apply(|node| {
+                    if let Some(read) = OracleVariantSql::trimmed_paths(node)
+                        && let Some(column) = node
+                            .children()
+                            .first()
+                            .and_then(|column| column.downcast_ref::<Column>())
+                    {
+                        paths.insert(column.name().to_owned(), read.clone());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("an expression walk that never fails");
+        }
+        Some(Self(paths))
     }
 
     /// Returns the projection a reader evaluates over `schema`: each column
@@ -72,32 +109,6 @@ impl LeafPaths {
             };
             ProjectionExpr::new(expr, field.name())
         }))
-    }
-
-    /// Restricts `planned` to the leaves of trimmed columns: every leaf of
-    /// another root column stays read, and a trimmed column keeps only the
-    /// leaves `planned` selects in it.
-    ///
-    /// A reader that chooses columns by its own rules (the Iceberg reader
-    /// matches field ids) intersects this mask with its own, so the trimming
-    /// can only drop leaves of the trimmed columns.
-    pub(crate) fn leaf_mask(
-        &self,
-        planned: &ProjectionMask,
-        descriptor: &SchemaDescriptor,
-    ) -> ProjectionMask {
-        ProjectionMask::leaves(
-            descriptor,
-            (0..descriptor.num_columns()).filter(|&leaf| {
-                let column = descriptor.column(leaf);
-                !column
-                    .path()
-                    .parts()
-                    .first()
-                    .is_some_and(|root| self.0.contains_key(root))
-                    || planned.leaf_included(leaf)
-            }),
-        )
     }
 }
 
@@ -136,10 +147,14 @@ impl Demand {
     /// Records every column use inside `expr`, evaluated over `schema`, into
     /// `columns`.
     ///
-    /// A literal path over a column (see [`Self::path`]) uses that path. Any
-    /// other column reference uses the whole column.
+    /// A literal path ending in a `variant_get` over a column (see
+    /// [`Self::path`]) uses that path. Any other column reference, a Struct or
+    /// List path without a Variant read included, uses the whole column.
     fn collect(expr: &Arc<dyn PhysicalExpr>, schema: &Schema, columns: &mut [Self]) {
-        if let Some((column, path, _)) = Self::path(expr, schema)
+        if expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|call| call.name() == VARIANT_GET)
+            && let Some((column, path, _)) = Self::path(expr, schema)
             && !path.is_empty()
         {
             Self::merge_at(columns, column.index(), Self::Paths(BTreeSet::from([path])));
@@ -219,7 +234,9 @@ impl Demand {
 pub(crate) struct LeafPathPushdown;
 
 impl PhysicalOptimizerRule for LeafPathPushdown {
-    /// Walks `plan` from its root, every root output read whole.
+    /// Returns `plan` untouched when no Oracle leaf in it has a
+    /// Variant-holding column; otherwise walks it from its root, every root
+    /// output read whole.
     ///
     /// # Errors
     ///
@@ -230,6 +247,17 @@ impl PhysicalOptimizerRule for LeafPathPushdown {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let reads_variant = plan.exists(|node| {
+            Ok(node.downcast_ref::<DataSourceExec>().is_some()
+                && node
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|field| holds_variant(field)))
+        })?;
+        if !reads_variant {
+            return Ok(plan);
+        }
         let whole = vec![Demand::Whole; plan.schema().fields().len()];
         Self::push(plan, whole)
     }
@@ -246,32 +274,6 @@ impl PhysicalOptimizerRule for LeafPathPushdown {
 }
 
 impl LeafPathPushdown {
-    /// Applies `paths` to a follower's resolved source `plan`, whose outputs
-    /// are the columns the paths name; every other output is read whole.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `DataFusion` error raised when a rebuilt operator rejects
-    /// its new children.
-    pub(crate) fn assign(
-        plan: Arc<dyn ExecutionPlan>,
-        paths: &LeafPaths,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if paths.is_empty() {
-            return Ok(plan);
-        }
-        let demand = plan
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| match paths.0.get(field.name()) {
-                Some(paths) => Demand::Paths(paths.clone()),
-                None => Demand::Whole,
-            })
-            .collect();
-        Self::push(plan, demand)
-    }
-
     /// Hands `plan` the use `demand` of each of its outputs and returns the
     /// rebuilt plan.
     ///
@@ -413,37 +415,69 @@ impl LeafPathPushdown {
 
     /// Returns `plan` with its paths when it is an Oracle leaf, else `None`.
     ///
+    /// A hot scan with no column to trim is returned unchanged. A hot scan trims only outputs its projection reads as plain columns.
+    /// An output that is an expression `DataFusion` moved into the scan is
+    /// read whole: the Parquet reader already prunes the Struct leaves it
+    /// names, and the file adapter reads shredded Variant paths in it
+    /// directly or unshreds the column inside it, so wrapping the whole
+    /// expression would only hide its column from both.
+    ///
     /// A remote placeholder keeps the paths for its follower and applies them
     /// to the leader-readable leaf it holds.
     ///
     /// # Errors
     ///
     /// Returns the `DataFusion` error raised while applying the paths to a
-    /// placeholder's local leaf.
+    /// Parquet scan.
     fn leaf(
         plan: &Arc<dyn ExecutionPlan>,
         demand: &[Demand],
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let paths = || Self::paths(plan, demand);
         Ok(
-            if let Some(hot) = plan.downcast_ref::<super::exec::HotParquetExec>() {
-                Some(Arc::new(hot.clone().with_leaf_paths(paths())))
-            } else if let Some(published) =
-                plan.downcast_ref::<super::exec::OracleIcebergScanExec>()
+            if let Some(hot) = plan.downcast_ref::<DataSourceExec>()
+                && let Some(config) = hot.data_source().downcast_ref::<FileScanConfig>()
             {
-                Some(Arc::new(published.clone().with_leaf_paths(paths())))
-            } else if let Some(placeholder) =
-                plan.downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
-            {
-                Some(Arc::new(placeholder.clone().with_leaf_paths(paths())?))
+                // An Oracle file scan is always a Parquet hot leaf, whose
+                // source merges the trimmed projection into its own.
+                let demand: Vec<Demand> = match config.file_source().projection() {
+                    Some(projection) => projection
+                        .iter()
+                        .zip(demand)
+                        .map(
+                            |(output, used)| match output.expr.downcast_ref::<Column>() {
+                                Some(_) => used.clone(),
+                                None => Demand::Whole,
+                            },
+                        )
+                        .collect(),
+                    None => demand.to_vec(),
+                };
+                let paths = Self::paths(plan, &demand);
+                // Nothing to trim: keep the scan as `DataFusion` built it.
+                if paths.is_empty() {
+                    return Ok(Some(Arc::clone(plan)));
+                }
+                let source = config
+                    .file_source()
+                    .try_pushdown_projection(&paths.projection(&plan.schema()))?
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "the hot Parquet source refused a projection".to_owned(),
+                        )
+                    })?;
+                Some(DataSourceExec::from_data_source(
+                    FileScanConfigBuilder::from(config.clone())
+                        .with_source(source)
+                        .build(),
+                ))
             } else {
                 None
             },
         )
     }
 
-    /// Returns the paths of each Variant or Struct output of `leaf` used only
-    /// through literal paths.
+    /// Returns the paths of each output of `leaf` that holds a Variant and is
+    /// used only through literal paths.
     fn paths(leaf: &Arc<dyn ExecutionPlan>, demand: &[Demand]) -> LeafPaths {
         LeafPaths(
             leaf.schema()
@@ -451,7 +485,9 @@ impl LeafPathPushdown {
                 .iter()
                 .zip(demand)
                 .filter_map(|(field, used)| match used {
-                    Demand::Paths(paths) => Some((field.name().clone(), paths.clone())),
+                    Demand::Paths(paths) if holds_variant(field) => {
+                        Some((field.name().clone(), paths.clone()))
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -461,28 +497,22 @@ impl LeafPathPushdown {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, AsArray, RecordBatch};
-    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    use arrow::array::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
-    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 
-    use super::super::exec::tests::{HotCausalFixture, hot_exec_for};
-    use super::super::exec::{HotParquetExec, HotParquetPlan, OracleScanMetricsHandle};
-    use super::super::nested_pushdown::tests::{decoded_leaves, logical_schema, read, write_file};
-    use super::super::nested_pushdown::{FileReadPlan, PublishedFileReadPlanner};
+    use super::super::nested_pushdown::tests::{HotTable, logical_schema, write_file};
     use super::*;
-    use bytes::Bytes;
 
     /// Plans `sql` with stock `DataFusion` over an in-memory copy of the
-    /// fixture, then swaps the scan for a hot leaf over the shredded fixture
-    /// file and runs [`LeafPathPushdown`] on that plan.
+    /// unshredded fixture, and over the shredded fixture object read by the
+    /// production hot scan trimmed by [`LeafPathPushdown`].
     ///
-    /// Returns the paths the hot leaf received, the rows the trimmed plan
-    /// returns, and the rows stock `DataFusion` returns for the same query,
-    /// both as [`json_rows`].
+    /// Returns the paths the hot scan's projection was trimmed to, the rows
+    /// the trimmed plan returns, and the rows stock `DataFusion` returns for
+    /// the same query, both as [`json_rows`].
     ///
     /// # Panics
     ///
@@ -490,102 +520,47 @@ mod tests {
     /// hold exactly one scan.
     async fn trimmed_and_stock(sql: &str) -> (LeafPaths, String, String) {
         let schema = logical_schema();
-        let unshredded = write_file(false);
-        let footer = ArrowReaderMetadata::load(&unshredded, ArrowReaderOptions::new())
-            .expect("valid footer");
-        let rows = read(
-            &unshredded,
-            FileReadPlan::new(
-                &footer,
-                &schema,
-                LeafPaths::default().projection(&schema),
-                None,
-                20,
-            )
-            .expect("whole read"),
+        let rows = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            write_file(false),
+            ArrowReaderOptions::new().with_schema(Arc::clone(&schema)),
+        )
+        .expect("valid footer")
+        .build()
+        .expect("whole read")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("whole rows");
+        let context = SessionContext::new_with_state(
+            OracleVariantSql::shared()
+                .install(SessionStateBuilder::new().with_default_features())
+                .build(),
         );
-        let state = OracleVariantSql::shared()
-            .install(SessionStateBuilder::new().with_default_features())
-            .build();
-        let context = SessionContext::new_with_state(state);
         context
             .register_table(
                 "t",
-                Arc::new(MemTable::try_new(rows.schema(), vec![vec![rows]]).expect("table")),
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![rows]).expect("table")),
             )
             .expect("register");
-        // Each run gets its own planned instance: executing a plan leaves
-        // state behind (a TopK's dynamic filter), so a reused plan would not
-        // start from what the rule sees at planning.
-        let plan = || async {
-            context
-                .sql(sql)
-                .await
-                .expect(sql)
-                .create_physical_plan()
-                .await
-                .expect(sql)
-        };
-        let expected = collect(plan().await, context.task_ctx()).await.expect(sql);
-
-        let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("shredded.parquet");
-        let bytes = write_file(true);
-        std::fs::write(&path, &bytes).expect("fixture file");
-        let size = bytes.len();
-        let fixture = HotCausalFixture {
-            _directory: directory,
-            path,
-            schema: Arc::clone(&schema),
-            bytes,
-        };
-        let metrics = Arc::new(OracleScanMetricsHandle::default());
-        let swapped = plan()
+        let expected = context
+            .sql(sql)
             .await
-            .transform_up(|node| {
-                if !node.children().is_empty() {
-                    return Ok(Transformed::no(node));
-                }
-                let hot: Arc<dyn ExecutionPlan> = Arc::new(hot_exec_for(
-                    &fixture,
-                    HotParquetPlan::Follower {
-                        memory_pool: crate::resources::bounded_memory_pool(1 << 30),
-                    },
-                    &metrics,
-                    size,
-                ));
-                let columns = node
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|field| {
-                        let index = schema.index_of(field.name()).expect("scan column");
-                        ProjectionExpr::new(
-                            Arc::new(Column::new(field.name(), index)),
-                            field.name(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                Ok(Transformed::yes(Arc::new(ProjectionExec::try_new(
-                    columns, hot,
-                )?)))
-            })
-            .expect("swap scan")
-            .data;
-        let trimmed = LeafPathPushdown
-            .optimize(swapped, &ConfigOptions::default())
-            .expect("pushdown");
+            .expect(sql)
+            .collect()
+            .await
+            .expect(sql);
+
+        let hot = HotTable::new(&write_file(true), schema);
+        let trimmed = hot.plan(sql).await;
         let mut paths = Vec::new();
         trimmed
             .apply(|node| {
-                if let Some(hot) = node.downcast_ref::<HotParquetExec>() {
-                    paths.push(hot.leaf_paths.clone());
+                if let Some(scan) = LeafPaths::of_scan(node.as_ref()) {
+                    paths.push(scan);
                 }
                 Ok(TreeNodeRecursion::Continue)
             })
             .expect("walk");
         let [paths] = <[LeafPaths; 1]>::try_from(paths).expect("one scan");
-        let actual = collect(trimmed, context.task_ctx()).await.expect(sql);
+        let actual = hot.run(trimmed).await;
         (paths, json_rows(&actual), json_rows(&expected))
     }
 
@@ -625,15 +600,9 @@ mod tests {
         )
     }
 
-    /// The paths of `v` in a [`LeafPaths`].
-    fn v(keys: &[&[&str]]) -> LeafPaths {
-        paths(&[("v", keys)])
-    }
-
-    /// Literal-key reads, Struct field reads, List element reads at a
-    /// literal index, and the same paths on `unnest` elements, in outputs,
-    /// filters, sort keys, nested chains, and under sorts, limits, and
-    /// grouping trim the scan to their paths, and every trimmed plan returns exactly the rows stock
+    /// Literal Variant paths that stay above the scan, in a filter `DataFusion`
+    /// keeps above it or on `unnest` elements, trim the scan to their
+    /// paths, and every trimmed plan returns exactly the rows stock
     /// `DataFusion` returns.
     ///
     /// # Panics
@@ -641,22 +610,7 @@ mod tests {
     /// Panics when a scan receives other paths or any row differs.
     #[tokio::test]
     async fn literal_key_reads_trim_the_scan_and_match_stock_datafusion() {
-        let cases: [(&str, LeafPaths); 16] = [
-            (
-                "SELECT events[1] FROM t ORDER BY id",
-                paths(&[("events", &[&["element"]])]),
-            ),
-            (
-                "SELECT events[1]['attributes'] ->> 'k' FROM t ORDER BY id",
-                paths(&[("events", &[&["element", "attributes", "k"]])]),
-            ),
-            (
-                "SELECT events[2]['name'], events[1]['attributes'] FROM t ORDER BY id",
-                paths(&[(
-                    "events",
-                    &[&["element", "name"], &["element", "attributes"]],
-                )]),
-            ),
+        let cases: [(&str, LeafPaths); 2] = [
             (
                 "SELECT id FROM t WHERE events[1]['attributes'] ->> 'x' = '1' ORDER BY id",
                 paths(&[("events", &[&["element", "attributes", "x"]])]),
@@ -666,48 +620,6 @@ mod tests {
                  FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, k",
                 paths(&[("events", &[&["element", "attributes", "k"]])]),
             ),
-            (
-                "SELECT id, u['name'] AS name \
-                 FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, name",
-                paths(&[("events", &[&["element", "name"]])]),
-            ),
-            (
-                "SELECT s['b'] FROM t ORDER BY id",
-                paths(&[("s", &[&["b"]])]),
-            ),
-            (
-                "SELECT id FROM t WHERE s['a'] > 1 ORDER BY id",
-                paths(&[("s", &[&["a"]])]),
-            ),
-            (
-                "SELECT s['b'], v ->> 'a' FROM t ORDER BY id",
-                paths(&[("s", &[&["b"]]), ("v", &[&["a"]])]),
-            ),
-            ("SELECT v ->> 'a' FROM t ORDER BY id", v(&[&["a"]])),
-            (
-                "SELECT id FROM t WHERE v ->> 'b' = 'x' ORDER BY id",
-                v(&[&["b"]]),
-            ),
-            (
-                "SELECT v ->> 'a', v ->> 'c' FROM t WHERE (v ->> 'b') IS NOT NULL ORDER BY id",
-                v(&[&["a"], &["b"], &["c"]]),
-            ),
-            (
-                "SELECT id FROM t ORDER BY v ->> 'a' NULLS LAST, id",
-                v(&[&["a"]]),
-            ),
-            (
-                "SELECT v -> 'a' ->> 'x' FROM t ORDER BY id LIMIT 3",
-                v(&[&["a", "x"]]),
-            ),
-            (
-                "SELECT id, v ->> 'c' FROM t ORDER BY id LIMIT 2",
-                v(&[&["c"]]),
-            ),
-            (
-                "SELECT v ->> 'b' AS b, count(*) FROM t GROUP BY v ->> 'b' ORDER BY b",
-                v(&[&["b"]]),
-            ),
         ];
         for (sql, expected) in cases {
             let (paths, actual, stock) = trimmed_and_stock(sql).await;
@@ -716,19 +628,38 @@ mod tests {
         }
     }
 
-    /// A bare Variant, Struct, or List use, a
-    /// non-literal key or List index, a Variant array index, an `unnest`
-    /// whose elements are used whole or not at all, or a path used above an
-    /// operator the walk does not see through reads the column whole, alone or beside literal-key reads, and the rows equal stock
-    /// `DataFusion`'s. A window is such an operator: `DataFusion` does not
-    /// move a path below it.
+    /// The rule leaves a column untrimmed, and the rows equal stock
+    /// `DataFusion`'s, when a path is an expression `DataFusion` moved into
+    /// the scan (the reader prunes Struct leaves and the file adapter reads
+    /// shredded Variant paths there, including a common subexpression such
+    /// as `events[1]` read twice), or when the column is used another way: a
+    /// Struct or List path that reads no Variant, which `DataFusion` prunes, a
+    /// bare Variant, Struct, or List use, a non-literal key or List index, a
+    /// Variant array index, an `unnest` whose elements are used whole or not
+    /// at all, or a path above an operator the walk does not see through. A
+    /// window is such an operator: `DataFusion` does not move a path below
+    /// it.
     ///
     /// # Panics
     ///
     /// Panics when such a scan is trimmed or any row differs.
     #[tokio::test]
-    async fn other_uses_read_the_column_whole() {
+    async fn other_uses_leave_the_column_untrimmed() {
         for sql in [
+            "SELECT events[1] FROM t ORDER BY id",
+            "SELECT events[1]['name'], events[1]['attributes'] ->> 'k' FROM t ORDER BY id",
+            "SELECT events[1]['attributes'] ->> 'k' FROM t ORDER BY id",
+            "SELECT events[2]['name'], events[1]['attributes'] FROM t ORDER BY id",
+            "SELECT s['b'] FROM t ORDER BY id",
+            "SELECT id FROM t WHERE s['a'] > 1 ORDER BY id",
+            "SELECT s['b'], v ->> 'a' FROM t ORDER BY id",
+            "SELECT v ->> 'a' FROM t ORDER BY id",
+            "SELECT id FROM t WHERE v ->> 'b' = 'x' ORDER BY id",
+            "SELECT v ->> 'a', v ->> 'c' FROM t WHERE (v ->> 'b') IS NOT NULL ORDER BY id",
+            "SELECT id FROM t ORDER BY v ->> 'a' NULLS LAST, id",
+            "SELECT v -> 'a' ->> 'x' FROM t ORDER BY id LIMIT 3",
+            "SELECT id, v ->> 'c' FROM t ORDER BY id LIMIT 2",
+            "SELECT v ->> 'b' AS b, count(*) FROM t GROUP BY v ->> 'b' ORDER BY b",
             "SELECT v FROM t ORDER BY id",
             "SELECT v ->> 'a' FROM t WHERE v IS NOT NULL ORDER BY id",
             "SELECT v ->> 'a', v FROM t ORDER BY id",
@@ -743,183 +674,12 @@ mod tests {
             "SELECT events[1]['attributes'] ->> 'k', events FROM t ORDER BY id",
             "SELECT id, u FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, u['name']",
             "SELECT id FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id",
+            "SELECT id, u['name'] AS name \
+             FROM (SELECT id, unnest(events) AS u FROM t) ORDER BY id, name",
         ] {
             let (paths, actual, stock) = trimmed_and_stock(sql).await;
             assert_eq!(paths, LeafPaths::default(), "{sql}");
             assert_eq!(actual, stock, "{sql}");
         }
-    }
-
-    /// Rows of `s['b']`, of `v ->> 'a'`, and of every event's
-    /// `attributes ->> 'k'` from `batch`: what the three paths read. The
-    /// rebuilt Struct's own nulls are not among them; no path reads them.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `batch` lacks a column or a path does not evaluate.
-    fn read_values(batch: &RecordBatch) -> (Vec<Option<String>>, String) {
-        let structs = batch.column_by_name("s").expect("s").as_struct();
-        let child = structs.column_by_name("b").expect("s.b").as_string::<i32>();
-        let b = (0..structs.len())
-            .map(|row| {
-                (structs.is_valid(row) && child.is_valid(row)).then(|| child.value(row).to_owned())
-            })
-            .collect();
-        let key = |variant: &dyn Array, row: usize, key: &str| {
-            wyrd_queue::variant::variant_cell_to_json(variant, row)
-                .expect("variant")
-                .get(key)
-                .cloned()
-        };
-        let v = batch.column_by_name("v").expect("v");
-        let a = (0..v.len())
-            .map(|row| key(v.as_ref(), row, "a"))
-            .collect::<Vec<_>>();
-        let events = batch
-            .column_by_name("events")
-            .expect("events")
-            .as_list::<i32>();
-        let k = (0..events.len())
-            .map(|row| {
-                events.is_valid(row).then(|| {
-                    let elements = events.value(row);
-                    let attributes = elements
-                        .as_struct()
-                        .column_by_name("attributes")
-                        .expect("attributes");
-                    (0..attributes.len())
-                        .map(|element| key(attributes.as_ref(), element, "k"))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
-        (b, format!("{a:?} {k:?}"))
-    }
-
-    /// The paths every trimmed-read test reads: one Struct field, one
-    /// Variant key, and one key of the Variant inside every List element.
-    fn trimmed_paths() -> LeafPaths {
-        paths(&[
-            ("s", &[&["b"]]),
-            ("v", &[&["a"]]),
-            ("events", &[&["element", "attributes", "k"]]),
-        ])
-    }
-
-    /// The Parquet leaves [`trimmed_paths`] decode from a shredded fixture
-    /// file: `id` whole, `s.b`, and for each Variant its `metadata` and the
-    /// key's shredded subtree, not the event `name`, the other shredded key
-    /// `x`, or either residual `value`.
-    const TRIMMED_LEAVES: [&str; 8] = [
-        "id",
-        "s.b",
-        "v.metadata",
-        "v.typed_value.a.value",
-        "v.typed_value.a.typed_value",
-        "events.list.element.attributes.metadata",
-        "events.list.element.attributes.typed_value.k.value",
-        "events.list.element.attributes.typed_value.k.typed_value",
-    ];
-
-    /// A hot read of a Struct field, a Variant key, and a key of the Variant
-    /// inside every List element decodes only those paths' leaves, and reads
-    /// the same values as a whole read of an all-residual file.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the read decodes other leaves or any value differs.
-    #[test]
-    fn trimmed_struct_reads_only_its_paths_leaves() {
-        let schema = logical_schema();
-        let plan = |file: &Bytes, paths: &LeafPaths| {
-            let footer =
-                ArrowReaderMetadata::load(file, ArrowReaderOptions::new()).expect("valid footer");
-            FileReadPlan::new(&footer, &schema, paths.projection(&schema), None, 20)
-                .expect("per-file plan")
-        };
-        let file = write_file(true);
-        let trimmed = plan(&file, &trimmed_paths());
-        assert_eq!(decoded_leaves(&file, &trimmed), TRIMMED_LEAVES);
-        let residual = write_file(false);
-        let whole = plan(&residual, &LeafPaths::default());
-        assert_eq!(
-            read_values(&read(&file, trimmed)),
-            read_values(&read(&residual, whole))
-        );
-    }
-
-    /// A published file read through the Iceberg reader with a Struct
-    /// field, a Variant key, and a key of the Variant inside every List
-    /// element decodes only their leaves, and the paths read the same values
-    /// as a whole published read of an all-residual file.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reader fails, decodes other leaves, or any value
-    /// differs.
-    #[tokio::test]
-    async fn published_reads_decode_only_struct_and_variant_paths() {
-        use futures_util::TryStreamExt as _;
-        use iceberg::arrow::ParquetFileReadPlanner as _;
-
-        let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("published.parquet");
-        let file = write_file(true);
-        std::fs::write(&path, &file).expect("fixture file");
-        let residual_path = directory.path().join("residual.parquet");
-        let residual = write_file(false);
-        std::fs::write(&residual_path, &residual).expect("fixture file");
-        let iceberg_schema = Arc::new(
-            iceberg::arrow::arrow_schema_to_schema(
-                ArrowReaderMetadata::load(&residual, ArrowReaderOptions::new())
-                    .expect("valid footer")
-                    .schema(),
-            )
-            .expect("the fixture carries every field id"),
-        );
-        let read = |path: &std::path::Path, paths: LeafPaths| {
-            let task = iceberg::scan::FileScanTask::builder()
-                .with_file_size_in_bytes(std::fs::metadata(path).expect("size").len())
-                .with_start(0)
-                .with_length(0)
-                .with_data_file_path(path.to_string_lossy().into_owned())
-                .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
-                .with_schema(Arc::clone(&iceberg_schema))
-                .with_project_field_ids(vec![1, 2, 5, 6])
-                .with_case_sensitive(false)
-                .build();
-            let planner = PublishedFileReadPlanner::new(logical_schema(), None, paths, 20);
-            async move {
-                let batches = iceberg::arrow::ArrowReaderBuilder::new(
-                    iceberg::io::FileIO::new_with_fs(),
-                    iceberg::Runtime::current(),
-                )
-                .with_parquet_file_read_planner(Arc::new(planner))
-                .build()
-                .read(Box::pin(futures_util::stream::iter(vec![Ok(task)])))
-                .expect("published reader")
-                .stream()
-                .try_collect::<Vec<_>>()
-                .await
-                .expect("published rows");
-                arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat")
-            }
-        };
-        let footer =
-            ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).expect("valid footer");
-        let narrowing = PublishedFileReadPlanner::new(logical_schema(), None, trimmed_paths(), 20)
-            .plan(&footer, vec![0])
-            .expect("narrowing");
-        let mask = narrowing.projection.expect("trimmed mask");
-        let descriptor = footer.metadata().file_metadata().schema_descr();
-        assert_eq!(
-            (0..descriptor.num_columns())
-                .filter(|&leaf| mask.leaf_included(leaf))
-                .map(|leaf| descriptor.column(leaf).path().string())
-                .collect::<Vec<_>>(),
-            TRIMMED_LEAVES
-        );
-        let whole = read_values(&read(&residual_path, LeafPaths::default()).await);
-        assert_eq!(read_values(&read(&path, trimmed_paths()).await), whole);
     }
 }

@@ -153,7 +153,8 @@ Each status was found by searching the tree for that scenario's named tests.
 | 2. Recovery and compaction preserve standard logical values | **Implemented, not pushed** | iceberg-rust `fdc02e0a0847f3219e234f81ee6b7a2ff0d67418` (reader unshreds), iceberg-compaction `28f35fc9fd39b1e4879e7652f074f1630ca417cb` (test) and `a52462a2114e6912b0c7fdf903abcbb31b7d7136` (repin). Evidence below |
 | 3. Distinct logical semantics share physical pushdown | **Implemented (spec revision 20)** | Commits `e76a74e09`, `740975234`, `f9fa00867`, `3aec57cec`, `f9b516a29`, `6fd3b6612`, plus the revision-20 read-core commit. Published files go through `FileReadPlan` via the iceberg fork's per-file hook (iceberg-rust `b0a88c310`). Journey `published::struct_and_variant_share_physical_pushdown` passes. Output leaf projection is still open (see the evidence below). |
 | 4. Unsigned distributed predicates preserve authority | **Implemented** | Commit `47bdd88dc` (protobuf, v8 digest, `private_conversion::tests::leaf_predicates_round_trip_and_reject_malformed`). MCP `query::pg_tests::sensitive_variant_leaf_is_denied_before_io` and peer `peer_network::security::unsigned_leaf_predicates_round_trip_and_execute` implemented (evidence below). |
-| Benchmark `bench:bifrost:nested-field-pushdown` | **Not started** | No mise task |
+| 3 and 4, re-scoped by spec revision 26 | **In progress** | Variant querying moves into a DataFusion fork `variant` feature; Wyrd deletes its Variant SQL, leaf-path, file-adapter and codec code and enables the feature. Plan and progress: `tasks/TASK-003-native-datafusion-read-path-plan.md` |
+| Benchmark `bench:bifrost:nested-field-pushdown` | **Implemented (spec revision 24)** | `benches/nested_field_pushdown.rs`, mise task; evidence under "Nested-field benchmark evidence" below |
 
 After the merge, resume shredding at Scenario 1.
 
@@ -500,6 +501,65 @@ Commands:
 `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all -E "test(/builtin_variant_and_struct_payloads_are_queryable$/)"'`;
 `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::(leaf_paths|nested_pushdown|variant_sql)::/)'`;
 fork: `mise exec -- cargo test -p iceberg --lib`; compaction: `mise exec -- cargo test -p iceberg-compaction-core`.
+
+#### Nested-field benchmark evidence (spec revision 24)
+
+The bench reads through the production `OracleTableProvider` over local hot
+files (`bench_support::OracleHotTables`), with the Oracle Variant SQL and the
+`LeafPathPushdown` rule installed, and a live Interactive grant bound through
+the same lock code the leaf tests use. No server, Postgres or network.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Fork workload: 512 rows, 2×256-row batches, 256-row row groups, 16 KiB varying strings | `ROWS_PER_BATCH`, `BATCHES`, `STRING_BYTES`, xorshift `text`; `OracleHotTables::writer_properties(256)` | bench run | PASS |
+| Narrow, wide, nested as Struct and shredded Variant | One Struct batch per shape; Variant = arrow `cast_to_variant` + `shred_variant` onto the Struct's type; field ids from `arrow_schema_to_schema_auto_assign_ids` | bench run | PASS |
+| Exact result before timing | `check`: rendered rows equal the generator's rows (sorted); sums equal 130816 | bench run, all 16 cases | PASS |
+| `get_field` / `variant_get` in the logical plan | `check`: logical plan text contains the function | bench run | PASS |
+| Same leaf paths for both forms | `check`: `hot_leaf_paths(plan)` equals the case's one expected path set for Struct and Variant | bench run | PASS |
+| No unselected sibling read | `check`: `bytes_scanned < (k + 1) ×` smallest large-string leaf (compressed, from the footer), `k` = large strings selected | bench run | PASS |
+| Setup outside timing; medians only; no thresholds | Fixtures, sessions and checks run before `bench_function`; the table is read from Criterion's `estimates.json` medians | bench run | PASS |
+
+Medians (local machine, comparison context only; the reference column is the
+spec's published optimized value):
+
+| Shape/case | Struct | Variant | Reference |
+|---|---:|---:|---:|
+| `wide/select_small_field` | 788 µs | 1035 µs | 419 µs |
+| `wide/sum_small_field` | 1138 µs | 1271 µs | 638 µs |
+| `wide/select_one_string_field` | 3957 µs | 11561 µs | 671 µs |
+| `nested/select_extra_string` | 3195 µs | 5620 µs | 685 µs |
+| `nested/select_inner_small_field` | 793 µs | 1085 µs | 450 µs |
+| `nested/sum_inner_small_field` | 1152 µs | 1351 µs | 662 µs |
+| `narrow/select_small_field` | 764 µs | 986 µs | 422 µs |
+| `narrow/select_id_and_small_field` | 860 µs | 1109 µs | 445 µs |
+
+Open observation, not diagnosed: `wide/select_one_string_field` on Variant
+takes about twice `nested/select_extra_string` on Variant, though both return
+one 16 KiB string per row and both pass the bytes bound. The string cases are
+also slower than the reference because these strings vary per row (8 MiB per
+sibling) where the fork's are one repeated value.
+
+| New item | Owners searched | Why new |
+|---|---|---|
+| `benches/nested_field_pushdown.rs` | crate benches (none), `wyrd-bench` | The spec requires one Criterion bench in this crate |
+| `bench_support::OracleHotTables` | `oracle::exec` test helpers (`#[cfg(test)]`), `wyrd-testing` (server) | The production provider over local hot files, reachable from a bench target |
+| `bench_support::{hot_leaf_paths, bytes_scanned}` | `OracleQueryScanStats::from_plan` (reused), `HotParquetExec` | Thin reads of existing plan state |
+| `HotParquetExec::leaf_paths` | — | Read accessor for the existing field |
+| `bindings::with_test_grant` | `bind_test_session` | Extracted from `bind_test_session`, which now calls it |
+| `bindings::bench_session_config` | `OracleExecutionGrant::for_test` (reused) | `OracleTelemetry` is private to `oracle`, so the grant is built there |
+| dev-dep `criterion` | workspace `criterion` 0.5 | Workspace pin; `wyrd-bench`'s feature only re-exports it |
+
+Commands:
+
+- `mise run bench:bifrost:nested-field-pushdown`: exit 0, all 16 cases
+  asserted and timed.
+- `cargo check --locked -p vala-bifrost-redux` with no features,
+  `--features test-support`, `--features bench-support`, and both: no
+  warnings.
+- Redux clippy `--all-features --all-targets -D warnings` (with `wyrd-testing`
+  and `wyrd-client`): clean.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support'`:
+  872 passed.
 
 ### Hot-reader fix: a key the file did not shred
 
@@ -909,8 +969,10 @@ During iteration, run only these focused proofs:
 12. `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(=query::pg_tests::sensitive_variant_leaf_is_denied_before_io)"'`
 13. `mise exec -- cargo nextest run --locked --manifest-path /home/thorrester/Documents/GitHub/iceberg-rust/Cargo.toml -p iceberg --lib -E 'test(=arrow::reader::projection::tests::variant_shredding_round_trips_nested_residuals) | test(=writer::file_writer::parquet_writer::tests::accepts_per_file_variant_physical_schema)'`; record the tested Iceberg and compaction revisions before repinning.
 
-The benchmark is performance evidence, not a timing gate. Use exactly 262,144
-rows and varying 8,192-byte string siblings. Build narrow (one string plus
+The benchmark is performance evidence, not a timing gate. Use the pinned
+DataFusion fork's `parquet_struct_projection` workload (spec revision 24): 512
+rows as two 256-row batches into 256-row row groups, with varying 16 KiB string
+siblings. Build narrow (one string plus
 `Int32`), wide (four strings plus `Int32`), and nested (inner string/`Int32`
 plus outer string) fixtures as fixed Struct and equivalent standard shredded
 Variant. Report wide `{select_small_field,sum_small_field,

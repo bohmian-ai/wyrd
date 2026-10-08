@@ -36,6 +36,7 @@ pub use layout::{
     TimePartitionError, TimePartitionSpec,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
+pub use storage::warehouse_uri;
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;
 pub use tenant_table::{TenantTableBinding, TenantTableBindingError, TenantTableKey};

@@ -12,7 +12,7 @@ use crate::namespaces::BifrostNamespace;
 /// Reject strings unsafe for object-store path segments.
 ///
 /// Allows `[A-Za-z0-9_.-]`, max 63 chars. Rejects empty, `..`, `/`, `\`, and
-/// leading/trailing `.` — blocks path traversal on opendal-fs.
+/// leading/trailing `.` — blocks path traversal on the local filesystem store.
 #[must_use]
 pub fn is_safe_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 63 {

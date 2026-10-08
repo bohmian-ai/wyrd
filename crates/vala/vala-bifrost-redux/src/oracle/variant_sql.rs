@@ -29,11 +29,13 @@ use std::sync::{Arc, LazyLock};
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder, StructArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion::catalog::{CatalogProviderList, MemoryCatalogProviderList};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, ScalarValue, exec_err, plan_err};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::context::SessionConfig;
+use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{
@@ -96,28 +98,58 @@ pub struct OracleVariantSql {
     planner: Arc<VariantOperatorPlanner>,
     /// Adapts per-file read plans to each file's own Variant layout.
     file_adapter: Arc<VariantFileAdapterFactory>,
+    /// `DataFusion`'s default features plus this surface, built once; every
+    /// Oracle session starts from it (see [`Self::session`]).
+    ///
+    /// It is never wrapped in a context and never holds a table: its catalog
+    /// list is replaced in every session built from it.
+    template: SessionState,
 }
 
 impl OracleVariantSql {
     /// Build the functions and the planner that refers to them.
     fn new() -> Self {
         let get = Arc::new(ScalarUDF::new_from_impl(VariantGet::new()));
-        let as_text = Arc::new(ScalarUDF::new_from_impl(VariantAsText::new()));
         let planner = Arc::new(VariantOperatorPlanner {
             get: Arc::clone(&get),
-            as_text: Arc::clone(&as_text),
+            as_text: Arc::new(ScalarUDF::new_from_impl(VariantAsText::new(true))),
         });
-        Self {
+        let mut sql = Self {
             functions: vec![
                 get,
-                as_text,
+                Arc::new(ScalarUDF::new_from_impl(VariantAsText::new(false))),
                 Arc::new(ScalarUDF::new_from_impl(ParseJson::new(false))),
                 Arc::new(ScalarUDF::new_from_impl(ParseJson::new(true))),
                 Arc::new(ScalarUDF::new_from_impl(ToJson::new())),
             ],
             planner,
             file_adapter: Arc::new(VariantFileAdapterFactory),
-        }
+            template: SessionStateBuilder::new().build(),
+        };
+        sql.template = sql
+            .install(SessionStateBuilder::new().with_default_features())
+            .build();
+        sql
+    }
+
+    /// Returns one Oracle session state under `config`: a clone of the
+    /// template, as `SessionContext::state` hands out per query, with its own
+    /// catalog list so one query's tables never reach another.
+    #[must_use]
+    pub fn session(&self, config: SessionConfig) -> SessionState {
+        let mut state = self.template.clone();
+        *state.config_mut() = config;
+        let catalogs = MemoryCatalogProviderList::new();
+        catalogs.register_catalog(
+            state.config().options().catalog.default_catalog.clone(),
+            Arc::new(SessionStateDefaults::default_catalog(
+                state.config(),
+                state.table_factories(),
+                state.runtime_env(),
+            )),
+        );
+        state.register_catalog_list(Arc::new(catalogs));
+        state
     }
 
     /// Return the expression adapter every per-file Parquet read plan uses.
@@ -143,6 +175,18 @@ impl OracleVariantSql {
         paths: BTreeSet<Vec<String>>,
     ) -> Arc<dyn PhysicalExpr> {
         FileRead::expr(column, field, paths)
+    }
+
+    /// Returns the literal paths `expr` narrows its column to when it is a
+    /// [`Self::trimmed`] read, else `None`.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn trimmed_paths(expr: &Arc<dyn PhysicalExpr>) -> Option<&BTreeSet<Vec<String>>> {
+        expr.downcast_ref::<ScalarFunctionExpr>()?
+            .fun()
+            .inner()
+            .downcast_ref::<FileRead>()
+            .map(|read| &read.paths)
     }
 
     /// Returns the column and keys of `expr` when it is `variant_get` over a
@@ -259,7 +303,8 @@ impl OracleVariantSql {
 struct VariantOperatorPlanner {
     /// The registered `variant_get` function.
     get: Arc<ScalarUDF>,
-    /// The registered `variant_as_text` function.
+    /// The `variant_as_text` `->>` plans: it reads only `variant_get`
+    /// output, so it skips the read gate (see [`VariantAsText::gated`]).
     as_text: Arc<ScalarUDF>,
 }
 
@@ -593,14 +638,24 @@ fn decode_rows(argument: &ColumnarValue, rows: usize) -> Result<VariantArray> {
 struct VariantAsText {
     /// One Variant argument.
     signature: Signature,
+    /// Whether the argument already passed [`mask_placeholders`].
+    ///
+    /// Only the `->>` planner's instance sets it: its argument is always a
+    /// [`VariantGet`] result, which gates its root and every residual below
+    /// it and then rebuilds a sub-value of that validated value. The SQL
+    /// function can be called on a stored column directly, so it gates.
+    /// Both share one name, so a plan decoded by name on a follower gets
+    /// the gating instance: slower there, never unchecked.
+    gated: bool,
 }
 
 impl VariantAsText {
     /// Declare the one-argument signature; the argument is checked when the
-    /// return field is resolved.
-    fn new() -> Self {
+    /// return field is resolved. `gated` is [`Self::gated`].
+    fn new(gated: bool) -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
+            gated,
         }
     }
 }
@@ -637,12 +692,18 @@ impl ScalarUDFImpl for VariantAsText {
     }
 
     /// Render each row: strings as themselves, other values as JSON text.
+    /// An ungated argument passes [`mask_placeholders`] first.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error raised while decoding a row or rendering JSON.
+    /// Returns the Arrow error raised while gating or decoding a row or
+    /// rendering JSON.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let variant = decode_rows(&args.args[0], args.number_rows)?;
+        let variant = if self.gated {
+            VariantArray::try_new(&args.args[0].to_array(args.number_rows)?)?
+        } else {
+            decode_rows(&args.args[0], args.number_rows)?
+        };
         let mut text = StringBuilder::with_capacity(variant.len(), 0);
         for row in 0..variant.len() {
             if variant.is_null(row) {
@@ -970,8 +1031,11 @@ impl VariantFileAdapter {
     }
 
     /// Wraps every shredded column reference in `expr` that is neither the
-    /// root of a `variant_get` nor inside a [`FileRead`] in a whole
-    /// [`FileRead`].
+    /// root of a literal-key `variant_get` nor inside a [`FileRead`] in a
+    /// whole [`FileRead`].
+    ///
+    /// A literal-key `variant_get` reads the shredded layout itself; any
+    /// other key, such as one computed per row, needs the unshredded value.
     ///
     /// # Errors
     ///
@@ -990,13 +1054,10 @@ impl VariantFileAdapter {
         if let Some(typed) = self.typed_comparison(&expr) {
             return typed;
         }
-        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
-            && (function.name() == FILE_READ
-                || function.name() == VARIANT_GET
-                    && function
-                        .args()
-                        .first()
-                        .is_some_and(|root| root.downcast_ref::<Column>().is_some()))
+        if expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|function| function.name() == FILE_READ)
+            || OracleVariantSql::literal_key_path(&expr).is_some()
         {
             return Ok(expr);
         }
@@ -1679,7 +1740,9 @@ mod tests {
     /// Malformed stored Variant bytes fail every Variant function, never panic.
     ///
     /// Upstream decoding validates shallowly and panics on such bytes, so this
-    /// proves each reader path validates the stored column first.
+    /// proves each reader path validates the stored column first, including a
+    /// residual below a shredded field, which `->>` relies on `variant_get`
+    /// to have checked.
     ///
     /// # Panics
     ///
@@ -1716,11 +1779,17 @@ mod tests {
                 Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table")),
             )
             .expect("register");
+        context
+            .register_table("s", malformed_residual_table())
+            .expect("register");
         for sql in [
             "SELECT v -> 'a' FROM m",
             "SELECT v -> k FROM m",
             "SELECT v ->> 'a' FROM m",
+            "SELECT variant_as_text(v) FROM m",
             "SELECT to_json(v) FROM m",
+            "SELECT v -> 'a' FROM s",
+            "SELECT v ->> 'a' FROM s",
         ] {
             let error = context
                 .sql(sql)
@@ -1734,6 +1803,72 @@ mod tests {
                 "{sql} refuses the malformed cell instead of panicking: {error}"
             );
         }
+    }
+
+    /// Sessions built from the shared template never see each other's
+    /// tables, and each has `DataFusion`'s built-ins and the Variant surface.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a table leaks between sessions or a function is missing.
+    #[tokio::test]
+    async fn template_sessions_share_functions_not_tables() {
+        let session = || {
+            SessionContext::new_with_state(OracleVariantSql::shared().session(SessionConfig::new()))
+        };
+        let (first, second) = (session(), session());
+        first
+            .register_table(
+                "t",
+                Arc::new(
+                    MemTable::try_new(
+                        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
+                        vec![vec![]],
+                    )
+                    .expect("table"),
+                ),
+            )
+            .expect("register");
+        assert!(first.table_exist("t").expect("lookup"));
+        assert!(!second.table_exist("t").expect("lookup"));
+        assert_eq!(
+            column(&second, "SELECT to_json(parse_json('[1]')) || upper('a')").await,
+            ["[1]A"]
+        );
+    }
+
+    /// One row of a Variant column `v` shredded as an object whose field `a`
+    /// keeps the malformed residual `0xff`, with valid top-level metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be built.
+    fn malformed_residual_table() -> Arc<MemTable> {
+        let one = EncodedVariant::from_json_text("1").expect("encodes");
+        let residual = StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Binary, true)),
+            Arc::new(BinaryArray::from(vec![&[0xff_u8][..]])) as ArrayRef,
+        )]);
+        let typed = StructArray::from(vec![(
+            Arc::new(Field::new("a", residual.data_type().clone(), false)),
+            Arc::new(residual) as ArrayRef,
+        )]);
+        let shredded = StructArray::from(vec![
+            (
+                Arc::new(Field::new("metadata", DataType::Binary, false)),
+                Arc::new(BinaryArray::from(vec![one.metadata()])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("typed_value", typed.data_type().clone(), true)),
+                Arc::new(typed) as ArrayRef,
+            ),
+        ]);
+        let field = Field::new("v", shredded.data_type().clone(), true)
+            .with_extension_type(parquet_variant_compute::VariantType);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(shredded)]).expect("batch");
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("table"))
     }
 
     /// Run a query expected to fail and return its typed Variant error.

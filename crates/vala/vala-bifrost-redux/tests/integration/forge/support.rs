@@ -25,24 +25,26 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::TryStreamExt as _;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, Error as IcebergError, ErrorKind as IcebergErrorKind, Namespace, NamespaceIdent,
     TableCommit, TableCreation, TableIdent,
 };
-use opendal::{Buffer, Entry, Metadata, Operator};
+use object_store::ObjectMeta;
 use secrecy::ExposeSecret as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{
-    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding, warehouse_uri,
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
-    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectStore, ForgeObjects, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry,
+    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -57,6 +59,7 @@ use vala_bifrost_redux::scribe::{
     ScribeIngressCpuPool, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribePressureConfig,
     ScribeWalIoPool,
 };
+use vala_bifrost_redux::storage::BifrostStorage;
 use vala_sql::OperatorPool;
 use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwner};
@@ -75,15 +78,13 @@ const FIXTURE_BOUND: Duration = Duration::from_secs(30);
 /// Object-store seam that delegates every call and counts what promotion did.
 ///
 /// The promotion route is defined by what it does *not* do to the object
-/// store: it reads footers and never writes or deletes a data object. Counting
-/// the delegated calls is therefore the direct proof, and it stays honest
-/// because every call still reaches the real operator.
+/// store: it reads footers and never deletes a data object. Counting the
+/// delegated calls is therefore the direct proof, and it stays honest because
+/// every call still reaches the production implementation.
 #[derive(Debug)]
 pub(crate) struct CountingObjectStore {
-    /// Real operator every delegated call runs against.
-    inner: Arc<Operator>,
-    /// Number of rewrite output writers opened, which promotion must leave at zero.
-    output_writers: AtomicUsize,
+    /// Production Forge object operations every delegated call runs against.
+    inner: ForgeObjects,
     /// Number of delegated deletes, which promotion must leave at zero.
     deletes: AtomicUsize,
     /// Number of delegated object reads, shared so a seam can snapshot it.
@@ -100,7 +101,7 @@ pub(crate) struct CountingObjectStore {
     delete_errors: AtomicUsize,
     /// Remaining delegated deletes to submit and then report as already absent.
     delete_absences: AtomicUsize,
-    /// Entries per orphan-listing page; `0` keeps the single-page default.
+    /// Entries per orphan-listing page; `0` keeps the production page size.
     list_page_entries: AtomicUsize,
     /// Every `start_after` cursor orphan listing has been given, in order.
     list_cursors: Mutex<Vec<Option<String>>>,
@@ -128,11 +129,10 @@ struct CallPause {
 }
 
 impl CountingObjectStore {
-    /// Wrap the fixture operator in a counting seam.
-    pub(crate) fn new(inner: Arc<Operator>) -> Arc<Self> {
+    /// Wrap production Forge object operations over `storage` in a counting seam.
+    pub(crate) fn new(storage: &BifrostStorage) -> Arc<Self> {
         Arc::new(Self {
-            inner,
-            output_writers: AtomicUsize::new(0),
+            inner: ForgeObjects::new(storage),
             deletes: AtomicUsize::new(0),
             reads: Arc::new(AtomicUsize::new(0)),
             stats: AtomicUsize::new(0),
@@ -191,7 +191,7 @@ impl CountingObjectStore {
 
     /// Fail the next `count` delegated stats with an injected transient error.
     ///
-    /// The error is an `Unexpected` opendal failure rather than `NotFound`, so
+    /// The error is a generic object-store failure rather than `NotFound`, so
     /// it exercises the branch where the object's existence stays unknown.
     pub(crate) fn fail_next_stats(&self, count: usize) {
         self.stat_errors.store(count, Ordering::Release);
@@ -241,11 +241,6 @@ impl CountingObjectStore {
         Arc::clone(&self.reads)
     }
 
-    /// Return how many rewrite outputs were opened.
-    pub(crate) fn output_writers(&self) -> usize {
-        self.output_writers.load(Ordering::Acquire)
-    }
-
     /// Return how many objects were deleted.
     pub(crate) fn deletes(&self) -> usize {
         self.deletes.load(Ordering::Acquire)
@@ -257,66 +252,54 @@ impl CountingObjectStore {
     }
 }
 
+/// Builds one injected object-store failure for the fault seams below.
+fn injected(message: &'static str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "fixture",
+        source: message.into(),
+    }
+}
+
 #[async_trait]
 impl ForgeObjectStore for CountingObjectStore {
-    async fn output_writer(
-        &self,
-        operator: &Operator,
-        path: &str,
-        chunk_bytes: usize,
-    ) -> opendal::Result<opendal::Writer> {
-        self.output_writers.fetch_add(1, Ordering::AcqRel);
-        operator.writer_with(path).chunk(chunk_bytes).await
-    }
-
-    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+    async fn read(&self, path: &str) -> object_store::Result<Bytes> {
         self.reads.fetch_add(1, Ordering::AcqRel);
         self.inner.read(path).await
     }
 
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
-        self.reads.fetch_add(1, Ordering::AcqRel);
-        self.inner.read_with(path).range(range).await
-    }
-
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
-        self.inner.list_with(prefix).recursive(true).await
-    }
-
-    /// Page the real listing while preserving exclusive, lexicographic cursors.
+    /// Page the production listing, optionally into smaller pages.
     ///
-    /// The production adapter delegates the cursor to the backend; the
-    /// filesystem operator behind this fixture cannot, so the same semantics
-    /// are applied here over a real recursive listing. Recording each cursor is
-    /// what lets a resume proof assert that earlier pages are never relisted.
-    async fn list_pages(
+    /// Recording each cursor is what lets a resume proof assert that earlier
+    /// pages are never relisted; re-chunking each production page keeps its
+    /// order and cursor semantics while letting the page cap bite.
+    fn list_pages(
         &self,
         prefix: &str,
         start_after: Option<&str>,
-    ) -> opendal::Result<vala_bifrost_redux::forge::ForgeObjectPages> {
+    ) -> vala_bifrost_redux::forge::ForgeObjectPages {
         self.list_cursors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(start_after.map(ToOwned::to_owned));
-        let mut entries = self.list(prefix).await?;
-        entries.retain(|entry| entry.metadata().is_file());
-        if let Some(cursor) = start_after {
-            entries.retain(|entry| entry.path() > cursor);
-        }
-        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+        let pages = self.inner.list_pages(prefix, start_after);
         let per_page = self.list_page_entries.load(Ordering::Acquire);
-        let pages: Vec<opendal::Result<Vec<Entry>>> = if per_page == 0 {
-            vec![Ok(entries)]
-        } else {
-            entries
-                .chunks(per_page)
-                .map(|chunk| Ok(chunk.to_vec()))
-                .collect()
-        };
-        Ok(Box::pin(futures_util::stream::iter(pages)))
+        if per_page == 0 {
+            return pages;
+        }
+        Box::pin(
+            pages
+                .map_ok(move |page| {
+                    futures_util::stream::iter(
+                        page.chunks(per_page)
+                            .map(|chunk| Ok(chunk.to_vec()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .try_flatten(),
+        )
     }
 
-    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+    async fn stat(&self, path: &str) -> object_store::Result<ObjectMeta> {
         let ordinal = self.stats.fetch_add(1, Ordering::AcqRel) + 1;
         if self.stat_pause.at.load(Ordering::Acquire) == ordinal {
             self.stat_pause.at.store(0, Ordering::Release);
@@ -330,15 +313,12 @@ impl ForgeObjectStore for CountingObjectStore {
             })
             .is_ok()
         {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "injected expired-cleanup stat failure",
-            ));
+            return Err(injected("injected expired-cleanup stat failure"));
         }
         self.inner.stat(path).await
     }
 
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
+    async fn delete(&self, path: &str) -> object_store::Result<()> {
         let ordinal = self.deletes.fetch_add(1, Ordering::AcqRel) + 1;
         if self.delete_pause.at.load(Ordering::Acquire) == ordinal {
             self.delete_pause.at.store(0, Ordering::Release);
@@ -354,8 +334,7 @@ impl ForgeObjectStore for CountingObjectStore {
             .is_ok()
         {
             submitted?;
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
+            return Err(injected(
                 "injected expired-cleanup delete acknowledgement failure",
             ));
         }
@@ -367,10 +346,10 @@ impl ForgeObjectStore for CountingObjectStore {
             .is_ok()
         {
             submitted?;
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::NotFound,
-                "injected expired-cleanup delete absence",
-            ));
+            return Err(object_store::Error::NotFound {
+                path: path.to_owned(),
+                source: "injected expired-cleanup delete absence".into(),
+            });
         }
         submitted
     }
@@ -811,8 +790,8 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) operator_pool: OperatorPool,
     /// Tenant-scoped SQL handle Forge transitions run through.
     pub(crate) vala: vala_sql::ValaPostgres,
-    /// Raw staging operator shared by Scribe, the catalog, and Forge.
-    pub(crate) staging: Arc<Operator>,
+    /// Storage owner whose one object store Scribe, the catalog, and Forge share.
+    pub(crate) storage: Arc<BifrostStorage>,
     /// Tenant that owns the table and every sealed row.
     pub(crate) tenant: DataTenantId,
     /// Physical and logical identity of the seeded table.
@@ -971,7 +950,7 @@ impl PromotionIntegrationFixture {
         &self,
         observer: ForgeWorkerCompletionObserver,
     ) -> ForgeWorker {
-        let store = CountingObjectStore::new(Arc::clone(&self.staging));
+        let store = CountingObjectStore::new(&self.storage);
         let forge = self.build_forge_for_test(
             self.catalog.iceberg_catalog(),
             store,
@@ -1090,8 +1069,7 @@ impl PromotionIntegrationFixture {
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let scratch_root = tempfile::tempdir().expect("scratch directory");
 
-        let storage = local_storage_owner(warehouse.path());
-        let staging = Arc::new(storage.operator().clone());
+        let storage = BifrostStorage::for_test(warehouse.path(), false);
         let catalog = Arc::new(
             BifrostCatalog::new(
                 database.catalog_dsn().expose_secret(),
@@ -1111,7 +1089,7 @@ impl PromotionIntegrationFixture {
         let scribe = start_scribe(
             &database,
             Arc::clone(&catalog),
-            Arc::clone(&staging),
+            Arc::clone(storage.objects()),
             wal_root.path(),
             scribe_resources,
         )
@@ -1124,7 +1102,7 @@ impl PromotionIntegrationFixture {
             catalog,
             operator_pool,
             vala: database.vala_postgres().clone(),
-            staging,
+            storage,
             tenant,
             binding,
             config: ForgeConfig::default(),
@@ -1188,7 +1166,7 @@ impl PromotionIntegrationFixture {
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
-                staging: Arc::clone(&self.staging),
+                warehouse: warehouse_uri(self.storage.backend()),
                 object_store,
                 hints,
                 config: self.config.clone(),
@@ -1225,8 +1203,8 @@ impl PromotionIntegrationFixture {
                 vala: self.vala.clone(),
                 operator_pool,
                 catalog: self.catalog.iceberg_catalog(),
-                staging: Arc::clone(&self.staging),
-                object_store: CountingObjectStore::new(Arc::clone(&self.staging)),
+                warehouse: warehouse_uri(self.storage.backend()),
+                object_store: CountingObjectStore::new(&self.storage),
                 hints,
                 config: self.config.clone(),
                 maintenance_interval: Duration::from_hours(1),
@@ -1896,6 +1874,74 @@ impl PromotionIntegrationFixture {
         paths
     }
 
+    /// Reads one object's bytes from the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object cannot be read.
+    pub(crate) async fn read_object(&self, key: &str) -> Bytes {
+        use object_store::ObjectStoreExt as _;
+
+        self.storage
+            .objects()
+            .get(&object_store::path::Path::from(key))
+            .await
+            .expect("fixture object read")
+            .bytes()
+            .await
+            .expect("fixture object bytes")
+    }
+
+    /// Writes one object directly into the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the write fails.
+    pub(crate) async fn write_object(&self, key: &str, bytes: impl Into<Bytes>) {
+        use object_store::ObjectStoreExt as _;
+
+        self.storage
+            .objects()
+            .put(&object_store::path::Path::from(key), bytes.into().into())
+            .await
+            .expect("fixture object write");
+    }
+
+    /// Deletes one object from the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the delete fails.
+    pub(crate) async fn delete_object(&self, key: &str) {
+        use object_store::ObjectStoreExt as _;
+
+        self.storage
+            .objects()
+            .delete(&object_store::path::Path::from(key))
+            .await
+            .expect("fixture object delete");
+    }
+
+    /// Reports whether one object exists in the fixture's object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the store fails for a reason other than absence.
+    pub(crate) async fn object_exists(&self, key: &str) -> bool {
+        use object_store::ObjectStoreExt as _;
+
+        match self
+            .storage
+            .objects()
+            .head(&object_store::path::Path::from(key))
+            .await
+        {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(error) => panic!("fixture object stat failed: {error}"),
+        }
+    }
+
     /// Snapshots every object under the table prefix with its exact content hash.
     ///
     /// Comparing the map across a promotion is the direct proof that no data
@@ -1904,28 +1950,29 @@ impl PromotionIntegrationFixture {
     ///
     /// # Panics
     ///
-    /// Panics when the staging operator cannot be listed or read.
+    /// Panics when the object store cannot be listed or read.
     pub(crate) async fn object_digests(&self) -> BTreeMap<String, String> {
-        let prefix = format!("{}/", self.binding.object_prefix);
-        let entries = self
-            .staging
-            .list_with(&prefix)
-            .recursive(true)
+        use object_store::ObjectStoreExt as _;
+
+        let objects = self.storage.objects();
+        let prefix = object_store::path::Path::from(self.binding.object_prefix.as_str());
+        let entries = objects
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
             .await
             .expect("fixture object listing");
         let mut digests = BTreeMap::new();
         for entry in entries {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            let bytes = self
-                .staging
-                .read(entry.path())
+            let bytes = objects
+                .get(&entry.location)
                 .await
-                .expect("fixture object read");
-            digests.insert(entry.path().to_owned(), {
+                .expect("fixture object read")
+                .bytes()
+                .await
+                .expect("fixture object bytes");
+            digests.insert(entry.location.to_string(), {
                 use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+                hex::encode(sha2::Sha256::digest(&bytes))
             });
         }
         digests
@@ -2653,27 +2700,6 @@ impl SupervisedPromotion {
     }
 }
 
-/// Builds the local-filesystem storage owner both Scribe and the catalog use.
-///
-/// One owner backs both, so the object Scribe writes is at the path the
-/// catalog resolves and the path Forge reads — which is the whole point of an
-/// append-in-place promotion.
-fn local_storage_owner(root: &std::path::Path) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
-    let signer = wyrd_storage::signer::BackendSigner::Local(
-        wyrd_storage::local::LocalSigner::new(root.to_path_buf()).expect("fixture local signer"),
-    );
-    Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            2 * 1024 * 1024 * 1024,
-            false,
-        )
-        .expect("fixture storage policy"),
-        None,
-    ))
-}
-
 /// Composes Scribe and Forge capabilities over the fixture's real volume roots.
 ///
 /// The snapshot is injected rather than probed so capacity is deterministic
@@ -2740,7 +2766,7 @@ fn fixture_roles(
 async fn start_scribe(
     database: &wyrd_dev_fixtures::pg::PgFixture,
     catalog: Arc<BifrostCatalog>,
-    staging: Arc<Operator>,
+    objects: Arc<dyn object_store::ObjectStore>,
     wal_root: &std::path::Path,
     resources: vala_bifrost_redux::resources::ScribeResources,
 ) -> Arc<ScribeImpl> {
@@ -2760,7 +2786,7 @@ async fn start_scribe(
     );
     Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
         catalog: Some(catalog),
-        operator: staging,
+        operator: objects,
         wal,
         stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
             node_id,

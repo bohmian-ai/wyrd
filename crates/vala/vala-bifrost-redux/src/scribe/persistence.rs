@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use num_traits::ToPrimitive;
-use opendal::Operator;
+use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 #[cfg(any(test, feature = "test-support"))]
@@ -652,12 +652,12 @@ impl ScribePersistenceConfig {
 /// Shared dependencies every persistence worker needs to publish a claim.
 ///
 /// Built once when the persistence runtime starts and handed to each worker,
-/// so workers share one object-store operator, WAL writer, CPU and WAL-IO
+/// so workers share one object store, WAL writer, CPU and WAL-IO
 /// lanes, fenced actor stream, memory budget, and hot-source registry rather
 /// than constructing their own.
 pub(crate) struct PersistenceRuntimeContext {
-    /// Object-store operator shared by persistence workers.
-    pub(crate) operator: Arc<Operator>,
+    /// Bifrost object store shared by persistence workers.
+    pub(crate) operator: Arc<dyn ObjectStore>,
     /// WAL writer used for manifest location and recovery identity.
     pub(crate) wal: Arc<WalWriter>,
     /// Bounded CPU lane used to encode immutable generations.
@@ -695,7 +695,7 @@ pub struct PersistenceRuntime {
     /// WAL-root stage owner used for pre-readiness publication recovery.
     recovery_wal: Option<Arc<WalWriter>>,
     /// Durable object store used for pre-readiness upload convergence.
-    recovery_operator: Option<Operator>,
+    recovery_operator: Option<Arc<dyn ObjectStore>>,
     /// Root owner charged before allocating recovery transfer buffers.
     recovery_memory: Option<ScribeResources>,
     /// The shared worker retained so drain can publish residue after the queue empties.
@@ -808,7 +808,7 @@ impl PersistenceRuntime {
         let stage = Arc::new(crate::scribe::hot_stage::ScribeHotStage::new(stage_root));
         let publisher = crate::scribe::claim_publication::ClaimPublisher::new(
             Arc::clone(&stage),
-            ScribeStageMover::new(context.wal.base_dir(), (*context.operator).clone()),
+            ScribeStageMover::new(context.wal.base_dir(), Arc::clone(&context.operator)),
             ScribePublicationReconciler::new(
                 operator_pool,
                 context.actor_stream,
@@ -868,7 +868,7 @@ impl PersistenceRuntime {
             )
         });
         let recovery_wal = Arc::clone(&context.wal);
-        let recovery_operator = (*context.operator).clone();
+        let recovery_operator = Arc::clone(&context.operator);
         let recovery_memory = context.memory.clone();
         let failures = Arc::new(Mutex::new(Vec::new()));
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -1261,7 +1261,7 @@ impl PersistenceRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe staged recovery has no root memory owner".to_owned(),
             })?;
-        ScribeStageMover::new(wal.base_dir(), operator.clone())
+        ScribeStageMover::new(wal.base_dir(), Arc::clone(operator))
             .recover_publications(reconciler, memory)
             .await
     }
@@ -1386,7 +1386,7 @@ pub struct ScribeStageMover {
 impl ScribeStageMover {
     /// Builds the mover over the WAL-root stage namespace and durable object store.
     #[must_use]
-    pub fn new(wal_root: &Path, operator: Operator) -> Self {
+    pub fn new(wal_root: &Path, operator: Arc<dyn ObjectStore>) -> Self {
         Self {
             staging: ScribeStaging::new(wal_root),
             uploader: BifrostParquetUploader::new(operator),
@@ -2956,11 +2956,7 @@ mod tests {
                     .with_operator_pool(database.operator_pool().clone())
                     .with_output_scratch(output_scratch),
                 PersistenceRuntimeContext {
-                    operator: Arc::new(
-                        Operator::new(opendal::services::Memory::default())
-                            .expect("memory operator")
-                            .finish(),
-                    ),
+                    operator: Arc::new(object_store::memory::InMemory::new()),
                     wal: Arc::clone(&wal),
                     persistence_cpu: ScribePersistenceCpuPool::new(1),
                     wal_io: ScribeWalIoPool::new(1),

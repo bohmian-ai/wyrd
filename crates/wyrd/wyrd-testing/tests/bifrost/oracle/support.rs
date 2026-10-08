@@ -9,7 +9,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray}
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
-use opendal::Buffer;
+use object_store::ObjectStoreExt as _;
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
@@ -365,8 +365,11 @@ pub(crate) async fn seed_foreign_hot_row(
     writer.close()?;
     let path = format!("{}/{path_tag}.parquet", binding.object_prefix);
     cluster
-        .storage_operator()
-        .write(&path, Buffer::from(parquet.clone()))
+        .storage_objects()
+        .put(
+            &object_store::path::Path::from(path.as_str()),
+            parquet.clone().into(),
+        )
         .await?;
     let event = AuditEvent::new(
         RequestId::now_v7(),

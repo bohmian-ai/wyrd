@@ -1724,21 +1724,6 @@ impl OracleResources {
     pub fn health(&self) -> BifrostResourceHealth {
         self.governor.inner.health.clone()
     }
-    /// Splits one named child from an already-admitted Oracle query pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DataFusion` resource exhaustion when the query-local pool
-    /// cannot cover `bytes`; this capability never admits root capacity again.
-    pub(crate) fn try_split_query_memory(
-        &self,
-        pool: &Arc<dyn MemoryPool>,
-        consumer: &'static str,
-        bytes: usize,
-    ) -> Result<OracleQueryMemoryReservation, DataFusionError> {
-        OracleQueryMemoryReservation::try_new(pool, self.governor.clone(), consumer, bytes)
-    }
-
     /// Returns the aggregate bytes every consumer holds in the pod's one pool.
     ///
     /// This is the shared figure, not one query's: it proves concurrent
@@ -4073,6 +4058,23 @@ impl OracleSessionShape {
         }
     }
 
+    /// Shapes a crate test's Oracle session: Oracle's smallest partition
+    /// count with Oracle's fixed Parquet read options, so a test reads the way
+    /// a production session does instead of with `DataFusion` defaults.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test() -> Self {
+        Self::new(ORACLE_MIN_TARGET_PARTITIONS)
+    }
+
+    /// Returns the `DataFusion` options of [`Self::session_config`], for a
+    /// crate test that builds a scan without a session.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn config_options(self) -> datafusion::config::ConfigOptions {
+        self.session_config().options().as_ref().clone()
+    }
+
     /// Builds the `DataFusion` session configuration this shape describes.
     #[must_use]
     pub fn session_config(self) -> datafusion::execution::context::SessionConfig {
@@ -4084,7 +4086,13 @@ impl OracleSessionShape {
     /// A closed leaf predicate recognized by `OracleTableProvider`'s classifier
     /// only prunes files, row groups, and pages if the session that opens the
     /// Parquet files enables pushdown, reorders filters ahead of decoding, and
-    /// consults bloom filters and page indexes. The leader's planning and
+    /// consults bloom filters and page indexes. Scans report row counts as
+    /// inexact (an exact count would let `count(*)` skip the footer tenant
+    /// proof), so the planner is told to trust those estimates: a scan that
+    /// fits in one batch is then neither split nor round-robined, as it is for
+    /// an exact count. The logical optimizer runs its rules once, not
+    /// `DataFusion`'s default three passes: each pass walks the whole plan and
+    /// costs tens of microseconds on every query. The leader's planning and
     /// execution sessions, the follower's per-request session, and every
     /// distributed stage session route through this one function, so no path
     /// can silently drift onto defaults.
@@ -4099,6 +4107,11 @@ impl OracleSessionShape {
         parquet_options.reorder_filters = true;
         parquet_options.bloom_filter_on_read = true;
         parquet_options.enable_page_index = true;
+        config
+            .options_mut()
+            .execution
+            .use_row_number_estimates_to_optimize_partitioning = true;
+        config.options_mut().optimizer.max_passes = 1;
         config
     }
 }
@@ -4232,7 +4245,10 @@ impl OracleExecution {
         self.shape.apply(config)
     }
 
-    /// Builds a default-featured session state for `config` under this grant.
+    /// Builds a default-featured session state for `config` under this grant:
+    /// the Oracle session for `config` (see
+    /// [`crate::oracle::variant_sql::OracleVariantSql::session`]) with its
+    /// runtime swapped for the grant's, as `SessionContext` swaps a runtime.
     ///
     /// The Oracle Variant SQL surface is installed before the state exists,
     /// so admission execution and follower decode resolve the same functions
@@ -4244,14 +4260,11 @@ impl OracleExecution {
         &self,
         config: datafusion::execution::context::SessionConfig,
     ) -> datafusion::execution::SessionState {
-        crate::oracle::variant_sql::OracleVariantSql::shared()
-            .install(
-                datafusion::execution::SessionStateBuilder::new()
-                    .with_default_features()
-                    .with_config(self.configure(config))
-                    .with_runtime_env(Arc::clone(&self.runtime)),
-            )
-            .build()
+        datafusion::execution::SessionStateBuilder::new_from_existing(
+            crate::oracle::variant_sql::OracleVariantSql::shared().session(self.configure(config)),
+        )
+        .with_runtime_env(Arc::clone(&self.runtime))
+        .build()
     }
 }
 
@@ -4562,7 +4575,8 @@ mod tests {
     /// Every Oracle session owner must set all four Parquet reader pushdown
     /// and indexing options to exactly `true`; a closed leaf predicate only
     /// prunes files, row groups, and pages when the reader is configured to
-    /// use it.
+    /// use it. It must also let the planner trust the scans' inexact row
+    /// counts, or every small scan is split across all partitions.
     #[test]
     fn oracle_reader_session_options_contract() {
         let config =
@@ -4572,6 +4586,12 @@ mod tests {
         assert!(parquet_options.reorder_filters);
         assert!(parquet_options.bloom_filter_on_read);
         assert!(parquet_options.enable_page_index);
+        assert!(
+            config
+                .options()
+                .execution
+                .use_row_number_estimates_to_optimize_partitioning
+        );
     }
 
     fn policy(roles: &[BifrostRole]) -> BifrostResourcePolicy {

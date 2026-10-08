@@ -1,306 +1,161 @@
-//! The node's one Bifrost storage owner and its decoded-metadata cache.
+//! The node's one Bifrost storage owner.
 
-pub(crate) mod cache;
 mod error;
 mod policy;
-pub(crate) mod telemetry;
 
-use std::ops::Range;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use futures_util::FutureExt as _;
-use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::file::metadata::ParquetMetaData;
-use tokio::sync::{Notify, Semaphore};
-use tokio_util::sync::CancellationToken;
-use wyrd_storage::handle::StorageHandle;
+use datafusion::execution::cache::cache_manager::FileMetadataCache;
+use datafusion::execution::cache::default_cache::DefaultCache;
+use object_store::ObjectStore;
+use object_store::limit::LimitStore;
+use object_store::local::LocalFileSystem;
+use wyrd_storage::BackendConfig;
 
-use crate::resources::OracleMetadataResources;
-#[cfg(any(test, feature = "test-support"))]
-pub use crate::storage::cache::MetadataCacheInspection;
-pub use crate::storage::cache::{ObjectMetadataKey, RetainedMetadata};
+use crate::resources::{BifrostResourceError, MetadataReservation, OracleMetadataResources};
+
 pub use crate::storage::error::BifrostStorageError;
 pub(crate) use crate::storage::error::error_chain_contains_not_found;
 pub use crate::storage::policy::{BifrostStorageConfig, BifrostStoragePolicy};
-pub use crate::storage::telemetry::{
-    CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle, StorageOperation,
-    StorageRequestOutcome,
-};
 
-use crate::storage::cache::ParquetMetadataCache;
-
-/// Fixed detail published when an admitted attempt panicked.
+/// The node's one Bifrost object store and Parquet footer cache.
 ///
-/// Deliberately says nothing about what panicked: a panic payload is arbitrary
-/// text produced anywhere beneath the backend client, and the one thing the
-/// owner can state truthfully is that the attempt did not reach a terminal
-/// result of its own.
-const PANICKED_ATTEMPT: &str = "a governed storage attempt panicked";
-
-/// The owner's live governed-request count and the signal that teardown waits on.
-///
-/// Owned by [`BifrostStorage`] and driven exclusively by
-/// [`StorageRequestGuard`], so the count teardown observes is the same
-/// admission that publishes the request's start and terminal rather than a
-/// second, separately maintained tally that could disagree with it.
-///
-/// The wake is a notification rather than a poll: a request that settles while
-/// nobody is waiting notifies nothing, and a waiter registers before it reads
-/// the count, so neither side can miss the transition to idle.
-#[derive(Debug, Default)]
-struct RequestSettlement {
-    /// Logical requests admitted and not yet settled.
-    active: AtomicUsize,
-    /// Fires each time the active count reaches zero.
-    idle: Notify,
-}
-
-impl RequestSettlement {
-    /// Records one logical request entering the owner.
-    fn admit(&self) {
-        self.active.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Records one logical request leaving the owner, waking teardown at zero.
-    fn settle(&self) {
-        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.idle.notify_waiters();
-        }
-    }
-
-    /// Reports whether no governed request is currently admitted.
-    fn is_idle(&self) -> bool {
-        self.active.load(Ordering::SeqCst) == 0
-    }
-
-    /// Waits until every admitted governed request has settled.
-    ///
-    /// The notification is enabled before the count is read so a settlement
-    /// that lands between the two still wakes this waiter; the loop re-reads
-    /// rather than trusting a single wake, because a later admission may raise
-    /// the count again before this future is polled.
-    async fn wait_for_idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_idle() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-/// One admitted logical request, settled exactly once.
-///
-/// Held by [`BifrostStorage::run_read`] and [`BifrostStorage::run_once`] for
-/// the whole logical operation, not per attempt, so a retried read is one start
-/// and one terminal. The `settled` flag is what makes settlement idempotent:
-/// the explicit terminal and the drop path can never both lower the owner's
-/// live request count.
-struct StorageRequestGuard<'owner> {
-    /// The owner's live request count, raised here and lowered on settlement.
-    settlement: &'owner RequestSettlement,
-    /// Which governed operation this request performs.
-    operation: StorageOperation,
-    /// When the logical request was admitted, for the terminal histogram.
-    started: Instant,
-    /// Whether a terminal outcome has already been published.
-    settled: bool,
-}
-
-impl<'owner> StorageRequestGuard<'owner> {
-    /// Admits one logical request and raises the active-request count.
-    ///
-    /// The owner's settlement count is raised before the start is published, so
-    /// a teardown that begins between the two still observes this request as
-    /// outstanding and waits for it.
-    fn admit(settlement: &'owner RequestSettlement, operation: StorageOperation) -> Self {
-        settlement.admit();
-        telemetry::record_request_start(operation);
-        Self {
-            settlement,
-            operation,
-            started: Instant::now(),
-            settled: false,
-        }
-    }
-
-    /// Publishes this request's one terminal outcome and lowers the live count.
-    ///
-    /// A second call does nothing, so two paths cannot disagree about how one
-    /// request ended or lower the count twice.
-    fn settle(&mut self, outcome: StorageRequestOutcome) {
-        if self.settled {
-            return;
-        }
-        self.settled = true;
-        telemetry::record_request_terminal(self.operation, outcome, self.started.elapsed());
-        self.settlement.settle();
-    }
-}
-
-impl Drop for StorageRequestGuard<'_> {
-    /// Settles a request whose caller went away before it could finish.
-    ///
-    /// Every governed path settles its own request before returning, so
-    /// reaching this branch means the whole future was dropped mid-request —
-    /// the caller's query was cancelled, its stream abandoned, or its task
-    /// aborted. That is cancellation, not a lost terminal, so it publishes a
-    /// [`StorageRequestOutcome::Cancelled`] terminal: the active-request count
-    /// comes back down without claiming an invariant was violated.
-    fn drop(&mut self) {
-        if !self.settled {
-            self.settle(StorageRequestOutcome::Cancelled);
-        }
-    }
-}
-
-/// One attempt's failure and whether the owner may admit another.
-///
-/// `retryable` is not derived from the error alone: a panicked attempt maps to
-/// [`BifrostStorageError::Backend`], which is retryable as a class, but a
-/// panic may have left a durable effect half-applied and must never be
-/// replayed behind the caller's back.
-struct AttemptFailure {
-    /// The closed failure this attempt reached.
-    error: BifrostStorageError,
-    /// Whether another attempt of the same operation is permitted.
-    retryable: bool,
-}
-
-impl AttemptFailure {
-    /// Builds the failure for an attempt the owner refused or stopped.
-    const fn terminal(error: BifrostStorageError) -> Self {
-        Self {
-            error,
-            retryable: false,
-        }
-    }
-
-    /// Builds the failure for a backend result, retryable by its own class.
-    fn backend(error: &opendal::Error) -> Self {
-        let error = BifrostStorageError::from_opendal(error);
-        Self {
-            retryable: error.is_retryable(),
-            error,
-        }
-    }
-
-    /// Builds the one-attempt failure for a panicked operation future.
-    fn panicked() -> Self {
-        Self::terminal(BifrostStorageError::Backend {
-            detail: PANICKED_ATTEMPT.to_owned(),
-        })
-    }
-}
-
-/// One storage owner's live state, read from the owners that hold it.
-///
-/// Test-support only; returned by [`BifrostStorage::inspect`].
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageInspection {
-    /// Lifecycle derived from the owner token, request settlement, and cache.
-    pub lifecycle: StorageLifecycle,
-    /// Logical governed requests admitted and not yet settled.
-    pub active_requests: usize,
-    /// The metadata cache's live state, absent when the composition has none.
-    pub metadata_cache: Option<MetadataCacheInspection>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl StorageInspection {
-    /// Returns whether the owner is closed and holds and owes nothing.
-    #[must_use]
-    pub fn is_settled(&self) -> bool {
-        self.lifecycle == StorageLifecycle::Closed
-            && self.active_requests == 0
-            && self.metadata_cache.is_none_or(|cache| cache.is_quiescent())
-    }
-}
-
-/// The node's one storage owner for every Bifrost role co-located on it.
-///
-/// Dedicated role pods each construct their own owner because they are separate
-/// processes; an `All` or `Server` process constructs exactly one and shares it
-/// across Scribe, Oracle, and Forge, so the coarse concurrency ceiling is a real
-/// node-wide ceiling rather than one per role.
+/// Every Bifrost role reads and writes through [`Self::objects`]: Scribe
+/// uploads, Oracle's `DataFusion` scans, Forge rewrites and cleanup, and the
+/// Iceberg catalog's `FileIO`. The store is `object_store`'s own client for the
+/// configured backend behind one node-wide [`LimitStore`]; timeouts and
+/// retries are the cloud clients' own. `wyrd-storage` keeps its separate
+/// client for card and artifact storage.
 #[derive(Debug)]
 pub struct BifrostStorage {
-    /// The already-built backend client every operation runs against.
-    ///
-    /// Owned rather than rebuilt: the handle carries the process's one
-    /// configured, credentialed, connection-pooled client, and constructing a
-    /// second one here would give Bifrost a different backend identity from the
-    /// rest of the server.
-    handle: Arc<StorageHandle>,
-    /// Validated policy applied to every operation.
+    /// The backend store every Bifrost operation runs against, rooted at the
+    /// warehouse.
+    objects: Arc<dyn ObjectStore>,
+    /// The backend the store was built for; the Iceberg catalog derives its
+    /// warehouse location from it.
+    backend: BackendConfig,
+    /// Validated policy the store was built with.
     policy: BifrostStoragePolicy,
-    /// Decoded-metadata cache, present only for an Oracle-serving composition
-    /// with a nonzero budget.
-    metadata_cache: Option<Arc<ParquetMetadataCache>>,
-    /// Node-wide ceiling on concurrent backend requests.
-    ///
-    /// One ceiling for every role co-located in this process, so a node running
-    /// Scribe, Oracle, and Forge together cannot issue three roles' worth of
-    /// concurrent object-store work against a limit each of them believes it
-    /// alone is spending.
-    requests: Arc<Semaphore>,
-    /// Triggered once when this owner begins shutting down.
-    owner: CancellationToken,
-    /// Live governed-request count that teardown waits on before reporting closed.
-    ///
-    /// Distinct from [`Self::requests`]: the semaphore bounds concurrent
-    /// *attempts*, while this tracks whole logical requests, so a read parked
-    /// in retry backoff between two attempts holds no permit but is still
-    /// outstanding work that a close or abort must wait for.
-    settlement: RequestSettlement,
-    /// Deterministic attempt barrier installed by a test harness.
-    ///
-    /// Absent in a production build entirely: the field only exists when the
-    /// test-support surface is compiled, so no shipped node carries a seam that
-    /// can stall its object I/O.
-    #[cfg(any(test, feature = "test-support"))]
-    test_barrier: std::sync::Mutex<Option<Arc<StorageOperationBarrier>>>,
+    /// `DataFusion`'s node-wide Parquet footer cache, shared by every Oracle
+    /// scan on this node; absent on a node that serves no Oracle or has a zero
+    /// budget.
+    metadata_cache: Option<Arc<FileMetadataCache>>,
+    /// The whole cache budget, charged once to the Oracle memory root and held
+    /// for the owner's life, so footers are never an ungoverned second pool.
+    metadata_charge: Option<MetadataReservation>,
 }
 
 impl BifrostStorage {
-    /// Builds the node's storage owner over one validated policy.
+    /// Builds the node's store for `backend` under one validated policy.
     ///
-    /// `serves_oracle` gates the cache alone: a Scribe-only or Forge-only
-    /// process still holds the owner and its policy but spends no
-    /// metadata-cache budget, because neither reads a hot Parquet footer.
-    #[must_use]
+    /// A local root is created when absent and served by
+    /// [`LocalFileSystem`], which has no timeout or retry. A cloud backend
+    /// uses `object_store`'s client for it, configured from the environment
+    /// for credentials, with the policy's request timeout and retry bounds and
+    /// `wyrd-storage`'s idle-connection lifetime for that backend. An endpoint
+    /// selects an S3-compatible service or an emulator.
+    ///
+    /// # Errors
+    /// Returns [`BifrostStorageError::InvalidConfiguration`] when the local
+    /// root cannot be created, a cloud backend is selected in a build without
+    /// the `cloud` feature, or `object_store` rejects the backend settings.
     pub fn new(
-        handle: Arc<StorageHandle>,
+        backend: &BackendConfig,
         policy: BifrostStoragePolicy,
-        metadata_resources: Option<OracleMetadataResources>,
-    ) -> Self {
-        let metadata_cache = metadata_resources
-            .filter(|_| policy.metadata_cache_bytes() > 0)
-            .map(|resources| {
-                Arc::new(ParquetMetadataCache::new(
-                    policy.metadata_cache_bytes(),
-                    resources,
-                ))
-            });
-        let requests = Arc::new(Semaphore::new(policy.max_concurrent_requests()));
-        Self {
-            handle,
+    ) -> Result<Self, BifrostStorageError> {
+        let store = Self::backend_store(backend, policy)?;
+        Ok(Self {
+            objects: Arc::new(LimitStore::new(store, policy.max_concurrent_requests())),
+            backend: backend.clone(),
             policy,
-            metadata_cache,
-            requests,
-            owner: CancellationToken::new(),
-            settlement: RequestSettlement::default(),
-            #[cfg(any(test, feature = "test-support"))]
-            test_barrier: std::sync::Mutex::new(None),
+            metadata_cache: None,
+            metadata_charge: None,
+        })
+    }
+
+    /// Builds the unlimited backend store for `backend`.
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::new`].
+    fn backend_store(
+        backend: &BackendConfig,
+        policy: BifrostStoragePolicy,
+    ) -> Result<Arc<dyn ObjectStore>, BifrostStorageError> {
+        let invalid = |error: &dyn std::fmt::Display| BifrostStorageError::InvalidConfiguration {
+            detail: format!("the Bifrost object store cannot be built: {error}"),
+        };
+        #[cfg(feature = "cloud")]
+        let built = |store: object_store::Result<Arc<dyn ObjectStore>>| {
+            store.map_err(|error| invalid(&error))
+        };
+        match backend {
+            BackendConfig::Local { root } => {
+                std::fs::create_dir_all(root).map_err(|error| invalid(&error))?;
+                Ok(Arc::new(
+                    LocalFileSystem::new_with_prefix(root).map_err(|error| invalid(&error))?,
+                ))
+            }
+            #[cfg(feature = "cloud")]
+            BackendConfig::S3(config) => built(cloud::s3(config, backend, policy)),
+            #[cfg(feature = "cloud")]
+            BackendConfig::Gcs(config) => built(cloud::gcs(config, backend, policy)),
+            #[cfg(feature = "cloud")]
+            BackendConfig::Azure(config) => built(cloud::azure(config, backend, policy)),
+            #[cfg(not(feature = "cloud"))]
+            BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
+                let _ = policy;
+                Err(invalid(
+                    &"cloud storage backends are not compiled in this build; rebuild with the `cloud` feature",
+                ))
+            }
         }
+    }
+
+    /// Gives this owner `DataFusion`'s node-wide Parquet footer cache.
+    ///
+    /// Called once at composition on an Oracle-serving node. The cache's
+    /// whole byte limit, `metadata_cache_bytes`, is charged to the Oracle
+    /// memory root up front and held for the owner's life, because
+    /// `DataFusion`'s cache reports no per-entry charge. A zero budget leaves
+    /// the owner without a cache and charges nothing.
+    ///
+    /// # Errors
+    /// Returns the [`BifrostResourceError`] of a refused root charge, or
+    /// [`BifrostResourceError::Unavailable`] when the budget does not fit this
+    /// platform's `usize`.
+    pub fn with_metadata_cache(
+        mut self,
+        resources: &OracleMetadataResources,
+    ) -> Result<Self, BifrostResourceError> {
+        if self.policy.metadata_cache_bytes() == 0 {
+            return Ok(self);
+        }
+        let bytes = usize::try_from(self.policy.metadata_cache_bytes()).map_err(|_| {
+            BifrostResourceError::Unavailable {
+                detail: "the metadata cache budget does not fit this platform".to_owned(),
+            }
+        })?;
+        self.metadata_charge = Some(resources.try_reserve_metadata(bytes)?);
+        self.metadata_cache = Some(Arc::new(DefaultCache::new(bytes)));
+        Ok(self)
+    }
+
+    /// Returns the store every Bifrost read and write goes through.
+    #[must_use]
+    pub fn objects(&self) -> &Arc<dyn ObjectStore> {
+        &self.objects
+    }
+
+    /// Returns the backend this store was built for.
+    #[must_use]
+    pub const fn backend(&self) -> &BackendConfig {
+        &self.backend
+    }
+
+    /// Returns the node-wide Parquet footer cache, when this node has one.
+    #[must_use]
+    pub fn metadata_cache(&self) -> Option<&Arc<FileMetadataCache>> {
+        self.metadata_cache.as_ref()
     }
 
     /// Returns the validated policy this owner applies.
@@ -309,1681 +164,214 @@ impl BifrostStorage {
         self.policy
     }
 
-    /// Returns the backend client handle this owner runs every operation on.
+    /// Replaces this owner's store with `wrap` applied to it, for a fixture.
     ///
-    /// Exposed so Scribe and Forge can use this node's one configured client
-    /// directly. They deliberately do not go through the owner's read path: a
-    /// publication write is not idempotent and must never be retried behind
-    /// their backs.
+    /// A test harness wraps the production store to observe or hold the calls
+    /// every Bifrost role makes through [`Self::objects`].
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn handle(&self) -> &Arc<StorageHandle> {
-        &self.handle
-    }
-
-    /// Returns the object-store operator backing this owner.
-    ///
-    /// This is the exact operator the rest of the server uses, which is what
-    /// makes "one storage owner per node" true rather than merely stated.
-    #[must_use]
-    pub fn operator(&self) -> &opendal::Operator {
-        self.handle.operator()
-    }
-
-    /// Returns whether this composition retains decoded metadata at all.
-    #[must_use]
-    pub const fn metadata_cache_enabled(&self) -> bool {
-        self.metadata_cache.is_some()
+    pub fn with_objects_for_test(
+        mut self,
+        wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+    ) -> Self {
+        self.objects = wrap(self.objects);
+        self
     }
 
     /// Builds an owner over one local root for a fixture.
     ///
-    /// Composed the way production composes: a real local backend handle, the
-    /// default policy, and the same Oracle-serving decision that decides
-    /// whether this node retains decoded metadata at all. A fixture that needs
-    /// the cache asks for it here rather than by reaching into the owner.
+    /// Composed the way production composes: a local store, the default
+    /// policy resolved for the fixture's Oracle-serving decision, and, on an
+    /// Oracle-serving fixture, the footer cache charged to a 1 GiB test Oracle
+    /// composition.
     ///
     /// # Panics
-    /// Panics when the local signer or the default storage policy is invalid,
-    /// which would mean the fixture root itself is unusable.
+    /// Panics when the root, the default storage policy, or the test
+    /// composition's footer-cache charge is invalid, which would mean the
+    /// fixture itself is unusable.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn for_test(root: &std::path::Path, serves_oracle: bool) -> Arc<Self> {
-        let signer = wyrd_storage::signer::BackendSigner::Local(
-            wyrd_storage::local::LocalSigner::new(root.to_path_buf())
-                .expect("the fixture local signer is valid"),
-        );
-        let resources = serves_oracle.then(|| {
-            crate::resources::BifrostRuntimeResources::composed_for_test(
-                2 * 1024 * 1024 * 1024,
-                1024 * 1024 * 1024,
-                [crate::resources::BifrostRole::Oracle],
-            )
-            .oracle()
-            .expect("the fixture observation admits Oracle")
-            .metadata()
-        });
-        Arc::new(Self::new(
-            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
+        let owner = Self::new(
+            &BackendConfig::Local {
+                root: root.to_path_buf(),
+            },
             BifrostStoragePolicy::resolve(
                 BifrostStorageConfig::default(),
                 2 * 1024 * 1024 * 1024,
                 serves_oracle,
             )
             .expect("the fixture storage policy is valid"),
-            resources,
-        ))
-    }
-
-    /// Returns the latest instant a metadata load started now may still run.
-    ///
-    /// A caller that has no deadline of its own still must not hand
-    /// [`Self::object_metadata`] an unbounded one. This is the owner's own bound —
-    /// the same figure `object_metadata` would clamp any wider deadline to — so a
-    /// caller without a budget inherits the process policy rather than
-    /// inventing a constant.
-    #[must_use]
-    pub fn metadata_deadline(&self) -> Instant {
-        Instant::now() + self.policy.max_retry_elapsed()
-    }
-
-    /// Returns decoded metadata for one immutable hot object.
-    ///
-    /// With a cache present the decode happens at most once per node per
-    /// object, and concurrent callers join one loader. With no cache the same
-    /// reader decodes directly and the decision is recorded as
-    /// `bypass=disabled`, so a disabled deployment still publishes positive
-    /// evidence of the path it took rather than silence. Both paths are bounded
-    /// by the caller's deadline and token and by this owner's shutdown.
-    ///
-    /// `reader` is a factory rather than a reader because reading an immutable
-    /// object is idempotent and therefore retryable, and a retried attempt
-    /// needs a reader that has not already consumed part of the response.
-    ///
-    /// The caller must already have validated ticket, binding, full-schema
-    /// fingerprint, and the signed descriptor: this operation returns bytes'
-    /// structure, never authority.
-    ///
-    /// # Errors
-    /// Returns the loader's closed [`BifrostStorageError`]:
-    /// [`BifrostStorageError::Cancelled`] or [`BifrostStorageError::Deadline`]
-    /// when this caller's bounds elapse, including while it waits for a
-    /// node-wide request permit, [`BifrostStorageError::Closed`] once
-    /// the owner is shutting down, or the backend's own typed failure.
-    pub async fn object_metadata<R, F>(
-        &self,
-        key: ObjectMetadataKey,
-        reader: F,
-        deadline: Instant,
-        cancel: CancellationToken,
-    ) -> Result<RetainedMetadata, Arc<BifrostStorageError>>
-    where
-        F: Fn() -> R + Send + Sync + 'static,
-        R: AsyncFileReader + Send + 'static,
-    {
-        let size = key.size_bytes();
-        // One immutable bound for the whole operation, chosen before any work
-        // starts: the caller's own deadline, or the point at which this owner
-        // stops retrying a read, whichever comes first.
-        let bound = deadline.min(Instant::now() + self.policy.max_retry_elapsed());
-        let Some(cache) = self.metadata_cache.as_ref() else {
-            telemetry::record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Disabled);
-            let load = self.governed_decode(reader, size, bound);
-            return Self::bounded(load, bound, &cancel, &self.owner)
-                .await
-                .map(RetainedMetadata::unreserved);
-        };
-        cache
-            .get_or_load(
-                key,
-                self.governed_decode(reader, size, bound).boxed(),
-                bound,
-                cancel,
-            )
-            .await
-    }
-
-    /// Builds the governed, retrying decode of one object's metadata.
-    ///
-    /// Owned by the storage owner rather than the cache because everything it
-    /// bounds — node-wide request admission and the retry policy — belongs to
-    /// the process, not to one cache entry. The cache decides *whether* a
-    /// decode happens; this decides what a decode is allowed to spend. A decode
-    /// charges no memory up front: only the metadata a cache retains afterwards
-    /// is charged, at its actual size.
-    ///
-    /// Each attempt waits for one permit of the node's single request
-    /// semaphore rather than refusing when it is occupied. That wait, every
-    /// attempt, and every backoff share the one absolute `bound` the caller
-    /// fixed; the per-attempt request timeout starts only once the permit is
-    /// held, and the permit is dropped when the attempt ends however it ends.
-    /// Caller cancellation drops this future, and with it any queued wait or
-    /// held permit.
-    ///
-    /// # Errors
-    /// The returned future resolves to [`BifrostStorageError::Closed`] when the
-    /// owner shuts down while waiting for a permit,
-    /// [`BifrostStorageError::Deadline`] when `bound` elapses first,
-    /// [`BifrostStorageError::Timeout`] when one attempt exceeds the request
-    /// timeout and no retry remains, or the decode's own classified failure.
-    fn governed_decode<R, F>(
-        &self,
-        reader: F,
-        size: u64,
-        bound: Instant,
-    ) -> impl std::future::Future<Output = Result<Arc<ParquetMetaData>, BifrostStorageError>>
-    + Send
-    + 'static
-    where
-        F: Fn() -> R + Send + Sync + 'static,
-        R: AsyncFileReader + Send + 'static,
-    {
-        let requests = Arc::clone(&self.requests);
-        let owner = self.owner.clone();
-        let policy = self.policy;
-        async move {
-            let mut attempt = 0_u32;
-            loop {
-                let permit = Self::acquire_request(&requests, &owner, bound).await?;
-                let decoded = tokio::time::timeout(
-                    policy.request_timeout(),
-                    Self::decode_metadata(reader(), size),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(BifrostStorageError::Timeout {
-                        detail: "the object's footer did not decode within the request timeout"
-                            .to_owned(),
-                    })
-                });
-                drop(permit);
-                let error = match decoded {
-                    Ok(metadata) => return Ok(metadata),
-                    Err(error) => error,
-                };
-                if attempt >= policy.max_retries() || !error.is_retryable() {
-                    return Err(error);
-                }
-                attempt += 1;
-                // Exponential, and deliberately not jittered here: the caller's
-                // absolute bound already caps the total, and the retry count is
-                // small enough that spreading a herd matters less than staying
-                // predictable. Cancellation during the backoff is the caller's
-                // own bound and is applied by `bounded`.
-                tokio::time::sleep(Duration::from_millis(50) * 2_u32.pow(attempt.min(8))).await;
-            }
+        )
+        .expect("the fixture local store is valid");
+        if !serves_oracle {
+            return Arc::new(owner);
         }
-    }
-
-    /// Bounds one operation by a deadline, a caller token, and owner shutdown.
-    ///
-    /// Used by the cache-disabled path, which has no loader task to supervise
-    /// it. The enabled path gets the same bounds from the cache's own
-    /// supervision, so this deliberately does not wrap it twice.
-    async fn bounded<T>(
-        operation: impl std::future::Future<Output = Result<T, BifrostStorageError>>,
-        deadline: Instant,
-        cancel: &CancellationToken,
-        owner: &CancellationToken,
-    ) -> Result<T, Arc<BifrostStorageError>> {
-        tokio::select! {
-            biased;
-            () = owner.cancelled() => Err(Arc::new(BifrostStorageError::Closed)),
-            () = cancel.cancelled() => Err(Arc::new(BifrostStorageError::Cancelled)),
-            () = tokio::time::sleep_until(deadline.into()) => {
-                Err(Arc::new(BifrostStorageError::Deadline))
-            }
-            completed = operation => completed.map_err(Arc::new),
-        }
-    }
-
-    /// Decodes one object's Parquet metadata through the caller's reader.
-    ///
-    /// The page index is decoded with the footer when the object carries one,
-    /// so a hot scan can select pages rather than whole row groups; its bytes
-    /// are part of the retained metadata's weight. Kept as an associated
-    /// function so it can be boxed into the cache's retained loader task
-    /// without borrowing the owner.
-    ///
-    /// # Errors
-    /// Returns [`BifrostStorageError::InvalidData`] when the object's footer
-    /// does not decode. Range failures reach here already wrapped by the
-    /// caller's reader.
-    async fn decode_metadata<R>(
-        mut reader: R,
-        size: u64,
-    ) -> Result<Arc<ParquetMetaData>, BifrostStorageError>
-    where
-        R: AsyncFileReader + Send + 'static,
-    {
-        parquet::file::metadata::ParquetMetaDataReader::new()
-            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
-            .load_and_finish(&mut reader, size)
-            .await
-            .map(Arc::new)
-            .map_err(|error| BifrostStorageError::from_parquet(&error))
-    }
-
-    /// Probes whether one object exists beneath this owner's backend.
-    ///
-    /// # Errors
-    /// Returns the closed [`BifrostStorageError`] the governed read reached:
-    /// [`BifrostStorageError::Closed`] when the owner is shutting down,
-    /// [`BifrostStorageError::Timeout`] for one attempt's timeout,
-    /// [`BifrostStorageError::Deadline`] when the fixed retry bound elapses,
-    /// including while waiting for a node-wide request permit, or the
-    /// backend's own classified failure.
-    pub async fn exists(&self, key: &str) -> Result<bool, BifrostStorageError> {
-        self.run_read(StorageOperation::Exists, || self.operator().exists(key))
-            .await
-    }
-
-    /// Returns one object's content length.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::exists`].
-    pub async fn stat(&self, key: &str) -> Result<u64, BifrostStorageError> {
-        self.run_read(StorageOperation::Stat, || async {
-            self.operator()
-                .stat(key)
-                .await
-                .map(|metadata| metadata.content_length())
-        })
-        .await
-    }
-
-    /// Reads one object in full.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::exists`].
-    pub async fn read(&self, key: &str) -> Result<Bytes, BifrostStorageError> {
-        self.run_read(StorageOperation::Read, || async {
-            self.operator()
-                .read(key)
-                .await
-                .map(|buffer| buffer.to_bytes())
-        })
-        .await
-    }
-
-    /// Reads one byte range of an object.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::exists`].
-    pub async fn read_range(
-        &self,
-        key: &str,
-        range: Range<u64>,
-    ) -> Result<Bytes, BifrostStorageError> {
-        self.run_read(StorageOperation::ReadRange, || async {
-            self.operator()
-                .read_with(key)
-                .range(range.clone())
-                .await
-                .map(|buffer| buffer.to_bytes())
-        })
-        .await
-    }
-
-    /// Lists the entries beneath one prefix.
-    ///
-    /// The complete listing is materialized before returning, so no request
-    /// permit is held for a consumer-driven stream's lifetime.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::exists`].
-    pub async fn list(
-        &self,
-        prefix: &str,
-        recursive: bool,
-    ) -> Result<Vec<opendal::Entry>, BifrostStorageError> {
-        self.run_read(StorageOperation::List, || async {
-            self.operator().list_with(prefix).recursive(recursive).await
-        })
-        .await
-    }
-
-    /// Writes one object's complete bytes as a single, unrepeated effect.
-    ///
-    /// # Errors
-    /// Returns [`BifrostStorageError::Closed`], [`BifrostStorageError::Timeout`],
-    /// [`BifrostStorageError::Deadline`] when the operation bound elapses
-    /// (including while waiting for a request permit), or the backend's
-    /// classified failure. Never retried: a replayed publication is how a
-    /// duplicate data file reaches a snapshot.
-    pub async fn write_once(&self, key: &str, bytes: Bytes) -> Result<(), BifrostStorageError> {
-        self.run_once(StorageOperation::Write, async {
-            self.operator().write(key, bytes).await.map(|_| ())
-        })
-        .await
-    }
-
-    /// Opens one streaming writer as a single, unrepeated effect.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::write_once`].
-    pub async fn open_writer_once(
-        &self,
-        key: &str,
-    ) -> Result<opendal::Writer, BifrostStorageError> {
-        self.run_once(StorageOperation::OpenWriter, async {
-            self.operator().writer(key).await
-        })
-        .await
-    }
-
-    /// Appends one buffer through an already-open writer, once.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::write_once`].
-    pub async fn writer_write_once(
-        &self,
-        writer: &mut opendal::Writer,
-        bytes: Bytes,
-    ) -> Result<(), BifrostStorageError> {
-        self.run_once(StorageOperation::WriterWrite, writer.write(bytes))
-            .await
-    }
-
-    /// Finalizes an already-open writer, once.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::write_once`].
-    pub async fn writer_close_once(
-        &self,
-        writer: &mut opendal::Writer,
-    ) -> Result<(), BifrostStorageError> {
-        self.run_once(StorageOperation::WriterClose, async {
-            writer.close().await.map(|_| ())
-        })
-        .await
-    }
-
-    /// Deletes one object, once.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::write_once`].
-    pub async fn delete_once(&self, key: &str) -> Result<(), BifrostStorageError> {
-        self.run_once(StorageOperation::Delete, self.operator().delete(key))
-            .await
-    }
-
-    /// Deletes every object beneath one prefix, once.
-    ///
-    /// # Errors
-    /// Same closed vocabulary as [`Self::write_once`].
-    pub async fn delete_prefix_once(&self, key: &str) -> Result<(), BifrostStorageError> {
-        self.run_once(StorageOperation::DeletePrefix, async {
-            self.operator().delete_with(key).recursive(true).await
-        })
-        .await
-    }
-
-    /// Runs one idempotent read under the owner's complete governance.
-    ///
-    /// The absolute bound is fixed once, at entry, so a sequence of attempts
-    /// can never extend its own budget. Each attempt waits within that bound for
-    /// its own request permit and then races, in this precedence, owner cancellation, that fixed
-    /// bound, the per-attempt request timeout, and the operation itself; the
-    /// losing future is dropped before the method returns or retries, so no
-    /// backend work and no permit survives a terminal result. Another attempt
-    /// is admitted only while the failure's own class is retryable, the
-    /// operation is idempotent, retries performed remain strictly below the
-    /// policy's ceiling, the owner is open, and the fixed bound remains.
-    ///
-    /// The whole logical read publishes exactly one telemetry start and one
-    /// terminal regardless of attempt count; every attempt after the first
-    /// publishes one retry.
-    ///
-    /// # Errors
-    /// Returns the closed [`BifrostStorageError`] of the last attempt, or
-    /// [`BifrostStorageError::Closed`] or [`BifrostStorageError::Deadline`]
-    /// when the owner refused or the fixed bound elapsed, including while an
-    /// attempt waited for a request permit.
-    async fn run_read<T, Fut>(
-        &self,
-        operation: StorageOperation,
-        attempt: impl Fn() -> Fut,
-    ) -> Result<T, BifrostStorageError>
-    where
-        Fut: std::future::Future<Output = Result<T, opendal::Error>>,
-    {
-        let mut guard = StorageRequestGuard::admit(&self.settlement, operation);
-        let result = self.read_attempts(operation, attempt).await;
-        guard.settle(match &result {
-            Ok(_) => StorageRequestOutcome::Success,
-            Err(error) => error.request_outcome(),
-        });
-        result
-    }
-
-    /// Drives one read's bounded attempt sequence without owning its telemetry.
-    ///
-    /// Split from [`Self::run_read`] so the one logical start and terminal are
-    /// published around the whole sequence rather than once per attempt.
-    ///
-    /// # Errors
-    /// Returns the same closed vocabulary as [`Self::run_read`].
-    async fn read_attempts<T, Fut>(
-        &self,
-        operation: StorageOperation,
-        attempt: impl Fn() -> Fut,
-    ) -> Result<T, BifrostStorageError>
-    where
-        Fut: std::future::Future<Output = Result<T, opendal::Error>>,
-    {
-        let bound = Instant::now() + self.policy.max_retry_elapsed();
-        let mut retries_performed = 0_u32;
-        loop {
-            if self.owner.is_cancelled() {
-                return Err(BifrostStorageError::Closed);
-            }
-            if Instant::now() >= bound {
-                return Err(BifrostStorageError::Deadline);
-            }
-            let failure = match self.attempt_once(operation, Some(bound), &attempt).await {
-                Ok(value) => return Ok(value),
-                Err(failure) => failure,
-            };
-            if !failure.retryable
-                || !operation.is_retryable()
-                || retries_performed >= self.policy.max_retries()
-            {
-                return Err(failure.error);
-            }
-            let backoff =
-                Duration::from_millis(50) * 2_u32.pow(retries_performed.saturating_add(1).min(8));
-            tokio::select! {
-                biased;
-                () = self.owner.cancelled() => return Err(BifrostStorageError::Closed),
-                () = tokio::time::sleep_until(bound.into()) => {
-                    return Err(BifrostStorageError::Deadline);
-                }
-                () = tokio::time::sleep(backoff) => {}
-            }
-            retries_performed = retries_performed.saturating_add(1);
-            telemetry::record_request_retry(operation);
-        }
-    }
-
-    /// Runs one non-idempotent effect under the owner's governance, once.
-    ///
-    /// Same admission, cancellation, and per-attempt timeout as a read, bounded
-    /// by the policy's retry-elapsed ceiling in place of a caller bound, and
-    /// deliberately no second attempt: the owner
-    /// cannot distinguish an effect that never landed from one whose
-    /// acknowledgement was lost, so replaying it is how a duplicate object or a
-    /// second delete happens.
-    ///
-    /// # Errors
-    /// Returns [`BifrostStorageError::Closed`], [`BifrostStorageError::Timeout`],
-    /// [`BifrostStorageError::Deadline`], or the backend's classified failure.
-    async fn run_once<T, Fut>(
-        &self,
-        operation: StorageOperation,
-        attempt: Fut,
-    ) -> Result<T, BifrostStorageError>
-    where
-        Fut: std::future::Future<Output = Result<T, opendal::Error>>,
-    {
-        let mut guard = StorageRequestGuard::admit(&self.settlement, operation);
-        let result = if self.owner.is_cancelled() {
-            Err(BifrostStorageError::Closed)
-        } else {
-            let mut attempt = Some(attempt);
-            self.attempt_once(operation, None, || {
-                attempt
-                    .take()
-                    .expect("run_once admits exactly one attempt of its operation")
-            })
-            .await
-            .map_err(|failure| failure.error)
-        };
-        guard.settle(match &result {
-            Ok(_) => StorageRequestOutcome::Success,
-            Err(error) => error.request_outcome(),
-        });
-        result
-    }
-
-    /// Admits and races exactly one attempt of a governed operation.
-    ///
-    /// The attempt first waits for one permit of the node's single request
-    /// semaphore under owner cancellation and the absolute bound — the caller's
-    /// `bound`, or the policy's retry-elapsed ceiling when it supplies none —
-    /// so an occupied semaphore delays the attempt instead of refusing it. The
-    /// per-attempt request timeout starts only once the permit is held. The
-    /// race is then biased in the fixed precedence order — owner cancellation,
-    /// the absolute bound, the per-attempt request timeout, then completion —
-    /// so the absolute bound terminates an in-flight attempt even when its own
-    /// timeout has not elapsed, and a request timeout wins only when it truly
-    /// occurs first. The permit is dropped on every exit. A panic beneath the backend client
-    /// is caught here and reported as a one-attempt backend failure, because a
-    /// panicked effect may already have been durable.
-    ///
-    /// # Errors
-    /// Returns [`AttemptFailure`] carrying the closed error and whether the
-    /// owner may admit another attempt.
-    async fn attempt_once<T, Fut>(
-        &self,
-        operation: StorageOperation,
-        bound: Option<Instant>,
-        attempt: impl FnOnce() -> Fut,
-    ) -> Result<T, AttemptFailure>
-    where
-        Fut: std::future::Future<Output = Result<T, opendal::Error>>,
-    {
-        let deadline = bound.unwrap_or_else(|| Instant::now() + self.policy.max_retry_elapsed());
-        let permit = Self::acquire_request(&self.requests, &self.owner, deadline)
-            .await
-            .map_err(AttemptFailure::terminal)?;
-        tracing::trace!(
-            operation = operation.as_str(),
-            "Bifrost storage admitted one governed attempt"
-        );
-        let raced = tokio::select! {
-            biased;
-            () = self.owner.cancelled() => Err(AttemptFailure::terminal(BifrostStorageError::Closed)),
-            () = tokio::time::sleep_until(deadline.into()) => {
-                Err(AttemptFailure::terminal(BifrostStorageError::Deadline))
-            }
-            () = tokio::time::sleep(self.policy.request_timeout()) => {
-                Err(AttemptFailure {
-                    error: BifrostStorageError::Timeout {
-                        detail: "the backend did not answer within the request timeout".to_owned(),
-                    },
-                    retryable: true,
-                })
-            }
-            outcome = AssertUnwindSafe(async {
-                #[cfg(any(test, feature = "test-support"))]
-                self.pause_for_test(operation).await;
-                attempt().await
-            })
-            .catch_unwind() => match outcome {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(error)) => Err(AttemptFailure::backend(&error)),
-                Err(_) => Err(AttemptFailure::panicked()),
-            },
-        };
-        drop(permit);
-        raced
-    }
-
-    /// Waits for one permit of the node's single storage-request semaphore.
-    ///
-    /// An occupied semaphore is contention, not refusal: the caller queues in
-    /// the semaphore's own FIFO order until a permit returns, the owner begins
-    /// shutting down, or the operation's absolute `deadline` elapses, in that
-    /// biased precedence. Losing the race drops the queued acquisition, so a
-    /// cancelled or expired waiter leaves nothing behind. Callers start their
-    /// per-attempt request timeout only after this returns.
-    ///
-    /// # Errors
-    /// Returns [`BifrostStorageError::Closed`] when the owner is cancelled or
-    /// the semaphore is closed, and [`BifrostStorageError::Deadline`] when
-    /// `deadline` elapses before a permit is available.
-    async fn acquire_request(
-        requests: &Arc<Semaphore>,
-        owner: &CancellationToken,
-        deadline: Instant,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, BifrostStorageError> {
-        tokio::select! {
-            biased;
-            () = owner.cancelled() => Err(BifrostStorageError::Closed),
-            () = tokio::time::sleep_until(deadline.into()) => Err(BifrostStorageError::Deadline),
-            permit = Arc::clone(requests).acquire_owned() => {
-                permit.map_err(|_| BifrostStorageError::Closed)
-            }
-        }
-    }
-
-    /// Pauses one admitted attempt at an installed deterministic barrier.
-    ///
-    /// Test-support only, and deliberately incapable of producing a result: it
-    /// may only delay or release the real operation, so every byte, cache
-    /// effect, retry, lifecycle transition, and terminal outcome a test then
-    /// observes came from the production path.
-    #[cfg(any(test, feature = "test-support"))]
-    async fn pause_for_test(&self, operation: StorageOperation) {
-        let barrier = self
-            .test_barrier
-            .lock()
-            .ok()
-            .and_then(|barrier| barrier.clone());
-        if let Some(barrier) = barrier {
-            barrier.pause(operation).await;
-        }
-    }
-
-    /// Installs the deterministic attempt barrier this owner honors.
-    ///
-    /// Replaces any previously installed barrier. Test-support only.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn install_operation_barrier_for_test(&self, barrier: Arc<StorageOperationBarrier>) {
-        if let Ok(mut installed) = self.test_barrier.lock() {
-            *installed = Some(barrier);
-        }
-    }
-
-    /// Returns request permits this owner currently has free.
-    ///
-    /// Test-support only: it exists so a test can prove a terminal attempt
-    /// released its admission rather than leaking it into the node's ceiling.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn available_request_permits(&self) -> usize {
-        self.requests.available_permits()
-    }
-
-    /// Reads this owner's live state from the owners that hold it.
-    ///
-    /// Test-support only. The lifecycle is derived rather than retained:
-    /// `Open` until the owner token is cancelled, then `Closed` once every
-    /// governed request has settled and the cache, when present, has finished
-    /// its own close; `Closing` in between. Active requests come from the
-    /// request settlement teardown waits on, and the cache fields from the
-    /// cache's own state lock, so a drained node is proven settled by the
-    /// owners rather than by a parallel tally.
-    ///
-    /// # Panics
-    /// Panics when the cache state lock is poisoned; see
-    /// [`ParquetMetadataCache::inspect`].
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn inspect(&self) -> StorageInspection {
-        let metadata_cache = self.metadata_cache.as_ref().map(|cache| cache.inspect());
-        let cache_closed =
-            metadata_cache.is_none_or(|cache| cache.lifecycle == StorageLifecycle::Closed);
-        let lifecycle = if !self.owner.is_cancelled() {
-            StorageLifecycle::Open
-        } else if cache_closed && self.settlement.is_idle() {
-            StorageLifecycle::Closed
-        } else {
-            StorageLifecycle::Closing
-        };
-        StorageInspection {
-            lifecycle,
-            active_requests: self.settlement.active.load(Ordering::SeqCst),
-            metadata_cache,
-        }
-    }
-
-    /// Closes admission and settles every loader and governed request by `deadline`.
-    ///
-    /// Called only after public and query admission are closed and query owners
-    /// have drained, so a load or request still outstanding here belongs to work
-    /// that was already cancelled. Idempotent.
-    ///
-    /// Cancelling the owner is what makes the wait finite rather than hopeful:
-    /// every governed path races that token ahead of its own work, in an
-    /// attempt, in retry backoff, and before admitting another attempt, so each
-    /// outstanding request reaches its terminal on its own rather than being
-    /// abandoned. Both waits share the caller's one absolute `deadline`, and
-    /// the cache is settled first because a retained loader's own object read
-    /// is one of the governed requests the second wait then covers.
-    ///
-    /// Returns `true` only when both the cache and every governed request
-    /// settled within the deadline, so a clean close can never claim a drain
-    /// that live object I/O contradicts.
-    pub async fn close(&self, deadline: Instant) -> bool {
-        self.owner.cancel();
-        let cache_settled = match self.metadata_cache.as_ref() {
-            None => true,
-            Some(cache) => cache.close(deadline).await,
-        };
-        let requests_settled =
-            tokio::time::timeout_at(deadline.into(), self.settlement.wait_for_idle())
-                .await
-                .is_ok();
-        cache_settled && requests_settled
-    }
-
-    /// Closes admission immediately, aborting every retained loader.
-    ///
-    /// Idempotent, and safe after [`Self::close`]: both share the cache's one
-    /// close completion, so a second caller observes the first one's outcome,
-    /// and the request wait is satisfied immediately once the owner is already
-    /// idle.
-    ///
-    /// Awaits every aborted loader *and* every governed request, so once this
-    /// returns no retained task and no admitted object operation is still
-    /// running against the owner's state. The wait is unbounded by design: an
-    /// abort exists to leave nothing behind, and a second grace period here
-    /// would just recreate the deadline `close` already owns.
-    pub async fn abort(&self) {
-        self.owner.cancel();
-        if let Some(cache) = self.metadata_cache.as_ref() {
-            cache.abort().await;
-        }
-        self.settlement.wait_for_idle().await;
+        let oracle = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1 << 30,
+            1 << 30,
+            [crate::resources::BifrostRole::Oracle],
+        )
+        .oracle()
+        .expect("the composed test roles include Oracle");
+        Arc::new(
+            owner
+                .with_metadata_cache(&oracle.metadata())
+                .expect("the test Oracle composition covers the footer cache"),
+        )
     }
 }
 
-/// A deterministic pause installed immediately before one governed operation
-/// reaches `OpenDAL`.
-///
-/// Exists so a journey can hold a real backend request open long enough to
-/// cancel the server underneath it. It carries no result of its own: the only
-/// thing it can do is delay and release the production operation, so the bytes,
-/// cache effects, retries, lifecycle transitions, and terminal outcomes a test
-/// observes afterwards are the ones the production path produced.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug)]
-pub struct StorageOperationBarrier {
-    /// The one operation this barrier stalls; every other passes untouched.
-    operation: StorageOperation,
-    /// Fires once an admitted attempt of that operation has reached the pause.
-    reached: CancellationToken,
-    /// Fires when the test releases every stalled attempt.
-    released: CancellationToken,
-}
+/// `object_store`'s cloud clients, built from `wyrd-storage`'s backend settings.
+#[cfg(feature = "cloud")]
+mod cloud {
+    use std::sync::Arc;
 
-#[cfg(any(test, feature = "test-support"))]
-impl StorageOperationBarrier {
-    /// Builds a barrier that stalls exactly one governed operation.
-    #[must_use]
-    pub fn new(operation: StorageOperation) -> Arc<Self> {
-        Arc::new(Self {
-            operation,
-            reached: CancellationToken::new(),
-            released: CancellationToken::new(),
-        })
-    }
+    use object_store::aws::AmazonS3Builder;
+    use object_store::azure::MicrosoftAzureBuilder;
+    use object_store::gcp::GoogleCloudStorageBuilder;
+    use object_store::{ClientOptions, ObjectStore, RetryConfig};
+    use wyrd_storage::BackendConfig;
+    use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
 
-    /// Waits until one admitted attempt of the stalled operation has arrived.
-    pub async fn wait_until_reached(&self) {
-        self.reached.cancelled().await;
-    }
+    use super::BifrostStoragePolicy;
 
-    /// Reports whether an admitted attempt has already reached the barrier.
-    #[must_use]
-    pub fn was_reached(&self) -> bool {
-        self.reached.is_cancelled()
-    }
-
-    /// Releases every stalled attempt and stops stalling future ones.
-    pub fn release(&self) {
-        self.released.cancel();
-    }
-
-    /// Stalls one admitted attempt when it matches this barrier's operation.
+    /// Returns the HTTP options and retry bounds every cloud client shares.
     ///
-    /// Returns immediately for every other operation and once released, so a
-    /// barrier installed for a ranged read never delays an unrelated write.
-    async fn pause(&self, operation: StorageOperation) {
-        if operation != self.operation {
-            return;
+    /// The request timeout and retry bounds are the policy's; the idle-pool
+    /// lifetime is `wyrd-storage`'s for this backend, and plain HTTP is allowed
+    /// only for an `http://` endpoint (an emulator or local service).
+    fn client(
+        backend: &BackendConfig,
+        endpoint: Option<&str>,
+        policy: BifrostStoragePolicy,
+    ) -> (ClientOptions, RetryConfig) {
+        let options = ClientOptions::new()
+            .with_timeout(policy.request_timeout())
+            .with_pool_idle_timeout(wyrd_storage::factory::pool_idle_timeout(backend))
+            .with_allow_http(endpoint.is_some_and(|endpoint| endpoint.starts_with("http://")));
+        let retry = RetryConfig {
+            max_retries: usize::try_from(policy.max_retries()).unwrap_or(usize::MAX),
+            retry_timeout: policy.max_retry_elapsed(),
+            ..RetryConfig::default()
+        };
+        (options, retry)
+    }
+
+    /// Builds the S3 client: virtual-hosted on AWS, path-style at an endpoint.
+    ///
+    /// # Errors
+    /// Returns the `object_store` error for unusable settings or credentials.
+    pub(super) fn s3(
+        config: &S3Config,
+        backend: &BackendConfig,
+        policy: BifrostStoragePolicy,
+    ) -> object_store::Result<Arc<dyn ObjectStore>> {
+        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
+        let mut builder = AmazonS3Builder::from_env()
+            .with_bucket_name(&config.bucket)
+            .with_client_options(options)
+            .with_retry(retry);
+        if let Some(region) = &config.region {
+            builder = builder.with_region(region);
         }
-        self.reached.cancel();
-        self.released.cancelled().await;
+        builder = match &config.endpoint_url {
+            Some(endpoint) => builder.with_endpoint(endpoint),
+            None => builder.with_virtual_hosted_style_request(true),
+        };
+        Ok(Arc::new(builder.build()?))
+    }
+
+    /// Builds the GCS client with `wyrd-storage`'s service-account cascade;
+    /// an endpoint without a key is an anonymous emulator.
+    ///
+    /// # Errors
+    /// Returns the `object_store` error for unusable settings or credentials.
+    pub(super) fn gcs(
+        config: &GcsConfig,
+        backend: &BackendConfig,
+        policy: BifrostStoragePolicy,
+    ) -> object_store::Result<Arc<dyn ObjectStore>> {
+        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
+        let mut builder = GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(&config.bucket)
+            .with_client_options(options)
+            .with_retry(retry);
+        let key = wyrd_storage::factory::gcs::service_account_json();
+        if let Some(key) = &key {
+            builder = builder.with_service_account_key(key);
+        }
+        if let Some(endpoint) = &config.endpoint_url {
+            builder = builder
+                .with_base_url(endpoint)
+                .with_skip_signature(key.is_none());
+        }
+        Ok(Arc::new(builder.build()?))
+    }
+
+    /// Builds the Azure Blob client; an endpoint names the account URL.
+    ///
+    /// # Errors
+    /// Returns the `object_store` error for unusable settings or credentials.
+    pub(super) fn azure(
+        config: &AzureConfig,
+        backend: &BackendConfig,
+        policy: BifrostStoragePolicy,
+    ) -> object_store::Result<Arc<dyn ObjectStore>> {
+        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
+        let mut builder = MicrosoftAzureBuilder::from_env()
+            .with_account(&config.account)
+            .with_container_name(&config.container)
+            .with_client_options(options)
+            .with_retry(retry);
+        if let Some(endpoint) = &config.endpoint_url {
+            builder = builder.with_endpoint(endpoint.clone());
+        }
+        Ok(Arc::new(builder.build()?))
     }
 }
 
 #[cfg(test)]
-mod governed_request_tests {
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use wyrd_bench::BenchmarkRecorder;
+mod tests {
+    use object_store::ObjectStoreExt as _;
+    use object_store::path::Path as ObjectPath;
 
     use super::*;
-    use crate::storage::telemetry::recorded::{
-        self, ACTIVE_REQUESTS, REQUEST_RETRIES, REQUEST_TERMINALS, REQUESTS,
-    };
 
-    /// Marks its flag when dropped, proving a losing attempt future was released.
-    struct DropSentinel(Arc<AtomicBool>);
-
-    impl Drop for DropSentinel {
-        /// Records that the attempt future this sentinel lives in was dropped.
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Builds one storage owner over a real local backend at `root`.
-    ///
-    /// A real handle rather than a stub: the governed workflows are only
-    /// meaningful against the operator a node actually holds, and the injected
-    /// failures below are supplied by the attempt closure rather than by a fake
-    /// backend, so nothing about admission, retry, or settlement is simulated.
+    /// A local owner reads and writes beneath its root, and a missing object
+    /// is `object_store`'s `NotFound`, which the stale-object rule recognizes.
     ///
     /// # Panics
-    /// Panics when the local signer or the supplied policy is invalid.
-    fn owner(root: &Path, config: BifrostStorageConfig) -> Arc<BifrostStorage> {
-        let signer = wyrd_storage::signer::BackendSigner::Local(
-            wyrd_storage::local::LocalSigner::new(root.to_path_buf()).expect("local signer"),
-        );
-        Arc::new(BifrostStorage::new(
-            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-            BifrostStoragePolicy::resolve(config, u64::from(u32::MAX), false)
-                .expect("the supplied storage policy is valid"),
-            None,
-        ))
-    }
-
-    /// Returns one injected retryable backend failure.
-    fn transient() -> opendal::Error {
-        opendal::Error::new(opendal::ErrorKind::Unexpected, "injected transient failure")
-    }
-
-    /// A governed read spends exactly the attempts its owner's policy allows,
-    /// stops at the one absolute bound fixed when it began, and leaves nothing
-    /// behind when that bound wins.
-    ///
-    /// The bound is the load-bearing part. A retry sequence that re-derived its
-    /// deadline from each attempt could extend itself indefinitely while every
-    /// individual attempt still looked bounded, so the test stalls the last
-    /// admitted attempt past the elapsed ceiling and requires `Deadline` rather
-    /// than the later per-attempt timeout, the losing future to be dropped, the
-    /// request permit to be released, and no further backend call.
-    ///
-    /// # Panics
-    /// Panics when the attempt count, retry count, terminal error, or released
-    /// state does not match.
+    /// Panics when the round trip or the not-found classification fails.
     #[tokio::test]
-    async fn iceberg_read_retry_is_bounded_by_owner_policy() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
+    async fn local_store_round_trips_and_reports_missing_objects() {
         let root = tempfile::tempdir().expect("warehouse root");
-        let storage = owner(
-            root.path(),
-            BifrostStorageConfig {
-                request_timeout_ms: Some(1_000),
-                max_retries: Some(2),
-                max_retry_elapsed_ms: Some(1_000),
-                ..BifrostStorageConfig::default()
-            },
-        );
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let dropped = Arc::new(AtomicBool::new(false));
-        let error = storage
-            .run_read(StorageOperation::Read, || {
-                let attempts = Arc::clone(&attempts);
-                let dropped = Arc::clone(&dropped);
-                async move {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                    if attempt < 3 {
-                        return Err::<Bytes, _>(transient());
-                    }
-                    let _sentinel = DropSentinel(dropped);
-                    tokio::time::sleep(Duration::from_mins(10)).await;
-                    Err(transient())
-                }
-            })
-            .await
-            .expect_err("the fixed absolute bound terminates the sequence");
-
-        assert_eq!(error, BifrostStorageError::Deadline);
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            3,
-            "one initial attempt plus exactly max_retries retries, and no fourth"
-        );
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "the losing attempt future must be dropped when the bound wins"
-        );
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_RETRIES, &[("operation", "read")]),
-            2
-        );
-        assert_eq!(
-            recorded::counter(&recorder, REQUESTS, &[]),
-            1,
-            "a retried read is one request"
-        );
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "deadline")]),
-            1
-        );
-        assert_eq!(storage.inspect().active_requests, 0);
-        assert_eq!(
-            storage.available_request_permits(),
-            storage.policy().max_concurrent_requests(),
-            "the terminal attempt must release its admission"
-        );
-
-        let timeout_root = tempfile::tempdir().expect("warehouse root");
-        let bounded = owner(
-            timeout_root.path(),
-            BifrostStorageConfig {
-                request_timeout_ms: Some(100),
-                max_retries: Some(0),
-                max_retry_elapsed_ms: Some(1_000),
-                ..BifrostStorageConfig::default()
-            },
-        );
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let error = bounded
-            .run_read(StorageOperation::Read, || {
-                let attempts = Arc::clone(&attempts);
-                async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_mins(10)).await;
-                    Err::<Bytes, _>(transient())
-                }
-            })
-            .await
-            .expect_err("the per-attempt timeout terminates the only attempt");
-        assert!(
-            matches!(error, BifrostStorageError::Timeout { .. }),
-            "a request timeout that occurs first must not be reported as the elapsed bound"
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_RETRIES, &[]),
-            2,
-            "a timed-out attempt with no retry budget adds no retry"
-        );
-    }
-
-    /// Every non-idempotent effect is admitted exactly once, whatever it returns.
-    ///
-    /// A transparently replayed write, writer append, close, or delete is how a
-    /// duplicate data file reaches a snapshot or a live object disappears, so
-    /// the owner must refuse a second attempt even for a failure class it would
-    /// happily retry on a read. The injected failure is deliberately the
-    /// retryable one.
-    ///
-    /// # Panics
-    /// Panics when an effect is attempted more than once or an effect operation
-    /// declares itself retryable.
-    #[tokio::test]
-    async fn iceberg_mutations_are_attempted_once() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let root = tempfile::tempdir().expect("warehouse root");
-        let storage = owner(
-            root.path(),
-            BifrostStorageConfig {
-                max_retries: Some(5),
-                ..BifrostStorageConfig::default()
-            },
-        );
-        for effect in [
-            StorageOperation::Write,
-            StorageOperation::OpenWriter,
-            StorageOperation::WriterWrite,
-            StorageOperation::WriterClose,
-            StorageOperation::Delete,
-            StorageOperation::DeletePrefix,
-        ] {
-            assert!(
-                !effect.is_retryable(),
-                "{} must never be transparently replayed",
-                effect.as_str()
-            );
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&attempts);
-            let error = storage
-                .run_once(effect, async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    Err::<(), _>(transient())
-                })
-                .await
-                .expect_err("the injected effect fails");
-            assert!(matches!(error, BifrostStorageError::Backend { .. }));
-            assert_eq!(
-                attempts.load(Ordering::SeqCst),
-                1,
-                "{} was attempted more than once",
-                effect.as_str()
-            );
-        }
-        assert_eq!(recorded::counter(&recorder, REQUESTS, &[]), 6);
-        assert_eq!(recorded::counter(&recorder, REQUEST_TERMINALS, &[]), 6);
-        assert_eq!(recorded::counter(&recorder, REQUEST_RETRIES, &[]), 0);
-        assert_eq!(storage.inspect().active_requests, 0);
-    }
-
-    /// Every attempt-level terminal settles its own request accounting.
-    ///
-    /// Asserted as one matrix because the property under test is not any single
-    /// outcome but the invariant across all of them: one logical request
-    /// publishes one start and one terminal, active work returns to zero, and
-    /// no settlement is unmatched. An owner that leaked exactly one path would
-    /// still look correct from every other path's side. The admission-level
-    /// terminals — timeout, refusal, and owner closure — are asserted by
-    /// [`storage_request_telemetry_reconciles_admission_terminals`], which needs
-    /// a differently configured owner to reach them.
-    ///
-    /// # Panics
-    /// Panics when an expected terminal is not published or the totals do not
-    /// reconcile after a case.
-    #[tokio::test]
-    async fn storage_request_telemetry_reconciles_attempt_terminals() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let root = tempfile::tempdir().expect("warehouse root");
-
-        let storage = owner(root.path(), BifrostStorageConfig::default());
+        let storage = BifrostStorage::for_test(&root.path().join("warehouse"), false);
+        let path = ObjectPath::from("data/one.parquet");
         storage
-            .run_read(StorageOperation::Exists, || async { Ok(true) })
+            .objects()
+            .put(&path, bytes::Bytes::from_static(b"abc").into())
             .await
-            .expect("a successful read returns its value");
-        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Success, 1);
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        storage
-            .run_read(StorageOperation::Read, || {
-                let attempts = Arc::clone(&attempts);
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        return Err(transient());
-                    }
-                    Ok(Bytes::from_static(b"rows"))
-                }
-            })
+            .expect("put");
+        let read = storage
+            .objects()
+            .get(&path)
             .await
-            .expect("a retried read still succeeds");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(recorded::counter(&recorder, REQUEST_RETRIES, &[]), 1);
-        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Success, 2);
-
-        let error = storage
-            .run_once(StorageOperation::Delete, async {
-                Err::<(), _>(opendal::Error::new(
-                    opendal::ErrorKind::NotFound,
-                    "injected missing object",
-                ))
-            })
+            .expect("get")
+            .bytes()
             .await
-            .expect_err("a missing object fails");
-        assert!(matches!(error, BifrostStorageError::NotFound { .. }));
-        assert_reconciled(&recorder, &storage, StorageRequestOutcome::NotFound, 1);
-
-        let panicking = storage
-            .run_once(StorageOperation::Write, async {
-                panic!("an injected panic beneath the backend client");
-                #[allow(unreachable_code)]
-                Ok::<(), opendal::Error>(())
-            })
+            .expect("bytes");
+        assert_eq!(read.as_ref(), b"abc");
+        assert!(root.path().join("warehouse/data/one.parquet").exists());
+        let missing = storage
+            .objects()
+            .head(&ObjectPath::from("data/absent.parquet"))
             .await
-            .expect_err("a panicked attempt fails rather than unwinding the owner");
-        assert_eq!(
-            panicking,
-            BifrostStorageError::Backend {
-                detail: PANICKED_ATTEMPT.to_owned(),
-            }
-        );
-        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Backend, 1);
-    }
-
-    /// Timeout, a permit wait that outlives its bound, and owner closure each
-    /// settle their own accounting.
-    ///
-    /// Split from the attempt-level matrix because every terminal here needs an
-    /// owner configured to reach it — a short request timeout, a single request
-    /// slot, and no retries. The queued-wait case holds the owner's only permit
-    /// directly, so the waiter's bound — not the holder's request timeout —
-    /// decides it; the closure case holds a real request mid-flight.
-    ///
-    /// # Panics
-    /// Panics when an expected terminal is not published or the totals do not
-    /// reconcile after a case.
-    #[tokio::test]
-    async fn storage_request_telemetry_reconciles_admission_terminals() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let timeout_root = tempfile::tempdir().expect("warehouse root");
-        let timing = owner(
-            timeout_root.path(),
-            BifrostStorageConfig {
-                request_timeout_ms: Some(100),
-                max_retries: Some(0),
-                max_retry_elapsed_ms: Some(1_000),
-                max_concurrent_requests: Some(1),
-                ..BifrostStorageConfig::default()
-            },
-        );
-        let error = timing
-            .run_read(StorageOperation::Read, || async {
-                tokio::time::sleep(Duration::from_mins(10)).await;
-                Ok::<Bytes, opendal::Error>(Bytes::new())
-            })
-            .await
-            .expect_err("a stalled attempt times out");
-        assert!(matches!(error, BifrostStorageError::Timeout { .. }));
-        assert_reconciled(&recorder, &timing, StorageRequestOutcome::Timeout, 1);
-
-        let held = Arc::clone(&timing.requests)
-            .acquire_owned()
-            .await
-            .expect("the owner's only permit");
-        let expired = timing
-            .run_read(StorageOperation::Stat, || async { Ok(0_u64) })
-            .await
-            .expect_err("the node's one request slot stays spent past the wait's bound");
-        assert_eq!(expired, BifrostStorageError::Deadline);
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "deadline")]),
-            1
-        );
-        assert_eq!(
-            timing.inspect().active_requests,
-            0,
-            "the expired waiter settles and leaves nothing admitted"
-        );
-        assert_eq!(
-            timing.available_request_permits(),
-            0,
-            "the expired waiter took no permit"
-        );
-        drop(held);
-
-        let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
-        timing.install_operation_barrier_for_test(Arc::clone(&barrier));
-        let stalled = tokio::spawn({
-            let timing = Arc::clone(&timing);
-            async move {
-                timing
-                    .run_read(StorageOperation::Exists, || async { Ok(true) })
-                    .await
-            }
-        });
-        barrier.wait_until_reached().await;
-        timing.abort().await;
-        assert_eq!(
-            stalled
-                .await
-                .expect("the stalled read joins")
-                .expect_err("owner cancellation terminates the stalled attempt"),
-            BifrostStorageError::Closed,
-            "an admitted attempt must observe owner cancellation"
-        );
-        barrier.release();
-        assert_eq!(
-            timing
-                .run_read(StorageOperation::Read, || async {
-                    Ok::<Bytes, opendal::Error>(Bytes::new())
-                })
-                .await
-                .expect_err("a closed owner admits nothing"),
-            BifrostStorageError::Closed
-        );
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "closed")]),
-            2
-        );
-        assert_reconciled_totals(&recorder, &timing);
-    }
-
-    /// An occupied storage permit delays a read instead of refusing it, and
-    /// the wait spends the read's one operation bound.
-    ///
-    /// The owner's only permit is held directly, as another in-flight attempt
-    /// would hold it. A read queues behind it and must complete once the permit
-    /// returns inside its bound,
-    /// with its per-attempt request timeout starting only after admission —
-    /// the queued wait is deliberately longer than that timeout. A second read,
-    /// queued under a caller-owned cancellation, must settle as cancelled and
-    /// leave no waiter or permit behind.
-    ///
-    /// # Panics
-    /// Panics when a queued read is refused, times out, completes before the
-    /// permit returns, or leaves a permit or request outstanding.
-    #[tokio::test]
-    async fn occupied_storage_permit_waits_within_operation_deadline() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let root = tempfile::tempdir().expect("warehouse root");
-        let storage = owner(
-            root.path(),
-            BifrostStorageConfig {
-                request_timeout_ms: Some(100),
-                max_retries: Some(0),
-                max_retry_elapsed_ms: Some(30_000),
-                max_concurrent_requests: Some(1),
-                ..BifrostStorageConfig::default()
-            },
-        );
-        let held = Arc::clone(&storage.requests)
-            .acquire_owned()
-            .await
-            .expect("the owner's only permit");
-        assert_eq!(storage.available_request_permits(), 0);
-
-        let mut queued = Box::pin(storage.run_read(StorageOperation::Read, || async {
-            Ok::<Bytes, opendal::Error>(Bytes::from_static(b"rows"))
-        }));
-        assert!(
-            futures_util::poll!(queued.as_mut()).is_pending(),
-            "an occupied permit queues the read rather than refusing it"
-        );
-        let abandoned = CancellationToken::new();
-        let cancelled = tokio::spawn({
-            let storage = Arc::clone(&storage);
-            let abandoned = abandoned.clone();
-            async move {
-                tokio::select! {
-                    () = abandoned.cancelled() => None,
-                    read = storage.run_read(StorageOperation::Stat, || async { Ok(0_u64) }) => {
-                        Some(read)
-                    }
-                }
-            }
-        });
-        wait_until(|| storage.inspect().active_requests == 2).await;
-        // Outlive the per-attempt timeout while queued: a timeout that began
-        // before admission would now fail the queued read on its first poll
-        // after the permit returns.
-        tokio::time::timeout(Duration::from_millis(300), queued.as_mut())
-            .await
-            .expect_err("the queued read stays pending while the permit is held");
-
-        abandoned.cancel();
-        assert!(
-            cancelled
-                .await
-                .expect("the cancelled waiter joins")
-                .is_none(),
-            "caller cancellation ends the queued wait"
-        );
-        wait_until(|| {
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "cancelled")]) == 1
-        })
-        .await;
-
-        drop(held);
-        assert_eq!(
-            queued
-                .await
-                .expect("the queued read completes once the permit returns"),
-            Bytes::from_static(b"rows")
-        );
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "success")]),
-            1
-        );
-        assert_reconciled_totals(&recorder, &storage);
-        assert_eq!(
-            storage.available_request_permits(),
-            1,
-            "success and cancellation both return every permit"
-        );
-    }
-
-    /// A footer decode holds no fixed memory slot: it succeeds while the Oracle
-    /// root has far less than one historical 40 MiB slot free, and the only
-    /// charge it leaves behind is the retained metadata's actual size.
-    ///
-    /// # Panics
-    /// Panics when the decode is refused, the retained metadata is unfunded,
-    /// or the root charge differs from the decoded metadata's own size.
-    #[tokio::test]
-    async fn footer_decode_has_no_fixed_memory_slot() {
-        use arrow::array::{ArrayRef, Int64Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-
-        const MIB: usize = 1024 * 1024;
-        let oracle = crate::resources::BifrostRuntimeResources::composed_for_test(
-            512 * MIB,
-            1024 * 1024 * 1024,
-            [crate::resources::BifrostRole::Oracle],
-        )
-        .oracle()
-        .expect("the fixture observation admits Oracle");
-        let used = || {
-            oracle
-                .snapshot()
-                .expect("root snapshot")
-                .oracle_memory_used_bytes
-        };
-        // Drain the root, then return one MiB: the decode must fit in room far
-        // smaller than a fixed 40 MiB slot.
-        let mut held = Vec::new();
-        while let Ok(reservation) = oracle.metadata().try_reserve_metadata(MIB) {
-            held.push(reservation);
-        }
-        assert!(
-            held.pop().is_some(),
-            "the fixture root admits some metadata"
-        );
-        assert!(
-            oracle.metadata().try_reserve_metadata(2 * MIB).is_err(),
-            "the drained root has under two MiB free"
-        );
-        let drained = used();
-
-        let root = tempfile::tempdir().expect("warehouse root");
-        let signer = wyrd_storage::signer::BackendSigner::Local(
-            wyrd_storage::local::LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        );
-        let storage = BifrostStorage::new(
-            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-            BifrostStoragePolicy::resolve(
-                BifrostStorageConfig {
-                    metadata_cache_bytes: Some(MIB as u64),
-                    ..BifrostStorageConfig::default()
-                },
-                512 * MIB as u64,
-                true,
-            )
-            .expect("the fixture storage policy is valid"),
-            Some(oracle.metadata()),
-        );
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from((0..64).collect::<Vec<i64>>())) as ArrayRef],
-        )
-        .expect("footer fixture batch");
-        let mut buffer = Vec::new();
-        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)
-            .expect("footer fixture writer");
-        writer.write(&batch).expect("footer fixture write");
-        writer.close().expect("footer fixture close");
-        let object = Bytes::from(buffer);
-        let key = ObjectMetadataKey::new(
-            wyrd_spec::ids::DataTenantId::new_v7(),
-            "vala.bifrost.events".to_owned(),
-            "footer.parquet".to_owned(),
-            uuid::Uuid::nil(),
-            [0x40; 32],
-            u64::try_from(object.len()).expect("fixture size fits u64"),
-        );
-        let key_bytes = usize::try_from(key.owned_bytes()).expect("key size fits usize");
-
-        let retained = storage
-            .object_metadata(
-                key,
-                move || std::io::Cursor::new(object.clone()),
-                Instant::now() + Duration::from_secs(30),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("a footer decodes without a fixed memory slot");
-        assert!(
-            retained.is_funded(),
-            "the drained root still funds the actual bytes"
-        );
-        assert_eq!(
-            used() - drained,
-            retained.metadata().memory_size() + key_bytes,
-            "the only charge is the retained metadata and key's actual size"
-        );
-        drop(retained);
-        drop(held);
-        storage.abort().await;
-    }
-
-    /// An abort cannot report a closed owner while governed work is still admitted.
-    ///
-    /// The property is about the *order* of teardown, not its eventual result:
-    /// an owner that cancels admission, publishes `Closed`, and returns while
-    /// two object operations are still running reports a drain its own backend
-    /// contradicts, and every downstream caller — process shutdown, a test
-    /// harness, an operator reading the lifecycle gauge — believes it. So the
-    /// assertions are taken immediately after `abort` returns and deliberately
-    /// before the caller tasks are joined: nothing but the owner's own wait can
-    /// have settled those requests by then.
-    ///
-    /// Both stalled shapes are covered because they leave the owner in
-    /// different places: one request is parked at the production barrier before
-    /// its backend call, the other is inside a backend future that never
-    /// returns, and only the second can prove the losing future was dropped
-    /// rather than merely abandoned.
-    ///
-    /// # Panics
-    /// Panics when a request is still admitted, a terminal is missing, a permit
-    /// leaked, the stalled backend future survived, the lifecycle is not
-    /// `Closed`, or any settlement was unmatched.
-    #[tokio::test]
-    async fn abort_settles_every_governed_request_before_reporting_closed() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let root = tempfile::tempdir().expect("warehouse root");
-        let storage = owner(root.path(), patient_config());
-        let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
-        storage.install_operation_barrier_for_test(Arc::clone(&barrier));
-
-        let parked = tokio::spawn({
-            let storage = Arc::clone(&storage);
-            async move {
-                storage
-                    .run_read(StorageOperation::Exists, || async { Ok(true) })
-                    .await
-            }
-        });
-        barrier.wait_until_reached().await;
-
-        let dropped = Arc::new(AtomicBool::new(false));
-        let sleeping = tokio::spawn({
-            let storage = Arc::clone(&storage);
-            let dropped = Arc::clone(&dropped);
-            async move {
-                storage
-                    .run_read(StorageOperation::Read, || {
-                        let dropped = Arc::clone(&dropped);
-                        async move {
-                            let _sentinel = DropSentinel(dropped);
-                            tokio::time::sleep(Duration::from_mins(10)).await;
-                            Ok::<Bytes, opendal::Error>(Bytes::new())
-                        }
-                    })
-                    .await
-            }
-        });
-        wait_until(|| storage.inspect().active_requests == 2).await;
-
-        storage.abort().await;
-
-        let inspection = storage.inspect();
-        assert_eq!(
-            inspection.active_requests, 0,
-            "abort returned while governed requests were still admitted"
-        );
-        assert_eq!(recorded::counter(&recorder, REQUESTS, &[]), 2);
-        assert_reconciled_totals(&recorder, &storage);
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "closed")]),
-            2,
-            "a request the owner cancelled settles as closed"
-        );
-        assert_eq!(
-            storage.available_request_permits(),
-            storage.policy().max_concurrent_requests(),
-            "every cancelled attempt must return its admission"
-        );
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "the losing backend future must be dropped before abort returns"
-        );
-        assert_eq!(inspection.lifecycle, StorageLifecycle::Closed);
-
-        barrier.release();
-        assert_eq!(
-            parked
-                .await
-                .expect("the parked read joins")
-                .expect_err("owner cancellation terminates the attempt stalled at the barrier"),
-            BifrostStorageError::Closed
-        );
-        assert_eq!(
-            sleeping
-                .await
-                .expect("the sleeping read joins")
-                .expect_err("owner cancellation terminates the stalled backend future"),
-            BifrostStorageError::Closed
-        );
-
-        storage.abort().await;
-        assert_reconciled_totals(&recorder, &storage);
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[]),
-            2,
-            "a repeated abort publishes no second terminal"
-        );
-    }
-
-    /// A close waits for governed requests under the same absolute deadline it
-    /// gives the cache, and never claims a drain it did not reach.
-    ///
-    /// The two branches are the whole point. A deadline with room left must
-    /// actually wait — a close that returned `true` the instant it cancelled
-    /// admission would be indistinguishable from one that waited, and process
-    /// shutdown reads that boolean as proof. An already-elapsed deadline must
-    /// report `false` and leave the lifecycle at `Closing`, because the caller
-    /// then has a real decision to make, and the awaited abort that follows is
-    /// what settles the request and earns `Closed`.
-    ///
-    /// # Panics
-    /// Panics when a close reports the wrong settlement, publishes `Closed`
-    /// with governed work still admitted, or leaves the totals unreconciled.
-    #[tokio::test]
-    async fn close_waits_for_governed_requests_within_its_absolute_deadline() {
-        let recorder = BenchmarkRecorder::default();
-        let _metrics = metrics::set_default_local_recorder(&recorder);
-        let patient_root = tempfile::tempdir().expect("warehouse root");
-        let patient = owner(patient_root.path(), patient_config());
-        let patient_barrier = StorageOperationBarrier::new(StorageOperation::Exists);
-        patient.install_operation_barrier_for_test(Arc::clone(&patient_barrier));
-        let waited = tokio::spawn({
-            let patient = Arc::clone(&patient);
-            async move {
-                patient
-                    .run_read(StorageOperation::Exists, || async { Ok(true) })
-                    .await
-            }
-        });
-        patient_barrier.wait_until_reached().await;
-        assert!(
-            patient
-                .close(Instant::now() + Duration::from_secs(30))
-                .await,
-            "a deadline with room left must settle the cancelled request"
-        );
-        let settled = patient.inspect();
-        assert_eq!(settled.active_requests, 0);
-        assert_eq!(settled.lifecycle, StorageLifecycle::Closed);
-        patient_barrier.release();
-        assert_eq!(
-            waited
-                .await
-                .expect("the stalled read joins")
-                .expect_err("owner cancellation terminates the stalled attempt"),
-            BifrostStorageError::Closed
-        );
-
-        let expired_root = tempfile::tempdir().expect("warehouse root");
-        let expired = owner(expired_root.path(), patient_config());
-        let expired_barrier = StorageOperationBarrier::new(StorageOperation::Exists);
-        expired.install_operation_barrier_for_test(Arc::clone(&expired_barrier));
-        let mut outstanding =
-            Box::pin(expired.run_read(StorageOperation::Exists, || async { Ok(true) }));
-        assert!(
-            futures_util::poll!(outstanding.as_mut()).is_pending(),
-            "the first poll admits the request and parks it at the barrier"
-        );
-        assert!(expired_barrier.was_reached());
-        assert_eq!(expired.inspect().active_requests, 1);
-
-        assert!(
-            !expired
-                .close(Instant::now() + Duration::from_millis(200))
-                .await,
-            "a deadline that elapses with a request still admitted cannot report settled"
-        );
-        let unsettled = expired.inspect();
-        assert_eq!(
-            unsettled.lifecycle,
-            StorageLifecycle::Closing,
-            "a close that did not settle must not report Closed"
-        );
-        assert_eq!(unsettled.active_requests, 1);
-
-        drop(outstanding);
-        expired.abort().await;
-        let aborted = expired.inspect();
-        assert_eq!(aborted.active_requests, 0);
-        assert_eq!(
-            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "cancelled")]),
-            1,
-            "an abandoned caller settles its request as cancelled"
-        );
-        assert_reconciled_totals(&recorder, &expired);
-        assert_eq!(aborted.lifecycle, StorageLifecycle::Closed);
-        expired_barrier.release();
-    }
-
-    /// Returns a policy whose own timers cannot settle a stalled request.
-    ///
-    /// Every bound is far beyond the test's lifetime, so a request that does
-    /// settle can only have been settled by owner cancellation. A short
-    /// per-attempt timeout would settle it anyway and quietly prove nothing.
-    fn patient_config() -> BifrostStorageConfig {
-        BifrostStorageConfig {
-            request_timeout_ms: Some(300_000),
-            max_retries: Some(0),
-            max_retry_elapsed_ms: Some(300_000),
-            ..BifrostStorageConfig::default()
-        }
-    }
-
-    /// Waits until `reached` holds, yielding to the test's own runtime.
-    ///
-    /// Bounded so a never-satisfied condition fails the test with its own
-    /// message instead of hanging the lane.
-    ///
-    /// # Panics
-    /// Panics when the condition is not reached within the bound.
-    async fn wait_until(reached: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !reached() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the owner reached the expected state");
-    }
-
-    /// Asserts one owner published the expected terminal and settled.
-    ///
-    /// # Panics
-    /// Panics when the terminal count differs or the owner did not settle; see
-    /// [`assert_reconciled_totals`].
-    fn assert_reconciled(
-        recorder: &BenchmarkRecorder,
-        storage: &BifrostStorage,
-        outcome: StorageRequestOutcome,
-        expected: u64,
-    ) {
-        assert_eq!(
-            recorded::counter(
-                recorder,
-                REQUEST_TERMINALS,
-                &[("outcome", outcome.as_str())]
-            ),
-            expected,
-            "{} terminals",
-            outcome.as_str()
-        );
-        assert_reconciled_totals(recorder, storage);
-    }
-
-    /// Asserts every admitted request published one terminal and settled.
-    ///
-    /// The live count comes from the request settlement teardown waits on;
-    /// the active-request gauge must agree with it, and the retired shadow
-    /// families must never appear.
-    ///
-    /// # Panics
-    /// Panics when starts and terminals disagree, the owner or its gauge still
-    /// counts admitted work, or a retired family was emitted.
-    fn assert_reconciled_totals(recorder: &BenchmarkRecorder, storage: &BifrostStorage) {
-        assert_eq!(
-            recorded::counter(recorder, REQUESTS, &[]),
-            recorded::counter(recorder, REQUEST_TERMINALS, &[])
-        );
-        assert_eq!(storage.inspect().active_requests, 0);
-        assert!(recorded::gauge(recorder, ACTIVE_REQUESTS).abs() < f64::EPSILON);
-        assert!(!recorded::emitted(recorder, recorded::RETIRED_ANOMALIES));
+            .expect_err("absent");
+        assert!(error_chain_contains_not_found(&missing));
+        assert!(matches!(
+            BifrostStorageError::from_object_store(&missing),
+            BifrostStorageError::NotFound { .. }
+        ));
     }
 }

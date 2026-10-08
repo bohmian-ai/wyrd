@@ -11,15 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::resources::ResourcePlan;
 
-use async_trait::async_trait;
-use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
     Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError,
-    ForgeLeaderPeer, ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker,
+    ForgeLeaderPeer, ForgeObjectStore, ForgeObjects, ForgeTelemetry, ForgeWorker,
     ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
@@ -74,187 +72,6 @@ const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
 /// Longest boot waits for the Oracle to finish startup before failing.
 const ORACLE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of listing entries the production Forge object store groups into one
-/// orphan-GC page. The producer owns page granularity: this bounds how much of
-/// an OpenDAL recursive walk materializes before orphan GC can check its page
-/// cap and run budget at a page boundary. Sized so a steady-state prefix scans
-/// in a handful of pages while a pathological prefix still yields control
-/// promptly.
-const FORGE_OBJECT_LIST_PAGE_ENTRIES: usize = 1_000;
-
-/// Production Forge object-store capability backed by the server's OpenDAL operator.
-#[derive(Debug, Clone)]
-struct OpenDalForgeObjectStore {
-    /// Shared OpenDAL operator used for Forge reads and lifecycle operations.
-    operator: Arc<opendal::Operator>,
-}
-
-impl OpenDalForgeObjectStore {
-    /// Create a Forge capability over the process-owned storage operator.
-    #[must_use]
-    fn new(operator: Arc<opendal::Operator>) -> Self {
-        Self { operator }
-    }
-
-    /// Page a prefix in ascending key order on a backend without a native cursor.
-    ///
-    /// Each page is one full recursive walk that keeps only the
-    /// [`FORGE_OBJECT_LIST_PAGE_ENTRIES`] smallest file keys strictly after the
-    /// cursor, so memory stays bounded by the page size whatever the prefix
-    /// holds and the walk order the backend happens to use. The last key of a
-    /// page becomes the next cursor; a short page ends the stream. Pages are
-    /// produced lazily, so orphan GC stopping at its page cap stops the walks.
-    // ponytail: one full walk per page (O(pages × objects)); fine for local and
-    // Azure staging prefixes, native cursor backends never take this path.
-    fn emulated_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
-        let state = Some((
-            self.clone(),
-            prefix.to_owned(),
-            start_after.map(str::to_owned),
-        ));
-        Box::pin(futures_util::stream::try_unfold(
-            state,
-            |state| async move {
-                let Some((store, prefix, cursor)) = state else {
-                    return Ok(None);
-                };
-                let page = store.smallest_after(&prefix, cursor.as_deref()).await?;
-                let Some(last) = page.last().map(|entry| entry.path().to_owned()) else {
-                    return Ok(None);
-                };
-                let next = (page.len() == FORGE_OBJECT_LIST_PAGE_ENTRIES).then_some((
-                    store,
-                    prefix,
-                    Some(last),
-                ));
-                Ok(Some((page, next)))
-            },
-        ))
-    }
-
-    /// Walk `prefix` once and return its smallest file keys after `cursor`, sorted.
-    ///
-    /// Directory keys are skipped for the same reason as on the native path:
-    /// they are not addressable objects and must not consume the page bound.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the walk cannot be opened or
-    /// fails part-way.
-    async fn smallest_after(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-    ) -> opendal::Result<Vec<opendal::Entry>> {
-        let mut lister = self.operator.lister_with(prefix).recursive(true).await?;
-        let mut smallest = std::collections::BTreeMap::new();
-        while let Some(entry) = lister.try_next().await? {
-            if !entry.metadata().is_file() || cursor.is_some_and(|cursor| entry.path() <= cursor) {
-                continue;
-            }
-            smallest.insert(entry.path().to_owned(), entry);
-            if smallest.len() > FORGE_OBJECT_LIST_PAGE_ENTRIES {
-                smallest.pop_last();
-            }
-        }
-        Ok(smallest.into_values().collect())
-    }
-}
-
-#[async_trait]
-impl ForgeObjectStore for OpenDalForgeObjectStore {
-    /// Read one staged or Iceberg-owned object through OpenDAL.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when the object cannot be read.
-    async fn read(&self, path: &str) -> opendal::Result<opendal::Buffer> {
-        self.operator.read(path).await
-    }
-
-    /// Read only the requested Parquet byte range through OpenDAL's ranged reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the reader cannot be opened or
-    /// the requested range cannot be fetched.
-    async fn read_range(
-        &self,
-        path: &str,
-        range: std::ops::Range<u64>,
-    ) -> opendal::Result<opendal::Buffer> {
-        self.operator.reader(path).await?.read(range).await
-    }
-
-    /// Recursively list objects below a Forge-owned prefix.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when listing cannot complete.
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<opendal::Entry>> {
-        self.operator.list_with(prefix).recursive(true).await
-    }
-
-    /// Recursively list objects below a Forge-owned prefix as bounded pages.
-    ///
-    /// Overrides the trait default with a true incremental OpenDAL lister so a
-    /// large orphan prefix never materializes at once. The returned stream owns
-    /// its lister and groups entries into fixed-size pages; orphan GC pulls one
-    /// page at a time and stops at a page boundary once its per-run page cap or
-    /// time budget is reached. Each page collects the lister's per-entry results
-    /// so a mid-walk backend error surfaces as a failed page rather than being
-    /// silently truncated.
-    ///
-    /// A backend with native `list_with_start_after` (S3, GCS) resumes on the
-    /// backend's own cursor. A backend without it (local fs, Azure) is served
-    /// by [`Self::emulated_pages`], which keeps the same ascending, exclusive
-    /// cursor contract and page bound at the cost of one walk per page.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying OpenDAL error when the native lister cannot be
-    /// opened. Errors encountered after the walk begins, including every
-    /// emulated walk, surface as a failed page in the returned stream.
-    async fn list_pages(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-    ) -> opendal::Result<ForgeObjectPages> {
-        if !self.operator.info().full_capability().list_with_start_after {
-            return Ok(self.emulated_pages(prefix, start_after));
-        }
-        let mut listing = self.operator.lister_with(prefix).recursive(true);
-        if let Some(cursor) = start_after {
-            listing = listing.start_after(cursor);
-        }
-        let lister = listing.await?;
-        // A resumable scan advances its cursor over objects only: a directory
-        // key ends in a separator and is not an addressable object, so it must
-        // not consume the page bound either — a chunk of only directories would
-        // yield an empty page and leave the frontier standing still, starving
-        // the objects behind it.
-        let objects = lister.try_filter(|entry| std::future::ready(entry.metadata().is_file()));
-        let pages = objects
-            .chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES)
-            .map(|chunk| chunk.into_iter().collect::<opendal::Result<Vec<_>>>());
-        Ok(Box::pin(pages))
-    }
-
-    /// Read object metadata before Forge makes a destructive decision.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when metadata cannot be read.
-    async fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
-        self.operator.stat(path).await
-    }
-
-    /// Delete one object after Forge's live-set and fence checks complete.
-    ///
-    /// # Errors
-    /// Returns the underlying OpenDAL error when deletion cannot complete.
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
-        self.operator.delete(path).await
-    }
-}
-
 /// Caller-supplied overrides applied to core `AppState` before
 /// `production_validate`. Enterprise uses this to inject a real ABAC policy
 /// hook + audit writer through the same seam production hardening enforces.
@@ -571,16 +388,22 @@ async fn build_bifrost_external_dependencies(
     // an Oracle-serving target, so it cannot be resolved before the resource
     // plan exists, and the catalog cannot be built before the owner it must run
     // its Iceberg I/O through.
-    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
-        Arc::clone(&storage),
+    let mut bifrost_storage = vala_bifrost_redux::storage::BifrostStorage::new(
+        storage.backend_config(),
         vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
             config.storage.to_storage_config(),
             u64::try_from(resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
             resources.oracle().is_some(),
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        resources.oracle().map(|oracle| oracle.metadata()),
-    ));
+    )
+    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    if let Some(oracle) = resources.oracle() {
+        bifrost_storage = bifrost_storage
+            .with_metadata_cache(&oracle.metadata())
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    }
+    let bifrost_storage = Arc::new(bifrost_storage);
     let catalog = Arc::new(
         BifrostCatalog::new(
             dsns.catalog().expose_secret(),
@@ -621,7 +444,6 @@ pub async fn compose_bifrost(
         target,
         deployment_profile,
         postgres,
-        storage,
         bifrost_storage,
         catalog: bifrost,
         resources: bifrost_resources,
@@ -830,7 +652,7 @@ pub async fn compose_bifrost(
         );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
             catalog: Some(Arc::clone(&bifrost)),
-            operator: Arc::new(storage.operator().clone()),
+            operator: Arc::clone(bifrost_storage.objects()),
             wal,
             stream,
             admission,
@@ -906,15 +728,13 @@ pub async fn compose_bifrost(
             .as_ref()
             .and_then(|controls| controls.forge_config.clone())
             .unwrap_or(forge_config);
-        let staging = Arc::new(storage.operator().clone());
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
             .as_ref()
             .and_then(|controls| controls.forge_object_store.clone())
-            .unwrap_or_else(|| Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging))));
+            .unwrap_or_else(|| Arc::new(ForgeObjects::new(&bifrost_storage)));
         #[cfg(not(feature = "test-support"))]
-        let object_store: Arc<dyn ForgeObjectStore> =
-            Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
+        let object_store: Arc<dyn ForgeObjectStore> = Arc::new(ForgeObjects::new(&bifrost_storage));
         let coordinator = ForgeCoordinator::new(ForgeBuildConfig {
             resources: bifrost_resources.forge().ok_or_else(|| {
                 ServerBootError::ForgeSchedulerRequired {
@@ -937,7 +757,7 @@ pub async fn compose_bifrost(
                     bifrost.iceberg_catalog()
                 }
             },
-            staging,
+            warehouse: vala_bifrost_redux::catalog::warehouse_uri(bifrost_storage.backend()),
             object_store,
             hints: staging_file_inbox,
             config: forge_config,
@@ -1309,7 +1129,6 @@ pub async fn build_state(
         target: config.role,
         deployment_profile: config.deployment_profile,
         postgres: external.postgres.as_ref().clone(),
-        storage: Arc::clone(&external.storage),
         bifrost_storage: Arc::clone(&external.bifrost_storage),
         catalog: Arc::clone(&external.catalog),
         resources: external.resources,
@@ -2325,125 +2144,6 @@ mod tests {
                 .next()
                 .is_some_and(|guard| guard.starts_with("&BifrostRuntimeRole::ForgeWorker)")),
             "the executor must be built only under the Forge worker role guard"
-        );
-    }
-
-    /// Orphan listing pages a backend without a native cursor in ascending order.
-    ///
-    /// The filesystem service advertises no `list_with_start_after` and walks
-    /// in directory order, so it takes the emulated path. Keys are written in
-    /// reverse so walk order and key order disagree; the pages must still be
-    /// bounded, globally ascending, and complete, and a resume from a mid-page
-    /// cursor must yield exactly the keys after it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the operator cannot be built or written, when it starts
-    /// advertising cursor support, or when any page is oversized, out of order,
-    /// or skips or repeats a key.
-    #[tokio::test]
-    async fn open_dal_forge_listing_pages_backend_without_start_after() {
-        let root = tempfile::tempdir().expect("listing root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
-        )
-        .expect("filesystem operator builds")
-        .finish();
-        assert!(
-            !operator.info().full_capability().list_with_start_after,
-            "the filesystem service is the backend the emulated path exists for"
-        );
-        let prefix = "tenants/t/table/data/forge/v1/";
-        let total = FORGE_OBJECT_LIST_PAGE_ENTRIES * 2 + 3;
-        let mut keys = (0..total)
-            .map(|index| format!("{prefix}{index:06}.parquet"))
-            .collect::<Vec<_>>();
-        for key in keys.iter().rev() {
-            operator
-                .write(key, "orphan")
-                .await
-                .expect("object is written");
-        }
-        keys.sort();
-        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
-
-        for (cursor, expected) in [(None, &keys[..]), (Some(keys[700].as_str()), &keys[701..])] {
-            let pages = store
-                .list_pages(prefix, cursor)
-                .await
-                .expect("an emulated listing opens")
-                .try_collect::<Vec<_>>()
-                .await
-                .expect("every emulated page lists");
-            assert!(
-                pages
-                    .iter()
-                    .all(|page| page.len() <= FORGE_OBJECT_LIST_PAGE_ENTRIES),
-                "every page stays within the page bound"
-            );
-            let listed = pages
-                .iter()
-                .flatten()
-                .map(|entry| entry.path().to_owned())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                listed, expected,
-                "pages are ascending, complete, and exclusive"
-            );
-        }
-    }
-
-    /// Directory entries never consume the page bound.
-    ///
-    /// The production page bound counts addressable objects, because the task
-    /// cursor advances over objects only. A chunk of leading directory markers
-    /// would otherwise yield an empty page and leave the frontier stationary,
-    /// starving the later object behind it. The filesystem service is the
-    /// installed backend that yields directory entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the operator cannot be built, when the single page is not
-    /// exactly the one object, or when the stream yields another page.
-    #[tokio::test]
-    async fn open_dal_forge_listing_filters_directories_before_page_boundary() {
-        let root = tempfile::tempdir().expect("listing root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
-        )
-        .expect("filesystem operator builds")
-        .finish();
-        let prefix = "tenants/t/table/data/forge/v1/";
-        for index in 0..FORGE_OBJECT_LIST_PAGE_ENTRIES {
-            operator
-                .create_dir(&format!("{prefix}{index:06}/"))
-                .await
-                .expect("leading directory marker is created");
-        }
-        let object = format!("{prefix}zzzzzz.parquet");
-        operator
-            .write(&object, "orphan")
-            .await
-            .expect("trailing object is written");
-
-        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
-        let mut pages = store
-            .list_pages(prefix, None)
-            .await
-            .expect("the backend is listable");
-        let page = pages
-            .next()
-            .await
-            .expect("one object-only page is yielded")
-            .expect("the page lists successfully");
-        let paths = page
-            .iter()
-            .map(|entry| entry.path().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec![object], "the page holds only the object");
-        assert!(
-            pages.next().await.is_none(),
-            "the object-only page is the whole listing"
         );
     }
 

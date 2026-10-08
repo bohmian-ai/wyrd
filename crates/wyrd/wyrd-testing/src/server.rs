@@ -93,7 +93,8 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
     insert_user, provision_system_principal, revoke_role_from_service_account,
-    revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
+    revoke_role_from_user, role_by_name, tenant_admin_principal_id, trusted_issuer_by_url,
+    workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -3234,6 +3235,56 @@ impl WyrdTestServer {
             .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(row.is_some())
+    }
+
+    /// Issue a key for the fixture tenant's administrative principal.
+    ///
+    /// Mirrors tenant provisioning: the tenant's one `tenant_admin` principal
+    /// binds no Card and holds the built-in `admin` Role. It is created on
+    /// first use and reused afterwards, and every call issues it one more
+    /// credential. This is the key `wyrd setup` hands an operator, so a
+    /// journey that authenticates with it exercises the unbound
+    /// administrator rather than a Card-bound Service holding `admin`.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes fail.
+    pub async fn tenant_admin_key(&self) -> Result<SecretString, WyrdTestServerError> {
+        let tenant_id = self.data_tenant_id();
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let principal_id =
+            if let Some(existing) = tenant_admin_principal_id(&mut conn).await.map_err(sql)? {
+                existing
+            } else {
+                let created = Uuid::now_v7();
+                insert_service_account(
+                    &mut conn,
+                    created,
+                    "tenant_admin",
+                    None,
+                    "tenant-admin",
+                    Some("Tenant administrative principal"),
+                    creator_id,
+                )
+                .await
+                .map_err(sql)?;
+                grant_role(&mut conn, created, PrincipalTable::ServiceAccount, "admin").await?;
+                created
+            };
+        let api_key = WyrdApiKey::generate(tenant_id);
+        insert_api_key(
+            &mut conn,
+            Uuid::now_v7(),
+            principal_id,
+            &api_key.prefix,
+            &wyrd_auth_issue::hash_secret(api_key.secret.expose_secret()),
+            creator_id,
+            None,
+        )
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(api_key.secret)
     }
 
     /// Bootstrap an Agent principal through fixture SQL.

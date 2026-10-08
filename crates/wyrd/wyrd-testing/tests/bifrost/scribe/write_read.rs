@@ -895,6 +895,118 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
+/// An unbound writer attributes rows to any registered observation-target
+/// Card in its tenant, end to end through the public routes.
+///
+/// The tenant administrator binds no Card, so its signed claims name no Card
+/// scope at all. A row naming a registered Service still stamps that Card's
+/// registry UID, while a row naming an unregistered Card, or a registered Card
+/// of a kind observations are never attributed to, refuses its frame with the
+/// same typed scope denial a Card-bound writer receives.
+///
+/// # Panics
+///
+/// Panics when the registered Card is not stamped with its registry UID, when
+/// an unregistered or non-observation Card is admitted, or when a refusal
+/// leaves a row behind.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_unbound_writer_card_attribution_journey() {
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let table = register_table(
+        &server,
+        tenant,
+        BifrostNamespace::Datasets,
+        &unique_table("unbound_attribution"),
+    )
+    .await;
+    let observed = server
+        .bootstrap_service_in_tenant(tenant, &unique_table("observed"), &["viewer"])
+        .await
+        .expect("the observed Service registers")
+        .card_ref()
+        .expect("a bootstrapped service is bound to its Card")
+        .clone();
+    let client = wyrd_client::WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: server.grpc_url().expect("bound gRPC URL"),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: server.base_url().expect("bound HTTP URL").to_owned(),
+            ..HttpConfig::default()
+        },
+        credential: Some(server.tenant_admin_key().await.expect("tenant admin key")),
+        ..ClientConfig::default()
+    })
+    .expect("the administrator's SDK client");
+    let trigger = wyrd_client::cards::Cards::with_client(client.clone())
+        .register_from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/scheduled_drift_alerts_operator/daily.yaml"
+        ))
+        .await
+        .expect("the Trigger registers");
+    let identity = |card: &wyrd_spec::reference::CardRef| {
+        wyrd_spec::reference::CardRef {
+            uid: None,
+            ..card.clone()
+        }
+        .to_string()
+    };
+
+    append_correlated(
+        &client,
+        &table,
+        &[(1, None), (2, Some(identity(&observed)))],
+    )
+    .await
+    .expect("a registered observation target is attributable");
+    let stamped = read_correlation(&client, &table)
+        .await
+        .into_iter()
+        .map(|(value, card_uid, _principal)| (value, card_uid))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![
+            (1, None),
+            (2, Some(registry_card_uid(&server, &observed).await))
+        ],
+        "the registered Card is stamped with its registry UID"
+    );
+
+    for refused in [
+        "default/Service/never-registered@1.0.0".to_owned(),
+        identity(&trigger.root),
+    ] {
+        let refusal = append_correlated(&client, &table, &[(3, Some(refused.clone()))])
+            .await
+            .expect_err("only registered observation targets are attributable");
+        let code = match &refusal {
+            wyrd_spec::error::WyrdError::UpstreamFailure { details, .. } => details
+                .get("original_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            other => other.code().to_owned(),
+        };
+        assert_eq!(
+            code, "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            "{refused}: {refusal:?}"
+        );
+    }
+    assert_eq!(
+        read_correlation(&client, &table).await.len(),
+        2,
+        "the refused batches left no row behind"
+    );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
 /// Declare one component Card on the writer's root Service Card.
 ///
 /// The mint walk signs every observation-target component of the root spec into

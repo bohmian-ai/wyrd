@@ -709,6 +709,7 @@ impl ScribeImpl {
         Scribe::ingest_frame(
             self,
             ScribeIngressFrame {
+                attributed_cards: None,
                 authenticated_tenant: frame.principal.tenant_id,
                 principal: frame.principal,
                 table: frame.table,

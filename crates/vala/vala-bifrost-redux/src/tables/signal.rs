@@ -286,7 +286,7 @@ pub const RUN_ID_ATTRIBUTE: &str = "wyrd.run_id";
 const CARD_REF_REJECTION: &str = "wyrd.card_ref is not a valid card correlation";
 
 /// Stable rejection reason for a `wyrd.card_ref` the principal cannot assert.
-const CARD_REF_UNAUTHORIZED: &str = "wyrd.card_ref is outside the signed Card scope";
+const CARD_REF_UNAUTHORIZED: &str = "wyrd.card_ref is outside the principal's Card scope";
 
 /// Stable rejection reason for a wrongly typed `wyrd.run_id`.
 const RUN_ID_REJECTION: &str = "wyrd.run_id is not a valid run correlation";
@@ -311,12 +311,13 @@ pub struct RecordCorrelation {
 impl RecordCorrelation {
     /// Extract both optional correlations from one record's attributes.
     ///
-    /// `card_scope` is the authenticated principal's verified signed Card
-    /// scope, borrowed from the request that carried this record. It is checked
+    /// `card_scope` is the request's Card scope: a Card-bound principal's
+    /// verified signed scope, or, for an unbound principal, the registered
+    /// observation-target Cards Gate resolved for this export. It is checked
     /// here, per record, so one unauthorized reference rejects only its own
     /// OTLP record instead of failing the whole canonical batch later in
-    /// Scribe. The check is decided entirely from the signed claims and
-    /// performs no registry, database, or cache lookup.
+    /// Scribe. The check itself performs no registry, database, or cache
+    /// lookup.
     ///
     /// # Errors
     ///
@@ -345,18 +346,30 @@ impl RecordCorrelation {
     }
 }
 
-/// Confirm one parsed record reference lies within the signed Card scope.
+/// The final `wyrd.card_ref` text of one record, when it is a string.
+///
+/// Gate reads this to learn which Cards an unbound writer's export names
+/// before projection; a wrongly typed occurrence yields nothing here and is
+/// rejected by [`RecordCorrelation::extract`] on its own record.
+#[must_use]
+pub fn card_ref_text(attributes: &[KeyValue]) -> Option<&str> {
+    correlation_text(attributes, CARD_REF_ATTRIBUTE, CARD_REF_REJECTION)
+        .ok()
+        .flatten()
+}
+
+/// Confirm one parsed record reference lies within the request's Card scope.
 ///
 /// This mirrors Scribe's own authorization exactly — identity match on
-/// `(kind, space, name, version)` plus a UID the mint signed onto that same
-/// member — so a record accepted here cannot be refused again when Scribe
+/// `(kind, space, name, version)` plus a UID the mint signed or Gate resolved
+/// onto that same member — so a record accepted here cannot be refused again when Scribe
 /// re-validates the assembled canonical batch. Scribe keeps that whole-frame
 /// check as defense in depth; this one exists only so a rejection stays
 /// per-record.
 ///
 /// # Errors
 ///
-/// Returns [`CARD_REF_UNAUTHORIZED`] when the principal carries no signed
+/// Returns [`CARD_REF_UNAUTHORIZED`] when the request carries no Card
 /// scope, the reference lies outside it, or the matching signed member carries
 /// no UID.
 fn authorize_card_ref(

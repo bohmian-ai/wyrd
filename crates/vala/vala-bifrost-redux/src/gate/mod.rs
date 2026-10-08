@@ -1,5 +1,6 @@
 //! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
+pub mod attribution;
 pub mod auth;
 pub mod error;
 pub mod limits;
@@ -332,6 +333,9 @@ pub struct Gate<A: GateAudit + 'static> {
     query: Option<Arc<dyn OracleQueryDispatch>>,
     /// Post-acknowledgement hook for Eval observation frames, when composed.
     observations: Option<Arc<dyn ObservationAck>>,
+    /// Tenant registry resolving unbound writers' Card attribution, when
+    /// composed; without it an unbound writer's `card_ref` is refused.
+    cards: Option<attribution::CardRegistry>,
     /// Non-blocking sink for write-authorization decisions.
     ///
     /// Absent only where no Scribe is attached: a Gate that cannot write also
@@ -358,6 +362,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
             scribe: self.scribe.clone(),
             query: self.query.clone(),
             observations: self.observations.clone(),
+            cards: self.cards.clone(),
             audit: self.audit.clone(),
             limits: self.limits,
             auth: self.auth.clone(),
@@ -413,6 +418,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: Some(scribe),
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -432,6 +438,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: Some(scribe),
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -451,6 +458,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: None,
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -474,6 +482,34 @@ impl<A: GateAudit + 'static> Gate<A> {
     pub fn with_observation_ack(mut self, observations: Arc<dyn ObservationAck>) -> Self {
         self.observations = Some(observations);
         self
+    }
+
+    /// Attaches the tenant registry unbound writers' Card attribution
+    /// resolves against.
+    #[must_use]
+    pub fn with_card_registry(mut self, cards: attribution::CardRegistry) -> Self {
+        self.cards = Some(cards);
+        self
+    }
+
+    /// Resolves the Cards an unbound writer attributes one frame to.
+    ///
+    /// `cards` collects the frame's distinct references; it runs only when a
+    /// registry is composed and the principal is unbound. `None` leaves the
+    /// principal's signed scope in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's validation or unavailability error.
+    async fn attributed_cards(
+        &self,
+        auth: &AuthContext,
+        cards: impl FnOnce() -> Vec<wyrd_spec::reference::CardRef>,
+    ) -> Result<Option<wyrd_spec::reference::CardRefScope>, IngestError> {
+        match &self.cards {
+            Some(registry) => registry.attributed_cards(auth, cards).await,
+            None => Ok(None),
+        }
     }
 
     /// Attaches the sink every write decision is staged on.
@@ -783,9 +819,14 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::span_card_refs(&decoded.request))
+            .await?;
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
-            auth.principal.card_ref_scope(),
+            attributed
+                .as_ref()
+                .or_else(|| auth.principal.card_ref_scope()),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
@@ -798,6 +839,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -817,9 +859,14 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Metrics, "points"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::metric_card_refs(&decoded.request))
+            .await?;
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
-            auth.principal.card_ref_scope(),
+            attributed
+                .as_ref()
+                .or_else(|| auth.principal.card_ref_scope()),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("metric", &error))?;
@@ -832,6 +879,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -851,9 +899,14 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Logs, "records"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::log_card_refs(&decoded.request))
+            .await?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
-            auth.principal.card_ref_scope(),
+            attributed
+                .as_ref()
+                .or_else(|| auth.principal.card_ref_scope()),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
@@ -866,6 +919,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -902,6 +956,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         measured_wire_bytes: usize,
         batch: RecordBatch,
         owner: Option<OtlpDecodeOwner>,
+        attributed_cards: Option<wyrd_spec::reference::CardRefScope>,
     ) -> Result<(), IngestError> {
         self.ensure_open()?;
         if measured_wire_bytes > self.limits.max_frame_bytes {
@@ -923,6 +978,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 authenticated_tenant: auth.tenant,
+                attributed_cards,
                 table,
                 expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
@@ -991,6 +1047,9 @@ impl<A: GateAudit + 'static> Gate<A> {
         }
         let table = TableRef::new(namespace, name);
         self.authorize_record_write(auth, &table).await?;
+        let attributed_cards = self
+            .attributed_cards(auth, || attribution::native_card_refs(&frame.arrow_ipc))
+            .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let observed = self
             .observations
@@ -1003,6 +1062,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             authenticated_tenant: auth.tenant,
+            attributed_cards,
             table,
             expected_schema_fingerprint: None,
             request_id: auth.request_id.clone(),

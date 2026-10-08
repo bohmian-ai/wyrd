@@ -64,6 +64,13 @@ pub struct ScribeIngressFrame {
     pub principal: Principal,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
+    /// Registry-resolved Cards an unbound writer attributes this frame to.
+    ///
+    /// Gate resolves the frame's distinct `card_ref` values against the
+    /// tenant registry when the principal may attribute to any registered
+    /// observation-target Card; each member carries its registry UID. `None`
+    /// for a Card-bound writer, whose signed scope governs instead.
+    pub attributed_cards: Option<wyrd_spec::reference::CardRefScope>,
     /// Requested logical table, unchanged by physical resolution.
     pub table: TableRef,
     /// Fingerprint asserted by an engine-internal producer with no catalog.

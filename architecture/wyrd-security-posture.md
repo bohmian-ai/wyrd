@@ -85,7 +85,10 @@ Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 The first projection grants the built-in `wyrd_default` role
 (`bifrost_table:read`, `bifrost_record:write`, `evals:run`) in the registration
 transaction, so the workload can emit and verify its evidence; its Card scope
-still bounds which Cards it may emit for and verify. Tenant-wide Bifrost query
+still bounds which Cards it may emit for and verify. A principal bound to no
+Card (User, tenant administrator, unbound Service) may attribute evidence to
+any registered observation-target Card in its own tenant; ingest resolves those
+references against the tenant registry, never across tenants. Tenant-wide Bifrost query
 reads come only from an explicit grant of the built-in `workload` role.
 Re-applying a Card never grants the role again, so an administrator's
 revocation stands. A tenant administrator (`*`, not `service_accounts:write`)

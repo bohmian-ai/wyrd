@@ -125,7 +125,10 @@ not a passive integration or inventory product.
     their Agent card and include its declared card refs. Every token mint —
     including the re-exchange a machine performs when its access token expires
     — resolves those bounded scope identities to Card UIDs and signs that
-    mapping.
+    mapping. A principal bound to no Card — a User, a tenant administrator, or
+    an unbound Service — has no bounded scope: it may attribute to any
+    registered observation-target Card in its tenant, which ingest resolves
+    against the tenant registry.
     An observation may carry its subject `card_ref`; when present, the
     server authorizes it against that scope and stamps the mapped `card_uid`.
     Generic telemetry may omit it and retains the authenticated publisher through
@@ -812,7 +815,8 @@ and Run correlation are optional per-row values:
 
 Resolution rule: **tenant and `principal_id` come from the token; a present
 `card_ref` is client-asserted, server-authorized, and resolved from its trusted
-signed scope mapping; absent Card correlation produces null `card_uid`;
+signed scope mapping, or, for a principal bound to no Card, from the tenant
+registry; absent Card correlation produces null `card_uid`;
 `run_id` and `wyrd_request_id` pass through untouched.**
 
 On OTLP input, canonical table projection reads these optional values from the
@@ -859,6 +863,13 @@ Consequences, stated so they stop drifting:
   rotation — resolves each bounded member against the tenant Card registry and
   signs its authoritative UID with the identity. Ingest uses that verified
   in-memory mapping and performs no Card-registry Postgres or cache lookup.
+  A principal bound to no Card (User, tenant administrator, unbound Service)
+  carries no bounded scope; its scope is every registered observation-target
+  Card in its tenant. Gate resolves the distinct `card_ref` values of each
+  frame (at most 32) against the tenant registry before dispatch and hands
+  Scribe the resolved UID-bearing members as that frame's scope, so an
+  unregistered or non-observation Card is refused exactly like a reference
+  outside a signed scope.
 - **This is not the governance token.** `card_ref` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).

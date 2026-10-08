@@ -351,6 +351,7 @@ impl AuditPublisher {
             .map_err(|error| AuditPublicationError::Projection(error.to_string()))?;
         self.scribe
             .ingest_frame(ScribeIngressFrame {
+                attributed_cards: None,
                 principal: publisher_principal(tenant),
                 authenticated_tenant: tenant,
                 table: TableRef::new(BifrostNamespace::Audit, AuditLogTable::NAME),

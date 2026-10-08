@@ -1157,6 +1157,9 @@ pub async fn compose_bifrost(
     .with_audit(Arc::clone(&audit_outbox))
     .with_observation_ack(Arc::new(
         crate::verification::observations::ObservationEnqueue::new(Arc::clone(&observation_runs)),
+    ))
+    .with_card_registry(vala_bifrost_redux::gate::attribution::CardRegistry::new(
+        postgres.wyrd().clone(),
     ));
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {

@@ -94,6 +94,8 @@ fn take_transport_decode_owner(
 struct AdmittedRowContext {
     /// Authenticated principal moved into the retained source.
     principal: wyrd_runtime::Principal,
+    /// Card scope every `card_ref` is authorized and stamped against.
+    card_scope: Option<wyrd_spec::reference::CardRefScope>,
     /// Catalog fingerprint required of the projected source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Stable request identity moved into managed-column stamping.
@@ -306,6 +308,7 @@ impl ScribeImpl {
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
             principal,
+            card_scope,
             expected_schema_fingerprint,
             request_id,
             batch_id,
@@ -324,6 +327,7 @@ impl ScribeImpl {
                 Ok(AdmittedRows::Native(Box::new(NativeAdmittedRows {
                     bytes,
                     principal,
+                    card_scope,
                     expected_schema_fingerprint,
                     request_id,
                     batch_id,
@@ -345,6 +349,7 @@ impl ScribeImpl {
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
                             principal,
+                            card_scope,
                             expected_schema_fingerprint,
                             request_id,
                             receipt_micros,
@@ -547,6 +552,9 @@ impl ScribeImpl {
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
+                    card_scope: frame
+                        .attributed_cards
+                        .or_else(|| frame.principal.card_ref_scope().cloned()),
                     principal: frame.principal,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
@@ -894,6 +902,7 @@ mod tests {
         .expect("decoded-size fixture batch");
         let request_id = RequestId::now_v7();
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),

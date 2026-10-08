@@ -217,6 +217,10 @@ impl Principals {
     /// # Errors
     /// Returns a Wyrd error when the query is invalid, the caller lacks
     /// principal administration, or the read fails.
+    ///
+    /// # Panics
+    /// Never in practice: a query of optional scalar fields always
+    /// URL-encodes.
     pub async fn list(&self, query: &PrincipalQuery) -> Result<PrincipalPage, WyrdError> {
         let query = serde_urlencoded::to_string(query)
             .expect("a principal query of optional scalars always URL-encodes");

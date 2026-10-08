@@ -216,6 +216,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             .scribe()
             .as_ref(),
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table,

@@ -412,6 +412,7 @@ impl CaptureBatch {
             ),
         };
         ScribeIngressFrame {
+            attributed_cards: None,
             principal: Principal::new(id, kind, self.tenant, Vec::new(), PermissionSet::new()),
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),

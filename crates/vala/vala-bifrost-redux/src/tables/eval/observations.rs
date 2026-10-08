@@ -96,7 +96,7 @@ impl ObservationsTable {
         let mut keys = Vec::new();
         for rows in reader {
             let rows = rows.map_err(|_| ScribeError::InvalidFrame)?;
-            let card_uids = resolve_card_uids(&rows, principal, rows.num_rows())?;
+            let card_uids = resolve_card_uids(&rows, principal.card_ref_scope(), rows.num_rows())?;
             let records = rows
                 .column_by_name("record_id")
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>())

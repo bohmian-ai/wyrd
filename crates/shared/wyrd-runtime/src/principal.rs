@@ -212,12 +212,46 @@ impl Principal {
         }
     }
 
+    /// The Cards this principal may attribute observations and verifications to.
+    ///
+    /// A Card-bound Service or Agent and the tenant SYSTEM writer are limited
+    /// to their signed scope. A principal bound to no Card — a tenant
+    /// administrator, a human user, or Card-free tenant automation — may
+    /// attribute evidence to any registered observation-target Card in its own
+    /// tenant, which the write path resolves against the tenant registry.
+    #[must_use]
+    pub fn card_attribution(&self) -> CardAttribution<'_> {
+        match &self.kind {
+            PrincipalKind::Service {
+                card_ref: Some(_),
+                card_ref_scope,
+            }
+            | PrincipalKind::Agent { card_ref_scope, .. }
+            | PrincipalKind::System { card_ref_scope } => CardAttribution::Scoped(card_ref_scope),
+            PrincipalKind::Service { card_ref: None, .. }
+            | PrincipalKind::TenantAdmin
+            | PrincipalKind::User => CardAttribution::AnyRegistered,
+        }
+    }
+
     /// True when this principal is authorized to emit for `card`.
     #[must_use]
     pub fn authorizes_card(&self, card: &CardRef) -> bool {
         self.card_ref_scope()
             .is_some_and(|scope| scope.authorizes(card))
     }
+}
+
+/// Which Cards a principal may attribute observations and verifications to.
+///
+/// Returned by [`Principal::card_attribution`]. The distinction is explicit so
+/// an unbound principal is never mistaken for one with an empty bounded scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardAttribution<'a> {
+    /// Only the members of this signed Card scope.
+    Scoped(&'a CardRefScope),
+    /// Any registered observation-target Card in the principal's tenant.
+    AnyRegistered,
 }
 
 /// Self-describing projection of a principal for request delegation chains.
@@ -269,7 +303,7 @@ impl PrincipalRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
+    use super::{CardAttribution, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
     use crate::permission::{Permission, PermissionSet};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
@@ -375,6 +409,46 @@ mod tests {
         let mut unrelated = service_card_ref();
         unrelated.name = CardName::new("unrelated").expect("static card name is valid");
         assert!(!principal.authorizes_card(&unrelated));
+    }
+
+    /// A Card-bound principal attributes only within its signed scope, while a
+    /// tenant administrator, a user, and Card-free automation may attribute to
+    /// any registered Card rather than to an empty bounded scope.
+    ///
+    /// # Panics
+    /// Panics when a principal kind projects the wrong attribution.
+    #[test]
+    fn only_unbound_principals_attribute_to_any_registered_card() {
+        let own = service_card_ref();
+        let scope = CardRefScope::own(&own);
+        let principal = |kind| {
+            Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                kind,
+                wyrd_spec::DataTenantId::new_v7(),
+                Vec::new(),
+                PermissionSet::new(),
+            )
+        };
+
+        let bound = principal(PrincipalKind::Service {
+            card_ref: Some(own),
+            card_ref_scope: scope.clone(),
+        });
+        assert_eq!(bound.card_attribution(), CardAttribution::Scoped(&scope));
+        for unbound in [
+            PrincipalKind::TenantAdmin,
+            PrincipalKind::User,
+            PrincipalKind::Service {
+                card_ref: None,
+                card_ref_scope: CardRefScope::default(),
+            },
+        ] {
+            assert_eq!(
+                principal(unbound).card_attribution(),
+                CardAttribution::AnyRegistered
+            );
+        }
     }
 
     /// Build the UID-bearing Verifier reference a SYSTEM result frame is

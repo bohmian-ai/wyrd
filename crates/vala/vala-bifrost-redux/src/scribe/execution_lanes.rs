@@ -27,7 +27,7 @@ use crate::scribe::wal::{
 };
 use std::str::FromStr;
 use wyrd_runtime::Principal;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
     CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
@@ -218,6 +218,7 @@ impl ScribeIngressCpuPool {
     ) -> Result<RecordBatch, ScribeError> {
         let IngressDecodeInputs {
             principal,
+            card_scope,
             expected_schema_fingerprint,
             request_id,
             receipt_micros,
@@ -250,6 +251,7 @@ impl ScribeIngressCpuPool {
                     payload,
                     &DecodeContext {
                         principal: &principal,
+                        card_scope: card_scope.as_ref(),
                         expected_schema_fingerprint,
                         request_id: &request_id,
                         window,
@@ -463,8 +465,11 @@ pub(crate) fn decode_native_batch(
 /// The lane moves these into its worker, so they are owned rather than the
 /// borrowed [`DecodeContext`] the decode itself assembles from them.
 pub(crate) struct IngressDecodeInputs {
-    /// Authenticated principal used for scope checks and managed columns.
+    /// Authenticated principal stamped as the writer.
     pub(crate) principal: Principal,
+    /// Card scope every `card_ref` is authorized and stamped against: the
+    /// registry-resolved Cards of an unbound writer, or the signed scope.
+    pub(crate) card_scope: Option<CardRefScope>,
     /// Catalog fingerprint required of the caller-owned source schema.
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
@@ -489,8 +494,11 @@ pub(crate) struct IngressDecodeInputs {
 /// request; every batch of one request stamps the same request identity and
 /// admission instant.
 pub(crate) struct DecodeContext<'a> {
-    /// Authenticated principal used for scope checks and managed columns.
+    /// Authenticated principal stamped as the writer.
     pub(crate) principal: &'a Principal,
+    /// Card scope every `card_ref` is authorized and stamped against: the
+    /// registry-resolved Cards of an unbound writer, or the signed scope.
+    pub(crate) card_scope: Option<&'a CardRefScope>,
     /// Catalog fingerprint required of the caller-owned source schema.
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
@@ -565,7 +573,7 @@ fn decode_rows(
     {
         enforce_canonical_source_contract(rows, definition)?;
     }
-    validate_card_scope(rows, context.principal)?;
+    validate_card_scope(rows, context.card_scope)?;
     let stamped = stamp_correlation_columns(rows, context)?;
     match context.registered_schema {
         Some(registered) => crate::tables::stamp_registered_field_ids(&stamped, registered)
@@ -715,22 +723,27 @@ pub(crate) fn current_receipt_micros() -> Result<i64, ScribeError> {
         })
 }
 
-/// Authorize every client-supplied `card_ref` against the principal's scope.
+/// Authorize every client-supplied `card_ref` against the writer's Card scope.
 ///
 /// A batch without the column carries no Card correlation and is admitted
 /// unchanged. Within the column, a null is a valid uncorrelated row; a present
-/// value must parse under the `CardRef` grammar and name an identity the
-/// principal's verified signed [`CardRefScope`](wyrd_spec::reference::CardRefScope)
-/// authorizes. Authorization is decided for the whole batch before any row is
-/// admitted, so a single denied row refuses the frame.
+/// value must parse under the `CardRef` grammar and name an identity `scope`
+/// authorizes. `scope` is a Card-bound principal's verified signed scope, or
+/// the registry-resolved Cards Gate attached for an unbound writer, so a Card
+/// that is unregistered, of a non-observation kind, or outside the signed
+/// scope is refused alike. Authorization is decided for the whole batch
+/// before any row is admitted, so a single denied row refuses the frame.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardScopeDenied`] when the column is not UTF-8, or
-/// when a row supplies a present value and the principal carries no signed
-/// scope, the value is malformed, or the value lies outside the signed scope.
-/// A batch whose correlation column is entirely null needs no scope.
-fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), ScribeError> {
+/// when a row supplies a present value and there is no scope, the value is
+/// malformed, or the value lies outside the scope. A batch whose correlation
+/// column is entirely null needs no scope.
+fn validate_card_scope(
+    rows: &RecordBatch,
+    scope: Option<&CardRefScope>,
+) -> Result<(), ScribeError> {
     let Some(column) = rows.column_by_name(CARD_REF) else {
         return Ok(());
     };
@@ -743,9 +756,7 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
             // An absent correlation is a valid row: it simply carries no Card.
             continue;
         }
-        let scope = principal
-            .card_ref_scope()
-            .ok_or(ScribeError::CardScopeDenied)?;
+        let scope = scope.ok_or(ScribeError::CardScopeDenied)?;
         let raw = cards.value(index);
         let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardScopeDenied)?;
         if !scope.authorizes(&card) {
@@ -870,6 +881,7 @@ fn stamp_correlation_columns(
         rows,
         &ManagedValues {
             principal,
+            card_scope: context.card_scope,
             request_id,
             receipt_micros,
             caller_run_id,
@@ -1073,27 +1085,26 @@ fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
         .collect()
 }
 
-/// Resolves row card references against the principal's signed Card scope.
+/// Resolves row card references against the writer's Card scope.
 ///
-/// A null row reference resolves to no UID and needs no signed scope, so an
-/// entirely uncorrelated batch resolves without consulting the principal. A
-/// present reference is matched by exact identity — kind, space, name, and
-/// version — against the authenticated principal's verified signed
-/// [`CardRefScope`](wyrd_spec::reference::CardRefScope), and only the UID the
-/// mint signed onto that same member is stamped. Root and secondary members
-/// each stamp their own UID; the principal's root is never substituted for
-/// another identity, and a client-supplied UID is never trusted. Resolution is
-/// decided entirely from signed claims, so it performs no registry IO.
+/// A null row reference resolves to no UID and needs no scope, so an entirely
+/// uncorrelated batch resolves without consulting it. A present reference is
+/// matched by exact identity — kind, space, name, and version — against
+/// `scope`, and only the UID carried on that same member is stamped: the UID
+/// the mint signed for a Card-bound principal, or the registry UID Gate
+/// resolved for an unbound writer. Each member stamps its own UID; a
+/// principal's root is never substituted for another identity, and a
+/// client-supplied UID is never trusted. Resolution performs no IO.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardUnresolved`] when the card column has the wrong
-/// type, or when a row supplies a present reference and the principal carries
-/// no signed scope, the reference is malformed, its identity lies outside the
-/// signed scope, or the matching signed member carries no UID.
+/// type, or when a row supplies a present reference and there is no scope, the
+/// reference is malformed, its identity lies outside the scope, or the
+/// matching member carries no UID.
 pub(crate) fn resolve_card_uids(
     rows: &RecordBatch,
-    principal: &Principal,
+    scope: Option<&CardRefScope>,
     row_count: usize,
 ) -> Result<Vec<Option<String>>, ScribeError> {
     let Some(index) = rows.schema().index_of(CARD_REF).ok() else {
@@ -1110,9 +1121,7 @@ pub(crate) fn resolve_card_uids(
             if cards.is_null(row) {
                 None
             } else {
-                let scope = principal
-                    .card_ref_scope()
-                    .ok_or(ScribeError::CardUnresolved)?;
+                let scope = scope.ok_or(ScribeError::CardUnresolved)?;
                 let raw = cards.value(row);
                 let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
                 if !scope.authorizes(&card) {
@@ -1156,8 +1165,10 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
 
 /// The per-batch values the managed columns are stamped from.
 struct ManagedValues<'a> {
-    /// Authenticated writer stamped as `principal_id` and used to resolve Cards.
+    /// Authenticated writer stamped as `principal_id`.
     principal: &'a Principal,
+    /// Card scope each row's `card_ref` resolves its `card_uid` against.
+    card_scope: Option<&'a CardRefScope>,
     /// Request identity stamped as `wyrd_request_id`.
     request_id: &'a RequestId,
     /// Admission instant stamped as `wyrd_ingested_at`.
@@ -1201,7 +1212,7 @@ fn managed_arrays(
                 ),
                 CARD_UID => Arc::new(StringArray::from(resolve_card_uids(
                     rows,
-                    values.principal,
+                    values.card_scope,
                     row_count,
                 )?)),
                 PRINCIPAL_ID => Arc::new(StringArray::from(vec![
@@ -2174,6 +2185,7 @@ mod tests {
         super::DecodeContext {
             definition: None,
             principal,
+            card_scope: principal.card_ref_scope(),
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
             window: EventTimeWindow::default(),
@@ -2652,6 +2664,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2697,6 +2710,7 @@ mod tests {
             payload,
             &DecodeContext {
                 principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(schema),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2825,6 +2839,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2871,6 +2886,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2909,6 +2925,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2961,6 +2978,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3074,6 +3092,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3115,6 +3134,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3160,6 +3180,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3209,6 +3230,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3290,6 +3312,7 @@ mod tests {
             ipc_payload(&rows_with),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows_with.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3343,6 +3366,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3450,6 +3474,7 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
+                    card_scope: principal.card_ref_scope(),
                     expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
@@ -3515,6 +3540,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3562,6 +3588,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window,
@@ -3601,6 +3628,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window,
@@ -3641,6 +3669,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3691,6 +3720,7 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal.card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3732,6 +3762,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3771,6 +3802,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3816,6 +3848,7 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal().card_ref_scope(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: tight_window,
@@ -3896,6 +3929,7 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
+                    card_scope: principal.card_ref_scope(),
                     expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
@@ -4155,7 +4189,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![Some(forged)]))],
         );
         assert!(matches!(
-            super::validate_card_scope(&rows, &principal),
+            super::validate_card_scope(&rows, principal.card_ref_scope()),
             Err(ScribeError::CardScopeDenied)
         ));
         assert!(matches!(

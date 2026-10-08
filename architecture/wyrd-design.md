@@ -600,10 +600,9 @@ platform plane, and neither plane's credential or token is accepted by the
 other.
 
 Both planes write their authorization decisions to the one canonical audit
-path: `vala.audit_staging`, then `AuditPublisher` into
-`vala.system.audit_log`. Permissions are blocking; audits are non-blocking:
-a decision is staged on the shared audit outbox and never delays or fails
-the operation. A decision records the deciding principal's
+path: the in-memory Scribe outbox into `vala.system.audit_log`. Permissions
+are blocking; audits are non-blocking: a decision is staged on the shared
+Scribe outbox and never delays or fails the operation. A decision records the deciding principal's
 stored kind and, when its token was minted from a credential, that
 credential's non-secret id.
 
@@ -1182,18 +1181,19 @@ and any fitted Drift baseline. Parsed Verifiers are cached per process by
 tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
 shared across tenants. A deleted Verifier terminates the run `errored`.
 
-A run's result is decided once. When execution completes, the runner encodes
-the result and stores it, with its result ID, event time, batch IDs, and
-Arrow IPC bytes, in `wyrd.verifier_run_results` in one lease-fenced
-transaction before writing any of it. A stale lease stores nothing. Any later
-claimant of a run with a stored result writes those stored batches instead of
-executing again, so Scribe's batch fence absorbs every repeat. The settlement
-that completes or terminates the run deletes the stored result. While a run is
-in flight, one statement per tenant renews its leases on the PostgreSQL clock
-once a third of the lease has passed. An expired lease is never revived, and a
-renewal that no longer finds a run's token cancels that run's work. A run
-holds a connection only to claim, store, settle, and renew. The store and the
-settlement retry with backoff while the lease holds.
+When execution completes, the runner builds the result once, with one result
+ID and event time, stages it on the process Scribe outbox attributed to the
+tenant SYSTEM principal and the exact Verifier, and settles the run at once:
+settlement never waits for Scribe. The outbox writes the result tables through
+the same in-memory path as audit and gateway capture, so a result Scribe has
+not acknowledged is lost on abrupt process death or an expired shutdown
+deadline, and that loss never changes the settled run. A realtime Verifier
+invocation stages its result the same way. While a run is in flight, one
+statement per tenant renews its leases on the PostgreSQL clock once a third of
+the lease has passed. An expired lease is never revived, and a renewal that no
+longer finds a run's token cancels that run's work. A run holds a connection
+only to claim, settle, and renew. The settlement retries with backoff while
+the lease holds.
 
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +

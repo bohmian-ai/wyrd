@@ -104,7 +104,9 @@ async fn strings(
 /// completion there. The call row reaches `vala.gateway.calls` and its attempt
 /// span `vala.traces.spans` on the scribe pod through the capture-only peer
 /// RPC, both stamped with the reserved capture principal and the admitting
-/// request, and read back through the oracle pod's public query path.
+/// request, and read back through the oracle pod's public query path. The
+/// oracle pod's authorization decision for the call travels the same peer
+/// route into `vala.system.audit_log`.
 ///
 /// # Panics
 ///
@@ -228,5 +230,38 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
             "{table} holds exactly the call's capture, stamped with the capture principal"
         );
     }
+
+    let decisions = loop {
+        gateway
+            .await_audit_retained()
+            .await
+            .expect("the gateway pod's Scribe outbox settles");
+        scribe
+            .flush_bifrost()
+            .await
+            .expect("the scribe pod flushes");
+        let decisions = gateway
+            .retained_audit_records(
+                gateway.data_tenant_id(),
+                "outcome",
+                &format!("request_id = '{request_id}'"),
+            )
+            .await
+            .expect("retained audit reads");
+        if !decisions.is_empty() {
+            break decisions;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call's decision never reached retained audit through the peer Scribe"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(
+        decisions
+            .iter()
+            .all(|row| row == &[Some("allowed".to_owned())]),
+        "the call's authorization decision is retained as allowed: {decisions:?}"
+    );
     cluster.shutdown().await.expect("cluster shuts down");
 }

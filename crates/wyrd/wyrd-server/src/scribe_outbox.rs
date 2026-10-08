@@ -832,11 +832,16 @@ mod tests {
     use chrono::Utc;
     use vala_bifrost_redux::contracts::ScribeError;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+    use wyrd_runtime::audit::AuditStage;
+    use wyrd_spec::auth::{
+        GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag,
+    };
     use wyrd_spec::gateway::GatewayCaptureMode;
     use wyrd_spec::ids::{CardUid, VerificationResultId};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::verification::DriftWindow;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
     use wyrd_sql::queries::verifier_runs::RunInput;
     use wyrd_tonic::tonic::Code;
 
@@ -972,6 +977,58 @@ mod tests {
                 .iter()
                 .all(|frame| frame.batch_id.get_version_num() == 7)
         );
+    }
+
+    /// One allowed decision for `operation`, attributed to a fresh principal.
+    fn decision(operation: &str) -> AuditEvent {
+        AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            operation.to_owned(),
+            "bifrost".to_owned(),
+            None,
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKindTag::User,
+            operation.to_owned(),
+            AuditOutcome::Allowed,
+        )
+    }
+
+    /// Proves audit decisions stage through the [`AuditStage`] seam and frame
+    /// like every other write: each tenant slice's decisions share one
+    /// `vala.system.audit_log` frame under the platform audit principal with
+    /// no Card scope, the reserved system owner's decisions travel in their
+    /// own frame, and every frame carries a v7 content identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frames, their rows, or attribution differ.
+    #[tokio::test]
+    async fn audit_decisions_frame_under_the_platform_audit_principal() {
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
+        let audit: &dyn AuditStage = &*outbox;
+        let tenant = DataTenantId::new_v7();
+        audit.stage(tenant, decision("bifrost.query.read_decision"));
+        audit.stage(tenant, decision("bifrost.record.write"));
+        audit.stage(DataTenantId::SYSTEM_OWNER, decision("platform.authorize"));
+        settle(&outbox).await;
+
+        let mut frames = scribe
+            .received()
+            .into_iter()
+            .map(|frame| {
+                assert_eq!(frame.table, "vala.system.audit_log");
+                assert_eq!(frame.principal, PLATFORM_AUDIT_PRINCIPAL);
+                assert!(frame.card_scope.is_empty());
+                assert_eq!(frame.batch_id.get_version_num(), 7);
+                (frame.tenant, frame.rows)
+            })
+            .collect::<Vec<_>>();
+        frames.sort_unstable();
+        let mut expected = vec![(tenant, 2), (DataTenantId::SYSTEM_OWNER, 1)];
+        expected.sort_unstable();
+        assert_eq!(frames, expected);
     }
 
     /// Proves a retryable refusal replays the identical slice: the refused

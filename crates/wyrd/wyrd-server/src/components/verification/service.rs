@@ -8,7 +8,7 @@
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
-use wyrd_runtime::Permission;
+use wyrd_runtime::{CardAttribution, Permission};
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -472,7 +472,7 @@ impl<'a> VerificationControl<'a> {
         let subject = Self::card(&mut conn, &request.subject_card_uid).await?;
         drop(conn);
         if let Some(subject) = &subject
-            && caller.principal.card_ref().is_some()
+            && caller.principal.card_attribution() != CardAttribution::AnyRegistered
             && !caller.principal.authorizes_card(&exact_ref(subject))
         {
             self.stage_decision(caller, EXECUTE, resource, AuditOutcome::Denied);
@@ -569,7 +569,7 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         target: &VerificationRunTarget,
     ) -> Result<bool, WyrdError> {
-        if caller.principal.card_ref().is_none() {
+        if caller.principal.card_attribution() == CardAttribution::AnyRegistered {
             return Ok(true);
         }
         let Some(subject) = self

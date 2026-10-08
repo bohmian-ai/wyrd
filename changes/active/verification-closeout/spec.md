@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-closeout
-revision: 1
+revision: 2
 status: approved
 approved: 2026-10-08
 ---
@@ -64,18 +64,30 @@ pub type ScribeOutbox = Outbox<ScribeSink>;
 ```
 
 Audit records, gateway captures, queued Eval and Drift results, and realtime
-Verifier results enter `ScribeOutbox`. `ScribeOutbox` retains the existing
-`Outbox<S>` behavior: it groups accepted items by tenant, supplies batches to
-its sink, retries failed sink writes, and drains during orderly shutdown.
+Verifier results enter `ScribeOutbox` as logical `ScribeWrite` values.
+`ScribeOutbox` retains the existing `Outbox<S>` behavior: `stage()` only places
+an item on its in-memory channel, the background worker continuously groups
+accepted items by tenant, and orderly shutdown drains accepted work to its
+deadline.
 
-`ScribeSink` sends those batches to the in-process Scribe when local and to a
-Scribe peer otherwise. A producer never waits for Scribe acknowledgement and a
-Scribe failure never changes the originating request or verdict.
+`ScribeSink` is the batching boundary. It groups the tenant slice by destination,
+encodes Arrow batches, assigns deterministic batch identities, and pushes each
+batch to the in-process Scribe when local or to a Scribe peer otherwise. The
+existing Scribe ingress remains the only owner of item admission, byte limits,
+memory accounting, WAL persistence, and acknowledgement. `ScribeOutbox` adds no
+second Scribe admission or memory reservation.
 
-Domain owners remain responsible for producing their canonical Scribe batch,
-including audit integrity fields and verification attribution. They do not own
-a separate Scribe publisher, retry loop, deadline-bound delivery loop, or
-transport.
+Domain owners remain responsible for validated domain values and attribution;
+they do not encode or deliver Arrow batches. A producer never waits for Scribe
+acknowledgement, and a Scribe failure never changes the originating permission
+decision, gateway call, run settlement, or verdict.
+
+This path deliberately has no PostgreSQL intermediary. Work buffered only in
+`ScribeOutbox` may be lost on abrupt process death or after the orderly-shutdown
+deadline. Observable rejection and shutdown loss are logged and counted;
+abrupt process loss is inherently not observable by that process. Once Scribe
+accepts a batch, Scribe's existing WAL and storage lifecycle own durability. A
+future durable outbox is a separate change if operational evidence requires one.
 
 ### REQ-005 — Observation runs remain separate
 
@@ -99,6 +111,11 @@ Every completed queued or direct judgment produces its canonical result and
 detail batches through `ScribeOutbox`. Direct execution still creates no
 durable verification run, performs no sampling, and dispatches no Operator.
 Its response is built independently of the non-blocking result write.
+
+A queued run settles after its logical result has been staged in memory. It
+does not retain encoded result bytes in PostgreSQL and does not wait for Scribe
+acknowledgement. The accepted best-effort contract therefore permits a settled
+run's analytical result to be absent after abrupt process loss.
 
 Result rows use the application Run as their managed `run_id` when one exists:
 the observed Run for continuous Eval and the caller's Run for direct
@@ -221,22 +238,41 @@ error.
 
 1. `ScribeOutbox` is the existing in-process `Outbox<S>` specialized with one
    `ScribeSink`; it is not a new persistence product.
-2. One staged item is a canonical Scribe batch, not one analytical row.
-   `Outbox<S>` groups items per tenant and calls the sink with a slice.
-3. `ScribeSink` owns both in-process and peer routing. Producers own projection,
-   schema validation, attribution, and stable batch identity only.
-4. The existing outbox worker owns continuous consumption, retry, metrics, and
-   orderly drain. No second `ScribeConsumer`, polling loop, claim size, lease,
-   `SKIP LOCKED`, or publication-concurrency mechanism is introduced.
-5. Audit preparation retains its ordered hash-chain and canonical audit
-   projection. Queued results retain their run/lease settlement guarantees.
-   Neither retains a separate route or Scribe publication loop.
-6. Gateway capture no longer drops Scribe delivery at the originating call's
-   deadline. Once staged, it follows the same outbox retry contract.
-7. Realtime result recording uses the same outbox and remains best effort
-   across abrupt process loss; it never changes the returned Judgment.
-8. Observation-run enqueueing remains a second `Outbox<S>` instance because
+2. `ScribeWrite` is the closed logical input set for audit events, gateway
+   captures, and verification results. It is not an Arrow batch and is not a
+   generic destination envelope.
+3. The existing outbox worker continuously drains its in-memory channel and
+   supplies each tenant's pending logical writes to `ScribeSink`. Each closed
+   variant maps to a fixed destination set; `ScribeSink` groups the resulting
+   rows by destination and encodes complete Arrow batches. No producer performs
+   one Scribe call per analytical row.
+4. `ScribeSink` owns deterministic batch identity and both in-process and peer
+   routing. A retry of a failed sink write must use the identical logical slice
+   so every destination batch retains the same identity; later arrivals wait
+   for a subsequent sink write.
+5. Existing Scribe ingress owns capacity admission and memory accounting. The
+   outbox and sink acquire no Scribe memory lease and add no capacity setting.
+6. Retryable Scribe failures use the existing outbox retry/backoff lifecycle.
+   A terminal Scribe rejection is logged, counted, and consumed so one invalid
+   write cannot block all later writes for that tenant.
+7. `vala.audit_staging`, its chain head/publication progress, `AuditPublisher`,
+   and the gapless audit hash-chain fields are retired. Retained audit history
+   remains `vala.system.audit_log`, containing the authorization-decision
+   content without `seq`, `entry_hash`, or `prev_hash`.
+8. `wyrd.verifier_run_results` and runner-owned Scribe publication are retired.
+   A queued run settles once its result is staged on `ScribeOutbox`.
+9. Gateway capture no longer owns a deadline-bound delivery loop. Realtime
+   result recording uses the same best-effort path and never changes the
+   returned Judgment.
+10. Observation-run enqueueing remains a second `Outbox<S>` instance because
    its sink schedules PostgreSQL work rather than writing Scribe evidence.
+11. No PostgreSQL Scribe queue, consumer poller, claim size, lease,
+    `SKIP LOCKED`, new publication concurrency, or second admission governor is
+    introduced. Existing unconsumed staging rows may be discarded when the
+    retired tables are removed; already retained Scribe history is untouched.
+12. `ScribeOutbox` retains the existing unbounded in-memory queue. This change
+    adds no queue-capacity setting; a prolonged retryable Scribe outage can grow
+    producer-process memory until delivery resumes or the process stops.
 
 ### R4 verification and journey decisions
 
@@ -309,9 +345,10 @@ span, gateway call, and both verdicts join by application Run.
   producers never wait for Scribe and never fail their originating operation
   because Scribe is unavailable.
 - **INV-003 — Existing batching model.** `ScribeOutbox` uses the existing
-  per-tenant batched `OutboxSink::write` contract. This change adds no claim
-  protocol, polling publisher, durable generic staging table, or new
-  concurrency mechanism.
+  per-tenant `OutboxSink::write` contract, and `ScribeSink` converts each
+  tenant slice into destination-specific Arrow batches. This change adds no
+  claim protocol, polling publisher, durable staging table, or new concurrency
+  mechanism.
 - **INV-004 — One delivery owner.** Only `ScribeSink` chooses local versus peer
   Scribe and owns Scribe delivery retry behavior.
 - **INV-005 — Stable write identity.** A retry reuses the same Scribe batch
@@ -319,6 +356,11 @@ span, gateway call, and both verdicts join by application Run.
 - **INV-006 — Observation work is not evidence delivery.** Observation-run
   enqueueing remains independently drainable and cannot be delayed by Scribe
   delivery.
+- **INV-007 — One admission owner.** Only existing Scribe ingress admits batch
+  items and bytes. The producer outbox performs no Scribe capacity reservation.
+- **INV-008 — Explicit best effort.** Before Scribe acknowledgement, audit,
+  capture, and verification-result writes are process-memory state and may be
+  lost on abrupt process death without changing their originating operation.
 
 ## Scope and non-goals
 
@@ -327,6 +369,8 @@ Included:
 - the R3 principal, role, authentication-adapter, Card-attribution, local-flow,
   and public-client closeout;
 - the R3A shared Scribe outbox and removal of producer-specific Scribe delivery;
+- retirement of audit and verification-result PostgreSQL staging and the audit
+  hash-chain-only analytical fields;
 - the R4 verification, correlation, gateway, telemetry, declared-table, and
   canonical support-desk outcomes.
 
@@ -334,11 +378,13 @@ Excluded:
 
 - a new durable generic Scribe staging system, claims, leases, polling, or
   publication concurrency;
+- a second memory governor, outbox capacity setting, Scribe admission policy,
+  or producer-specific delivery guarantee;
 - new MCP tools or an SDK MCP abstraction;
 - Workflow-step correlation;
 - Agent tool-calling or structured output;
 - metrics or log-provider setup in the telemetry helper;
-- table evolution, table dropping, layout, or compaction controls;
+- unrelated table evolution, table dropping, layout, or compaction controls;
 - compatibility aliases for retired routes, roles, or behavior;
 - UI work.
 
@@ -352,8 +398,10 @@ Excluded:
   test-only Bifrost flush.
 - **AC-003.** Focused server tests prove audit, gateway capture, queued
   Eval/Drift results, and realtime results all enter `ScribeOutbox`; its sink
-  delivers batches through local and peer routes; failure retries through the
-  existing outbox; observation-run enqueueing remains separate.
+  batches logical writes and delivers them through local and peer routes;
+  retryable failure reuses the identical batch identity; terminal rejection
+  cannot poison later tenant writes; existing Scribe admission remains the
+  only capacity owner; observation-run enqueueing remains separate.
 - **AC-004.** Focused server tests prove declared tables, realtime-only
   bindings, unbound-writer Eval activation, application-Run result identity,
   stored realtime verdicts, gateway correlation, and gateway-owned judge
@@ -369,6 +417,12 @@ Excluded:
 None.
 
 ## Revision history
+
+- **Revision 2 — 2026-10-08.** Approved the in-memory best-effort Scribe path:
+  `ScribeSink` batches logical writes and pushes them through existing local or
+  peer Scribe ingress, with no PostgreSQL intermediary or duplicate admission.
+  Audit staging/hash-chain publication and queued-result staging are retired;
+  observation-run scheduling remains PostgreSQL-backed.
 
 - **Revision 1 — 2026-10-08.** Approved consolidation of TASK-017 R3, the
   shared R3A Scribe outbox, and TASK-017 R4 into a three-task closeout packet.

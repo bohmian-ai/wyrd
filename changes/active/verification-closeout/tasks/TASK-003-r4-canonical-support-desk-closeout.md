@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-verification-closeout
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, INV-001, AC-004, AC-005, AC-006]
 depends_on: [TASK-001, TASK-002]
 provenance: TASK-017-R4
@@ -203,7 +203,7 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 - AC-004, AC-005, and AC-006 pass.
 - No task-local result sink, gateway transport, auth model, or telemetry
   provider duplicates Task 1 or Task 2 ownership.
-- Direct execution stores exactly one result through `ScribeOutbox` and creates
+- Direct execution stages exactly one result through `ScribeOutbox` and creates
   no durable verification run, observation, or Operator dispatch.
 - The support-desk journeys use the same story and observable outcomes in all
   three SDKs and no test-only publication hook.
@@ -259,7 +259,7 @@ inside this task.
 
 ## Authority Links
 
-- `../spec.md` revision 1: REQ-006..010, AC-004..006
+- `../spec.md` revision 2: REQ-006..010, AC-004..006
 - `AGENTS.md`; `architecture/agent-rules.md`;
   `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;
   `architecture/bifrost-design.md`;

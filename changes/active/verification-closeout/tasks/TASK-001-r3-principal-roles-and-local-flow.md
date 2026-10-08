@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-verification-closeout
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-001, REQ-002, REQ-003, AC-001, AC-002]
 depends_on: []
 provenance: TASK-017-R3
@@ -203,7 +203,7 @@ collector. Broad lanes above do not replace those focused Red/Green commands.
 
 ## Authority Links
 
-- `../spec.md` revision 1: REQ-001..003, AC-001..002
+- `../spec.md` revision 2: REQ-001..003, AC-001..002
 - `AGENTS.md`; `architecture/agent-rules.md`;
   `architecture/wyrd-security-posture.md`; `architecture/wyrd-design.md`;
   `TESTING.md` (definitive Wyrd guide for test ergonomics,

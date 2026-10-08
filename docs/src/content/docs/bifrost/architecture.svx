@@ -314,23 +314,25 @@ Tenancy is a property of the physical table, of each Parquet file, and of each i
 ## Audit data
 
 Audit records authorization decisions. Every boundary that evaluates a
-principal's permission stages exactly one decision on the server's process
-audit outbox once the decision is known, and returns its result or refusal
-without waiting for the audit commit. The outbox commits each tenant's
-decisions in order as immutable, hash-chained rows in `vala.audit_staging`.
-Redux owns the canonical `vala.system.audit_log` table definition and
-deterministic row projection.
+principal's permission stages exactly one decision in memory on the server's
+process Scribe outbox once the decision is known, and returns its result or
+refusal without waiting for the audit write. The outbox's one background writer
+groups each tenant slice by destination, encodes Arrow frames with
+content-derived batch ids, and submits them to the local Scribe or to a Scribe
+pod over the peer plane, which writes them to `vala.system.audit_log` under the
+platform audit principal. Redux owns the canonical `vala.system.audit_log`
+table definition and deterministic row projection.
 
-The audit row captures: operation name, principal ID, tenant, timestamp,
-decision (allow/deny), result, and detail field. Permissions block; audits do
-not. An audit write that fails never refuses or delays the operation: the
-outbox retries it with backoff until it commits. A commit that returns an error
-is resolved from Postgres transaction status first, so a committed decision is
-never written twice and each decision is retained once. A decision is lost only
-at abrupt process loss, when graceful shutdown reaches its deadline with it
-unwritten, or when Postgres no longer holds the status of its failed commit. Engine-internal transitions —
-Scribe batch commits, Forge maintenance, audit publication — evaluate no
-permission and record lineage in their own operational tables instead.
+The audit row carries only decision content: request and trace IDs, operation,
+resource, audit Card, principal ID and kind, permission, outcome, detail, and
+credential ID, with `wyrd_event_time` set to the decision time. Permissions
+block; audits do not. An audit write that fails never refuses or delays the
+operation: a retryable failure resubmits the identical slice, which Scribe's
+batch-id fence absorbs, and a terminal rejection is logged, counted, and
+consumed. Writes Scribe has not acknowledged are lost on abrupt process death
+or an expired shutdown deadline; observable loss is counted. Engine-internal
+transitions — Scribe batch commits, Forge maintenance — evaluate no permission
+and record lineage in their own operational tables instead.
 
 ## Payload governance
 

@@ -36,7 +36,7 @@ active insertion. It does not wait for staging, object publication, Iceberg
 promotion, or compaction. WAL retirement occurs only after every member in the
 rotation cohort has a validated staged replacement registered for live-tail
 reads. Staged authority switches to the published hot object only after the
-fenced `file_list` and audit transaction commits or reconciles as identical.
+fenced `file_list` transaction commits or reconciles as identical.
 
 Scribe writes 32 MiB logical or 131,072-row Parquet row groups and combines
 compatible same-node staged runs into approximately 512 MiB immutable hot

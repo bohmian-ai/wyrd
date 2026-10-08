@@ -38,7 +38,7 @@ wyrd-sql
 
 wyrd-server
   HTTP handlers, TenantConn acquisition,
-  transactional credential/audit writes, error mapping
+  transactional credential writes, audit staging, error mapping
 ```
 
 Shared auth crates do not depend on SQL. Tenant permissions are resolved once,

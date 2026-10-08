@@ -91,20 +91,19 @@ Audit is foundational across CLI, UI, MCP, Python SDK, TypeScript SDK,
 `wyrd-server`, and Vala surfaces, and it records authorization decisions rather
 than engine mechanics. Every decision that evaluates a principal's permission
 stages one row — allowed and denied alike — once the decision is known, outside
-the operation's transaction; a decision that fails to commit is logged and
+the operation's transaction; a decision whose write fails is logged and
 counted and never fails the operation.
 Engine-internal transitions that evaluate no permission are lineage in their
 own operational tables, never audit.
 
-Every surface stages its decision on the one process audit outbox, which is
-the canonical append's only caller, so an authorized call is never refused or
-delayed by the write. Do not create alternative audit writers.
+Every surface stages its decision in memory on the one process Scribe outbox,
+whose one background writer submits it to Scribe, so an authorized call is
+never refused or delayed by the write. Do not create alternative audit writers.
 
-`vala.audit_staging` is transient write-ahead state. Retained history is the
-tenant-qualified Bifrost `vala.system.audit_log` projection, published through
-Scribe and Forge. Staged rows are garbage-collected once the per-tenant
-watermark has advanced past them. Agent-facing audit reads never treat staging
-or a legacy direct-Iceberg projection as a second historical authority.
+Retained history is the tenant-qualified Bifrost `vala.system.audit_log` table,
+written only through Scribe. No audit staging table or publisher exists.
+Agent-facing audit reads never treat a legacy direct-Iceberg projection as a
+second historical authority.
 
 ## Repository Guidance
 

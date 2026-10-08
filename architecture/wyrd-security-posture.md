@@ -93,7 +93,7 @@ reads come only from an explicit grant of the built-in `workload` role.
 Re-applying a Card never grants the role again, so an administrator's
 revocation stands. A tenant administrator (`*`, not `service_accounts:write`)
 grants further roles to a Card-bound principal with `POST /v1/auth/grant-role`
-(`wyrd auth grant-role`); the decision is staged on the audit outbox as
+(`wyrd auth grant-role`); the decision is staged on the Scribe outbox as
 `auth.principal.role.grant`, and the role reaches tokens at the next key
 exchange.
 Credential issuance is a separate privileged operation and is policy-gated.
@@ -461,42 +461,40 @@ the Wyrd gateway, and a `wyrd_gateway` request never carries binding secrets.
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
 engine mechanics. Permissions are blocking; audits are non-blocking. Every
-audited surface stages its decision on the one process audit outbox once the
-decision is known, outside the operation's transaction, and never waits for
-the commit. The outbox has no count limit: a tenant batch whose commit fails
-stays at the front of that tenant's queue and is retried with backoff while
-other tenants keep committing, each failed attempt logged with its tenant and
-counted in `outbox_write_failures_total{outbox="audit"}`. A commit that returns
-an error is resolved from Postgres transaction status (`pg_xact_status`) before
-any retry: a committed batch is not written again, an aborted one is retried,
-and the writer waits while the outcome is still unknown. Each decision is
-therefore staged and retained once. A decision is lost only at abrupt process
-loss, when graceful shutdown reaches its deadline with it still unwritten, or
-when Postgres no longer holds the status of its failed commit; each is counted
-in `outbox_events_lost_total{outbox="audit"}`. Scribe batch commits and Forge
-maintenance transitions evaluate no permission: they are recorded as lineage
-in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no audit
-event.
+audited surface stages its decision in memory on the one process Scribe outbox
+once the decision is known, outside the operation's transaction, and never
+waits for the write. The outbox queue is unbounded. Its one background writer
+groups each tenant slice by destination, encodes Arrow frames with
+content-derived batch ids, and submits them to the local Scribe or over the
+mutually authenticated peer plane to a Scribe pod. A retryable failure is
+logged with its tenant, counted in `outbox_write_failures_total{outbox="scribe"}`,
+and resubmitted as the identical slice, which Scribe's durable batch-id fence
+absorbs when the earlier acknowledgement was lost. A terminal rejection is
+logged, counted in `outbox_events_lost_total{outbox="scribe"}`, and consumed.
+Writes Scribe has not acknowledged are lost on abrupt process death or when
+graceful shutdown reaches its deadline; observable loss is counted, and loss
+never changes the originating permission decision. Scribe batch commits and
+Forge maintenance transitions evaluate no permission: they are recorded as
+lineage in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no
+audit event.
 
 Oracle query admission, gateway invocation and administration, and direct
 verification execution follow the same rule with no surface-specific
 exception: each evaluates its permission synchronously before protected work
-and stages its decision on the process outbox. No surface-specific audit WAL,
-disk spool, durable queue, relay, table, publisher, or sink exists.
+and stages its decision on the process outbox. No audit staging table,
+publisher, surface-specific WAL, disk spool, durable queue, relay, or sink
+exists.
 
-`vala.audit_staging` is transient transactional write-ahead state with no
-external consumer. Retained audit history lives in the
-tenant-qualified Bifrost `vala.system.audit_log` table. A bounded publisher in a
-process owning a local Scribe moves events idempotently into that table through
-that Scribe, never through Gate. Progress is the monotonic per-tenant watermark
-plus at most one frozen in-flight upper bound, which every competing or
-restarted publisher reuses so the replayed range and its batch identity are
-identical; rows appended above the bound wait for the next batch. One tenant
-transaction advances the watermark, clears the matching bound, and
-garbage-collects through the watermark; a replayed range is absorbed by Scribe's
-durable batch-id dedup fence.
-Because publication evaluates no new permission, it appends no audit event and
-retained history cannot feed itself. A legacy direct-Iceberg relay and
+Retained audit history lives in the tenant-qualified Bifrost
+`vala.system.audit_log` table, written only through Scribe, never through Gate.
+Audit frames are submitted under the platform audit principal, the one
+principal Scribe admits for the reserved system owner's audit history. A row
+carries only decision content (request, trace, operation, resource, audit Card,
+principal, permission, outcome, detail, and credential id) with
+`wyrd_event_time` set to the decision time; there is no chain, sequence, or
+publication progress, and readers order by decision time. Because the outbox
+writer evaluates no new permission, it appends no audit event and retained
+history cannot feed itself. A legacy direct-Iceberg relay and
 `platform.audit_log` are not alternate historical authorities.
 
 Audit schemas minimize personal data. They store typed identities and decisions,
@@ -504,9 +502,8 @@ not credentials, raw prompts, request bodies, Source payloads, or unnecessary
 personal attributes. Classification determines field retention and export
 controls. Where a legal erasure obligation applies, encrypted supplemental
 personal fields use tenant- or subject-scoped envelope keys that can be
-destroyed while the minimal immutable event, sequence, and hash-chain evidence
-remain. Erasure is itself audited and never rewrites or silently breaks the
-chain.
+destroyed while the minimal immutable decision event remains. Erasure is
+itself audited and never rewrites the retained event.
 
 ## Cryptography and secret handling
 
@@ -525,8 +522,8 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer context refusal, tenant-tripwire failure, audit outbox write failure, audit-chain or
-publication failure, SSRF rejection, secret-resolution failure, and privileged
+peer context refusal, tenant-tripwire failure, Scribe outbox write failure or
+counted loss, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 
 Each event has a bounded-cardinality metric, structured redacted log, trace

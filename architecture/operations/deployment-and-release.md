@@ -127,10 +127,10 @@ transaction-pooled path.
   loss and invokes recovery; it is not a clean restart.
 - Oracle has a bounded, encrypted scratch volume for spill. Spill is disposable
   after query termination; Oracle keeps no durable local audit state.
-- Audit projection uses the current Scribe and Forge publication path to write
-  retained `vala.system.audit_log` history. Deployment readiness includes
-  durable idempotent publication and bounded staging retirement;
-  `vala.audit_staging` is not retained history.
+- Audit history is written to retained `vala.system.audit_log` through the
+  process Scribe outbox and Scribe. No pod holds durable local audit state;
+  writes Scribe has not acknowledged are lost on abrupt process death or an
+  expired shutdown deadline, and that loss is counted.
 - Forge requires no local scratch volume: managed compaction does not enable
   DataFusion disk spilling. Its pod memory limit remains the final physical
   boundary behind estimated-memory admission.
@@ -227,7 +227,7 @@ journeys against the published registry digest named in its manifest.
   cannot decode; an old worker cannot claim work whose writer requires newer
   semantics.
 - Rollout proceeds by role and limits unavailable capacity so Scribe admission,
-  Oracle interactive capacity, Forge lease progress, and audit publication remain
+  Oracle interactive capacity, Forge lease progress, and Scribe outbox writes remain
   within their service objectives.
 - Readiness is removed before connection drain. Shutdown stops new admission,
   cancels or hands off bounded work according to its owner, waits for durable
@@ -248,7 +248,7 @@ A production release records:
 - security-key and peer compatibility checks;
 - targeted user journeys for enabled surfaces;
 - Scribe recovery, Oracle cancellation/peer-loss, Forge reconciliation, and
-  audit publication evidence; and
+  Scribe outbox write and loss evidence; and
 - rollout owner, rollback boundary, and incident contacts.
 
 Passing unit tests alone does not establish deployment readiness.

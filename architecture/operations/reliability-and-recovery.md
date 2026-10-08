@@ -28,9 +28,10 @@ defaults may aid development but never become an implicit production promise.
 At minimum, deployments measure:
 
 - HTTP/gRPC/MCP availability and latency by bounded route family and outcome;
-- authentication, permission, and policy availability, and audit outbox health:
+- authentication, permission, and policy availability, and Scribe outbox
+  health for audit, gateway capture, and Verifier result writes:
   `outbox_pending`, `outbox_write_failures_total`, and
-  `outbox_events_lost_total`, each labelled `outbox="audit"`;
+  `outbox_events_lost_total`, each labelled `outbox="scribe"`;
 - Scribe admission latency, queue age, fairness, WAL fsync latency, staged-run
   age, persistence lag, object publication, replay, and rejection;
 - Oracle interactive and analytical queue age, execution latency, result
@@ -42,8 +43,7 @@ At minimum, deployments measure:
   snapshot expiry, and orphan cleanup;
 - Postgres saturation, replication health, migration state, transaction
   failures, and RLS/role verification;
-- object-store latency, throttling, integrity failure, and capacity;
-- audit-staging publication lag and failure outcome; and
+- object-store latency, throttling, integrity failure, and capacity; and
 - backup age, backup verification, restore duration, and recovery-point age.
 
 Tenant, table, query, object path, task, attempt, and principal identities do
@@ -71,9 +71,9 @@ Overload is bounded and explicit:
   protected resource floor.
 - Postgres and external dependencies use bounded pools, timeouts, and
   backpressure. An exhausted dependency does not trigger unbounded retries or
-  queue growth, with one deliberate exception: the audit outbox has no count
-  limit and retries with capped backoff, because holding a decision in memory
-  is preferred to dropping it.
+  queue growth, with one deliberate exception: the Scribe outbox queue is
+  unbounded and resubmits a retryable failure as the identical slice, because
+  holding a write in memory is preferred to dropping it.
 
 When a protected floor, durable volume, or safety invariant is
 exhausted, the responsible surface rejects new work. It does not borrow across
@@ -110,19 +110,18 @@ Restore proceeds under write isolation:
    evidence before mutation.
 2. Restore keys and trust configuration required to verify, but not yet serve,
    the recovered state.
-3. Restore Postgres and verify migrations, roles, RLS, sentinels, audit chains,
+3. Restore Postgres and verify migrations, roles, RLS, sentinels,
    task/lease state, and catalog pointers.
 4. Restore or select the object-store version set and verify every referenced
    Iceberg metadata, manifest, and data object.
-5. Reconcile `vala.audit_staging` with retained `vala.system.audit_log` history.
-6. Attach each Scribe volume to its stable node identity; replay WAL and staged
+5. Attach each Scribe volume to its stable node identity; replay WAL and staged
    runs without accepting traffic.
-7. Reconcile Scribe publications, Forge attempts and uncertain commits,
+6. Reconcile Scribe publications, Forge attempts and uncertain commits,
    snapshot cleanup cursors, and orphan protection sets.
-8. Rebuild disposable indexes and caches from authoritative state.
-9. Run tenant-isolation, append/replay, pinned-query, audit, and SDK journeys.
-10. Admit traffic by role only after the restored state satisfies the approved
-    recovery point and time objectives.
+7. Rebuild disposable indexes and caches from authoritative state.
+8. Run tenant-isolation, append/replay, pinned-query, audit, and SDK journeys.
+9. Admit traffic by role only after the restored state satisfies the approved
+   recovery point and time objectives.
 
 If Postgres and object storage cannot be reconciled to one safe cut, recovery
 fails closed. Operators do not advance catalog pointers, delete objects, or
@@ -149,8 +148,8 @@ fabricate task completion to make health checks pass.
 
 ## Oracle failure boundaries
 
-- Query admission stages its read decision on the process audit outbox and
-  never waits for, or is refused by, that decision's commit.
+- Query admission stages its read decision on the process Scribe outbox and
+  never waits for, or is refused by, that decision's write.
 - Interactive and analytical execution share one immutable deadline and a
   query-owned cancellation tree. Cancellation joins every descendant and
   releases memory, exchange, spill, peer, and admission resources.
@@ -188,23 +187,18 @@ fabricate task completion to make health checks pass.
   oldest-first at the retained ceiling or after 24 hours. Active runs are
   never evicted.
 
-## Audit history projection and retirement
+## Audit history failure boundaries
 
-`vala.audit_staging` is transient write-ahead state. Retained audit history is
-the tenant-qualified Bifrost `vala.system.audit_log` table. Projection reads
-immutable contiguous tenant ranges by a per-tenant watermark rather than
-claiming them, and garbage-collects staged rows once the watermark has advanced
-past them; a replayed range is absorbed by Scribe's durable batch-id fence.
-The current Scribe and Forge publication path publishes those ranges
-idempotently; a legacy direct-Iceberg relay is not a recovery mechanism.
-
-Staging rows retire only after their corresponding events are durably published
-to `vala.system.audit_log`. Recovery reads the per-tenant watermark together with
-the persisted frozen upper bound: a bound that survived a crash names the exact
-range whose publication is uncertain, so every competing or restarted publisher
-replays that identical range and derives the identical batch identity. An
-ambiguous boundary preserves the staging row and retries the idempotent
-publication. Publication is itself an engine transition and appends no audit.
+Retained audit history is the tenant-qualified Bifrost `vala.system.audit_log`
+table. Audit decisions, gateway captures, and Verifier results are held only in
+memory on the process Scribe outbox until Scribe acknowledges them, so there is
+no audit staging state to restore or reconcile. A retryable failure resubmits
+the identical slice, which Scribe's durable batch-id fence absorbs; a terminal
+rejection is logged, counted in `outbox_events_lost_total{outbox="scribe"}`, and
+consumed. Writes Scribe has not acknowledged are lost on abrupt process death
+or an expired shutdown deadline. Loss never changes the originating permission
+decision, gateway call, run settlement, or realtime verdict. A legacy
+direct-Iceberg relay is not a recovery mechanism.
 
 ## Forge failure boundaries
 
@@ -237,8 +231,8 @@ publication. Publication is itself an engine transition and appends no audit.
 
 - Postgres unavailability stops mutations, policy decisions that require
   durable state, and Forge transitions. Requests fail with stable retry
-  semantics. Audit decisions stay queued in the process audit outbox and are
-  retried until Postgres recovers; they never fail a request.
+  semantics. Audit decisions stay queued in memory on the process Scribe outbox,
+  which resubmits retryable failures; they never fail a request.
 - Object-store unavailability stops publication and queries requiring missing
   objects. Scribe retains accepted data within governed local durability;
   resource exhaustion then stops admission.
@@ -259,7 +253,7 @@ owner, communications owner, and evidence custodian. The response sequence is:
    durable transitions.
 2. Contain without destroying evidence: remove readiness, stop targeted
    admission, fence workers, revoke credentials, or isolate egress as needed.
-3. Preserve logs, traces, audit chains, database WAL, object versions, Scribe
+3. Preserve logs, traces, audit history, database WAL, object versions, Scribe
    volumes, task/lease state, and deployment
    fingerprints under controlled access.
 4. Determine the last verified safe cut and whether confidentiality,
@@ -287,7 +281,6 @@ The production qualification suite exercises, with real dependencies:
 
 - Postgres point-in-time restore and migration compatibility;
 - object-store version recovery and missing/corrupt-object detection;
-- audit-staging and retained audit-log reconciliation;
 - Scribe crash at each durability boundary, replay, duplicate suppression,
   staged-run recovery, and uncertain publication;
 - Oracle leader and peer loss, cancellation, timeout, spill exhaustion,

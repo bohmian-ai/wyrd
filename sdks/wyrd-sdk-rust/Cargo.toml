@@ -17,16 +17,33 @@ path = "src/lib.rs"
 # the same implementation the executable renders. Never enabled by a
 # production build.
 testing = ["dep:wyrd-cli"]
+# Stock OpenTelemetry OTLP/HTTP exporters authenticated by a `WyrdClient`
+# (`wyrd_sdk::otel`).
+otel = [
+    "dep:async-trait",
+    "dep:opentelemetry-http",
+    "dep:opentelemetry-otlp",
+    "dep:reqwest",
+    "dep:tokio",
+]
 
 [dependencies]
+async-trait = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["http-proto", "logs"] }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 wyrd-cli = { workspace = true, optional = true }
 wyrd-client = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# Short access-token lifetimes for the signed-in expiry story.
+chrono = { workspace = true }
+wyrd-auth-verify = { workspace = true }
 # The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
-wyrd-sdk-rust = { path = ".", features = ["testing"] }
+wyrd-sdk-rust = { path = ".", features = ["otel", "testing"] }
 # Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from

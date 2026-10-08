@@ -7,6 +7,7 @@
 
 mod gateway_admin;
 mod gateway_inference;
+mod local_development;
 mod observe_a_run;
 mod operator_connections;
 mod otel_export;
@@ -15,6 +16,7 @@ mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
+mod signed_in_development;
 mod support;
 mod verify_in_real_time;
 mod workflow_loading;

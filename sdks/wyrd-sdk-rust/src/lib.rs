@@ -53,6 +53,9 @@ pub mod transport {
     pub use wyrd_client::transport::{GrpcConfig, HttpConfig, ResolvedCredential};
 }
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 /// In-process `wyrd` CLI commands: a test surface behind the `testing`
 /// feature.
 ///

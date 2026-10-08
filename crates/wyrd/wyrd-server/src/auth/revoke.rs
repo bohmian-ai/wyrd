@@ -98,7 +98,7 @@ pub async fn revoke_principal(
         reason,
         delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
     });
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, tenant).await?;
     // A miss is an authorized decision with no effect, so the transaction

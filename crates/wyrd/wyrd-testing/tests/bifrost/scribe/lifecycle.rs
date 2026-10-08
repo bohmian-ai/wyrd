@@ -66,7 +66,6 @@ async fn scribe_publishes_idle_rows_on_its_own_clock() {
     // tick is the only thing that can publish the idle table.
     let server = WyrdTestServer::builder()
         .with_scribe_geometry_for_test(geometry)
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -148,7 +147,6 @@ async fn scribe_publishes_due_claims_concurrently_within_the_claim_budget() {
     let server = WyrdTestServer::builder()
         .with_scribe_geometry_for_test(geometry)
         .with_scribe_persistence_faults_for_test(faults.clone())
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -221,7 +219,6 @@ async fn concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once()
     faults.hold_object_writes_for_test();
     let server = WyrdTestServer::builder()
         .with_scribe_persistence_faults_for_test(faults.clone())
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -305,7 +302,6 @@ async fn scribe_tick_retries_a_failed_due_claim() {
     let server = WyrdTestServer::builder()
         .with_scribe_geometry_for_test(geometry)
         .with_scribe_persistence_faults_for_test(faults.clone())
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -367,7 +363,6 @@ async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
     let server = WyrdTestServer::builder()
         .with_scribe_geometry_for_test(geometry)
         .with_scribe_persistence_faults_for_test(faults.clone())
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");

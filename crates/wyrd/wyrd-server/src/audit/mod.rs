@@ -1,8 +1,8 @@
 //! Data-plane audit threading for the HTTP, MCP, and gRPC handlers.
 //!
 //! Every audited operation (register/install, query, RBAC deny, administration)
-//! stages one `AuditEvent` on the process audit outbox
-//! ([`vala_sql::audit_outbox::AuditOutbox`], held as `AppState::audit_outbox`).
+//! stages one `AuditEvent` on the process Scribe outbox
+//! ([`crate::scribe_outbox::ScribeOutbox`], held as `AppState::scribe_outbox`).
 //! The attribution is derived from the resolved [`Caller`]:
 //! `principal_id`/`principal_kind`/`card_ref` come straight off the `Principal`
 //! and `request_id` off the caller.
@@ -10,13 +10,10 @@
 //! Permissions block; audits do not. The permission check completes before the
 //! operation proceeds or refuses, and its decision is staged as soon as it is
 //! known, allowed and denied alike. Staging never waits for, or fails on, the
-//! audit commit: the outbox commits in the background, a failed commit is
-//! logged, counted on `outbox_write_failures_total{outbox="audit"}`, and
-//! retried only once Postgres confirms it aborted. An event can be lost only on
-//! abrupt process loss, at the graceful-shutdown deadline, or when Postgres no
-//! longer holds the status of its failed commit.
-
-pub mod publication;
+//! audit write: the outbox writes to Scribe in the background, retries a
+//! retryable refusal, and logs and counts a terminal one. An event can be lost
+//! on a terminal Scribe refusal, abrupt process loss, or at the
+//! graceful-shutdown deadline.
 
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
@@ -108,9 +105,9 @@ pub fn audit_event_unauthenticated(
 /// Evaluate one receiving permission and stage the verdict exactly once.
 ///
 /// This is the shared owner of the "decide, stage the decision, then act"
-/// boundary. The verdict is staged on the process audit outbox before the
+/// boundary. The verdict is staged on the process Scribe outbox before the
 /// caller proceeds or is refused, so an allowed operation is never unaudited and
-/// a refusal is never silent, and the request never waits for the audit commit.
+/// a refusal is never silent, and the request never waits for the audit write.
 ///
 /// Use [`authorize_recording_denial`] instead when the allowed row must carry
 /// an operation-specific detail before it is staged.
@@ -125,7 +122,7 @@ pub fn authorize(
     resource: &str,
 ) -> Result<(), WyrdError> {
     let allowed = authorize_recording_denial(state, caller, required, operation, resource)?;
-    state.audit_outbox.stage(caller.data_tenant_id, allowed);
+    state.scribe_outbox.stage(caller.data_tenant_id, allowed);
     Ok(())
 }
 
@@ -133,7 +130,7 @@ pub fn authorize(
 ///
 /// A denial is staged here because it carries no operation detail. The
 /// returned `Allowed` event is *not* yet staged: the caller enriches it with
-/// its operation-specific detail and MUST stage it on `state.audit_outbox`
+/// its operation-specific detail and MUST stage it on `state.scribe_outbox`
 /// before performing the operation, so every evaluated allowance is recorded
 /// whether or not the operation later succeeds.
 ///
@@ -159,7 +156,7 @@ pub fn authorize_recording_denial(
             &required.to_string(),
             AuditOutcome::Denied,
         );
-        state.audit_outbox.stage(caller.data_tenant_id, denied);
+        state.scribe_outbox.stage(caller.data_tenant_id, denied);
         return Err(permission_deny_reason_to_wyrd(reason));
     }
     Ok(audit_event(
@@ -176,7 +173,7 @@ pub fn authorize_recording_denial(
 /// Credential administration shares one permission across issuance, trusted
 /// issuers, workload bindings, and principal revocation. A denial is staged
 /// here; the returned `Allowed` event lets the handler attach its
-/// operation-specific detail and MUST be staged on `state.audit_outbox` before
+/// operation-specific detail and MUST be staged on `state.scribe_outbox` before
 /// the handler performs the operation.
 ///
 /// The verdict comes from the configured `PermissionCheck` through

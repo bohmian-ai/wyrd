@@ -4,8 +4,6 @@
 //! crate's dependency cone is linked once. Each submodule owns one surface;
 //! nextest selects a surface with `-E 'test(/^<module>::/)'`.
 
-mod pg_audit_outbox;
-mod pg_audit_staging;
 mod pg_file_list_cluster_nodes;
 mod pg_forge_file_list;
 mod pg_forge_leader;

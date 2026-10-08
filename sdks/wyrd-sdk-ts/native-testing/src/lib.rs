@@ -503,15 +503,13 @@ impl NativeWyrdTestServer {
 }
 
 /// Test-only capabilities a story's server starts with; every field is
-/// optional and defaults to off, except `auditPublication`.
+/// optional and defaults to off.
 #[napi(object)]
 pub struct NativeTestServerOptions {
     /// Roots built-in gateway adapters at a local mock upstream; its `/v1`
     /// segment also serves the verification runtime's `OpenAI` Eval judge,
     /// which calls `<providerBaseUrl>/v1/chat/completions`.
     pub provider_base_url: Option<String>,
-    /// `false` keeps staged audit rows for assertions; defaults to `true`.
-    pub audit_publication: Option<bool>,
     /// `true` runs Drift baseline fitting and Verifier runs.
     pub verification_runtime: Option<bool>,
     /// `true` serves the public origin the identity lane's Keycloak clients
@@ -522,7 +520,7 @@ pub struct NativeTestServerOptions {
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
 /// `options` selects the test-only capabilities; omitted, the server keeps
-/// its default upstreams, publishes audit, and runs no verification runtime.
+/// its default upstreams and runs no verification runtime.
 ///
 /// # Errors
 ///
@@ -533,7 +531,6 @@ pub fn start_test_server(
 ) -> napi::Result<NativeWyrdTestServer> {
     let options = options.unwrap_or(NativeTestServerOptions {
         provider_base_url: None,
-        audit_publication: None,
         verification_runtime: None,
         human_sso: None,
     });
@@ -548,7 +545,6 @@ pub fn start_test_server(
         .transpose()?;
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
         provider_root,
-        options.audit_publication.unwrap_or(true),
         options.verification_runtime.unwrap_or(false),
         options.human_sso.unwrap_or(false),
     )))
@@ -561,16 +557,12 @@ pub fn start_test_server(
 /// Returns a napi error when any server setup step fails.
 async fn start_test_server_async(
     provider_root: Option<url::Url>,
-    audit_publication: bool,
     verification_runtime: bool,
     human_sso: bool,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
     if human_sso {
         builder = builder.with_public_origin(url::Url::parse(HUMAN_PUBLIC_ORIGIN).map_err(reason)?);
-    }
-    if !audit_publication {
-        builder = builder.without_audit_publication_for_test();
     }
     if verification_runtime {
         builder = builder.with_verification_runtime_for_test();

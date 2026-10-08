@@ -105,8 +105,6 @@ pub struct WyrdTestServer {
     cleanup: bool,
     /// Whether entering publishes the `WYRD_*` endpoint variables.
     mutate_env: bool,
-    /// Whether the audit publisher runs during the fixture.
-    audit_publication: bool,
     /// Whether the verification runtime is composed during the fixture.
     verification_runtime: bool,
     /// Root every built-in gateway adapter targets; `None` keeps a gateway
@@ -154,7 +152,7 @@ impl WyrdTestServer {
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false))]
+    #[pyo3(signature = (cleanup = true, mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false))]
     #[allow(
         clippy::fn_params_excessive_bools,
         reason = "PyO3 projects the existing Python test-harness flags directly"
@@ -162,7 +160,6 @@ impl WyrdTestServer {
     fn __new__(
         cleanup: bool,
         mutate_env: bool,
-        audit_publication: bool,
         verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
@@ -182,7 +179,6 @@ impl WyrdTestServer {
         Ok(Self {
             cleanup,
             mutate_env,
-            audit_publication,
             verification_runtime,
             provider_base_url,
             live_providers,
@@ -206,15 +202,11 @@ impl WyrdTestServer {
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let root = slf.provider_base_url.clone();
         let live_providers = slf.live_providers;
-        let audit_publication = slf.audit_publication;
         let verification_runtime = slf.verification_runtime;
         let human_sso = slf.human_sso;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
-                if !audit_publication {
-                    builder = builder.without_audit_publication_for_test();
-                }
                 if verification_runtime {
                     builder = builder.with_verification_runtime_for_test();
                 }

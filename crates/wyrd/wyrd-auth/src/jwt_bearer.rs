@@ -90,7 +90,7 @@ impl JwtBearer {
     /// Stage the audit of a refused workload `jwt-bearer` exchange.
     ///
     /// Stages one denied `auth.token.exchange` event with the closed failure
-    /// code on the issuer's process outbox; `principal_id` is nil when the
+    /// code on the issuer's process audit stage; `principal_id` is nil when the
     /// service account was never resolved. Staging never waits and never
     /// replaces the caller's refusal.
     fn audit_workload_failure(

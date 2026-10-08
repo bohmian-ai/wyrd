@@ -10,7 +10,6 @@
 
 #![deny(missing_docs)]
 
-pub mod audit_outbox;
 pub mod postgres;
 pub mod queries;
 pub mod row_types;

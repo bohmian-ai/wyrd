@@ -333,7 +333,7 @@ mod pg_tests {
     ) -> Vec<vala_sql::row_types::audit_staging::AuditStagingRow> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );

@@ -1,11 +1,10 @@
-//! Authentication audit events on the canonical audit outbox.
+//! Authentication audit events on the process audit stage.
 //!
 //! Token grants, API-key issuance, refresh-family revocation, and card-scope
 //! mints are each recorded as one [`AuditEvent`] staged on the process
-//! [`vala_sql::audit_outbox::AuditOutbox`], the single audit write path. A grant
-//! never waits for, or fails on, that commit. The server's `AuditPublisher` is
-//! the only thing that moves staged rows into retained history; this module
-//! owns no table and no other sink.
+//! [`wyrd_runtime::audit::AuditStage`], which the server backs with its one
+//! Scribe outbox into retained audit history. A grant never waits for, or
+//! fails on, that write; this module owns no table and no other sink.
 
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
@@ -176,57 +175,57 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) mod test_outbox {
-    //! A real process audit outbox for Postgres-backed auth tests.
+pub(crate) mod test_audit {
+    //! A recording audit stage for auth tests.
 
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::sync::{Arc, Mutex};
 
-    use vala_sql::ValaPostgres;
-    use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_runtime::audit::AuditStage;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::vala::api::AuditEvent;
 
-    /// Upper bound for the outbox to commit everything a test staged.
-    const DRAIN_BUDGET: Duration = Duration::from_secs(30);
-
-    /// An outbox committing through the fixture's application pool, exactly as
-    /// the server's does.
-    pub(crate) fn outbox(fixture: &PgFixture) -> Arc<AuditOutbox> {
-        AuditSink::outbox(ValaPostgres::from_pool(fixture.app_pool().clone()))
+    /// Records every staged decision in staging order, in place of the
+    /// server's Scribe outbox, so a test asserts exactly what a grant staged.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecordedAudit {
+        /// Every staged decision with its tenant.
+        staged: Mutex<Vec<(DataTenantId, AuditEvent)>>,
     }
 
-    /// Proves `outbox` cannot commit what a test staged while audit staging
-    /// refuses writes.
-    ///
-    /// The writer retries a failed batch from 50 ms backoff, so one second of
-    /// settling covers several attempts; the staged decisions must all remain
-    /// pending, neither committed nor dropped.
-    ///
-    /// # Panics
-    ///
-    /// Panics when fewer than `staged` decisions remain pending.
-    pub(crate) async fn assert_retrying(outbox: &AuditOutbox, staged: usize) {
-        assert_eq!(
-            outbox.settle(Instant::now() + Duration::from_secs(1)).await,
-            staged,
-            "a decision whose commit fails stays queued for retry"
-        );
+    impl RecordedAudit {
+        /// A fresh, empty recorder.
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Every decision staged with `operation`, with its tenant, in
+        /// staging order.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the recorder lock is poisoned.
+        pub(crate) fn operation(&self, operation: &str) -> Vec<(DataTenantId, AuditEvent)> {
+            self.staged
+                .lock()
+                .expect("audit recorder lock")
+                .iter()
+                .filter(|(_, event)| event.operation == operation)
+                .cloned()
+                .collect()
+        }
     }
 
-    /// Commits everything staged on `outbox` before a test reads staging.
-    ///
-    /// Shutting the outbox down is the drain: it stops intake and waits for the
-    /// writer, so every decision staged before the call is committed when
-    /// this returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics when staged events remain uncommitted after the drain budget.
-    pub(crate) async fn drain(outbox: &AuditOutbox) {
-        assert_eq!(
-            outbox.shutdown(Instant::now() + DRAIN_BUDGET).await,
-            0,
-            "every staged auth decision is committed"
-        );
+    impl AuditStage for RecordedAudit {
+        /// Records `event` for `tenant`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the recorder lock is poisoned.
+        fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
+            self.staged
+                .lock()
+                .expect("audit recorder lock")
+                .push((tenant, event));
+        }
     }
 }

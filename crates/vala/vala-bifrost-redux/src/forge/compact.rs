@@ -579,25 +579,4 @@ mod tests {
             assert_eq!(config.validate().is_ok(), valid, "percent {percent}");
         }
     }
-
-    /// The history readers may continue to call the audit query module until
-    /// state-backed reconciliation replaces them, but none of the four
-    /// transition modules may append an audit event directly.
-    #[test]
-    fn forge_transition_writers_do_not_append_audit_directly() {
-        let modules = [
-            ("compact.rs", include_str!("compact.rs")),
-            ("live_replace.rs", include_str!("live_replace.rs")),
-            ("expire.rs", include_str!("expire.rs")),
-            ("orphan_gc.rs", include_str!("orphan_gc.rs")),
-        ];
-        let forbidden_call = ["audit_staging::append_", "audit"].concat();
-
-        for (module, source) in modules {
-            assert!(
-                !source.contains(&forbidden_call),
-                "{module} bypasses ForgeOperations"
-            );
-        }
-    }
 }

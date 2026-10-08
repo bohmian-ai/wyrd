@@ -89,7 +89,7 @@ fn refuse_after_decision<T>(
     decision: AuditEvent,
     refusal: WyrdError,
 ) -> Result<T, WyrdErrorResponse> {
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
     Err(WyrdErrorResponse::from(refusal))
 }
 
@@ -244,7 +244,7 @@ async fn test_candidate(
     Json(request): Json<ConnectionTestRequest>,
 ) -> Result<Json<ConnectionTestResponse>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.test")?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
     let tester = ConnectionTester {
         principal_id: caller.principal.id,
         principal_kind: caller.principal.kind.tag(),
@@ -497,7 +497,7 @@ mod pg_tests {
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             test_catalog().await,
         );
-        let audit = Arc::clone(&state.audit_outbox);
+        let audit = Arc::clone(&state.scribe_outbox);
         state
             .with_auth(ServerAuth {
                 human_connections: Some(HumanConnections::new(
@@ -579,7 +579,7 @@ mod pg_tests {
     ) -> Vec<(String, i64)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );

@@ -311,7 +311,7 @@ async fn create_trusted_issuer(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
@@ -390,7 +390,7 @@ async fn list_trusted_issuers(
         "trusted_issuers",
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
     let rows = trusted_issuers_for_tenant(&mut conn)
@@ -458,7 +458,7 @@ async fn delete_trusted_issuer_route(
         &format!("trusted_issuer:{issuer}"),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
 
@@ -542,7 +542,7 @@ async fn create_workload_binding(
         ),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
@@ -607,7 +607,7 @@ async fn list_workload_bindings(
         "workload_bindings",
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     // Normalize the issuer filter to the stored form so a trailing slash does
     // not silently miss; the subject is matched verbatim.
@@ -673,7 +673,7 @@ async fn delete_workload_binding_route(
         &format!("workload_binding:{issuer}:{}", query.subject),
     )
     .map_err(WyrdErrorResponse::from)?;
-    state.audit_outbox.stage(caller.data_tenant_id, decision);
+    state.scribe_outbox.stage(caller.data_tenant_id, decision);
 
     let mut conn = acquire_conn(&state, &caller).await?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
@@ -1648,7 +1648,7 @@ mod pg_tests {
     async fn settle_audit(state: &AppState) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );

@@ -130,7 +130,7 @@ fn gateway_config(tenant: DataTenantId) -> GatewayConfig {
 pub(super) async fn settle_audit(state: &AppState) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     assert_eq!(
-        state.audit_outbox.settle(deadline).await,
+        state.scribe_outbox.settle(deadline).await,
         0,
         "audit settles"
     );
@@ -911,7 +911,7 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     );
 
     state
-        .audit_outbox
+        .scribe_outbox
         .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
         .await;
     let decisions = audit_decisions(&fixture, tenant).await;
@@ -1227,7 +1227,7 @@ async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_a
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
     state
-        .audit_outbox
+        .scribe_outbox
         .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
         .await;
     assert_eq!(audit_decisions(&fixture, tenant).await, expected);

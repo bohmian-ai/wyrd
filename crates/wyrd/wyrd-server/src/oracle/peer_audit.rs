@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use crate::scribe_outbox::ScribeOutbox;
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerSecurityAuditError};
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -13,11 +13,11 @@ use wyrd_spec::vala::api::{
 use crate::audit;
 use crate::postgres::ServerPostgres;
 
-/// Server-owned peer-security auditor staging on the process audit outbox.
+/// Server-owned peer-security auditor staging on the process Scribe outbox.
 #[derive(Clone)]
 pub struct PostgresPeerSecurityAudit {
-    /// The process audit outbox every rejection is staged on.
-    audit: Arc<AuditOutbox>,
+    /// The process Scribe outbox every rejection is staged on.
+    audit: Arc<ScribeOutbox>,
 }
 
 impl PostgresPeerSecurityAudit {
@@ -31,7 +31,7 @@ impl PostgresPeerSecurityAudit {
     /// the sentinel cannot be read, or any canonical attribute differs.
     pub async fn try_new(
         postgres: &ServerPostgres,
-        audit: Arc<AuditOutbox>,
+        audit: Arc<ScribeOutbox>,
     ) -> Result<Self, PeerSecurityAuditError> {
         let operator = postgres.operator_pool().ok_or(PeerSecurityAuditError)?;
         let sentinel: Option<(
@@ -104,7 +104,7 @@ impl PeerSecurityAudit for PostgresPeerSecurityAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vala_sql::audit_outbox::AuditSink;
+    use vala_sql::scribe_outbox::AuditSink;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
     /// Production peer audit stages exact system and verified-tenant identities.

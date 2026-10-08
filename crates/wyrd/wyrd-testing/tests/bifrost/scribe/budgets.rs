@@ -48,7 +48,6 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
     // The accounting snapshot is read live, so the tenant's audit table must
     // not write between its per-shard and per-bucket totals.
     let server = wyrd_testing::WyrdTestServer::builder()
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");

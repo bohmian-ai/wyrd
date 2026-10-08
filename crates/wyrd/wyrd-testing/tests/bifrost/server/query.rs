@@ -89,7 +89,7 @@ async fn read_decision_detail(
     tenant: DataTenantId,
     request_id: &str,
 ) -> Result<serde_json::Value, ServerJourneyError> {
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     let records = server
         .retained_audit_records(
             tenant,
@@ -126,7 +126,7 @@ pub(super) async fn audit_rows(
     tenant: DataTenantId,
     operation: &str,
 ) -> Result<i64, ServerJourneyError> {
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     Ok(server
         .retained_audit_operation_count(tenant, operation)
         .await?)

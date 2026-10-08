@@ -757,7 +757,7 @@ async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
         before,
         "nothing is staged while audit fails"
     );
-    let queued = state.audit_outbox.pending();
+    let queued = state.scribe_outbox.pending();
     fixture
         .restore_audit_staging()
         .await
@@ -3086,7 +3086,7 @@ async fn drain_gateway(state: &AppState) {
     state.gateway_tasks.reopen();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     assert_eq!(
-        state.audit_outbox.settle(deadline).await,
+        state.scribe_outbox.settle(deadline).await,
         0,
         "audit settles"
     );

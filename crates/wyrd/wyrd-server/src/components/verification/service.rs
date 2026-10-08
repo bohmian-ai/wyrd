@@ -273,7 +273,7 @@ impl<'a> VerificationControl<'a> {
     /// transaction it then checks a Card-bound caller's signed scope over the
     /// exact subject and enqueues the run with the caller as requester —
     /// never as a binding owner. The single allow or deny decision is staged
-    /// on [`AppState::audit_outbox`] as soon as it is known, so the enqueue
+    /// on [`AppState::scribe_outbox`] as soon as it is known, so the enqueue
     /// transaction never touches the tenant audit chain and the request never
     /// waits for the audit commit. A request carrying `key` replays the
     /// requester's earlier run for the same body and is refused for a
@@ -356,7 +356,7 @@ impl<'a> VerificationControl<'a> {
     /// Checks input bounds, then evaluates `evals:run`, then resolves both
     /// Cards and checks a Card-bound caller's signed scope over the exact
     /// subject. Permission blocks; audit does not: the single allow or deny
-    /// decision is staged on [`AppState::audit_outbox`] and the request never
+    /// decision is staged on [`AppState::scribe_outbox`] and the request never
     /// waits for its commit. The engine runs under [`EXECUTION_DEADLINE`] as
     /// a `direct` execution on its own telemetry; nothing else is persisted.
     /// Dropping the future cancels the execution. An HTTP caller passes its
@@ -611,7 +611,7 @@ impl<'a> VerificationControl<'a> {
         resource: &str,
         outcome: AuditOutcome,
     ) {
-        self.state.audit_outbox.stage(
+        self.state.scribe_outbox.stage(
             caller.data_tenant_id,
             audit::audit_event(
                 caller,

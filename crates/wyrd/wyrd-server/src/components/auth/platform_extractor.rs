@@ -178,7 +178,7 @@ impl FromRequestParts<AppState> for PlatformCaller {
         let sessions = PlatformSessions::new(
             pool.clone(),
             issuing_key,
-            std::sync::Arc::clone(&state.audit_outbox),
+            std::sync::Arc::clone(&state.scribe_outbox) as _,
         );
         let session = match sessions.confirm(&claims).await {
             Ok(session) => session,

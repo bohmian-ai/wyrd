@@ -71,7 +71,6 @@ use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
     ScribeCoordinationRuntime,
 };
-use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
 /// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
 /// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
@@ -1055,16 +1054,18 @@ pub async fn compose_bifrost(
         None
     };
 
-    // The one process audit outbox: Gate, Oracle, peer security, and every
-    // request-path decision stage on it; `BoundServer::run` drains it last.
-    let audit_outbox = AuditSink::outbox(postgres.vala().clone());
-    // The one process Scribe outbox; its route is bound once the roles exist.
+    // The one process Scribe outbox: Gate, Oracle, peer security, every
+    // request-path decision, gateway capture, and Verifier results stage on
+    // it; its route is bound once the roles exist.
     let (scribe_outbox, scribe_route) = crate::scribe_outbox::ScribeSink::outbox();
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
-            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
-                .await
-                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+            crate::oracle::PostgresPeerSecurityAudit::try_new(
+                &postgres,
+                Arc::clone(&scribe_outbox),
+            )
+            .await
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
         let fragment_authority = Arc::new(crate::oracle::OraclePeerAuthority::new(
             fragment_security_audit.clone(),
@@ -1099,13 +1100,13 @@ pub async fn compose_bifrost(
         advertise_addr: &advertise_addr,
         peer_tls: peer_tls.clone(),
         local_scribe: scribe.clone(),
-        audit: Arc::clone(&audit_outbox),
+        audit: Arc::clone(&scribe_outbox),
         shutdown: shutdown.clone(),
     }
     .build()
     .await?;
     let forwarding_audit = Arc::new(
-        PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
+        PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&scribe_outbox))
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
@@ -1156,7 +1157,7 @@ pub async fn compose_bifrost(
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
-    .with_audit(Arc::clone(&audit_outbox))
+    .with_audit(Arc::clone(&scribe_outbox))
     .with_observation_ack(Arc::new(
         crate::verification::observations::ObservationEnqueue::new(Arc::clone(&observation_runs)),
     ))
@@ -1175,7 +1176,6 @@ pub async fn compose_bifrost(
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
             observation_runs,
-            audit_outbox,
             scribe_outbox,
             scribe_route,
             #[cfg(feature = "test-support")]
@@ -1634,7 +1634,7 @@ fn install_auth(
 
 /// Attach the human and platform login owners to `state`'s auth handles.
 ///
-/// Both owners stage their decisions on the process audit outbox, which
+/// Both owners stage their decisions on the process Scribe outbox, which
 /// exists only once [`AppState::new`] has adopted the one `compose_bifrost`
 /// built, so they are attached here rather than in [`install_auth`]. One
 /// owner of each serves every login, so its provider cache outlives a
@@ -1650,7 +1650,7 @@ fn attach_human_logins(
         sealing_key.clone(),
         config.deployment_profile.screened_http(),
         config.auth.public_origin.as_ref(),
-        Arc::clone(&state.audit_outbox),
+        Arc::clone(&state.scribe_outbox) as _,
     ));
     state.auth.platform_login = state
         .postgres
@@ -1663,7 +1663,7 @@ fn attach_human_logins(
                 Arc::new(PlatformSessions::new(
                     pool,
                     issuing_key,
-                    Arc::clone(&state.audit_outbox),
+                    Arc::clone(&state.scribe_outbox) as _,
                 )),
                 config.deployment_profile.screened_http(),
             )
@@ -1710,8 +1710,8 @@ struct OracleRoleBuilder<'a> {
     peer_tls: Option<BifrostPeerTls>,
     /// Co-located Scribe a process-local Oracle lists and reads in-process.
     local_scribe: Option<Arc<crate::state::Scribe>>,
-    /// Process audit outbox for the leader's read decisions and tenant refusals.
-    audit: Arc<AuditOutbox>,
+    /// Process Scribe outbox for the leader's read decisions and tenant refusals.
+    audit: Arc<crate::scribe_outbox::ScribeOutbox>,
     /// One process-wide shutdown token injected into every Oracle owner.
     shutdown: CancellationToken,
 }

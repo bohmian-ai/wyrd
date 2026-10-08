@@ -215,13 +215,11 @@ impl CloseoutJourney {
         let profile = GeometryProfile::selected();
         // The one worker drains only the journey's tables, so the tenant's audit
         // table cannot take a slot a geometry or competing-table plan is owed.
-        let mut spec = BifrostClusterSpec::dedicated_forge_workers()
-            .with_scribe_geometry_for_test(
-                vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
-                    .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
-                    .expect("the selected staging target is a valid geometry"),
-            )
-            .without_audit_publication_for_test();
+        let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
+            vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
+                .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
+                .expect("the selected staging target is a valid geometry"),
+        );
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
@@ -2711,7 +2709,7 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
 #[ignore = "requires Postgres and two replicas"]
 async fn restart_recovers_hot_promotion_with_empty_schedule() {
     // The tenant's audit table would otherwise join the recovered membership.
-    let mut spec = BifrostClusterSpec::two_mixed().without_audit_publication_for_test();
+    let mut spec = BifrostClusterSpec::two_mixed();
     spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
     let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
     let mut journey = LeaderJourney::start(spec, false).await;

@@ -9,11 +9,6 @@ authors = { workspace = true }
 publish = false
 description = "Server-tier SQL migrations for Vala observability storage."
 
-[features]
-# Exposes the canonical staging append for tests that seed audit rows directly.
-# Production code stages through `audit_outbox::AuditOutbox` only.
-test-support = []
-
 [lib]
 path = "src/lib.rs"
 
@@ -32,7 +27,6 @@ wyrd-spec = { workspace = true }
 wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 
 [dev-dependencies]
-vala-sql = { path = ".", features = ["test-support"] }
 workspace-hack.workspace = true
 secrecy = { workspace = true }
 serde_json = { workspace = true }

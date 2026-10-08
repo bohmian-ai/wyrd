@@ -2662,7 +2662,7 @@ async fn tenant_connection_admin_journey() {
         "tenant B is untouched"
     );
 
-    srv.await_audit_published(tenant_a)
+    srv.await_audit_retained()
         .await
         .expect("tenant A audit publishes");
     let decisions = srv

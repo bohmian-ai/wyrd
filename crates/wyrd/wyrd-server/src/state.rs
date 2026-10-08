@@ -24,7 +24,6 @@ use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, Runn
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
-use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
 use crate::scribe_outbox::{ScribeOutbox, ScribeRouteBinding, ScribeSink};
 use wyrd_auth_verify::TokenVerifier;
@@ -325,9 +324,9 @@ pub struct BifrostTestControls {
 }
 /// The one monomorphic Bifrost Gate specialization served by this process.
 ///
-/// Fixing the audit sink keeps [`Bifrost`] and [`AppState`] non-generic while
-/// the Gate itself stays generic over its sink.
-pub type ServerGate = Gate<AuditOutbox>;
+/// Fixing the audit sink to the process [`ScribeOutbox`] keeps [`Bifrost`] and
+/// [`AppState`] non-generic while the Gate itself stays generic over its sink.
+pub type ServerGate = Gate<ScribeOutbox>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,11 +1507,6 @@ pub struct Bifrost {
     /// when no role owns one.
     #[cfg(feature = "test-support")]
     test_catalog: Option<Arc<BifrostCatalog>>,
-    /// The process audit outbox the Gate, Oracle, and peer security stage on.
-    ///
-    /// `None` only for the ownerless unit-test shell, whose `AppState` starts
-    /// its own outbox.
-    audit_outbox: Option<Arc<AuditOutbox>>,
     /// The process Scribe outbox every Scribe-bound write stages on.
     ///
     /// `None` only for the ownerless unit-test shell, whose `AppState` starts
@@ -1546,8 +1540,6 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
     /// Run-request outbox the Gate's observation acknowledgement stages on.
     pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
-    /// The process audit outbox every audited surface of this process shares.
-    pub(crate) audit_outbox: Arc<AuditOutbox>,
     /// The process Scribe outbox, started before its route is known.
     pub(crate) scribe_outbox: Arc<ScribeOutbox>,
     /// Binds `scribe_outbox`'s route once the roles above exist.
@@ -1571,7 +1563,6 @@ impl Bifrost {
             query_forwarder,
             query_controls,
             observation_runs,
-            audit_outbox,
             scribe_outbox,
             scribe_route,
             #[cfg(feature = "test-support")]
@@ -1593,7 +1584,6 @@ impl Bifrost {
             test_resources: resources,
             #[cfg(feature = "test-support")]
             test_catalog: None,
-            audit_outbox: Some(audit_outbox),
             scribe_outbox: Some(scribe_outbox),
         })
     }
@@ -1620,7 +1610,6 @@ impl Bifrost {
             observation_runs: None,
             test_resources: None,
             test_catalog: None,
-            audit_outbox: None,
             scribe_outbox: None,
         })
     }
@@ -1656,7 +1645,6 @@ impl Bifrost {
             observation_runs: None,
             test_resources: None,
             test_catalog: Some(catalog),
-            audit_outbox: None,
             scribe_outbox: None,
         })
     }
@@ -1685,12 +1673,6 @@ impl Bifrost {
     #[must_use]
     pub const fn scribe(&self) -> Option<&Arc<Scribe>> {
         self.scribe.as_ref()
-    }
-
-    /// Borrows the process audit outbox, absent only for the unit-test shell.
-    #[must_use]
-    pub const fn audit_outbox(&self) -> Option<&Arc<AuditOutbox>> {
-        self.audit_outbox.as_ref()
     }
 
     /// Borrows the process Scribe outbox, absent only for the unit-test shell.
@@ -2118,14 +2100,6 @@ pub struct AppState {
     /// merely compiling `test-support` never adds a capability to the catalog.
     #[cfg(feature = "test-support")]
     pub mcp_context_probe: bool,
-    /// Keep this process's audit publisher from starting.
-    ///
-    /// Default `false`. A journey that asserts on `vala.audit_staging` sets it
-    /// through `WyrdTestServerBuilder::without_audit_publication_for_test`,
-    /// because the publisher otherwise retires staged rows on its own cadence
-    /// and races the assertion. Production never sets it.
-    #[cfg(feature = "test-support")]
-    pub audit_publication_disabled: bool,
     /// Telemetry guard (holds the tracer provider).
     pub telemetry: Arc<TelemetryGuard>,
     /// Request-shaping limits for the router middleware stack.
@@ -2140,8 +2114,10 @@ pub struct AppState {
     pub gateway_secret_keys: Arc<ManagedSecretKeys>,
     /// Shared gateway execution engine behind every governed invocation entry.
     pub gateway_engine: Arc<GatewayEngine>,
-    /// The process's one non-blocking outbox for gateway capture and Verifier
-    /// results; drained by `BoundServer::run` after Bifrost shutdown.
+    /// The process's one non-blocking outbox for audit decisions, gateway
+    /// capture, and Verifier results; every audited surface stages on it
+    /// without waiting for the write. Drained by `BoundServer::run` before
+    /// Bifrost shutdown.
     pub scribe_outbox: Arc<ScribeOutbox>,
     /// gRPC health reporter shared between HTTP readiness and gRPC health service.
     pub grpc_health: HealthReporter,
@@ -2156,13 +2132,6 @@ pub struct AppState {
     pub verification: Arc<VerificationHealth>,
     /// Key-encryption keys that seal and open Operator connection credentials.
     pub operator_keys: Arc<OperatorKeys>,
-    /// Non-blocking audit outbox writer every request-path decision of this
-    /// process stages on without waiting for its commit.
-    ///
-    /// The one outbox `compose_bifrost` builds and shares with the Gate,
-    /// Oracle, and peer security; drained by `BoundServer::run` after Bifrost
-    /// shutdown.
-    pub audit_outbox: Arc<AuditOutbox>,
     /// Model providers Eval judges call, in queued runs and direct execution.
     ///
     /// The environment-built process default unless a test or embedding
@@ -2176,8 +2145,9 @@ pub struct AppState {
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
     ///
-    /// Shares the process audit outbox `bifrost` was composed with, and starts
-    /// one only for the ownerless unit-test shell, which has none.
+    /// Shares the process Scribe outbox `bifrost` was composed with, and starts
+    /// one reaching no Scribe only for the ownerless unit-test shell, which
+    /// has none.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime with the unit-test shell,
@@ -2190,9 +2160,6 @@ impl AppState {
         shutdown_token: CancellationToken,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
-        let audit_outbox = bifrost
-            .audit_outbox()
-            .map_or_else(|| AuditSink::outbox(postgres.vala().clone()), Arc::clone);
         let scribe_outbox = bifrost.scribe_outbox().map_or_else(
             || {
                 let (outbox, route) = ScribeSink::outbox();
@@ -2202,7 +2169,6 @@ impl AppState {
             Arc::clone,
         );
         Self {
-            audit_outbox,
             postgres,
             storage,
             bifrost,
@@ -2218,8 +2184,6 @@ impl AppState {
             )),
             #[cfg(feature = "test-support")]
             mcp_context_probe: false,
-            #[cfg(feature = "test-support")]
-            audit_publication_disabled: false,
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
             )),
@@ -2248,18 +2212,6 @@ impl AppState {
     #[must_use]
     pub fn with_mcp_context_probe(mut self, enabled: bool) -> Self {
         self.mcp_context_probe = enabled;
-        self
-    }
-
-    /// Keep the audit publisher from starting when `disabled` is set.
-    ///
-    /// Test servers call this through
-    /// `WyrdTestServerBuilder::without_audit_publication_for_test`; staged
-    /// audit rows then remain in `vala.audit_staging` for the test to read.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn with_audit_publication_disabled(mut self, disabled: bool) -> Self {
-        self.audit_publication_disabled = disabled;
         self
     }
 

@@ -94,7 +94,7 @@ impl RefreshTokens {
     /// Execute the refresh-token grant for the authenticated `client`.
     ///
     /// The full rotation and reuse detection run inside the transaction owned
-    /// by `conn`; the decision audit is staged on the process outbox without
+    /// by `conn`; the decision audit is staged on the process audit stage without
     /// waiting. The caller must call `conn.commit()` on success.
     ///
     /// Algorithm (F07 atomicity):
@@ -327,12 +327,32 @@ mod pg_tests {
     use wyrd_spec::vala::api::AuditOutcome;
 
     use super::{RefreshError, RefreshTokens};
-    use crate::audit::test_outbox::{drain, outbox};
-    use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, principal_event};
+    use crate::audit::test_audit::RecordedAudit;
+    use crate::audit::{
+        REFRESH_FAMILY_REVOKE_OPERATION, TOKEN_EXCHANGE_OPERATION, principal_event,
+    };
     use crate::connections::HumanConnections;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
-    use vala_sql::audit_outbox::AuditOutbox;
+
+    /// The credential each `operation` decision staged on `audit` for
+    /// `tenant` names, in staging order, narrowed to `principal` when given.
+    fn staged_credentials(
+        audit: &RecordedAudit,
+        tenant: DataTenantId,
+        operation: &str,
+        principal: Option<Uuid>,
+    ) -> Vec<Option<Uuid>> {
+        audit
+            .operation(operation)
+            .into_iter()
+            .filter(|(staged, event)| {
+                *staged == tenant
+                    && principal.is_none_or(|principal| event.principal_id.as_uuid() == principal)
+            })
+            .map(|(_, event)| event.credential_id)
+            .collect()
+    }
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -351,12 +371,12 @@ mod pg_tests {
     ///
     /// The test owns `audit` and drains it before its fixture drops, so no audit
     /// commit is still logging in when the fixture drops its database.
-    fn refresh_service(audit: &Arc<AuditOutbox>) -> RefreshTokens {
+    fn refresh_service(audit: &Arc<RecordedAudit>) -> RefreshTokens {
         RefreshTokens {
             issuer: TenantTokenIssuer::new(
                 test_issuing_key(),
                 TokenExchangeSettings::default(),
-                Arc::clone(audit),
+                Arc::clone(audit) as _,
             ),
         }
     }
@@ -477,7 +497,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_copies_the_connection_binding() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -515,7 +535,6 @@ mod pg_tests {
             new_row.human_connection_revision,
             Some(binding.connection_revision)
         );
-        drain(&audit).await;
     }
 
     /// A family whose connection is no longer Active, or which carries no
@@ -523,7 +542,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_refuses_an_inactive_or_unbound_connection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -588,7 +607,6 @@ mod pg_tests {
             user_rows, 0,
             "no successor is written for a refused rotation"
         );
-        drain(&audit).await;
     }
 
     /// A human session rotates: the consumed row is retired and the successor
@@ -596,7 +614,7 @@ mod pg_tests {
     #[tokio::test]
     async fn happy_rotation_mints_new_pair_and_revokes_old_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -662,7 +680,6 @@ mod pg_tests {
             new_row.expires_at.timestamp(),
             "signed exp equals the stored successor row expiry"
         );
-        drain(&audit).await;
     }
 
     /// Replaying a rotated token revokes only its own rotation chain.
@@ -680,7 +697,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotated_replay_revokes_only_its_chain() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -748,19 +765,13 @@ mod pg_tests {
                 .expect("row exists");
             assert_eq!(row.revoked_reason.as_deref(), expected, "{hash}");
         }
-        drain(&audit).await;
-        let containments: Vec<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
-        )
-        .bind(tenant.as_uuid())
-        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
-        .bind(user_id)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("audit query runs");
+        let containments = staged_credentials(
+            &audit,
+            tenant,
+            REFRESH_FAMILY_REVOKE_OPERATION,
+            Some(user_id),
+        );
         assert_eq!(containments, vec![Some(replayed)]);
-        drain(&audit).await;
     }
 
     /// F07 race: the second caller presenting the same token after the first has
@@ -768,7 +779,7 @@ mod pg_tests {
     #[tokio::test]
     async fn f07_race_second_caller_gets_reused_after_commit() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -820,13 +831,12 @@ mod pg_tests {
             Some("reuse_detected"),
             "successor token revoked by reuse-detection family revoke"
         );
-        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn unknown_token_returns_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -846,7 +856,6 @@ mod pg_tests {
             .await;
 
         assert!(matches!(result, Err(RefreshError::NotFound)));
-        drain(&audit).await;
     }
 
     /// An expired row, and a row revoked by logout, administration, or an
@@ -861,7 +870,7 @@ mod pg_tests {
     #[tokio::test]
     async fn inactive_rows_are_refused_without_containment() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -918,18 +927,9 @@ mod pg_tests {
             .expect("lookup")
             .expect("sibling exists");
         assert!(sibling.revoked_at.is_none(), "the other login stays active");
-        drain(&audit).await;
-        let containments: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2",
-        )
-        .bind(tenant.as_uuid())
-        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("audit query runs");
+        let containments =
+            staged_credentials(&audit, tenant, REFRESH_FAMILY_REVOKE_OPERATION, None).len();
         assert_eq!(containments, 0, "no theft is recorded");
-        drain(&audit).await;
     }
 
     /// `active_refresh` resolves only an active row of the bound tenant.
@@ -1008,7 +1008,7 @@ mod pg_tests {
     #[tokio::test]
     async fn f08_audit_row_written_on_rotation() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -1034,25 +1034,14 @@ mod pg_tests {
             .await
             .expect("rotation succeeds");
 
-        drain(&audit).await;
-        let credentials: Vec<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = 'auth.token.exchange'
-                AND principal_id = $2",
-        )
-        .bind(tenant.as_uuid())
-        .bind(user_id)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("audit query runs");
+        let credentials =
+            staged_credentials(&audit, tenant, TOKEN_EXCHANGE_OPERATION, Some(user_id));
 
         assert_eq!(
             credentials,
             vec![Some(consumed)],
             "the rotation is audited once, naming the consumed refresh row"
         );
-        drain(&audit).await;
     }
 
     /// A rotated human session keeps the authority its login established.
@@ -1066,7 +1055,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_carries_the_roles_login_persisted() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -1125,7 +1114,6 @@ mod pg_tests {
             vec!["credential_admin".to_owned()],
             "the successor carries the session's authority"
         );
-        drain(&audit).await;
     }
 
     /// R2-4: replay containment survives the refused request.
@@ -1140,7 +1128,7 @@ mod pg_tests {
     #[tokio::test]
     async fn f09_replay_containment_commits_and_kills_the_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -1200,19 +1188,13 @@ mod pg_tests {
             "the successor is revoked in committed state"
         );
 
-        drain(&audit).await;
-        let revocations: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = $2
-                AND principal_id = $3",
+        let revocations = staged_credentials(
+            &audit,
+            tenant,
+            REFRESH_FAMILY_REVOKE_OPERATION,
+            Some(user_id),
         )
-        .bind(tenant.as_uuid())
-        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
-        .bind(user_id)
-        .fetch_one(&mut **conn_c.transaction())
-        .await
-        .expect("audit query runs");
+        .len();
         assert_eq!(
             revocations, 1,
             "exactly one family revocation is visible from another transaction"
@@ -1221,18 +1203,15 @@ mod pg_tests {
         // The containment row names the refresh row that was actually
         // presented. Without it the only event that reports a theft cannot say
         // which of the principal's rows the attacker held.
-        let attributed: Option<Uuid> = sqlx::query_scalar(
-            "SELECT credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = $2
-                AND principal_id = $3",
+        let attributed = staged_credentials(
+            &audit,
+            tenant,
+            REFRESH_FAMILY_REVOKE_OPERATION,
+            Some(user_id),
         )
-        .bind(tenant.as_uuid())
-        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
-        .bind(user_id)
-        .fetch_one(&mut **conn_c.transaction())
-        .await
-        .expect("credential attribution query runs");
+        .first()
+        .copied()
+        .flatten();
         assert_eq!(
             attributed,
             Some(consumed_id),
@@ -1251,7 +1230,6 @@ mod pg_tests {
             matches!(successor_replay, Err(RefreshError::NotFound)),
             "the contained successor is an ordinary inactive token: {successor_replay:?}"
         );
-        drain(&audit).await;
     }
 
     /// Replaying ancestor `A` while current token `B` rotates still revokes
@@ -1265,7 +1243,7 @@ mod pg_tests {
     #[tokio::test]
     async fn ancestor_replay_overlapping_rotation_revokes_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let service = refresh_service(&audit);
@@ -1343,17 +1321,12 @@ mod pg_tests {
             Some("reuse_detected"),
             "C is revoked in committed state"
         );
-        drain(&audit).await;
-        let containments: Vec<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
-        )
-        .bind(tenant.as_uuid())
-        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
-        .bind(user_id)
-        .fetch_all(&mut **fresh.transaction())
-        .await
-        .expect("audit query runs");
+        let containments = staged_credentials(
+            &audit,
+            tenant,
+            REFRESH_FAMILY_REVOKE_OPERATION,
+            Some(user_id),
+        );
         assert_eq!(
             containments,
             vec![Some(ancestor_id)],
@@ -1371,7 +1344,6 @@ mod pg_tests {
             matches!(successor_rotation, Err(RefreshError::NotFound)),
             "contained C is an ordinary inactive token: {successor_rotation:?}"
         );
-        drain(&audit).await;
     }
 
     /// Poll until some backend is blocked on this tenant's human-connection
@@ -1432,7 +1404,7 @@ mod pg_tests {
     #[tokio::test]
     async fn connection_deactivation_overlapping_rotation_ends_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let service = refresh_service(&audit);
@@ -1441,7 +1413,7 @@ mod pg_tests {
             None,
             ScreenedHttp::allowing_internal(),
             None,
-            Arc::clone(&audit),
+            Arc::clone(&audit) as _,
         );
 
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
@@ -1511,7 +1483,6 @@ mod pg_tests {
         .await
         .expect("family count reads");
         assert_eq!(family, 2, "no successor of C was minted");
-        drain(&audit).await;
     }
 
     /// A machine principal's refresh row cannot rotate.
@@ -1523,7 +1494,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_machine_refresh_row_cannot_rotate() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let card_ref = service_card_ref();
@@ -1554,7 +1525,6 @@ mod pg_tests {
             ),
             "a machine refresh row is refused: {result:?}"
         );
-        drain(&audit).await;
     }
 
     /// The unverified payload read exposes the three routing claims intact.

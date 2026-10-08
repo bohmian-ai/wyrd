@@ -232,7 +232,7 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
         .chain([server.data_tenant_id()])
     {
         server
-            .await_audit_published(tenant)
+            .await_audit_retained()
             .await
             .expect("retained audit history settles");
     }

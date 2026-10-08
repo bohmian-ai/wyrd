@@ -25,9 +25,6 @@ class WyrdTestServer:
     ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
     (the server and embedded Postgres are always cleaned up on exit).
 
-    ``audit_publication=False`` keeps the server's audit publisher from retiring
-    staged audit rows, for a journey that counts staged decisions.
-
     ``verification_runtime=True`` composes the verification runtime, so Drift
     baselines fit and verification runs execute in the background.
     ``provider_base_url``, when set, makes the gateway dispatch over HTTP with
@@ -49,7 +46,6 @@ class WyrdTestServer:
         self,
         cleanup: bool = True,
         mutate_env: bool = True,
-        audit_publication: bool = True,
         verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
@@ -64,9 +60,6 @@ class WyrdTestServer:
                 ``WYRD_GRPC_URL``, and ``WYRD_API_KEY`` for the block and
                 exiting restores the original values (or removes them). Pass
                 false for parallel suites that manage these variables.
-            audit_publication: false keeps the audit publisher from retiring
-                staged audit rows, for a journey that counts staged decisions
-                such as ``table_describe_count()``.
             verification_runtime: true composes the verification runtime, so
                 Drift baselines fit and verification runs execute in the
                 background.

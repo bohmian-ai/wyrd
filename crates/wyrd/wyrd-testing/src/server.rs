@@ -1,6 +1,5 @@
 //! Real-socket Wyrd server test harness.
 
-use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -102,10 +101,10 @@ use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 use crate::time::ClockHandle;
 use crate::verification::{VerificationFixture, VerificationFixtureError};
 
-/// Retained authorization history: the durable home of every published decision.
+/// Retained authorization history: the durable home of every decision.
 const AUDIT_LOG: &str = "vala.system.audit_log";
 
-/// Bound on every wait for the server-owned audit publisher to make progress.
+/// Bound on every wait for staged audit to reach retained history.
 const RETAINED_AUDIT_BUDGET: Duration = Duration::from_secs(90);
 
 /// The fixed principal every retained-audit inspection query runs as.
@@ -311,93 +310,6 @@ pub struct BifrostQueryResourceSnapshot {
     pub peer_slots: u64,
 }
 
-/// Reads the process audit outbox's write-failure counter.
-///
-/// Every audited surface stages its decision on one non-blocking outbox. A
-/// tenant batch that cannot commit is retried, never dropped, and each failed
-/// attempt is counted in `outbox_write_failures_total{outbox="audit"}` rather
-/// than refusing the request. A journey proving that borrows the server's
-/// process-global Prometheus recorder through this owner, waits for a failed
-/// attempt, then restores the database and proves the decision commits.
-///
-/// The recorder is the one [`crate::bifrost::shared_process_telemetry_for_test`]
-/// installs, which every in-process test server also shares, so this works
-/// whether or not another test in the process started first. The counter is
-/// process-wide, so [`Self::count`] reports only failures since
-/// [`Self::install`].
-#[derive(Clone)]
-pub struct AuditCommitFailures {
-    /// Read-only capture over the shared process recorder.
-    capture: crate::bifrost::BifrostTelemetryCapture,
-    /// Process-wide failure count when this owner was installed.
-    baseline: u64,
-}
-
-impl std::fmt::Debug for AuditCommitFailures {
-    /// Formats the baseline only; the capture holds no printable state.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuditCommitFailures")
-            .field("baseline", &self.baseline)
-            .finish_non_exhaustive()
-    }
-}
-
-impl AuditCommitFailures {
-    /// Borrows the shared process recorder, installing it on first use, and
-    /// records the current failure count as this owner's baseline.
-    ///
-    /// # Errors
-    /// Returns [`WyrdTestServerError::Audit`] when the shared process
-    /// telemetry cannot be installed, for example because a recorder outside
-    /// the shared owner already holds the process.
-    pub fn install() -> Result<Self, WyrdTestServerError> {
-        let (_guard, capture) = crate::bifrost::shared_process_telemetry_for_test()
-            .map_err(|error| WyrdTestServerError::Audit(error.to_string()))?;
-        let baseline = Self::total(&capture);
-        Ok(Self { capture, baseline })
-    }
-
-    /// Returns the failed audit write attempts since [`Self::install`]; a
-    /// series never recorded reads zero.
-    #[must_use]
-    pub fn count(&self) -> u64 {
-        Self::total(&self.capture).saturating_sub(self.baseline)
-    }
-
-    /// Reads the process-wide `outbox_write_failures_total{outbox="audit"}`
-    /// sample from `capture`, or zero when the series was never recorded.
-    fn total(capture: &crate::bifrost::BifrostTelemetryCapture) -> u64 {
-        capture
-            .render()
-            .lines()
-            .find_map(|line| line.strip_prefix("outbox_write_failures_total{outbox=\"audit\"} "))
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .and_then(|value| value.to_u64())
-            .unwrap_or(0)
-    }
-
-    /// Waits up to `budget` until at least one audit write attempt has failed,
-    /// returning the count.
-    ///
-    /// # Errors
-    /// Returns [`WyrdTestServerError::Audit`] when no attempt failed in time.
-    pub async fn await_failure(&self, budget: Duration) -> Result<u64, WyrdTestServerError> {
-        let deadline = Instant::now() + budget;
-        loop {
-            let count = self.count();
-            if count > 0 {
-                return Ok(count);
-            }
-            if Instant::now() >= deadline {
-                return Err(WyrdTestServerError::Audit(format!(
-                    "no audit write attempt failed within {budget:?}"
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
-
 /// Production-owner Oracle residual state captured without a test adapter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleRuntimeInspection {
@@ -411,8 +323,8 @@ pub struct OracleRuntimeInspection {
     pub peer_running: u64,
     /// Analytical graph grants a leader's admit stream still holds open.
     pub held_grants: u64,
-    /// Process audit outbox commits still in flight.
-    pub audit_pending: u64,
+    /// Scribe outbox writes, audit decisions included, still in flight.
+    pub scribe_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
     /// Regular files beneath the Oracle-owned scratch prefix.
@@ -636,8 +548,6 @@ pub struct WyrdTestServerBuilder {
     serve_task_panic_for_test: bool,
     /// Register the test-support MCP context probe in the `/mcp` tool catalog.
     mcp_context_probe: bool,
-    /// Keep the server's audit publisher from retiring staged audit rows.
-    audit_publication_disabled: bool,
     /// Operator connection key source; `None` generates a file key.
     operator_keys: Option<OperatorKeysConfig>,
 }
@@ -707,7 +617,7 @@ impl TestBifrostPeerTls {
 }
 
 impl Default for WyrdTestServerBuilder {
-    /// A builder with every test hook off and audit publication enabled.
+    /// A builder with every test hook off.
     fn default() -> Self {
         Self {
             storage_settings: None,
@@ -762,7 +672,6 @@ impl Default for WyrdTestServerBuilder {
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
-            audit_publication_disabled: false,
             operator_keys: None,
         }
     }
@@ -1618,7 +1527,7 @@ impl WyrdTestServer {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
         let admission = runtime.oracle_runtime_inspection();
-        let audit_pending = self.inner.state.audit_outbox.pending();
+        let scribe_pending = self.inner.state.scribe_outbox.pending();
         let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
@@ -1626,7 +1535,7 @@ impl WyrdTestServer {
             reserved_memory_bytes: admission.reserved_memory_bytes,
             peer_running: admission.peer_running,
             held_grants: admission.held_grants,
-            audit_pending: audit_pending as u64,
+            scribe_pending: scribe_pending as u64,
             spill_directories,
             spill_files,
             spill_file_bytes,
@@ -1872,13 +1781,13 @@ impl WyrdTestServer {
             .collect()
     }
 
-    /// Wait until no audit outbox commit is still in flight.
+    /// Wait until no Scribe outbox write is still in flight.
     ///
-    /// Every surface stages its decisions in `vala.audit_staging` through the
-    /// process audit outbox's background writer, so a journey that asserts on
-    /// staging first waits for those commits without closing the outbox. The
-    /// returned count is the real residual; a nonzero return within `budget`
-    /// means commits did not finish.
+    /// Every surface stages its decisions on the process Scribe outbox, whose
+    /// background writer submits them to Scribe slightly after the request
+    /// returns, so a journey that asserts on retained audit first waits for
+    /// those writes without closing the outbox. The returned count is the real
+    /// residual; a nonzero return within `budget` means writes did not finish.
     ///
     /// # Errors
     ///
@@ -1891,7 +1800,7 @@ impl WyrdTestServer {
         let residual = self
             .inner
             .state
-            .audit_outbox
+            .scribe_outbox
             .settle(std::time::Instant::now() + budget)
             .await;
         Ok(residual as u64)
@@ -1932,7 +1841,7 @@ impl WyrdTestServer {
     ///
     /// `projection` is the `SELECT` list and must cast each column to text, so
     /// one decoder serves every assertion shape. Rows come back in the tenant's
-    /// own `seq` order — the order the decisions were made — and the inspector's
+    /// own decision-time order — the order the decisions were made — and the inspector's
     /// own reads are excluded by principal exactly as they are for a count.
     ///
     /// # Errors
@@ -1964,7 +1873,7 @@ impl WyrdTestServer {
                     sql: format!(
                         "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
-                         ORDER BY seq"
+                         ORDER BY wyrd_event_time"
                     ),
                     deadline_ms: Some(60_000),
                 },
@@ -2023,11 +1932,8 @@ impl WyrdTestServer {
 
     /// Counts retained audit rows matching one predicate, through the read path.
     ///
-    /// `vala.audit_staging` is transient: the server's publisher moves a
-    /// tenant's staged rows into retained history every few seconds and deletes
-    /// them, so a test that reads staging to prove a decision *was* recorded
-    /// races that sweep. This reads the durable table instead, fused and strict
-    /// so a row Scribe still holds counts the same as one already in an object.
+    /// The read is fused and strict, so a row Scribe still holds counts the
+    /// same as one already in an object.
     ///
     /// `predicate` is the `WHERE` fragment naming the exact rows under
     /// assertion, so one owner serves every shape a journey needs
@@ -2057,7 +1963,7 @@ impl WyrdTestServer {
                 .run(wyrd_spec::vala::api::BifrostQueryRequest {
                     params: Vec::new(),
                     sql: format!(
-                        "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
+                        "SELECT operation FROM {AUDIT_LOG} WHERE ({predicate}) \
                  AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
                     ),
                     deadline_ms: Some(60_000),
@@ -2077,10 +1983,10 @@ impl WyrdTestServer {
 
     /// Waits until retained history holds exactly `expected` rows for `predicate`.
     ///
-    /// Publication is a server-owned background move, so a read taken
-    /// immediately after a decision can honestly precede it. This polls the
-    /// durable read rather than sleeping past the publisher, and on timeout
-    /// fails naming the count it last observed.
+    /// The Scribe outbox writes in the background, so a read taken immediately
+    /// after a decision can honestly precede it. This polls the durable read
+    /// rather than sleeping past the writer, and on timeout fails naming the
+    /// count it last observed.
     ///
     /// # Errors
     /// Returns the query failure, or a timeout naming the last observed count.
@@ -2133,61 +2039,28 @@ impl WyrdTestServer {
         }
     }
 
-    /// Waits until this tenant owes retained history nothing.
+    /// Waits until every decision staged so far is in retained history.
     ///
     /// This is synchronization, never an assertion source: it settles the
-    /// server-owned publisher so a following retained-history read sees every
-    /// decision committed so far. Every decision lands in staging through the
-    /// audit outbox slightly after its request returns, so the outbox is
-    /// settled first; the chain head then reports the publisher's own
-    /// progress as its `published_seq` catching up to the chain head's `last_seq`. A tenant with no
-    /// chain-head row has appended nothing and owes nothing.
+    /// process Scribe outbox, and a settled write is one Scribe acknowledged,
+    /// which the fused retained read already sees.
     ///
     /// # Errors
-    /// Returns the Postgres failure, or a timeout naming the tenant and the
-    /// sequence pair it last observed.
-    pub async fn await_audit_published(
-        &self,
-        tenant: DataTenantId,
-    ) -> Result<(), WyrdTestServerError> {
+    /// Returns a timeout naming the writes still pending.
+    pub async fn await_audit_retained(&self) -> Result<(), WyrdTestServerError> {
         let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
         if pending != 0 {
             return Err(WyrdTestServerError::Audit(format!(
-                "audit outbox commits did not finish: {pending} pending after \
+                "Scribe outbox writes did not finish: {pending} pending after \
                  {RETAINED_AUDIT_BUDGET:?}"
             )));
         }
-        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
-        let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
-        loop {
-            let head = sqlx::query_as::<_, (i64, i64)>(
-                "SELECT head.last_seq, COALESCE(progress.published_seq, 0) \
-                   FROM vala.audit_chain_head head \
-                   LEFT JOIN vala.audit_publication progress USING (data_tenant_id) \
-                  WHERE head.data_tenant_id = $1",
-            )
-            .bind(tenant.as_uuid())
-            .fetch_optional(&pool)
-            .await
-            .map_err(sql)?
-            .unwrap_or((0, 0));
-            if head.0 == head.1 {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(WyrdTestServerError::Audit(format!(
-                    "tenant {tenant} published {} of {} audit rows within \
-                     {RETAINED_AUDIT_BUDGET:?}",
-                    head.1, head.0
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        Ok(())
     }
 
     /// Counts retained audit rows whose operation matches one `LIKE` pattern.
     ///
-    /// Callers that already settled publication use this to assert on an
+    /// Callers that already settled the Scribe outbox use this to assert on an
     /// operation family (`bifrost.query.stage%`) as well as an exact name.
     ///
     /// # Errors
@@ -2207,7 +2080,7 @@ impl WyrdTestServer {
     /// rejection occurs before Oracle planning or durable read accounting.
     ///
     /// # Errors
-    /// Returns the publication or retained-history failure.
+    /// Returns the settle or retained-history failure.
     pub async fn bifrost_read_decision_count(&self) -> Result<i64, WyrdTestServerError> {
         self.bifrost_read_decision_count_for_tenant(self.data_tenant_id())
             .await
@@ -2215,45 +2088,40 @@ impl WyrdTestServer {
 
     /// Count tenant-bound Bifrost read-decision audit rows.
     ///
-    /// The count comes from retained history after the publication barrier, so
-    /// it is cumulative: unlike transient staging, a published row stays
-    /// counted and a before/after pair measures the reads between them.
+    /// The count comes from retained history after the Scribe outbox settles,
+    /// so it is cumulative: a retained row stays counted and a before/after
+    /// pair measures the reads between them.
     ///
     /// # Errors
-    /// Returns the publication or retained-history failure.
+    /// Returns the settle or retained-history failure.
     pub async fn bifrost_read_decision_count_for_tenant(
         &self,
         tenant: DataTenantId,
     ) -> Result<i64, WyrdTestServerError> {
-        self.await_audit_published(tenant).await?;
+        self.await_audit_retained().await?;
         self.retained_audit_count(tenant, &format!("operation = '{READ_DECISION}'"))
             .await
     }
 
-    /// Count the fixture tenant's staged, allowed describes of `fqn`.
+    /// Count the fixture tenant's retained, allowed describes of `fqn`.
     ///
     /// The server stages exactly one `vala.bifrost.describe` decision per
     /// describe it serves, so this is the server-observed describe count a
-    /// journey uses to prove a writer reused its cached schema. Start the
-    /// server without audit publication: the publisher retires staged rows,
-    /// which would shrink the count mid-test. The count first waits for the
-    /// audit outbox to commit every decision already staged.
+    /// journey uses to prove a writer reused its cached schema. The count
+    /// first waits for every decision already staged to be retained.
     ///
     /// # Errors
-    /// Returns an error when the fixture's superuser pool cannot be acquired
-    /// or the audit query fails.
+    /// Returns the settle or retained-history failure.
     pub async fn table_describe_count(&self, fqn: &str) -> Result<i64, WyrdTestServerError> {
-        self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
-        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 \
-             AND operation = 'vala.bifrost.describe' AND resource = $2 AND outcome = 'allowed'",
+        self.await_audit_retained().await?;
+        self.retained_audit_count(
+            self.data_tenant_id(),
+            &format!(
+                "operation = 'vala.bifrost.describe' AND resource = '{fqn}' \
+                 AND outcome = 'allowed'"
+            ),
         )
-        .bind(self.data_tenant_id().as_uuid())
-        .bind(fqn)
-        .fetch_one(&pool)
         .await
-        .map_err(sql)
     }
 
     /// Read the last qualifying machine exchange of the principal `owner` projects.
@@ -2320,13 +2188,13 @@ impl WyrdTestServer {
     /// Count the exact tenant-bound read-decision audit row for one request ID.
     ///
     /// # Errors
-    /// Returns the publication or retained-history failure.
+    /// Returns the settle or retained-history failure.
     pub async fn bifrost_read_decision_for_request(
         &self,
         tenant: DataTenantId,
         request_id: &str,
     ) -> Result<i64, WyrdTestServerError> {
-        self.await_audit_published(tenant).await?;
+        self.await_audit_retained().await?;
         self.retained_audit_count(
             tenant,
             &format!("operation = '{READ_DECISION}' AND request_id = '{request_id}'"),
@@ -2906,7 +2774,7 @@ impl WyrdTestServer {
         wyrd_auth::platform_sessions::PlatformSessions::new(
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
-            std::sync::Arc::clone(&self.inner.state.audit_outbox),
+            std::sync::Arc::clone(&self.inner.state.scribe_outbox) as _,
         )
         .issue_federated(
             &issuer,
@@ -2995,7 +2863,7 @@ impl WyrdTestServer {
             .inner
             .state
             .auth
-            .tenant_issuer(&self.inner.state.audit_outbox)
+            .tenant_issuer(&self.inner.state.scribe_outbox)
             .ok_or_else(|| WyrdTestServerError::Auth("no issuing key".to_owned()))?;
         let exchanged = issuer
             .issue(
@@ -4191,17 +4059,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Keep the server's audit publisher from starting.
-    ///
-    /// A journey that asserts on `vala.audit_staging` rows opts in: the
-    /// publisher retires staged rows on its own interval, so a staging read
-    /// taken after one sweep would miss rows the server did write.
-    #[must_use]
-    pub fn without_audit_publication_for_test(mut self) -> Self {
-        self.audit_publication_disabled = true;
-        self
-    }
-
     /// Force the bound readiness phase to fail and exercise startup rollback.
     #[must_use]
     pub fn with_readiness_failure_for_test(mut self) -> Self {
@@ -4950,14 +4807,14 @@ impl WyrdTestServerBuilder {
                 managed_secret_key_root.path(),
             )?);
         let start = |error: String| WyrdTestServerError::Start(error);
-        // The login owners stage on the state's process audit outbox, so they
+        // The login owners stage on the state's process Scribe outbox, so they
         // attach once the state exists.
         state.auth.human_connections = Some(HumanConnections::new(
             state.postgres.wyrd().clone(),
             state.auth.sealing_key.clone(),
             DeploymentProfile::Development.screened_http(),
             self.public_origin.as_ref(),
-            Arc::clone(&state.audit_outbox),
+            Arc::clone(&state.scribe_outbox) as _,
         ));
         state.auth.platform_login = Some(wyrd_auth::platform_login::PlatformLogin::new(
             fixture.operator_pool().clone(),
@@ -4965,7 +4822,7 @@ impl WyrdTestServerBuilder {
             Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
                 fixture.operator_pool().clone(),
                 Arc::clone(&issuing_key),
-                Arc::clone(&state.audit_outbox),
+                Arc::clone(&state.scribe_outbox) as _,
             )),
             DeploymentProfile::Development.screened_http(),
         ));
@@ -5008,9 +4865,7 @@ impl WyrdTestServerBuilder {
         if let Some(workflow) = self.workflow_config {
             state = state.with_workflow_config(workflow);
         }
-        state = state
-            .with_mcp_context_probe(self.mcp_context_probe)
-            .with_audit_publication_disabled(self.audit_publication_disabled);
+        state = state.with_mcp_context_probe(self.mcp_context_probe);
         state.authz.permission_check = Arc::new(RbacCheck);
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;

@@ -26,8 +26,8 @@ use rand::RngCore as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_oidc::{CodeRedemption, MappedClaims, TrustedIssuer};
+use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -149,7 +149,7 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::DiscoveryUnavailable`] or
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
     /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
-    /// Every refusal after the tenant is known is staged on the audit outbox before
+    /// Every refusal after the tenant is known is staged on the audit stage before
     /// it is returned, and an authorization-request login's refusal after
     /// its state was consumed is returned as [`LoginCompletion::Refused`]
     /// instead. A failure after the consume commit leaves the state spent:
@@ -345,7 +345,7 @@ impl AuthorizationCodeExchange {
     ///   of its device authorization, which must still be pending.
     ///
     /// Either outcome stages one allowed `auth.login` event for the User on
-    /// the process audit outbox once the login, its roles, and its code or
+    /// the process audit stage once the login, its roles, and its code or
     /// approval have committed together; the audit never fails the login.
     ///
     /// No token is minted here; the token endpoint mints the session when the
@@ -490,7 +490,7 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::AuthVerifyUnavailable`] when the store fails; and the
     /// issuance errors, including a connection that is no longer Active or a
     /// suspended User. Every refusal for a routed tenant is staged on
-    /// the audit outbox.
+    /// the audit stage.
     pub async fn redeem_code(
         &self,
         code: &SecretBearer,
@@ -666,11 +666,11 @@ pub async fn ensure_user_identity(
 /// Stage the audit of a refused human authorization-code exchange.
 ///
 /// Stages one denied `auth.token.exchange` event carrying the closed failure
-/// code on the process outbox. A refusal rolls back any user it resolved, so
+/// code on the process audit stage. A refusal rolls back any user it resolved, so
 /// the event names the nil principal. Staging never waits and never fails, so
 /// the caller's original error still reaches the client.
 pub fn audit_authorization_code_failure(
-    audit: &AuditOutbox,
+    audit: &dyn AuditStage,
     tenant_id: DataTenantId,
     request_id: &str,
     error: &WyrdError,

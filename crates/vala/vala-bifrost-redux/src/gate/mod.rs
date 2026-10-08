@@ -15,6 +15,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::PermissionCheck;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
@@ -41,7 +42,6 @@ use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
@@ -261,16 +261,16 @@ pub fn initialize_gate_metrics() {
 /// decision that fails to commit is retried by the outbox and never refuses or
 /// delays the write.
 ///
-/// [`Gate`] is parameterized over the sink, so the server composes the process
-/// [`AuditOutbox`] and crate-local tests compose their recording double, both
+/// [`Gate`] is parameterized over the sink, so the server composes its process
+/// [`AuditStage`] and crate-local tests compose their recording double, both
 /// statically.
 pub trait GateAudit: Send + Sync {
     /// Stages one `bifrost_record:write` decision for `auth` on `resource`.
     fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
 }
 
-impl GateAudit for AuditOutbox {
-    /// Stages the decision on the caller's tenant chain.
+impl<T: AuditStage> GateAudit for T {
+    /// Stages the decision for the caller's tenant.
     ///
     /// The row is attributed to the verified principal — the subject a
     /// delegated token acts for — and, when the token carries a non-empty

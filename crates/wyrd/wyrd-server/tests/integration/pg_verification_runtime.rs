@@ -86,7 +86,6 @@ impl Harness {
     /// Panics when the server, seeding, or the audit floor read fails.
     async fn start() -> Self {
         let server = WyrdTestServer::builder()
-            .without_audit_publication_for_test()
             .start_bound()
             .await
             .expect("bound server starts");

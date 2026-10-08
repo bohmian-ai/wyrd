@@ -654,7 +654,7 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        self.state.audit_outbox.stage(caller.data_tenant_id, event);
+        self.state.scribe_outbox.stage(caller.data_tenant_id, event);
         verdict
     }
 

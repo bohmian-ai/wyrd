@@ -609,12 +609,7 @@ mod pg_tests {
     )]
     async fn the_audit_backlog_holds_from_a_pending_decision_until_its_publication() -> Result<()> {
         let metrics = wyrd_server::app::metrics::install_recorder()?;
-        let server = Box::pin(
-            WyrdTestServer::builder()
-                .without_audit_publication_for_test()
-                .start_bound(),
-        )
-        .await?;
+        let server = Box::pin(WyrdTestServer::builder().start_bound()).await?;
         let tenant = server.data_tenant_id();
         let table = format!("capacity_audit_{}", uuid::Uuid::now_v7().simple());
         server

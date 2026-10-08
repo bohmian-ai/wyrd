@@ -1286,7 +1286,6 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let builder = || {
         wyrd_testing::WyrdTestServer::builder()
             .with_durable_bifrost_data_root(data_root.path().to_path_buf())
-            .without_audit_publication_for_test()
     };
     let server = builder()
         .start_bound()

@@ -601,21 +601,6 @@ impl BoundServer {
                 },
             ));
         }
-        // Retained audit history: one bounded sweep per interval moves each
-        // tenant's oldest contiguous run of audit events out of the
-        // transactional staging and retires it only once Scribe has it durably.
-        #[cfg(feature = "test-support")]
-        let publication = (!self.state.audit_publication_disabled)
-            .then(|| crate::audit::publication::AuditPublisher::from_state(&self.state))
-            .flatten();
-        #[cfg(not(feature = "test-support"))]
-        let publication = crate::audit::publication::AuditPublisher::from_state(&self.state);
-        if let Some(publisher) = publication {
-            set.spawn(worker_task(
-                TaskId::Worker("audit_publisher"),
-                publisher.run(shutdown.clone()),
-            ));
-        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {
@@ -845,9 +830,10 @@ impl BoundServer {
 
         let deadline = deadline.into_std();
         // Every request, gateway call, and Verifier run has finished, so the
-        // Scribe outbox holds all it will be given while Scribe still accepts;
-        // write it before Bifrost closes. Losses are counted and logged by the
-        // outbox.
+        // Scribe outbox holds nearly all it will be given while Scribe still
+        // accepts; write it before Bifrost closes. A decision an Oracle drain
+        // stages after this fence is refused, and every loss is counted and
+        // logged by the outbox.
         let unwritten = self.state.scribe_outbox.shutdown(deadline).await;
         if unwritten != 0 {
             tracing::warn!(
@@ -923,16 +909,6 @@ impl BoundServer {
         if let Some(outbox) = self.state.bifrost.observation_runs() {
             outbox.shutdown(deadline).await;
         }
-        // Every request has finished and Oracle has drained, so no decision
-        // can still be staged; commit what the shared outbox holds.
-        let uncommitted = self.state.audit_outbox.shutdown(deadline).await;
-        if uncommitted != 0 {
-            tracing::warn!(
-                uncommitted,
-                "audit outbox did not drain before the shutdown deadline"
-            );
-        }
-
         tracing::info!("wyrd-server shutdown complete");
         server_shutdown_result(terminal, bifrost_shutdown_error, report)
     }

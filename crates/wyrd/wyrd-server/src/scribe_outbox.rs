@@ -1,5 +1,5 @@
-//! The process's one Scribe-bound outbox: gateway capture and Verifier
-//! results.
+//! The process's one Scribe-bound outbox: audit decisions, gateway capture,
+//! and Verifier results.
 //!
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
@@ -28,6 +28,7 @@ use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
@@ -36,19 +37,20 @@ use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeI
 use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+use vala_bifrost_redux::tables::audit::projection::project_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::{
-    DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
+    AuditLogTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
 };
 use wyrd_runtime::outbox::{Outbox, OutboxSink, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{AuditEvent, NodeId};
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
@@ -77,6 +79,13 @@ const FRAME_BUDGET_BYTES: usize = BIFROST_INGEST_REQUEST_LIMIT_BYTES / 4;
 /// the Arrow encoding, grouping, identity, and delivery of those rows.
 #[derive(Debug)]
 pub enum ScribeWrite {
+    /// One authorization decision bound for retained audit history.
+    Audit {
+        /// The decision.
+        event: AuditEvent,
+        /// When the boundary decided, captured as the decision is staged.
+        decided_at: DateTime<Utc>,
+    },
     /// One gateway call's validated analytical record, its objects already
     /// persisted.
     Capture(Box<CallCapture>),
@@ -87,6 +96,17 @@ pub enum ScribeWrite {
         /// The exact Verifier and SYSTEM principal the rows are written under.
         attribution: VerifierAttribution,
     },
+}
+
+impl From<AuditEvent> for ScribeWrite {
+    /// Stages one decision, stamped with the instant it is staged, which is
+    /// the instant the boundary decided.
+    fn from(event: AuditEvent) -> Self {
+        Self::Audit {
+            event,
+            decided_at: Utc::now(),
+        }
+    }
 }
 
 impl From<CallCapture> for ScribeWrite {
@@ -116,6 +136,12 @@ impl ScribeWrite {
     /// Returns the projection failure's reason when the rows cannot be built.
     fn rows(&self) -> Result<Vec<Rows<'_>>, &'static str> {
         match self {
+            Self::Audit { event, decided_at } => Ok(vec![Rows {
+                table: ScribeTable::AuditLog,
+                attribution: None,
+                request: None,
+                batch: project_audit_event(event, *decided_at).map_err(|_| "projection")?,
+            }]),
             Self::Capture(capture) => Ok(capture
                 .batches()
                 .map_err(|drop| drop.reason())?
@@ -149,10 +175,12 @@ impl ScribeWrite {
     }
 }
 
-/// The destinations the Scribe outbox writes: the two gateway capture tables
-/// and the three Verifier result tables.
+/// The destinations the Scribe outbox writes: retained audit history, the two
+/// gateway capture tables, and the three Verifier result tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
+    /// `vala.system.audit_log`, one row per authorization decision.
+    AuditLog,
     /// `vala.gateway.calls`, one row per captured call.
     Calls,
     /// `vala.traces.spans`, one span per captured attempt.
@@ -167,7 +195,8 @@ pub enum ScribeTable {
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
+        Self::AuditLog,
         Self::Calls,
         Self::Spans,
         Self::Results,
@@ -179,6 +208,7 @@ impl ScribeTable {
     #[must_use]
     pub const fn fqn(self) -> &'static str {
         match self {
+            Self::AuditLog => "vala.system.audit_log",
             Self::Calls => "vala.gateway.calls",
             Self::Spans => "vala.traces.spans",
             Self::Results => "vala.verification.results",
@@ -202,6 +232,7 @@ impl ScribeTable {
     /// Logical Bifrost table this destination names.
     fn table_ref(self) -> TableRef {
         match self {
+            Self::AuditLog => TableRef::new(BifrostNamespace::Audit, AuditLogTable::NAME),
             Self::Calls => TableRef::new(BifrostNamespace::Gateway, CallsTable::NAME),
             Self::Spans => TableRef::new(BifrostNamespace::Traces, SpansTable::NAME),
             Self::Results => TableRef::new(BifrostNamespace::Verification, ResultsTable::NAME),
@@ -337,8 +368,8 @@ impl ScribeRefusal {
 ///
 /// The sink and the peer service both submit through [`Self::into_frame`],
 /// so a frame is identical in-process and over the peer plane. A result
-/// table's frame carries its [`VerifierAttribution`] and a capture table's
-/// carries none; the peer service refuses any other combination.
+/// table's frame carries its [`VerifierAttribution`] and an audit or capture
+/// table's carries none; the peer service refuses any other combination.
 #[derive(Debug, Clone)]
 pub(crate) struct ScribeBatch {
     /// Tenant the rows belong to.
@@ -351,20 +382,25 @@ pub(crate) struct ScribeBatch {
     pub(crate) request_id: RequestId,
     /// The rows as one Arrow IPC stream.
     pub(crate) ipc: Bytes,
-    /// Verifier attribution of a result frame; `None` for capture.
+    /// Verifier attribution of a result frame; `None` for audit and capture.
     pub(crate) verifier: Option<VerifierAttribution>,
 }
 
 impl ScribeBatch {
     /// Builds the Scribe frame for this batch.
     ///
-    /// A capture frame is submitted under the reserved capture principal; a
-    /// result frame under the tenant SYSTEM principal whose Card scope is
-    /// exactly the Verifier, from which Scribe stamps `card_uid`. The
-    /// principal carries no permission: both are server-internal writes that
-    /// evaluate none, and its id is what Scribe stamps as `principal_id`.
+    /// An audit frame is submitted under the platform audit principal, the
+    /// one principal Scribe admits for the system owner's audit history; a
+    /// capture frame under the reserved capture principal; a result frame
+    /// under the tenant SYSTEM principal whose Card scope is exactly the
+    /// Verifier, from which Scribe stamps `card_uid`. The principal carries no
+    /// permission: all are server-internal writes that evaluate none, and its
+    /// id is what Scribe stamps as `principal_id`.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
         let (id, kind) = match &self.verifier {
+            None if self.table == ScribeTable::AuditLog => {
+                (PLATFORM_AUDIT_PRINCIPAL, PrincipalKind::User)
+            }
             None => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
             Some(attribution) => (
                 attribution.principal,

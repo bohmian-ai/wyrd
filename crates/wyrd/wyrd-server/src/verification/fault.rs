@@ -21,7 +21,7 @@ use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
 /// `lose_ack_next` lets Scribe durably accept one table's batch and then
 /// reports it busy, so the outbox must resend the identical batch. The fault
 /// fires once.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PublicationFault {
     /// One-shot lost acknowledgement after this table's durable batch.
     lose_ack_on: Arc<Mutex<Option<String>>>,

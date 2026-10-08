@@ -114,7 +114,6 @@ impl Delivery {
     /// Panics when startup or seeding fails.
     async fn boot() -> Self {
         let server = WyrdTestServer::builder()
-            .without_audit_publication_for_test()
             .start_bound()
             .await
             .expect("bound server starts");

@@ -34,7 +34,7 @@ pub async fn exchange_jwt_bearer(
     let service = wyrd_auth::jwt_bearer::JwtBearer {
         issuer: state
             .auth
-            .tenant_issuer(&state.audit_outbox)
+            .tenant_issuer(&state.scribe_outbox)
             .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
@@ -542,7 +542,7 @@ mod pg_tests {
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
             issuer: state
                 .auth
-                .tenant_issuer(&state.audit_outbox)
+                .tenant_issuer(&state.scribe_outbox)
                 .expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -813,7 +813,7 @@ mod pg_tests {
     ) -> Vec<AuditRow> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );

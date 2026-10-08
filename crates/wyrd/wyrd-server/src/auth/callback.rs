@@ -29,7 +29,7 @@ pub async fn exchange_authorization_code(
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
         issuer: state
             .auth
-            .tenant_issuer(&state.audit_outbox)
+            .tenant_issuer(&state.scribe_outbox)
             .ok_or_else(auth_not_configured)?,
         connections: state
             .auth
@@ -1484,7 +1484,7 @@ mod pg_tests {
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                &state.audit_outbox,
+                &state.scribe_outbox,
                 trusted.tenant_id,
                 "req",
                 &error.0,
@@ -1501,7 +1501,7 @@ mod pg_tests {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
-                .tenant_issuer(&state.audit_outbox)
+                .tenant_issuer(&state.scribe_outbox)
                 .expect("test state has issuing key"),
             connections: state
                 .auth
@@ -1576,7 +1576,7 @@ mod pg_tests {
         );
         let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
         let state = test_state(fixture).await;
-        let audit = Arc::clone(&state.audit_outbox);
+        let audit = Arc::clone(&state.scribe_outbox);
         state.with_auth(crate::components::auth::ServerAuth {
             issuing_key: Some(issuing_key),
             token_verifier: Some(Arc::new(verifier)),
@@ -1625,7 +1625,7 @@ mod pg_tests {
     async fn settle(state: &AppState) {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );
@@ -1635,7 +1635,7 @@ mod pg_tests {
     /// one second of retrying.
     async fn pending(state: &AppState) -> usize {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
-        state.audit_outbox.settle(deadline).await
+        state.scribe_outbox.settle(deadline).await
     }
 
     /// Canonical detail of a refused exchange with `error_code`.

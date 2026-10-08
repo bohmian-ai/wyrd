@@ -113,7 +113,7 @@ async fn authorize<'a>(
     } else {
         AuditOutcome::Denied
     };
-    state.audit_outbox.stage(
+    state.scribe_outbox.stage(
         caller.data_tenant_id,
         audit::audit_event(caller, operation, resource, REQUIRED_PERMISSION, outcome),
     );

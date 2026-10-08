@@ -318,11 +318,9 @@ fn scrape_staging(
 async fn staged_backlog_survives_abrupt_restart() {
     // The insertion counter is pod-wide, so the tenant's audit table must not
     // insert rows inside the resend window.
-    let mut cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
-    )
-    .await
-    .expect("the one-pod mixed cluster starts");
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
     let telemetry = cluster.telemetry().clone();
     let tenant = cluster.data_tenant_id();
     let name = unique_table("staged_restart");
@@ -460,7 +458,6 @@ async fn scribe_hot_path_telemetry_reconciles() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");
     let server = WyrdTestServer::builder()
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");

@@ -38,7 +38,7 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
         state.auth.human_connections.clone().ok_or_else(missing)?,
         state
             .auth
-            .tenant_issuer(&state.audit_outbox)
+            .tenant_issuer(&state.scribe_outbox)
             .ok_or_else(missing)?,
     ))
 }

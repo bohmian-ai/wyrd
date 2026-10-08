@@ -744,7 +744,7 @@ impl Fixture {
     async fn decisions(&self, operation: &str) -> Vec<Decision> {
         let tenant = self.server.data_tenant_id();
         self.server
-            .await_audit_published(tenant)
+            .await_audit_retained()
             .await
             .expect("audit publishes");
         self.server

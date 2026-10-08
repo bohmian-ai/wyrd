@@ -1586,7 +1586,7 @@ async fn system_reads(
     server: &WyrdTestServer,
     tenant: DataTenantId,
 ) -> Result<Vec<String>, ServerJourneyError> {
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     Ok(server
         .retained_audit_records(
             tenant,
@@ -2017,7 +2017,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     }
 
     // Under-scoped: outside the scope, and narrowed away from an input.
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     let outside = read_as(
         server,
         context.clone(),

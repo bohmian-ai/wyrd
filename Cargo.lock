@@ -11618,6 +11618,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "url",
+ "wyrd-auth-verify",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",

@@ -804,14 +804,15 @@ saved_login_journey() {
     client) rust_journey wyrd-client integration "pg_auth_e2e_against_fixture::$name" ;;
     python)
       mise run py:setup
-      # The story file is the journey: its six tests, one per saved-login outcome.
-      selector="tests/integration/test_$name.py"
-      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity "$selector" | grep -c "::test_" || true)"
-      if [ "$count" != 6 ]; then
-        echo "Python journey $selector selects $count tests; expected exactly 6" >&2
+      # The story files are the journey: six saved-login outcomes plus the
+      # signed-in development workflow.
+      selector="tests/integration/test_$name.py tests/integration/test_signed_in_development.py"
+      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity $selector | grep -c "::test_" || true)"
+      if [ "$count" != 7 ]; then
+        echo "Python journey $selector selects $count tests; expected exactly 7" >&2
         exit 1
       fi
-      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity "$selector")
+      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity $selector)
       ;;
     typescript)
       mise run ts:build

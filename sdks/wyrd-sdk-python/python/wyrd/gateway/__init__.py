@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from wyrd._wyrd.gateway import Gateway
+
+if TYPE_CHECKING:
+    from wyrd.gateway._auth import GatewayAuth
 
 GatewayOperation = Literal[
     "chat_completions", "responses", "embeddings", "images", "audio", "batches"
@@ -388,6 +391,7 @@ __all__ = [
     "FallbackRule",
     "FallbackScope",
     "Gateway",
+    "GatewayAuth",
     "GatewayBudget",
     "GatewayBudgetPeriod",
     "GatewayCaptureMode",
@@ -421,3 +425,12 @@ __all__ = [
     "UnknownCostPolicy",
     "VertexAdapter",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Load ``GatewayAuth`` on first use, so ``httpx`` stays optional."""
+    if name == "GatewayAuth":
+        from wyrd.gateway._auth import GatewayAuth
+
+        return GatewayAuth
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

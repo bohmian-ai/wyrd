@@ -1,4 +1,10 @@
-"""Run span correlation for OpenTelemetry.
+"""OpenTelemetry integration: stock OTLP/HTTP exporters and Run span correlation.
+
+``span_exporter``, ``log_exporter``, and ``metric_exporter`` build the stock
+OTLP/HTTP protobuf exporters for one ``WyrdClient``: every export asks the
+client for its current access token and sends it as ``x-wyrd-access-token``,
+so a long-lived exporter keeps working after any one token expires. They need
+the ``otel`` extra (``pip install 'wyrd[otel]'``).
 
 ``Run.__enter__``/``__exit__`` delegate here so spans created inside
 ``with state.run(...)`` carry the record-level ``wyrd.card_ref`` and
@@ -8,7 +14,14 @@ optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    from wyrd.client import WyrdClient
 
 try:
     from opentelemetry import context as _otel_context
@@ -144,3 +157,78 @@ def _exit_run(card_ref: str, run_id: str) -> None:
             _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, stack[:-1]))
     except Exception:  # telemetry must never fail the app
         pass
+
+
+_EXPORTER_EXTRA = (
+    "Wyrd OTLP exporters need the otel extra: pip install 'wyrd[otel]' "
+    "(opentelemetry-exporter-otlp-proto-http)"
+)
+
+
+def _session(client: WyrdClient) -> Any:
+    """A ``requests`` session that authenticates every request as ``client``."""
+    try:
+        import requests
+    except ImportError as missing:
+        raise ImportError(_EXPORTER_EXTRA) from missing
+
+    def authenticate(request: Any) -> Any:
+        request.headers["x-wyrd-access-token"] = f"Bearer {client.access_token()}"
+        return request
+
+    session = requests.Session()
+    session.auth = authenticate
+    return session
+
+
+def _endpoint(client: WyrdClient, signal: str) -> str:
+    """The signal-specific OTLP/HTTP URL on ``client``'s server."""
+    return f"{client.server_url.rstrip('/')}/v1/{signal}"
+
+
+def span_exporter(client: WyrdClient) -> OTLPSpanExporter:
+    """Build a stock OTLP/HTTP span exporter that authenticates as ``client``.
+
+    Args:
+        client: The client whose access token authenticates every export.
+
+    Raises:
+        ImportError: naming the ``otel`` extra when the exporter is not installed.
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    except ImportError as missing:
+        raise ImportError(_EXPORTER_EXTRA) from missing
+    return OTLPSpanExporter(endpoint=_endpoint(client, "traces"), session=_session(client))
+
+
+def log_exporter(client: WyrdClient) -> OTLPLogExporter:
+    """Build a stock OTLP/HTTP log exporter that authenticates as ``client``.
+
+    Args:
+        client: The client whose access token authenticates every export.
+
+    Raises:
+        ImportError: naming the ``otel`` extra when the exporter is not installed.
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    except ImportError as missing:
+        raise ImportError(_EXPORTER_EXTRA) from missing
+    return OTLPLogExporter(endpoint=_endpoint(client, "logs"), session=_session(client))
+
+
+def metric_exporter(client: WyrdClient) -> OTLPMetricExporter:
+    """Build a stock OTLP/HTTP metric exporter that authenticates as ``client``.
+
+    Args:
+        client: The client whose access token authenticates every export.
+
+    Raises:
+        ImportError: naming the ``otel`` extra when the exporter is not installed.
+    """
+    try:
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    except ImportError as missing:
+        raise ImportError(_EXPORTER_EXTRA) from missing
+    return OTLPMetricExporter(endpoint=_endpoint(client, "metrics"), session=_session(client))

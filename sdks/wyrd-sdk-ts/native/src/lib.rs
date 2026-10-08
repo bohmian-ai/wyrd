@@ -10,6 +10,7 @@ pub mod cli;
 pub mod client;
 pub mod gateway;
 pub mod operators;
+pub mod principals;
 pub mod workflow;
 
 use std::result::Result as StdResult;

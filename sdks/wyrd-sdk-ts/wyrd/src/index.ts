@@ -29,6 +29,7 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
+type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
@@ -1892,6 +1893,216 @@ export class OperatorConnections {
    */
   async disable(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
+  }
+}
+
+/** The kind of an assignable principal. */
+export type PrincipalKind = "user" | "service" | "agent";
+
+/** Where a Role assignment comes from: login's identity provider, or a direct grant. */
+export type RoleSource = "idp" | "direct";
+
+/** One Role a principal holds and its source. */
+export type RoleAssignment = { readonly role: string; readonly source: RoleSource };
+
+/** A principal's Role assignments, ordered by Role and then source. */
+export type PrincipalRoles = {
+  readonly principal_id: string;
+  readonly kind: PrincipalKind;
+  readonly roles: readonly RoleAssignment[];
+};
+
+/**
+ * The outcome of a direct grant or revoke: `changed` is false when the
+ * assignment already matched, and `roles` is the complete resulting set.
+ */
+export type RoleAssignmentChange = PrincipalRoles & {
+  readonly role: string;
+  readonly changed: boolean;
+};
+
+/** One assignable principal; users carry `email`, Services and Agents `name` and `card_ref`. */
+export type PrincipalSummary = {
+  readonly principal_id: string;
+  readonly kind: PrincipalKind;
+  readonly status: "active" | "suspended";
+  readonly email: string | null;
+  readonly name: string | null;
+  readonly card_ref: Readonly<Record<string, string>> | null;
+};
+
+/** One page of principals; `next` is the following page's `after`, or null on the last page. */
+export type PrincipalPage = {
+  readonly principals: readonly PrincipalSummary[];
+  readonly next: string | null;
+};
+
+/** Exact-match discovery filters and keyset position. */
+export type PrincipalQuery = {
+  readonly kind?: PrincipalKind;
+  readonly email?: string;
+  readonly name?: string;
+  /** Page size from 1 to 200; omitted, 100. */
+  readonly limit?: number;
+  readonly after?: string;
+};
+
+/** Create an unbound Service principal holding `roles`. */
+export type CreateServicePrincipalRequest = {
+  readonly name: string;
+  readonly roles: readonly string[];
+  readonly description?: string;
+};
+
+/** The created principal and its first plaintext credential, returned once. */
+export type CreateServicePrincipalResponse = { readonly principal_id: string; readonly credential: string };
+
+/** A newly issued credential and its plaintext secret, returned once. */
+export type IssuedCredential = { readonly id: string; readonly credential: string };
+
+/** Credential metadata; the secret is never returned. */
+export type CredentialMetadata = {
+  readonly id: string;
+  readonly prefix: string;
+  readonly created_at: string;
+  readonly expires_at: string | null;
+  readonly revoked_at: string | null;
+  readonly last_used_at: string | null;
+};
+
+/** A principal's credentials. */
+export type CredentialList = { readonly credentials: readonly CredentialMetadata[] };
+
+/** Revoke a principal of `principal_kind` for an audited `reason`. */
+export type RevokePrincipalRequest = { readonly principal_kind: PrincipalKind; readonly reason: string };
+
+/**
+ * Tenant principal client over the shared Rust handle: Service principals,
+ * their credentials, discovery, and direct Role assignment.
+ *
+ * A Role change reaches the principal at its next token; tokens already
+ * issued keep their Roles. Failures throw a structured {@link WyrdError}.
+ */
+export class Principals {
+  readonly #native: NativePrincipals;
+
+  private constructor(native: NativePrincipals) {
+    this.#native = native;
+  }
+
+  /**
+   * Build a principal client without performing IO.
+   *
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The principal client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   */
+  static connect(options: ClientOptions = {}): Principals {
+    return new Principals(wyrdClientNative(clientOf(options)).principals());
+  }
+
+  /**
+   * Create an unbound Service principal; requires `service_accounts:write`.
+   *
+   * @param request - The principal's name, Roles, and optional description.
+   * @returns The principal id and its first credential.
+   * @throws {@link WyrdError} for a malformed request or a transport or authorization failure.
+   */
+  async createServicePrincipal(request: CreateServicePrincipalRequest): Promise<CreateServicePrincipalResponse> {
+    return lifecycleValue(await this.#native.createServicePrincipal(JSON.stringify(request)));
+  }
+
+  /**
+   * Issue one more credential; requires `service_accounts:write`.
+   *
+   * @param principalId - The Service or Agent principal.
+   * @returns The credential and its plaintext secret.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async issueCredential(principalId: string): Promise<IssuedCredential> {
+    return lifecycleValue(await this.#native.issueCredential(principalId));
+  }
+
+  /**
+   * List a principal's credential metadata; requires `service_accounts:write`.
+   *
+   * @param principalId - The principal whose credentials to list.
+   * @returns The credentials, without secrets.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async listCredentials(principalId: string): Promise<CredentialList> {
+    return lifecycleValue(await this.#native.listCredentials(principalId));
+  }
+
+  /**
+   * Revoke one credential of a principal; requires `service_accounts:write`.
+   *
+   * @param principalId - The credential's principal.
+   * @param credentialId - The credential to revoke.
+   * @throws {@link WyrdError} when the credential is not the principal's, or a transport or authorization failure.
+   */
+  async revokeCredential(principalId: string, credentialId: string): Promise<void> {
+    lifecycleValue<null>(await this.#native.revokeCredential(principalId, credentialId));
+  }
+
+  /**
+   * Revoke a principal and every credential it holds.
+   *
+   * @param principalId - The principal to revoke.
+   * @param request - Its kind and the audited reason.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async revokePrincipal(principalId: string, request: RevokePrincipalRequest): Promise<void> {
+    lifecycleValue<null>(await this.#native.revokePrincipal(principalId, JSON.stringify(request)));
+  }
+
+  /**
+   * One page of assignable principals ordered by id; requires `service_accounts:write`.
+   *
+   * @param query - Exact filters, page size, and the previous page's `next`.
+   * @returns The page.
+   * @throws {@link WyrdError} for an invalid filter or a transport or authorization failure.
+   */
+  async list(query: PrincipalQuery = {}): Promise<PrincipalPage> {
+    return lifecycleValue(await this.#native.list(JSON.stringify(query)));
+  }
+
+  /**
+   * A principal's Role assignments; requires `service_accounts:write`.
+   *
+   * @param principalId - The principal to read.
+   * @returns Its assignments ordered by Role and source.
+   * @throws {@link WyrdError} for a principal that is not assignable, or a transport or authorization failure.
+   */
+  async roles(principalId: string): Promise<PrincipalRoles> {
+    return lifecycleValue(await this.#native.roles(principalId));
+  }
+
+  /**
+   * Idempotently grant a direct Role; requires tenant administration.
+   *
+   * @param principalId - The principal to grant to.
+   * @param role - The Role name.
+   * @returns Whether the call changed anything and the resulting assignments.
+   * @throws {@link WyrdError} for an unknown Role, a principal that is not
+   * assignable, or a transport or authorization failure.
+   */
+  async grantRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
+    return lifecycleValue(await this.#native.grantRole(principalId, role));
+  }
+
+  /**
+   * Idempotently revoke a direct Role; identity-provider assignments stay.
+   *
+   * @param principalId - The principal to revoke from.
+   * @param role - The Role name.
+   * @returns Whether the call changed anything and the resulting assignments.
+   * @throws {@link WyrdError} for an unknown Role, a principal that is not
+   * assignable, or a transport or authorization failure.
+   */
+  async revokeRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
+    return lifecycleValue(await this.#native.revokeRole(principalId, role));
   }
 }
 

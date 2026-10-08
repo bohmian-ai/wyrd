@@ -1058,6 +1058,8 @@ pub async fn compose_bifrost(
     // The one process audit outbox: Gate, Oracle, peer security, and every
     // request-path decision stage on it; `BoundServer::run` drains it last.
     let audit_outbox = AuditSink::outbox(postgres.vala().clone());
+    // The one process Scribe outbox; its route is bound once the roles exist.
+    let (scribe_outbox, scribe_route) = crate::scribe_outbox::ScribeSink::outbox();
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
@@ -1174,6 +1176,8 @@ pub async fn compose_bifrost(
             query_controls: Some(query_controls),
             observation_runs,
             audit_outbox,
+            scribe_outbox,
+            scribe_route,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),

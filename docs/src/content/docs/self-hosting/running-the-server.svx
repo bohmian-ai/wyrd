@@ -254,7 +254,7 @@ Each process exports its own verification runtime series. Labels are closed sets
 | `kind` | `drift_psi`, `drift_spc`, `drift_custom`, `eval_assertion`, `eval_llm_judge`, `eval_other`, `unknown` |
 | `mode` | `queued` (a claimed attempt of a durable run), `direct` (a supplied-input request) |
 | `origin` | `schedule`, `manual`, `observation` (queued only) |
-| `phase` | `load`, `input_read`, `prepare`, `engine`, `publication`, `settlement` |
+| `phase` | `load`, `input_read`, `prepare`, `engine`, `settlement` |
 | `outcome` | queued: `completed`, `retrying`, `exhausted`, `awaiting_trace`, `cancelled`, `timed_out`, `errored`, `released`, `deferred`, `stale_lease`, `settlement_failed`; direct: `completed`, `cancelled`, `timed_out`, `errored` |
 
 An Eval with any LLM judge is `eval_llm_judge`. An Eval made only of record assertions is `eval_assertion`. Any other Eval graph is `eval_other`. `unknown` means the exact Verifier could not be loaded or classified.
@@ -274,7 +274,7 @@ An Eval with any LLM judge is `eval_llm_judge`. An Eval made only of record asse
 **Runtime latency**
 
 - `wyrd_verification_run_duration_seconds{kind,mode,outcome}` is claim-to-settlement for a queued attempt and runtime-entry-to-result for a direct request. Do not combine the two modes into one percentile.
-- `wyrd_verification_phase_duration_seconds{kind,mode,phase}` records at most one sample per phase per execution. When a phase runs more than once, the sample is the union of its intervals. `engine` includes `input_read`, `prepare`, scoring, and provider waits, so phases overlap and never add up. A phase that did not run emits no sample. Direct requests have no `input_read`, `publication`, or `settlement`.
+- `wyrd_verification_phase_duration_seconds{kind,mode,phase}` records at most one sample per phase per execution. When a phase runs more than once, the sample is the union of its intervals. `engine` includes `input_read`, `prepare`, scoring, and provider waits, so phases overlap and never add up. A phase that did not run emits no sample. Direct requests have no `input_read` or `settlement`.
 - `wyrd_verification_engine_overhead_seconds{kind,mode,outcome}` is engine wall time minus the union of measured evidence, dependency, and provider waits inside the engine. Nested and concurrent waits are subtracted once. The result includes preparation, scoring, and scheduling delay. It is wall time, not CPU, and CPU work that overlaps a wait is hidden by it.
 
 **Health and delivery**

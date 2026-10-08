@@ -65,12 +65,10 @@ use super::ledger::{GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
     admin, audit_decisions, await_lock_waiters, keyring, managed_keys, test_state,
 };
-use super::{
-    GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayCapture,
-    GatewayInvocation,
-};
+use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
+use crate::scribe_outbox::ScribeSink;
 use crate::state::{AppState, LimitsConfig};
 
 /// One scripted provider attempt.
@@ -3062,19 +3060,20 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     drain_gateway(&d).await;
 }
 
-/// Routes `state`'s capture writer to a recording Scribe standing in for the
+/// Routes `state`'s Scribe outbox to a recording Scribe standing in for the
 /// pod's own, returning the state and the Scribe its batches land in.
 fn recorded(mut state: AppState) -> (AppState, Arc<RecordingScribe>) {
     let scribe = Arc::new(RecordingScribe::default());
-    state.gateway_capture = Arc::new(GatewayCapture::local(Arc::clone(&scribe) as _));
+    state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
     (state, scribe)
 }
 
 /// Waits for every spawned gateway task — accounting and post-answer
-/// capture — then reopens the tracker, and settles the audit outbox.
+/// capture — then reopens the tracker, and settles the audit and Scribe
+/// outboxes.
 ///
-/// Invocation audit is non-blocking, so a decision row exists only once the
-/// outbox has committed it.
+/// Invocation audit and capture are non-blocking, so a decision row or a
+/// captured frame exists only once its outbox has written it.
 ///
 /// # Panics
 ///
@@ -3091,10 +3090,15 @@ async fn drain_gateway(state: &AppState) {
         0,
         "audit settles"
     );
+    assert_eq!(
+        state.scribe_outbox.settle(deadline).await,
+        0,
+        "capture settles"
+    );
 }
 
 /// Proves capture follows the admitted policy without changing the call:
-/// `Disabled` submits nothing, `Metadata` delivers one row plus one span per
+/// `Disabled` submits nothing, `Metadata` writes one row plus one span per
 /// attempt under the admitting request, and a pod reaching no Scribe drops
 /// capture while the call still answers and accounts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3692,12 +3696,12 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
     );
 }
 
-/// Proves post-response capture is bounded by the admitted call's absolute
-/// deadline. With the captured object's storage read parked on a FIFO, and
-/// separately with the Scribe never acknowledging, each call still answers
-/// and accounts, its capture is dropped once as unavailable when the deadline
-/// passes, nothing is delivered, and the capture task ends so tracked gateway
-/// work drains while the dependency is still parked.
+/// Proves post-response capture work is bounded by the admitted call's
+/// absolute deadline. With the captured object's storage read parked on a
+/// FIFO, the call still answers and accounts, its capture is dropped once as
+/// unavailable when the deadline passes, nothing is staged, and the capture
+/// task ends so tracked gateway work drains while the dependency is still
+/// parked.
 ///
 /// # Panics
 ///
@@ -3715,7 +3719,6 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     let caller = invoker(tenant, 1, [provider_access()]);
     let deadline = Duration::from_millis(500);
     let dropped = "wyrd_gateway_capture_total{outcome=unavailable}";
-    let delivered = "wyrd_gateway_capture_total{outcome=delivered}";
 
     // Object get: the selected answer's object path is a FIFO no writer opens.
     GatewayAdministration::new(&state)
@@ -3776,39 +3779,6 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
             .open(&fifo)
             .expect("the FIFO opens"),
     );
-
-    // Delivery: the Scribe accepts the submission and never acknowledges it.
-    GatewayAdministration::new(&state)
-        .put_capture(
-            &admin(tenant),
-            GatewayCapturePolicyWrite {
-                mode: GatewayCaptureMode::Metadata,
-                payload_fields: BTreeSet::new(),
-            },
-        )
-        .await
-        .expect("metadata policy stores");
-    scribe.park();
-    dispatch.push(Step::Return(completed(100, 50)));
-    let answered = GatewayInvocation::new(&state)
-        .invoke(&caller, request("acme/a", None, deadline))
-        .await
-        .expect("a parked Scribe never fails the call");
-    drain_gateway(&state).await;
-    assert_eq!(scribe.attempts(), 1, "the row batch was submitted once");
-    assert!(scribe.received().is_empty(), "nothing is acknowledged");
-    assert!(
-        !recorder.series.lock().expect("series").contains(delivered),
-        "nothing is delivered"
-    );
-    assert!(
-        entries(&fixture, tenant, answered.call_id)
-            .await
-            .iter()
-            .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
-        "accounting is unaffected"
-    );
-    drain_gateway(&state).await;
 }
 
 /// Proves capture follows the policy admitted with each call: disabling

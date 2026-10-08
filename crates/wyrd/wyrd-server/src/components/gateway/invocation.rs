@@ -41,8 +41,8 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditOutcome;
 
 use super::capture::{
-    CallCapture, CallFacts, CaptureDrop, GatewayCapture, PayloadObjects, error_code,
-    operation_name, request_content, selects,
+    CallCapture, CallFacts, CaptureDrop, PayloadObjects, error_code, operation_name, record,
+    request_content, selects,
 };
 use super::ledger::{Admission, GatewayLedger, LedgerCall};
 use super::service::{GatewayAdministration, unavailable};
@@ -793,44 +793,41 @@ impl<'a> GatewayInvocation<'a> {
         })
     }
 
-    /// Projects and delivers the capture of one terminal call, if selected.
+    /// Projects the capture of one terminal call, if selected, and stages it
+    /// on the process Scribe outbox.
     ///
     /// Runs after the caller has its answer; every outcome is counted by
-    /// [`GatewayCapture::record`]. The whole capture — request content, object
-    /// get, put, and read-back, and every Scribe submission — is bounded by
-    /// the admitted call's absolute deadline, so a hung dependency cannot hold
-    /// facts, object bytes, or this task past the call. Delivery itself stops
-    /// retrying at that deadline with its own drop reason; work still running
-    /// when it passes is dropped, releasing what it held, and one
-    /// [`CaptureDrop::Unavailable`] is recorded.
+    /// [`record`]. Request-content resolution and object get, put, and
+    /// read-back are bounded by the admitted call's absolute deadline, so a
+    /// hung dependency cannot hold facts, object bytes, or this task past the
+    /// call; work still running when it passes is dropped, releasing what it
+    /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging itself
+    /// never waits: the outbox owns encoding and delivery.
     async fn capture(state: &AppState, call: &AdmittedCall, facts: Option<CallFacts>) {
         let Some(mut facts) = facts else {
             return;
         };
         let work = async {
             if selects(&facts.policy, GatewayPayloadField::Request) {
-                match request_content(&call.body, call.media.as_ref(), &mut facts.objects).await {
-                    Ok(content) => facts.request = Some(content),
-                    Err(_) => {
-                        return GatewayCapture::record(call.call_id, Err(CaptureDrop::Payload));
-                    }
-                }
+                request_content(&call.body, call.media.as_ref(), &mut facts.objects)
+                    .await
+                    .map(|content| facts.request = Some(content))
+                    .map_err(|_| CaptureDrop::Payload)?;
             }
-            match CallCapture::from_facts(facts) {
-                Ok(capture) => {
-                    state
-                        .gateway_capture
-                        .publish(state, &capture, call.deadline)
-                        .await
-                        .ok();
-                }
-                Err(drop) => GatewayCapture::record(call.call_id, Err(drop)),
-            }
+            let mut capture = CallCapture::from_facts(facts)?;
+            capture.persist(state).await?;
+            Ok(capture)
         }
         .instrument(tracing::info_span!("gateway.capture"));
-        if tokio::time::timeout_at(call.deadline, work).await.is_err() {
-            GatewayCapture::record(call.call_id, Err(CaptureDrop::Unavailable));
-        }
+        let result = match tokio::time::timeout_at(call.deadline, work).await {
+            Ok(Ok(capture)) => {
+                state.scribe_outbox.stage(capture.tenant(), capture);
+                Ok(())
+            }
+            Ok(Err(drop)) => Err(drop),
+            Err(_) => Err(CaptureDrop::Unavailable),
+        };
+        record(call.call_id, result);
     }
 
     /// Records the terminal request, attempt, routing, usage, and cost

@@ -5,24 +5,31 @@
 //! [`Caller`] and typed input, so authorization, audit, tenancy, idempotency,
 //! and error mapping have exactly one implementation.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 use wyrd_runtime::Permission;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::ids::{
     BindingId, CardUid, IdempotencyKey, VerificationExecutionId, VerificationRunId,
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
     VerificationRunInput, VerificationRunStatus, VerificationRunTarget, VerifierKind,
     VerifierReadiness,
 };
+use wyrd_sql::queries::auth::system_principal_id;
 use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::verifier_runs::RunInput;
 use wyrd_sql::queries::verifier_runs::{
     EnqueueRefusal, ManualEnqueueOutcome, RequestKey, VerifierRunQueue,
 };
@@ -32,8 +39,11 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
+use crate::scribe_outbox::{ScribeWrite, VerifierAttribution};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::direct::{self, DirectExecutor, EXECUTION_DEADLINE};
+use crate::verification::engines::VerifierReport;
+use crate::verification::results::{ResultPayloadBuilder, ResultRun};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -56,6 +66,8 @@ struct DirectTarget {
     implementation: VerifierImplementation,
     /// Exact subject reference.
     subject: CardRef,
+    /// The tenant's active SYSTEM principal the result is attributed to.
+    system_principal: Option<PrincipalId>,
 }
 
 /// The exact reference of a stored Card row.
@@ -402,6 +414,7 @@ impl<'a> VerificationControl<'a> {
         }
         let kind = VerifierKind::of(&target.implementation);
         telemetry.classify(kind);
+        let started_at = Utc::now();
         let executed = telemetry
             .phase(
                 Phase::Engine,
@@ -433,6 +446,13 @@ impl<'a> VerificationControl<'a> {
         span.record("outcome", outcome);
         telemetry.finish(outcome, outcome != "completed");
         let report = result?;
+        self.stage_result(
+            caller.data_tenant_id,
+            execution_id,
+            &target,
+            &report,
+            started_at,
+        );
         Ok(Judgment {
             execution_id,
             verifier: target.verifier,
@@ -443,6 +463,85 @@ impl<'a> VerificationControl<'a> {
             counts: report.counts(),
             detail: direct::detail(&report)?,
         })
+    }
+
+    /// Stage a completed direct execution's result on the Scribe outbox.
+    ///
+    /// The result takes the execution's identity, so the response's
+    /// `execution_id` is the `result_id` of its rows. It is attributed to the
+    /// tenant SYSTEM principal and the exact Verifier exactly like a queued
+    /// result, with no run, owner, binding, or Trigger. A Drift result records
+    /// the execution interval as its window; an Eval result records the
+    /// execution's synthetic record. The verdict is already decided, so a
+    /// missing SYSTEM principal or an unbuildable payload is logged and the
+    /// result is not recorded.
+    fn stage_result(
+        &self,
+        tenant: DataTenantId,
+        execution_id: VerificationExecutionId,
+        target: &DirectTarget,
+        report: &VerifierReport,
+        started_at: DateTime<Utc>,
+    ) {
+        let Some(principal) = target.system_principal else {
+            tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the direct result is not recorded");
+            return;
+        };
+        let (Some(subject), Ok(result_id)) = (
+            target.subject.uid.as_ref(),
+            VerificationResultId::new(execution_id.as_uuid()),
+        ) else {
+            return;
+        };
+        let ended_at = Utc::now();
+        let input = match &target.implementation {
+            VerifierImplementation::Drift(_) => RunInput::DriftWindow(DriftWindow {
+                start: started_at,
+                end: ended_at,
+            }),
+            VerifierImplementation::Eval(_) => RunInput::EvalRecord {
+                record_id: execution_id.as_uuid().to_string(),
+                event_time: started_at,
+            },
+        };
+        let verifier_ref = CardRef {
+            uid: None,
+            ..target.verifier.clone()
+        }
+        .to_string();
+        let verifier_version = target.verifier.version.to_string();
+        let built = ResultPayloadBuilder::new(
+            ResultRun {
+                run_id: None,
+                verifier_version: &verifier_version,
+                subject_card_uid: subject,
+                owner_card_uid: None,
+                binding_id: None,
+                trigger: None,
+                input: &input,
+            },
+            &verifier_ref,
+            result_id,
+            ended_at,
+            started_at,
+            ended_at,
+        )
+        .build(report);
+        match built {
+            Ok(payload) => self.state.scribe_outbox.stage(
+                tenant,
+                ScribeWrite::Result {
+                    payload,
+                    attribution: VerifierAttribution {
+                        verifier: target.verifier.clone(),
+                        principal,
+                    },
+                },
+            ),
+            Err(error) => {
+                tracing::warn!(%execution_id, %error, "the direct result cannot be encoded; it is not recorded");
+            }
+        }
     }
 
     /// Resolve a direct execution's Cards, check subject scope, and stage
@@ -470,6 +569,10 @@ impl<'a> VerificationControl<'a> {
             .await?;
         let verifier = Self::card(&mut conn, &request.verifier_uid).await?;
         let subject = Self::card(&mut conn, &request.subject_card_uid).await?;
+        let system_principal = system_principal_id(&mut conn)
+            .await
+            .map_err(registry_db_error)?
+            .map(PrincipalId::new);
         drop(conn);
         if let Some(subject) = &subject
             && caller.principal.card_ref().is_some()
@@ -487,6 +590,7 @@ impl<'a> VerificationControl<'a> {
                         verifier: reference,
                         implementation: spec.implementation,
                         subject: exact_ref(&subject),
+                        system_principal,
                     }),
                     _ => Err(Self::target_not_found(request)),
                 }

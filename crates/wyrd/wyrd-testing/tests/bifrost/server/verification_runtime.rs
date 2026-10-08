@@ -22,9 +22,13 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use secrecy::ExposeSecret;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::{TableRef, TableUid};
+use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use wyrd_client::Bifrost;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
+use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite, VerifierAttribution};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
@@ -54,7 +58,7 @@ const WAIT: Duration = Duration::from_mins(1);
 const DAY: Duration = Duration::from_hours(24);
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
-/// result through the gateway capture writer's peer ingest RPC and completes
+/// result through the Scribe outbox's peer ingest RPC and completes
 /// the run. Its summary and both feature rows are queryable through the
 /// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
 /// owner, binding, run, result, and one shared event time.
@@ -706,8 +710,8 @@ impl<'a> ResultLayoutJourney<'a> {
     }
 
     /// Publish one result with `event_time` through the production payload
-    /// builder and the internal result writer, and flush it into its own
-    /// file; returns its `result_id`.
+    /// builder and a Scribe outbox, and flush it into its own file; returns
+    /// its `result_id`.
     ///
     /// With `straddle`, Scribe's receipt clock moves one day ahead after the
     /// detail batch is acknowledged and before the summary is sent, so the
@@ -715,7 +719,8 @@ impl<'a> ResultLayoutJourney<'a> {
     /// before returning.
     ///
     /// # Errors
-    /// Returns a payload, write, or flush error.
+    /// Returns a payload or flush error, or an error when the outbox loses
+    /// the staged result.
     async fn publish(
         &self,
         event_time: DateTime<Utc>,
@@ -754,7 +759,6 @@ impl<'a> ResultLayoutJourney<'a> {
             ),
         };
         let result = VerificationResultId::new_v7();
-        let run_id = VerificationRunId::new_v7();
         let verifier_ref = CardRef {
             uid: None,
             ..self.verifier.clone()
@@ -762,7 +766,7 @@ impl<'a> ResultLayoutJourney<'a> {
         .to_string();
         let payload = ResultPayloadBuilder::new(
             ResultRun {
-                run_id,
+                run_id: Some(VerificationRunId::new_v7()),
                 verifier_version: "1.0.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
@@ -781,23 +785,26 @@ impl<'a> ResultLayoutJourney<'a> {
             .server
             .bifrost_scribe()
             .ok_or("the mixed node owns no Scribe")?;
-        let summary = payload.batches().len() - 1;
-        self.server
-            .state()
-            .gateway_capture
-            .write_result_payload_for_test(
-                &payload,
-                self.tenant,
-                run_id,
-                &self.verifier,
-                self.system,
-                |index| {
-                    if straddle && index == summary {
-                        scribe.shift_receipt_clock_for_test(DAY);
-                    }
+        let outbox = ScribeSink::local_outbox(Arc::new(StraddleScribe {
+            inner: Arc::clone(&scribe),
+            straddle,
+        }));
+        outbox.stage(
+            self.tenant,
+            ScribeWrite::Result {
+                payload,
+                attribution: VerifierAttribution {
+                    verifier: self.verifier.clone(),
+                    principal: self.system,
                 },
-            )
-            .await?;
+            },
+        );
+        let lost = outbox
+            .shutdown(std::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        if lost != 0 {
+            return Err("the staged result was never written".into());
+        }
         scribe.shift_receipt_clock_for_test(Duration::ZERO);
         self.server.flush_bifrost().await?;
         Ok(result)
@@ -906,6 +913,48 @@ impl<'a> ResultLayoutJourney<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Scribe decorator that moves the receipt clock one day ahead just before
+/// the summary frame, so a straddling result's detail and summary ACKs fall
+/// on different UTC receipt days.
+struct StraddleScribe {
+    /// The mixed node's real Scribe.
+    inner: Arc<ScribeImpl>,
+    /// Whether to shift the receipt clock before the summary.
+    straddle: bool,
+}
+
+#[async_trait::async_trait]
+impl Scribe for StraddleScribe {
+    /// Mirrors the real Scribe's readiness.
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// Shifts the receipt clock before a straddled summary, then forwards
+    /// `frame`.
+    ///
+    /// # Errors
+    /// Returns the real Scribe's outcome.
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        if self.straddle && frame.table.fqn() == "vala.verification.results" {
+            self.inner.shift_receipt_clock_for_test(DAY);
+        }
+        self.inner.ingest_frame(frame).await
+    }
+
+    /// Forwards table resolution to the real Scribe.
+    ///
+    /// # Errors
+    /// Returns the real Scribe's resolution error.
+    async fn resolve_write_table(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Result<TableUid, ScribeError> {
+        self.inner.resolve_write_table(tenant, table).await
     }
 }
 

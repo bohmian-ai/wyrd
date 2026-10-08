@@ -50,9 +50,9 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// One destination an outbox writes to.
 ///
-/// Implementations make exactly one durable call per write: everything a
-/// tenant has queued, in one transaction, all or nothing. The outbox owns
-/// queueing, grouping, concurrency, retry, and shutdown.
+/// Implementations write everything a tenant has queued in one call: in one
+/// transaction, or as idempotent writes whose repeat is absorbed. The outbox
+/// owns queueing, grouping, concurrency, retry, and shutdown.
 pub trait OutboxSink: Send + Sync + 'static {
     /// The item callers stage.
     type Item: Send + 'static;
@@ -478,8 +478,13 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
-/// Counts `count` items of outbox `S` as lost.
-fn count_lost<S: OutboxSink>(count: usize) {
+/// Counts `count` items of outbox `S` as lost in
+/// `outbox_events_lost_total{outbox}`.
+///
+/// The outbox counts shutdown and late-staging loss itself; a sink calls this
+/// for items it consumes without writing, such as a terminal rejection that a
+/// retry could never cure.
+pub fn count_lost<S: OutboxSink>(count: usize) {
     metrics::counter!("outbox_events_lost_total", "outbox" => S::NAME).increment(count as u64);
 }
 

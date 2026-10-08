@@ -372,8 +372,8 @@ uuid7_id_type!(
     /// Transient identity of one direct Verifier execution.
     ///
     /// `POST /v1/verification/execute` mints it per request. It appears only
-    /// in that response, the request's audit decision, and its trace; it is
-    /// never persisted and addresses nothing afterwards.
+    /// in that response, the request's audit decision, its trace, and as the
+    /// `result_id` of the execution's recorded result rows.
     VerificationExecutionId
 );
 

@@ -303,7 +303,7 @@ impl VerificationRuntime {
 /// Composes a [`VerificationRuntime`] from server state and wiring choices.
 pub struct VerificationRuntimeBuilder<'a> {
     /// Server state supplying the Wyrd Postgres owner, the operator pool,
-    /// the capture writer, and health.
+    /// the Scribe outbox, and health.
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
@@ -375,7 +375,7 @@ impl VerificationRuntimeBuilder<'_> {
     ///
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
-    /// runner additionally needs the process's capture writer to reach a
+    /// runner additionally needs the process's Scribe outbox to reach a
     /// Scribe, in-process or over the peer plane, and reads its inputs through
     /// the ordinary query service, local or peer-forwarded; without a
     /// reachable Scribe it is not composed and therefore not required, so
@@ -431,22 +431,21 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        let writer = Arc::clone(&self.state.gateway_capture);
+        let outbox = Arc::clone(&self.state.scribe_outbox);
         #[cfg(feature = "test-support")]
-        let writer = match (self.publication_fault, self.state.bifrost.scribe()) {
-            (Some(fault), Some(scribe)) => {
-                Arc::new(crate::components::gateway::GatewayCapture::local(Arc::new(
-                    fault.wrap(Arc::clone(scribe.scribe()) as _),
-                )))
-            }
-            _ => writer,
+        let outbox = match (self.publication_fault, self.state.bifrost.scribe()) {
+            (Some(fault), Some(scribe)) => fault.outbox(Arc::clone(scribe.scribe()) as _),
+            _ => outbox,
         };
-        if writer.reaches_scribe() {
+        if crate::scribe_outbox::reaches_scribe(
+            self.state.bifrost.scribe(),
+            self.state.bifrost.oracle(),
+        ) {
             let runner = VerifierRunner::new(
                 postgres.clone(),
                 operator,
                 queue,
-                writer,
+                outbox,
                 VerifierEngines::new(
                     DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
                     self::eval::EvalEngine::new(

@@ -844,6 +844,17 @@ impl BoundServer {
         };
 
         let deadline = deadline.into_std();
+        // Every request, gateway call, and Verifier run has finished, so the
+        // Scribe outbox holds all it will be given while Scribe still accepts;
+        // write it before Bifrost closes. Losses are counted and logged by the
+        // outbox.
+        let unwritten = self.state.scribe_outbox.shutdown(deadline).await;
+        if unwritten != 0 {
+            tracing::warn!(
+                unwritten,
+                "Scribe outbox did not drain before the shutdown deadline"
+            );
+        }
         #[cfg(feature = "test-support")]
         if shutdown_deadline_active(deadline)
             && let Some(probe) = &self.shutdown_probe

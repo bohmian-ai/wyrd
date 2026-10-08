@@ -5,9 +5,9 @@
 //! one tenant through [`VerificationFixture`], and composes a
 //! [`VerificationRuntime`] on that server's own state with a scripted engine.
 //! Coordination deadlines are PostgreSQL's, so a test that needs one to elapse
-//! places the row itself in the past through the fixture. Results travel
-//! through the server's internal capture writer to its own Scribe, wrapped in
-//! a [`PublicationFault`] that records every submitted batch; run state is
+//! places the row itself in the past through the fixture. Results are staged
+//! on a Scribe outbox writing to the server's own Scribe, wrapped in a
+//! [`PublicationFault`] that records every submitted batch; run state is
 //! read back from `wyrd.verifier_runs` and audit from `vala.audit_staging`,
 //! whose publisher is disabled so staged rows stay observable.
 
@@ -201,10 +201,11 @@ impl Harness {
     }
 
     /// The destination table of every result batch the runtime submitted to
-    /// Scribe, in submission order, resends included.
-    fn writes(&self) -> Vec<String> {
+    /// Scribe once its outbox settles, in submission order, resends included.
+    async fn writes(&self) -> Vec<String> {
         self.fault
             .sent()
+            .await
             .into_iter()
             .map(|sent| sent.table)
             .collect()
@@ -572,10 +573,12 @@ fn status(status: &'static str) -> impl Fn(&RunRow) -> bool {
     move |row| row.status == status
 }
 
-/// The sealed batches `fault` recorded for `table`, in send order.
-fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
+/// The batches `fault` recorded for `table` once the outbox settles, in send
+/// order.
+async fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
     fault
         .sent()
+        .await
         .into_iter()
         .filter(|sent| sent.table == table)
         .collect()
@@ -605,7 +608,7 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     );
     assert_eq!(row.error_code, None);
     assert_eq!(
-        harness.writes(),
+        harness.writes().await,
         vec![FEATURES.to_owned(), RESULTS.to_owned()]
     );
     assert_eq!(
@@ -635,8 +638,7 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
 /// Every attempt records its PostgreSQL-measured queue wait and its owned
 /// phase durations, every terminal settlement records trigger-to-terminal
 /// latency once, and each attempt is one correlated `verification.attempt`
-/// trace spanning claim, load, evidence read, engine, publication, and
-/// settlement with only bounded, scrubbed attributes.
+/// trace spanning claim, load, evidence read, engine, and settlement with only bounded, scrubbed attributes.
 ///
 /// Run one retries and then completes, run two is cancelled by the engine,
 /// and run three executes the real Drift engine, which reads its evidence
@@ -708,10 +710,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     // The scripted attempts execute the fixture's profile-less Drift
     // Verifier, which cannot be classified; the real run is a Custom Drift.
     let real_published = u64::from(real_row.result_id.is_some());
-    for (kind, attempts, published, completed) in [
-        ("unknown", 3, 1, 1),
-        ("drift_custom", 1, real_published, real_published),
-    ] {
+    for (kind, attempts, completed) in [("unknown", 3, 1), ("drift_custom", 1, real_published)] {
         let manual = format!(r#"kind="{kind}",origin="manual""#);
         let queued = format!(r#"kind="{kind}",mode="queued""#);
         assert_eq!(
@@ -744,13 +743,6 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
                 "only the real engine reads evidence and prepares:\n{rendered}"
             );
         }
-        assert_eq!(
-            count(&format!(
-                r#"wyrd_verification_phase_duration_seconds_count{{{queued},phase="publication"}}"#
-            )),
-            published,
-            "only completed {kind} reports publish:\n{rendered}"
-        );
         let overhead: u64 = ["completed", "retrying", "cancelled"]
             .iter()
             .map(|outcome| {
@@ -876,7 +868,6 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         "claim",
         "verification.load",
         "verification.engine",
-        "verification.publish",
         "verification.settle",
         "complete",
     ] {
@@ -939,7 +930,7 @@ async fn unscored_drift_publishes_only_the_summary() {
     let run = harness.enqueue().await;
 
     harness.wait_run(run, status("completed")).await;
-    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
+    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
     runtime.stop().await;
 }
 
@@ -958,18 +949,18 @@ async fn unscorable_verifier_errors_without_publishing() {
     let row = harness.wait_run(run, status("errored")).await;
     assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
     assert_eq!(row.result_id, None, "no verdict is fabricated");
-    assert!(harness.writes().is_empty());
+    assert!(harness.writes().await.is_empty());
     runtime.stop().await;
 }
 
 /// A result batch Scribe durably accepted but whose acknowledgement was lost
-/// is resent inside the same publication attempt as the identical sealed
-/// batch — same table, batch ID, and Arrow bytes — and Scribe acknowledges the
-/// replay without a second row. The run completes on its first attempt.
+/// is resent by the outbox as the identical batch — same table, batch ID, and
+/// Arrow bytes — and Scribe acknowledges the replay without a second row. The
+/// run completes on its first attempt once its result is staged.
 ///
 /// # Panics
 /// Panics when the run retries or fails, the replay differs from the original
-/// sealed batch, or Scribe keeps a duplicate summary row.
+/// batch, or Scribe keeps a duplicate summary row.
 #[tokio::test]
 async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates() {
     let harness = Harness::start().await;
@@ -985,9 +976,9 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
     let run = harness.enqueue().await;
 
     let row = harness.wait_run(run, status("completed")).await;
-    assert_eq!(row.attempts, 1, "the replay settled inside one attempt");
+    assert_eq!(row.attempts, 1, "staging settles the run in one attempt");
     assert!(row.result_id.is_some());
-    let summaries = sent_to(fault, RESULTS);
+    let summaries = sent_to(fault, RESULTS).await;
     assert_eq!(
         summaries.len(),
         2,
@@ -997,11 +988,11 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         summaries[0], summaries[1],
         "the replay carries the identical table, batch ID, and sealed bytes"
     );
-    let details = sent_to(fault, FEATURES);
+    let details = sent_to(fault, FEATURES).await;
     assert_eq!(details.len(), 1);
     assert_ne!(details[0].batch_id, summaries[0].batch_id);
     assert_eq!(
-        harness.writes(),
+        harness.writes().await,
         vec![FEATURES.to_owned(), RESULTS.to_owned(), RESULTS.to_owned()],
         "each submission, replay included, is recorded"
     );
@@ -1045,7 +1036,7 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     let row = harness.wait_run(run, status("errored")).await;
     assert_eq!(row.attempts, 3);
     assert_eq!(row.error_code.as_deref(), Some("engine_unavailable"));
-    assert!(harness.writes().is_empty());
+    assert!(harness.writes().await.is_empty());
     runtime.stop().await;
 }
 
@@ -1109,7 +1100,7 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     assert_eq!(row.error_code.as_deref(), Some("execution_timed_out"));
     assert_eq!(row.result_id, None);
     script.release();
-    assert!(harness.writes().is_empty());
+    assert!(harness.writes().await.is_empty());
     runtime.stop().await;
 }
 
@@ -1455,7 +1446,7 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     stale_script.release();
     stale.stop().await;
     assert_eq!(
-        harness.writes(),
+        harness.writes().await,
         vec![RESULTS.to_owned()],
         "only the fresh claimant's result reaches Bifrost"
     );
@@ -1509,7 +1500,7 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     harness.expire(run).await;
     let row = harness.wait_run(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
-    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
+    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
 
     let rendered = metrics.render();
     assert!(
@@ -1590,7 +1581,7 @@ async fn shutdown_stops_claims_drains_bounded_and_restart_recovers_identity() {
             "{run} holds no live lease"
         );
     }
-    assert!(harness.writes().is_empty());
+    assert!(harness.writes().await.is_empty());
 
     script.release();
     let restarted = harness.spawn(&Harness::limits(), &script);
@@ -1638,7 +1629,7 @@ async fn shutdown_releases_runs_still_in_flight_after_the_grace() {
             .verification
             .is_up(RuntimeCapability::Runner)
     );
-    assert!(harness.writes().is_empty());
+    assert!(harness.writes().await.is_empty());
 }
 
 /// Shutdown waits for a run that finishes within the drain grace and lets it
@@ -1662,7 +1653,7 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
     stopping.await.expect("the runtime stops");
     let row = harness.seed.run(run).await.expect("run reads");
     assert_eq!(row.status, "completed");
-    assert_eq!(harness.writes(), vec![RESULTS.to_owned()]);
+    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
 }
 
 /// Concurrent runtimes ticking the same due occurrence, and a runtime
@@ -1998,7 +1989,7 @@ async fn cancelled_runner_rolls_back_its_blocked_claim() {
         "the claim rolled back: no lease and no charged attempt"
     );
     assert_eq!(script.entered(), 0, "nothing executed");
-    assert!(harness.writes().is_empty(), "nothing published");
+    assert!(harness.writes().await.is_empty(), "nothing published");
 }
 
 /// Advisory lock key the commit-race test's deferred trigger waits on.
@@ -2076,7 +2067,7 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
     );
     assert_eq!(expires, None, "the released run holds no live lease");
     assert_eq!(script.entered(), 0, "the released claim never executed");
-    assert!(harness.writes().is_empty(), "nothing published");
+    assert!(harness.writes().await.is_empty(), "nothing published");
 
     sqlx::query("DROP TRIGGER test_hold_claim_commit ON wyrd.verifier_runs")
         .execute(&harness.assertion)
@@ -2086,125 +2077,6 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .execute(&harness.assertion)
         .await
         .expect("hold function drops");
-}
-
-/// A runner that crashes after its result is stored and its detail batch is
-/// durably acknowledged, but while its summary is blocked, leaves a partial
-/// result that neither completes the run nor dispatches an Operator. Once the
-/// lease expires the same run is reclaimed and writes its stored result
-/// without executing again: the replayed detail batch is byte-identical, so
-/// each result table holds exactly one copy, and completion and dispatch
-/// happen only after every stored batch is acknowledged.
-///
-/// # Panics
-/// Panics when the partial detail completes or dispatches, the run executes
-/// twice, the replay differs from the stored batch, the attempt count differs,
-/// or the final rows differ.
-#[tokio::test]
-async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
-    let harness = Harness::start().await;
-    let (owner, principal) = harness
-        .seed
-        .service("owner")
-        .await
-        .expect("owner registers");
-    let binding = harness
-        .seed
-        .bind_schedule(
-            &owner,
-            &owner,
-            &harness.verifier,
-            "0 2 * * *",
-            vec![FrozenTarget::Digest("sha256:operator".to_owned())],
-        )
-        .await
-        .expect("binding projects");
-    harness
-        .seed
-        .activate(principal)
-        .await
-        .expect("owner activates");
-    harness.make_due(binding).await;
-    let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(drifting_report()));
-    let fault = &harness.fault;
-    fault.hang_next(RESULTS);
-    let crash = CapabilityCrash::default();
-    let health = std::sync::Arc::clone(&harness.server.state().verification);
-    let runtime = RunningRuntime::spawn(harness.runtime(&Harness::limits(), &script, &crash));
-    wait_until("runtime health", || {
-        health.is_composed() && !health.is_degraded()
-    })
-    .await;
-    let run = harness.wait_single_run().await;
-
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while harness.durable_rows().await.get(FEATURES) != Some(&2) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the detail batch never became durable"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        sent_to(fault, RESULTS).is_empty(),
-        "the summary is blocked before it is sent"
-    );
-    crash.crash_next(RuntimeCapability::Runner);
-    wait_until("runner down", || !health.is_up(RuntimeCapability::Runner)).await;
-    wait_until("runner restarted", || !health.is_degraded()).await;
-
-    let partial = harness.seed.run(run).await.expect("run reads");
-    assert_eq!(
-        (partial.status.as_str(), partial.attempts, partial.result_id),
-        ("running", 1, None),
-        "a durable detail without its summary never completes the run"
-    );
-    assert_eq!(
-        harness.dispatches(run).await,
-        0,
-        "no dispatch from a partial result"
-    );
-    assert!(
-        !harness.durable_rows().await.contains_key(RESULTS),
-        "no summary was written"
-    );
-
-    harness.expire(run).await;
-    let row = harness.wait_run(run, status("completed")).await;
-    assert_eq!(
-        row.attempts, 2,
-        "the same run was reclaimed as its second attempt"
-    );
-    assert!(row.result_id.is_some());
-    assert_eq!(harness.seed.runs().await.expect("runs read"), vec![run]);
-    assert_eq!(
-        harness.dispatches(run).await,
-        1,
-        "the failed binding result dispatches its Operator once completed"
-    );
-    assert_eq!(
-        script.entered(),
-        1,
-        "the stored result is never re-executed"
-    );
-    assert_eq!(
-        harness.writes(),
-        vec![FEATURES.to_owned(), FEATURES.to_owned(), RESULTS.to_owned()]
-    );
-    let features = sent_to(fault, FEATURES);
-    assert_eq!(
-        features[0], features[1],
-        "the replay writes the stored table, batch ID, and bytes"
-    );
-    runtime.stop().await;
-    let rows = harness.durable_rows().await;
-    assert_eq!(
-        rows.get(FEATURES),
-        Some(&2),
-        "Scribe absorbs the replayed detail batch: {rows:?}"
-    );
-    assert_eq!(rows.get(RESULTS), Some(&1), "{rows:?}");
 }
 
 /// Write a small Parquet artifact for `data` and register its metadata, so a
@@ -2736,7 +2608,7 @@ async fn verifier_cards_are_cached_and_a_deleted_verifier_errors() {
     assert_eq!(row.error_code.as_deref(), Some(VERIFIER_UNAVAILABLE));
     assert_eq!(script.entered(), 2, "a deleted Verifier never executes");
     assert_eq!(
-        harness.writes(),
+        harness.writes().await,
         vec![RESULTS.to_owned(), RESULTS.to_owned()]
     );
     runtime.stop().await;
@@ -2791,21 +2663,17 @@ async fn renewal_keeps_a_long_run_and_a_taken_token_cancels_it() {
     .await;
     script.release();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(harness.writes().is_empty(), "cancelled work writes nothing");
-    let stored: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.verifier_run_results WHERE run_id = $1")
-            .bind(run.as_uuid())
-            .fetch_one(&harness.assertion)
-            .await
-            .expect("stored results read");
-    assert_eq!(stored, 0, "cancelled work stores nothing");
+    assert!(
+        harness.writes().await.is_empty(),
+        "cancelled work writes nothing"
+    );
     runtime.stop().await;
 }
 
 /// Two hundred held runs released at once on the eight-connection test pool
 /// all complete on their first attempt: no settlement fails and no
 /// connection acquire times out, because a run holds a connection only to
-/// claim, store, settle, and renew.
+/// claim, settle, and renew.
 ///
 /// # Panics
 /// Panics when a run does not complete on its first attempt, or a settlement

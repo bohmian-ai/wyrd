@@ -6,7 +6,8 @@
 //! payload can never drift from the registered contract. Every batch also
 //! carries the three correlation columns Scribe admits from a native payload:
 //! `card_ref` (the Verifier, resolved against the frame principal's Verifier scope),
-//! `run_id` (the Verifier run), and `wyrd_event_time` (the one server-chosen
+//! `run_id` (the Verifier run, null for a direct execution), and
+//! `wyrd_event_time` (the one server-chosen
 //! event time shared by the summary and every detail row).
 
 use std::collections::HashMap;
@@ -18,14 +19,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use uuid::Uuid;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::request_id::RequestId;
 
-use crate::components::gateway::{CaptureBatch, CaptureTable, VerifierAttribution};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Error as JsonError;
@@ -96,8 +91,8 @@ pub struct ResultBatch {
 /// Every batch of one result, in required write order.
 ///
 /// Non-empty detail batches precede the summary; a result with no detail rows
-/// holds only the summary. Built once per publication attempt and reused
-/// verbatim, so an unacknowledged retry resends identical rows.
+/// holds only the summary. Built once and staged on the Scribe outbox, which
+/// resends identical rows on every retry.
 #[derive(Debug, Clone)]
 pub struct ResultPayload {
     /// The result identity every row carries.
@@ -126,47 +121,6 @@ impl ResultPayload {
     pub fn batches(&self) -> &[ResultBatch] {
         &self.batches
     }
-
-    /// Encodes every batch, in write order, as one Arrow IPC stream bound for
-    /// `tenant` under `attribution`, each under a fresh `UUIDv7` batch id.
-    ///
-    /// The encoded batches are what the capture writer submits; resubmitting
-    /// the same encoded batch reuses its bytes and id, so Scribe's batch-id
-    /// dedup absorbs a write that was durable but unacknowledged.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ResultPayloadError::Arrow`] when a batch cannot be encoded,
-    /// and [`ResultPayloadError::ColumnMismatch`] when a batch names a table
-    /// outside the three result tables.
-    pub(crate) fn encode(
-        &self,
-        tenant: DataTenantId,
-        attribution: &VerifierAttribution,
-    ) -> Result<Vec<CaptureBatch>, ResultPayloadError> {
-        let request_id = RequestId::now_v7();
-        self.batches
-            .iter()
-            .map(|batch| {
-                let table = CaptureTable::from_fqn(&batch.table)
-                    .filter(|table| table.is_result())
-                    .ok_or_else(|| ResultPayloadError::ColumnMismatch {
-                        column: batch.table.clone(),
-                        problem: "unexpected",
-                    })?;
-                let mut writer = StreamWriter::try_new(Vec::new(), batch.batch.schema().as_ref())?;
-                writer.write(&batch.batch)?;
-                Ok(CaptureBatch {
-                    tenant,
-                    table,
-                    batch_id: Uuid::now_v7(),
-                    request_id: request_id.clone(),
-                    ipc: Bytes::from(writer.into_inner()?),
-                    verifier: Some(attribution.clone()),
-                })
-            })
-            .collect()
-    }
 }
 
 /// The frozen identities and input of the run a result belongs to.
@@ -175,8 +129,9 @@ impl ResultPayload {
 /// separated from the lease so the mapping can be exercised without a claim.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultRun<'a> {
-    /// The Verifier run, stored as the managed `run_id`.
-    pub run_id: VerificationRunId,
+    /// The Verifier run, stored as the managed `run_id`; `None` for a direct
+    /// execution, which creates no run.
+    pub run_id: Option<VerificationRunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
     /// Verified subject Card.
@@ -195,7 +150,7 @@ impl<'a> From<&'a ClaimedRun> for ResultRun<'a> {
     /// Borrow the result-relevant identities of a claimed run.
     fn from(run: &'a ClaimedRun) -> Self {
         Self {
-            run_id: run.lease.run_id,
+            run_id: Some(run.lease.run_id),
             verifier_version: &run.verifier_version,
             subject_card_uid: &run.subject_card_uid,
             owner_card_uid: run.owner_card_uid.as_ref(),
@@ -597,7 +552,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         ]);
         arrays.push(text(std::iter::repeat_n(Some(self.verifier_ref), rows)));
         arrays.push(text(std::iter::repeat_n(
-            Some(self.run.run_id.to_string()),
+            self.run.run_id.map(|run_id| run_id.to_string()),
             rows,
         )));
         arrays.push(timestamps(std::iter::repeat_n(Some(self.event_time), rows)));
@@ -778,7 +733,7 @@ mod tests {
         /// Borrow this run as the builder's view.
         fn view(&self) -> ResultRun<'_> {
             ResultRun {
-                run_id: self.run_id,
+                run_id: Some(self.run_id),
                 verifier_version: "1.2.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.owner),

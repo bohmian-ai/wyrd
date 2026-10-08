@@ -25,6 +25,8 @@ use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, Scrib
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
+
+use crate::scribe_outbox::{ScribeOutbox, ScribeRouteBinding, ScribeSink};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -1511,6 +1513,11 @@ pub struct Bifrost {
     /// `None` only for the ownerless unit-test shell, whose `AppState` starts
     /// its own outbox.
     audit_outbox: Option<Arc<AuditOutbox>>,
+    /// The process Scribe outbox every Scribe-bound write stages on.
+    ///
+    /// `None` only for the ownerless unit-test shell, whose `AppState` starts
+    /// its own outbox.
+    scribe_outbox: Option<Arc<ScribeOutbox>>,
 }
 
 /// Complete immutable composition retained by one published [`Bifrost`].
@@ -1541,6 +1548,10 @@ pub(crate) struct BifrostComposition {
     pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
     /// The process audit outbox every audited surface of this process shares.
     pub(crate) audit_outbox: Arc<AuditOutbox>,
+    /// The process Scribe outbox, started before its route is known.
+    pub(crate) scribe_outbox: Arc<ScribeOutbox>,
+    /// Binds `scribe_outbox`'s route once the roles above exist.
+    pub(crate) scribe_route: ScribeRouteBinding,
     /// Already-composed production resources exposed only to the test tier.
     #[cfg(feature = "test-support")]
     pub(crate) resources: Option<BifrostRoleResources>,
@@ -1561,9 +1572,12 @@ impl Bifrost {
             query_controls,
             observation_runs,
             audit_outbox,
+            scribe_outbox,
+            scribe_route,
             #[cfg(feature = "test-support")]
             resources,
         } = composition;
+        scribe_route.bind(scribe.as_ref(), oracle.as_ref());
         Arc::new(Self {
             gate,
             scribe,
@@ -1580,6 +1594,7 @@ impl Bifrost {
             #[cfg(feature = "test-support")]
             test_catalog: None,
             audit_outbox: Some(audit_outbox),
+            scribe_outbox: Some(scribe_outbox),
         })
     }
 
@@ -1606,6 +1621,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: None,
             audit_outbox: None,
+            scribe_outbox: None,
         })
     }
 
@@ -1641,6 +1657,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: Some(catalog),
             audit_outbox: None,
+            scribe_outbox: None,
         })
     }
 
@@ -1674,6 +1691,12 @@ impl Bifrost {
     #[must_use]
     pub const fn audit_outbox(&self) -> Option<&Arc<AuditOutbox>> {
         self.audit_outbox.as_ref()
+    }
+
+    /// Borrows the process Scribe outbox, absent only for the unit-test shell.
+    #[must_use]
+    pub const fn scribe_outbox(&self) -> Option<&Arc<ScribeOutbox>> {
+        self.scribe_outbox.as_ref()
     }
 
     /// Borrows the one public Gate.
@@ -2117,9 +2140,9 @@ pub struct AppState {
     pub gateway_secret_keys: Arc<ManagedSecretKeys>,
     /// Shared gateway execution engine behind every governed invocation entry.
     pub gateway_engine: Arc<GatewayEngine>,
-    /// Per-tenant embedded Bifrost producers of opted-in gateway call capture;
-    /// empty until a capturing tenant's first terminal call.
-    pub gateway_capture: Arc<crate::components::gateway::GatewayCapture>,
+    /// The process's one non-blocking outbox for gateway capture and Verifier
+    /// results; drained by `BoundServer::run` after Bifrost shutdown.
+    pub scribe_outbox: Arc<ScribeOutbox>,
     /// gRPC health reporter shared between HTTP readiness and gRPC health service.
     pub grpc_health: HealthReporter,
     /// Cached readiness snapshot from the background readiness_loop task.
@@ -2170,9 +2193,14 @@ impl AppState {
         let audit_outbox = bifrost
             .audit_outbox()
             .map_or_else(|| AuditSink::outbox(postgres.vala().clone()), Arc::clone);
-        let gateway_capture = Arc::new(crate::components::gateway::GatewayCapture::for_bifrost(
-            &bifrost,
-        ));
+        let scribe_outbox = bifrost.scribe_outbox().map_or_else(
+            || {
+                let (outbox, route) = ScribeSink::outbox();
+                route.bind(None, None);
+                outbox
+            },
+            Arc::clone,
+        );
         Self {
             audit_outbox,
             postgres,
@@ -2199,7 +2227,7 @@ impl AppState {
             gateway: Arc::default(),
             gateway_secret_keys: Arc::default(),
             gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
-            gateway_capture,
+            scribe_outbox,
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),

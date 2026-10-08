@@ -1,22 +1,21 @@
-//! The generic Verifier runner: claim, execute, store, publish, settle.
+//! The generic Verifier runner: claim, execute, stage, settle.
 //!
 //! [`VerifierRunner`] claims and starts runs without execution-count permits.
 //! The claim transaction also resolves the run's exact Verifier, from the
 //! process's [`VerifierCache`] or, on a miss, from the registry on the same
-//! connection, so a run holds a connection only to claim, store, settle, and
-//! renew. Each run goes through the one closed dispatch over
+//! connection, so a run holds a connection only to claim, settle, and renew.
+//! Each run goes through the one closed dispatch over
 //! [`VerifierImplementation`] and ends in exactly one fenced transition the
-//! runner applies itself. A completed report is encoded once and stored,
-//! lease-fenced, before any write; that stored result is then written through
-//! the process's capture writer, attributed to the tenant's SYSTEM principal
-//! and the exact Verifier, and the run completes. A later claimant of a run
-//! with a stored result writes the same batches instead of executing again. A
-//! retryable failure is retried within the run's attempt budget; a terminal
-//! failure is terminated without a verdict; work abandoned by shutdown is
-//! released with its attempt refunded; and work whose lease is lost stops
-//! without settling. While a run is in flight its lease is renewed by
-//! [`LeaseRenewal`]. Claims, renewals, and settlements are engine mechanics,
-//! not authorization decisions, so none of them writes audit.
+//! runner applies itself. A completed report becomes one result payload,
+//! staged on the process [`ScribeOutbox`] attributed to the tenant's SYSTEM
+//! principal and the exact Verifier, and the run completes once it is staged;
+//! delivery belongs to the outbox and never re-executes the run. A retryable
+//! failure is retried within the run's attempt budget; a terminal failure is
+//! terminated without a verdict; work abandoned by shutdown is released with
+//! its attempt refunded; and work whose lease is lost stops without settling.
+//! While a run is in flight its lease is renewed by [`LeaseRenewal`]. Claims,
+//! renewals, and settlements are engine mechanics, not authorization
+//! decisions, so none of them writes audit.
 
 #[cfg(feature = "test-support")]
 use std::collections::VecDeque;
@@ -28,7 +27,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
@@ -42,12 +40,10 @@ use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict, VerifierKind};
 use wyrd_sql::queries::cards::fetch_card_row;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, Settlement, StagedBatch, StagedResult, TerminalStatus,
-    TraceWaitOutcome, VerifierRunQueue,
+    ClaimedRun, RetryOutcome, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, ParsedCardRow, SqlError, TenantConn, WyrdPostgres};
 
@@ -63,7 +59,7 @@ use super::health::RuntimeCapability;
 use super::leases::LeaseRenewal;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
-use crate::components::gateway::{CaptureBatch, CaptureTable, GatewayCapture, VerifierAttribution};
+use crate::scribe_outbox::{ScribeOutbox, ScribeWrite, VerifierAttribution};
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.
@@ -72,23 +68,21 @@ pub const VERIFIER_UNAVAILABLE: &str = "verifier_unavailable";
 pub const EXECUTION_TIMED_OUT: &str = "execution_timed_out";
 /// Stable error code when a completed result could not be encoded.
 pub const RESULT_INVALID: &str = "result_invalid";
-/// Stable error code when a completed result was not durably acknowledged.
-pub const RESULT_PUBLICATION_FAILED: &str = "result_publication_failed";
 /// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
 /// to attribute a result to.
 pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
 
-/// First wait before a failed store or settlement is tried again.
+/// First wait before a failed settlement is tried again.
 const PERSIST_INITIAL: Duration = Duration::from_millis(50);
-/// Longest wait between store or settlement attempts.
+/// Longest wait between settlement attempts.
 const PERSIST_MAX: Duration = Duration::from_secs(5);
 
 /// The single transition one claimed run ends in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transition {
-    /// Every result batch was acknowledged; settle `completed` with this result.
+    /// The result was staged; settle `completed` with it.
     Complete {
-        /// The published result.
+        /// The staged result.
         result_id: VerificationResultId,
         /// Its verdict.
         verdict: VerificationVerdict,
@@ -118,8 +112,8 @@ pub enum Transition {
 ///
 /// The `verification.attempt` span is created before the claim statement
 /// runs and closes when the attempt settles, so one trace covers claim,
-/// Verifier resolution, evidence read, engine execution, result storage and
-/// publication, and settlement. It carries only scrubbed identifiers and
+/// Verifier resolution, evidence read, engine execution, result staging, and
+/// settlement. It carries only scrubbed identifiers and
 /// bounded labels.
 pub struct AttemptClaim {
     /// The claimed run.
@@ -183,10 +177,9 @@ impl VerifierEngines {
     }
 }
 
-/// Owner of claiming, executing, storing, publishing, and settling Verifier
-/// runs.
+/// Owner of claiming, executing, staging, and settling Verifier runs.
 pub struct VerifierRunner {
-    /// Wyrd Postgres owner that opens every tenant-scoped claim, store, and
+    /// Wyrd Postgres owner that opens every tenant-scoped claim and
     /// settlement transaction.
     postgres: WyrdPostgres,
     /// Operator pool for the cross-tenant runnable list.
@@ -195,8 +188,8 @@ pub struct VerifierRunner {
     queue: VerifierRunQueue,
     /// Shared claim loop owning durable claims, shutdown, and drain.
     claims: ClaimLoop,
-    /// The process's one capture writer, which also writes results.
-    writer: Arc<GatewayCapture>,
+    /// The process's Scribe outbox every result is staged on.
+    outbox: Arc<ScribeOutbox>,
     /// The Drift and Eval arms a claimed run dispatches to.
     engines: VerifierEngines,
     /// Parsed Verifier Cards by tenant and UID.
@@ -222,7 +215,7 @@ impl VerifierRunner {
         postgres: WyrdPostgres,
         operator: OperatorPool,
         queue: VerifierRunQueue,
-        writer: Arc<GatewayCapture>,
+        outbox: Arc<ScribeOutbox>,
         engines: VerifierEngines,
         limits: RuntimeLimits,
     ) -> Self {
@@ -232,7 +225,7 @@ impl VerifierRunner {
             postgres,
             operator,
             queue,
-            writer,
+            outbox,
             engines,
             cache: VerifierCache::default(),
             limits,
@@ -331,71 +324,23 @@ impl VerifierRunner {
         )))
     }
 
-    /// Produce or replay the run's result and map the attempt to a
-    /// transition.
+    /// Execute the run and map the attempt to a transition.
     ///
-    /// A run whose claim returned a stored result replays it without
-    /// executing; otherwise the Verifier executes and a completed report is
-    /// encoded and stored before any write. The store and the writes are the
-    /// `publication` phase. Never fails: every failure becomes the
-    /// [`Transition`] it maps to, and [`Transition::LeaseLost`] once `lost`
-    /// fires during storage or publication.
+    /// A run without a loadable Verifier terminates; otherwise the Verifier
+    /// executes and a completed report is staged. Never fails: every failure
+    /// becomes the [`Transition`] it maps to.
     async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
         verifier: Result<Arc<CachedVerifier>, VerificationError>,
         telemetry: &ExecutionTelemetry,
-        lost: &CancellationToken,
     ) -> Transition {
-        if let Ok(verifier) = &verifier {
-            telemetry.classify(VerifierKind::of(&verifier.implementation));
-        }
-        let fresh;
-        let staged = if let Some(staged) = &run.staged {
-            staged
-        } else {
-            let verifier = match verifier {
-                Ok(verifier) => verifier,
-                Err(error) => return Transition::Terminate(TerminalStatus::Errored, error),
-            };
-            fresh = match self.produce(tenant, run, &verifier, telemetry).await {
-                Ok(staged) => staged,
-                Err(transition) => return transition,
-            };
-            &fresh
+        let verifier = match verifier {
+            Ok(verifier) => verifier,
+            Err(error) => return Transition::Terminate(TerminalStatus::Errored, error),
         };
-        let replayed = run.staged.is_some();
-        telemetry
-            .phase(
-                Phase::Publication,
-                async {
-                    if !replayed
-                        && let Err(transition) = self.store(tenant, run, staged, lost).await
-                    {
-                        return transition;
-                    }
-                    self.publish(tenant, run, staged, lost).await
-                }
-                .instrument(tracing::info_span!("verification.publish")),
-            )
-            .await
-    }
-
-    /// Execute the Verifier under its deadline and encode a completed report.
-    ///
-    /// # Errors
-    /// Returns the transition of every outcome other than a completed,
-    /// encodable report: an exceeded deadline terminates `timed_out`, engine
-    /// failures map to their transitions, and an unencodable report or a
-    /// missing SYSTEM principal terminates `errored`.
-    async fn produce(
-        &self,
-        tenant: DataTenantId,
-        run: &ClaimedRun,
-        verifier: &CachedVerifier,
-        telemetry: &ExecutionTelemetry,
-    ) -> Result<StagedResult, Transition> {
+        telemetry.classify(VerifierKind::of(&verifier.implementation));
         let started_at = Utc::now();
         let executed = telemetry
             .phase(
@@ -408,22 +353,89 @@ impl VerifierRunner {
             )
             .await;
         let Ok(outcome) = executed else {
-            return Err(Transition::Terminate(
+            return Transition::Terminate(
                 TerminalStatus::TimedOut,
                 failure(
                     EXECUTION_TIMED_OUT,
                     "the Verifier exceeded its execution deadline",
                 ),
-            ));
+            );
         };
         match outcome {
             EngineOutcome::Completed(report) => {
-                stage(tenant, run, &verifier.reference, &report, started_at)
+                self.stage(tenant, run, &verifier.reference, &report, started_at)
             }
-            EngineOutcome::Retry(error) => Err(Transition::Retry(error)),
-            EngineOutcome::AwaitingTrace(error) => Err(Transition::AwaitTrace(error)),
-            EngineOutcome::Deferred(error) => Err(Transition::Defer(error)),
-            EngineOutcome::Terminal(status, error) => Err(Transition::Terminate(status, error)),
+            EngineOutcome::Retry(error) => Transition::Retry(error),
+            EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
+            EngineOutcome::Deferred(error) => Transition::Defer(error),
+            EngineOutcome::Terminal(status, error) => Transition::Terminate(status, error),
+        }
+    }
+
+    /// Build `report`'s result payload once and stage it on the Scribe outbox.
+    ///
+    /// Mints one result ID and one producer event time shared by every row —
+    /// a result fact this process observes, not a coordination instant — and
+    /// stages the payload attributed to the tenant SYSTEM principal and the
+    /// exact `verifier`. Staging never waits, so the run completes with the
+    /// staged result at once.
+    ///
+    /// A missing SYSTEM principal or an unbuildable report terminates
+    /// `errored`.
+    fn stage(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedRun,
+        verifier: &CardRef,
+        report: &VerifierReport,
+        started_at: DateTime<Utc>,
+    ) -> Transition {
+        let principal = match system_principal(run) {
+            Ok(principal) => principal,
+            Err(transition) => return transition,
+        };
+        let result_id = VerificationResultId::new_v7();
+        let event_time = Utc::now();
+        let verifier_ref = CardRef {
+            uid: None,
+            ..verifier.clone()
+        }
+        .to_string();
+        let payload = match ResultPayloadBuilder::new(
+            ResultRun::from(run),
+            &verifier_ref,
+            result_id,
+            event_time,
+            started_at,
+            event_time,
+        )
+        .build(report)
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
+                return Transition::Terminate(
+                    TerminalStatus::Errored,
+                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
+                );
+            }
+        };
+        let verdict = payload.verdict();
+        self.outbox.stage(
+            tenant,
+            ScribeWrite::Result {
+                payload,
+                attribution: VerifierAttribution {
+                    verifier: verifier.clone(),
+                    principal,
+                },
+            },
+        );
+        Transition::Complete {
+            result_id,
+            verdict,
+            summary: report.summary(),
+            counts: report.counts(),
         }
     }
 
@@ -449,110 +461,13 @@ impl VerifierRunner {
             .await
     }
 
-    /// Store `staged` as the run's result, fenced by its lease, retrying
-    /// failed transactions with backoff while the lease holds.
-    ///
-    /// # Errors
-    /// Returns [`Transition::LeaseLost`] when the lease no longer holds the
-    /// run or `lost` fires before a store commits.
-    async fn store(
-        &self,
-        tenant: DataTenantId,
-        run: &ClaimedRun,
-        staged: &StagedResult,
-        lost: &CancellationToken,
-    ) -> Result<(), Transition> {
-        let stored = persist(lost, || async {
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let stored = self
-                .queue
-                .store_result(&mut conn, run.lease, staged)
-                .await?;
-            conn.commit().await?;
-            Ok(stored)
-        })
-        .await;
-        match stored {
-            Ok(Settlement::Applied) => Ok(()),
-            Ok(Settlement::StaleLease) => Err(Transition::LeaseLost),
-            Err(error) => {
-                tracing::warn!(run_id = %run.lease.run_id, %error, "storing the verification result stopped; the lease is lost");
-                Err(Transition::LeaseLost)
-            }
-        }
-    }
-
-    /// Write the stored result's batches and complete with its verdict.
-    ///
-    /// Every batch is written in stored order, details before the summary,
-    /// under its stored identity and the tenant SYSTEM principal scoped to
-    /// the stored exact Verifier, so a replay resubmits identical batches that
-    /// Scribe's batch-id dedup absorbs. Completes only after the summary is
-    /// acknowledged. A missing SYSTEM principal or a stored batch naming a
-    /// non-result table terminates `errored`; a write stopped by `lost` is
-    /// [`Transition::LeaseLost`]; a terminal write refusal retries.
-    async fn publish(
-        &self,
-        tenant: DataTenantId,
-        run: &ClaimedRun,
-        staged: &StagedResult,
-        lost: &CancellationToken,
-    ) -> Transition {
-        let principal = match system_principal(run) {
-            Ok(principal) => principal,
-            Err(transition) => return transition,
-        };
-        let request_id = RequestId::now_v7();
-        let attribution = VerifierAttribution {
-            run_id: run.lease.run_id,
-            verifier: staged.verifier.clone(),
-            principal,
-        };
-        for stored in &staged.batches {
-            let Some(table) =
-                CaptureTable::from_fqn(&stored.table).filter(|table| table.is_result())
-            else {
-                tracing::warn!(run_id = %run.lease.run_id, table = %stored.table, "a stored result batch names a non-result table");
-                return Transition::Terminate(
-                    TerminalStatus::Errored,
-                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
-                );
-            };
-            let batch = CaptureBatch {
-                tenant,
-                table,
-                batch_id: stored.batch_id,
-                request_id: request_id.clone(),
-                ipc: Bytes::copy_from_slice(&stored.ipc),
-                verifier: Some(attribution.clone()),
-            };
-            if let Err(drop) = self.writer.write_result(&batch, lost).await {
-                if lost.is_cancelled() {
-                    return Transition::LeaseLost;
-                }
-                tracing::warn!(run_id = %run.lease.run_id, reason = drop.reason(), "verification result write failed");
-                return Transition::Retry(failure(
-                    RESULT_PUBLICATION_FAILED,
-                    "result publication was not acknowledged",
-                ));
-            }
-        }
-        Transition::Complete {
-            result_id: staged.result_id,
-            verdict: staged.verdict,
-            summary: staged.summary.clone(),
-            counts: staged.counts,
-        }
-    }
-
     /// Apply `transition` to `run` in one tenant transaction.
     ///
     /// Returns the stable outcome label: `completed`, `retrying`,
     /// `exhausted`, `awaiting_trace`, `cancelled`, `timed_out`, `errored`,
     /// `released`, `deferred`, or `stale_lease` when another claim already
     /// holds the run. [`Transition::LeaseLost`] opens no transaction and is
-    /// `stale_lease`. Completion and termination delete the run's stored
-    /// result.
+    /// `stale_lease`.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the transaction fails; nothing is applied.
@@ -793,7 +708,7 @@ impl VerifierRunner {
             biased;
             () = abandon.cancelled() => Transition::Release,
             () = lost.cancelled() => Transition::LeaseLost,
-            transition = self.execute(tenant, run, verifier, &telemetry, lost) => transition,
+            transition = self.execute(tenant, run, verifier, &telemetry) => transition,
         };
         let transition = match transition {
             Transition::LeaseLost if abandon.is_cancelled() => Transition::Release,
@@ -850,77 +765,6 @@ impl VerifierRunner {
         telemetry.finish(outcome, failed);
         refused
     }
-}
-
-/// Encode `report` once as the run's result.
-///
-/// Mints one result ID and one producer event time shared by every row — a
-/// result fact this process observes, not a coordination instant — and
-/// encodes every batch under a fresh batch identity, details before the
-/// summary, attributed to the tenant SYSTEM principal and the exact
-/// `verifier`.
-///
-/// # Errors
-/// Terminates `errored` when the tenant has no active `UUIDv7` SYSTEM
-/// principal or the report cannot be encoded.
-fn stage(
-    tenant: DataTenantId,
-    run: &ClaimedRun,
-    verifier: &CardRef,
-    report: &VerifierReport,
-    started_at: DateTime<Utc>,
-) -> Result<StagedResult, Transition> {
-    let principal = system_principal(run)?;
-    let result_id = VerificationResultId::new_v7();
-    let event_time = Utc::now();
-    let verifier_ref = CardRef {
-        uid: None,
-        ..verifier.clone()
-    }
-    .to_string();
-    let encoded = ResultPayloadBuilder::new(
-        ResultRun::from(run),
-        &verifier_ref,
-        result_id,
-        event_time,
-        started_at,
-        event_time,
-    )
-    .build(report)
-    .and_then(|payload| {
-        let batches = payload.encode(
-            tenant,
-            &VerifierAttribution {
-                run_id: run.lease.run_id,
-                verifier: verifier.clone(),
-                principal,
-            },
-        )?;
-        Ok((payload.verdict(), batches))
-    });
-    let (verdict, batches) = encoded.map_err(|error| {
-        tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
-        Transition::Terminate(
-            TerminalStatus::Errored,
-            failure(RESULT_INVALID, "the verification result cannot be encoded"),
-        )
-    })?;
-    Ok(StagedResult {
-        result_id,
-        event_time,
-        verdict,
-        summary: report.summary(),
-        counts: report.counts(),
-        verifier: verifier.clone(),
-        batches: batches
-            .into_iter()
-            .map(|batch| StagedBatch {
-                table: batch.table.fqn().to_owned(),
-                batch_id: batch.batch_id,
-                ipc: batch.ipc.to_vec(),
-            })
-            .collect(),
-    })
 }
 
 /// The tenant SYSTEM principal the claim returned, when it is an active

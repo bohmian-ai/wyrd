@@ -62,20 +62,17 @@ pub enum Phase {
     Prepare,
     /// Inclusive engine dispatch through judgment.
     Engine,
-    /// Queued report encoding and durable publication.
-    Publication,
     /// Queued fenced durable state transition.
     Settlement,
 }
 
 impl Phase {
     /// Every phase, in emission order.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Load,
         Self::InputRead,
         Self::Prepare,
         Self::Engine,
-        Self::Publication,
         Self::Settlement,
     ];
 
@@ -87,7 +84,6 @@ impl Phase {
             Self::InputRead => "input_read",
             Self::Prepare => "prepare",
             Self::Engine => "engine",
-            Self::Publication => "publication",
             Self::Settlement => "settlement",
         }
     }

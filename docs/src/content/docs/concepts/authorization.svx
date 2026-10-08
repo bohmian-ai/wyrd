@@ -74,47 +74,53 @@ The resolution path:
   ]}
   rows={[
     ['admin', 'All resources and actions (*)'],
-    ['writer', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run, triggers:write'],
-    ['reader', 'cards:read, artifacts:read, audit:read'],
-    ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
-    ['runtime_admin', 'service_accounts:write'],
-    ['workload', 'bifrost_table:read, bifrost_record:write, bifrost_query:read'],
-    ['wyrd_default', 'bifrost_table:read, bifrost_record:write, evals:run']
+    ['editor', 'workload, plus cards:write, cards:delete, artifacts:write, policy:lock, services:install'],
+    ['workload', 'viewer, plus bifrost_table:write, bifrost_record:write, evals:run, workflows:run, triggers:write, operators:invoke, gateway:invoke'],
+    ['viewer', 'cards:read, artifacts:read, audit:read, operators:read, gateway:read, gateway_payload:read, bifrost_table:read, bifrost_query:read']
   ]}
 />
 
-Built-in roles are seeded per tenant at tenant creation. A Service or Agent
-Card's principal receives `wyrd_default` when its Card is first registered, so
-the key `wyrd auth issue-key` issues for it can start Bifrost, emit its
-evidence, and run its Verifiers without a manual grant. Its Card scope still
-bounds which Cards it may emit for and verify. Re-registering the Card never
-re-grants a revoked `wyrd_default` role.
+The four built-in roles nest: each holds everything the one below it holds.
+They are seeded per tenant at tenant creation. A Service or Agent Card's
+principal receives `workload` when its Card is first registered, so the key
+`wyrd auth issue-key` issues for it can start Bifrost, emit and query its
+evidence, run its Verifiers, and call the Gateway without a manual grant. Its
+Card scope still bounds which Cards it may emit for and verify. Re-registering
+the Card never re-grants a revoked `workload` role. An identity connection
+that omits its default roles grants `viewer`.
 
-`wyrd_default` does not read the tenant's Bifrost tables. A Service that
-queries them needs the `workload` role, granted by a tenant administrator:
+Roles are assigned to principals, not Cards. A tenant administrator finds a
+principal, then grants or revokes a direct role:
 
 ```bash
-wyrd auth grant-role --kind Service --name my-svc --version 1.0.0 \
-  --space prod --role workload
+wyrd principal list --kind service --name my-svc
+wyrd principal role grant --principal <principal_id> --role editor
+wyrd principal role list --principal <principal_id>
+wyrd principal role revoke --principal <principal_id> --role editor
 ```
 
-The command calls `POST /v1/auth/grant-role` with `{ card_ref, role }` and
-prints the principal's roles. It requires tenant administration (`*`), so
-`runtime_admin` cannot use it. It names the target by its Card, so a human
-user is never a target; their roles come from federated login. A grant
-already held succeeds with `granted: false`. An unknown or foreign Card
-answers `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`, and an unknown role
-`WYRD_SPEC_400_VALIDATION`. The new role reaches the principal's tokens at its
-next key exchange. There is no revoke command.
+`wyrd auth issue-key` also prints the `principal_id` of the Card's principal.
+`principal list` pages through the tenant's users and Service and Agent
+principals (`GET /v1/principals`, exact `kind`, `email`, and `name` filters).
+`role grant` and `role revoke` call `PUT` and `DELETE
+/v1/principals/{id}/roles/{role}`; both are idempotent, answer `changed` with
+the principal's complete resulting assignments, and require tenant
+administration (`*`). A user's assignment records its source: `idp` roles come
+from federated login and are replaced at each login, `direct` roles come from
+an administrator and survive login. Both sources may hold the same role, and
+the user's tokens carry the union. Revoking removes only the direct
+assignment. A foreign or unknown principal answers
+`WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`, and an unknown role
+`WYRD_SPEC_400_VALIDATION`. A change reaches the principal's next token;
+tokens already issued keep their bounded lifetime.
 
 The `operators` resource has three actions. `operators:invoke` lets a
 principal register a verification binding that names an `on_failure` Operator
 (alongside `cards:write`). `operators:read` lists and reads redacted
 [Operator connections](/how-to/operate/operator-connections/), and
 `operators:write` creates, rotates, updates, disables, and re-enables them. No
-connection operation is authorized by `operators:invoke` alone. Of the
-built-in roles, only `admin` holds `operators:read` and `operators:write`;
-grant them to another role explicitly.
+connection operation is authorized by `operators:invoke` alone. Every
+built-in role reads connections; only `admin` holds `operators:write`.
 
 ## Two "kind" concepts
 

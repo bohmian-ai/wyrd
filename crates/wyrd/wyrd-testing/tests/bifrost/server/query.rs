@@ -77,9 +77,8 @@ fn journey_delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
 
 /// Reads the retained read-decision detail for one request id.
 ///
-/// The decision is read from `vala.system.audit_log` after publication settles,
-/// because the staged row it came from is transient and the publisher is
-/// entitled to have drained it already.
+/// The decision is read from retained history in `vala.system.audit_log` once
+/// the Scribe outbox has settled every decision staged so far.
 ///
 /// # Errors
 ///
@@ -112,15 +111,13 @@ const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Counts retained audit rows written under one operation name.
 ///
-/// `vala.audit_staging` is transient: the publisher drains it into retained
-/// history every few seconds, so counting staged rows measures the sweep rather
-/// than the journey. The harness settles in-flight Oracle commits and then
-/// publication, and counts `vala.system.audit_log`; its own inspection reads are
-/// excluded there by principal, so counting read decisions never counts itself.
+/// The harness settles the Scribe outbox and counts `vala.system.audit_log`;
+/// its own inspection reads are excluded there by principal, so counting read
+/// decisions never counts itself.
 ///
 /// # Errors
 ///
-/// Returns the publication-barrier timeout or the retained-history query error.
+/// Returns the outbox-settlement timeout or the retained-history query error.
 pub(super) async fn audit_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,

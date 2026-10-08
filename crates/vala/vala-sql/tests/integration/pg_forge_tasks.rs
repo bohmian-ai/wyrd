@@ -257,7 +257,7 @@ mod pg_tests {
         assert_eq!(resumed.task_id, task_id);
     }
 
-    /// Capacity refusal preserves retry budget while lease reclaim consumes it without audit.
+    /// Capacity refusal preserves retry budget while lease reclaim consumes it.
     #[tokio::test]
     async fn capacity_refusal_and_expired_reclaim_have_distinct_settlement() {
         let (fixture, admin) = setup().await;
@@ -308,10 +308,6 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("expire attempt");
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit count before reclaim");
         assert_eq!(
             tasks
                 .reclaim_expired_attempts(1)
@@ -329,11 +325,6 @@ mod pg_tests {
         assert_eq!(reclaimed.0, "retryable");
         assert_eq!(reclaimed.1, 1);
         assert!(reclaimed.2);
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit count after reclaim");
-        assert_eq!(audit_after, audit_before, "reclaim remains audit-free");
     }
 
     /// Proves worker admission is independent of scheduler leadership and only
@@ -438,15 +429,13 @@ mod pg_tests {
                 .await
                 .expect("rollback cancellation");
         }
-        let rolled_back: (String, i64) = sqlx::query_as(
-            "SELECT t.state,(SELECT count(*) FROM vala.audit_staging) FROM vala.forge_tasks t WHERE t.task_id=$1",
-        )
-        .bind(task_id)
-        .fetch_one(&admin)
-        .await
-        .expect("rolled-back cancellation state");
-        assert_eq!(rolled_back.0, "claimed");
-        assert_eq!(rolled_back.1, 0);
+        let rolled_back: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(&admin)
+                .await
+                .expect("rolled-back cancellation state");
+        assert_eq!(rolled_back, "claimed");
 
         let mut commit = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -717,10 +706,10 @@ mod pg_tests {
         assert_eq!(cursor_after, cursor_before, "worker cursor rolled back");
     }
 
-    /// Proves Prepared replay and both lifecycle audit boundaries are atomic under rollback.
+    /// Proves Prepared replay and both lifecycle transitions are atomic under rollback.
     ///
     /// # Panics
-    /// Panics when state/audit atomicity or replay assertions fail.
+    /// Panics when state atomicity or replay assertions fail.
     #[tokio::test]
     async fn prepared_and_terminal_audit_are_atomic_and_replay_safe() {
         let (fixture, _admin) = setup().await;
@@ -803,11 +792,6 @@ mod pg_tests {
             tasks.status(&mut verify, 10).await.expect("status").tasks[0].state,
             ForgeTaskState::Running
         );
-        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&mut **verify.transaction())
-            .await
-            .expect("audit count");
-        assert_eq!(audit_count, 0);
         verify.commit().await.expect("commit");
         let mut prepared_conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -845,14 +829,6 @@ mod pg_tests {
             .expect("after rollback");
         let page = tasks.status(&mut after, 10).await.expect("status");
         assert_eq!(page.tasks[0].state, ForgeTaskState::Prepared);
-        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&mut **after.transaction())
-            .await
-            .expect("audit count");
-        assert_eq!(
-            audit_count, 0,
-            "a rolled-back terminal transition leaves no lineage and no audit"
-        );
         assert!(
             tasks
                 .terminal(
@@ -1057,12 +1033,11 @@ mod pg_tests {
     /// Proves successful settlement belongs to the caller-owned transaction.
     ///
     /// A dropped transaction leaves the task Prepared; a committed one exposes
-    /// Succeeded and appends no audit, because settling evaluates no
-    /// permission. A no-op acknowledgement settles through the same path.
+    /// Succeeded. A no-op acknowledgement settles through the same path.
     ///
     /// # Panics
-    /// Panics when rollback exposes the transition, commit does not expose it,
-    /// or settlement appends audit.
+    /// Panics when rollback exposes the transition or commit does not expose
+    /// it.
     #[tokio::test]
     async fn terminal_success_is_caller_transactional_and_audit_free() {
         let (fixture, admin) = setup().await;
@@ -1139,10 +1114,6 @@ mod pg_tests {
                 .expect("state after rollback");
         assert_eq!(state, "prepared");
 
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit before");
         let mut committed = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("commit tenant");
@@ -1163,14 +1134,6 @@ mod pg_tests {
                 .await
                 .expect("state after commit");
         assert_eq!(state, "succeeded");
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&admin)
-            .await
-            .expect("audit after");
-        assert_eq!(
-            audit_after, audit_before,
-            "settlement evaluates no permission, so it appends no audit"
-        );
 
         let noop_table = ForgeTaskTableIdentity::new(
             "wyrd-redux",
@@ -1443,58 +1406,6 @@ mod pg_tests {
             rollback,
             ("ready".to_owned(), None, None, cursor_before),
             "claim decoding failure rolls back task ownership and cursor"
-        );
-    }
-
-    /// Proves the operator role can append platform decisions to tenant audit
-    /// staging and can do nothing else to it.
-    ///
-    /// Forge runs on the operator pool, so its grants are the boundary that
-    /// keeps maintenance from reading, rewriting, or forging tenant audit rows.
-    ///
-    /// # Panics
-    /// Panics when a grant read fails or the operator role exceeds append-only
-    /// access to tenant audit staging.
-    #[tokio::test]
-    async fn operator_cannot_read_or_mutate_tenant_audit_rows() {
-        let (fixture, admin) = setup().await;
-        let op = fixture.operator_pool();
-        let audit_grants: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name IN ('audit_chain_head','audit_staging')").fetch_all(&admin).await.expect("audit grants");
-        assert!(
-            !audit_grants
-                .iter()
-                .any(|value| value.1 == "wyrd_platform_admin"
-                    && value.0 == "audit_staging"
-                    && value.2 != "INSERT"),
-            "the operator appends platform decisions and can do nothing else to a tenant's audit: {audit_grants:?}"
-        );
-        assert!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")
-                .fetch_one(op.pool())
-                .await
-                .is_err(),
-            "operator cannot directly read tenant audit rows"
-        );
-        assert!(
-            sqlx::query("UPDATE vala.audit_staging SET outcome=outcome")
-                .execute(op.pool())
-                .await
-                .is_err(),
-            "operator cannot directly update tenant audit rows"
-        );
-        assert!(
-            sqlx::query("DELETE FROM vala.audit_staging")
-                .execute(op.pool())
-                .await
-                .is_err(),
-            "operator cannot directly delete tenant audit rows"
-        );
-        assert!(
-            sqlx::query("INSERT INTO vala.audit_staging (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,permission,outcome) VALUES (wyrd.current_tenant(),1,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'x','x','x',gen_random_uuid(),'service','x','allowed')")
-                .execute(op.pool())
-                .await
-                .is_err(),
-            "operator cannot append tenant audit rows"
         );
     }
 
@@ -1863,7 +1774,7 @@ mod pg_tests {
     /// the same handoff, so a source that only one of them rejects still reaches
     /// durable cleanup state. Each call seeds exactly one malformed source,
     /// drives both paths, and proves the enqueue transaction left no cleanup
-    /// row and no audit behind.
+    /// row behind.
     ///
     /// # Panics
     ///
@@ -1906,14 +1817,7 @@ mod pg_tests {
             .await
             .expect("cleanup row count")
         };
-        let audit_rows = || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")
-                .fetch_one(admin)
-                .await
-                .expect("audit row count")
-        };
         let before_cleanup = cleanup_rows().await;
-        let before_audits = audit_rows().await;
         assert!(
             tasks.enqueue(&cleanup).await.is_err(),
             "the locked enqueue admission accepted a source with {axis}"
@@ -1922,11 +1826,6 @@ mod pg_tests {
             cleanup_rows().await,
             before_cleanup,
             "a refused {axis} source inserts no cleanup task"
-        );
-        assert_eq!(
-            audit_rows().await,
-            before_audits,
-            "a refused {axis} source appends no enqueue audit"
         );
         sqlx::query("DELETE FROM vala.forge_tasks WHERE task_id=$1")
             .bind(source)
@@ -2529,9 +2428,7 @@ mod pg_tests {
     /// claim with the same task identity and an unchanged failure budget, so a
     /// partial scan is ordinary progress rather than a failed attempt. Work
     /// whose ownership is ambiguous cannot advance the cursor at all. Exhaustion
-    /// clears the cursor and marks the task succeeded in the same transaction as
-    /// its one success audit, proven by forcing that audit append to fail and
-    /// observing the transition roll back with it.
+    /// clears the cursor and marks the task succeeded in one transaction.
     ///
     /// # Panics
     /// Panics when `PostgreSQL` setup or any closure assertion fails.

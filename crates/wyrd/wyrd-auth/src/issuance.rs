@@ -963,7 +963,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
+    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag, RoleSource};
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::CardUid;
@@ -1377,7 +1377,7 @@ mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let role_id = seed_card_reader_role(&mut conn).await;
         let user = seed_user(&mut conn).await;
-        grant_role_to_user(&mut conn, user, role_id)
+        grant_role_to_user(&mut conn, user, role_id, RoleSource::Idp)
             .await
             .expect("role grants");
 

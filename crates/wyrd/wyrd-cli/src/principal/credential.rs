@@ -104,7 +104,7 @@ pub async fn dispatch(command: CredentialCommand) -> Result<ExitCode, WyrdCliErr
 ///
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] when the value is not a UUID.
-fn principal_id(value: &str) -> Result<PrincipalId, WyrdCliError> {
+pub(crate) fn principal_id(value: &str) -> Result<PrincipalId, WyrdCliError> {
     value.parse().map_err(|_| WyrdCliError::InvalidArgument {
         field: "principal".to_owned(),
         value: value.to_owned(),

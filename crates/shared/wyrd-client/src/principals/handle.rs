@@ -6,7 +6,8 @@ use reqwest::Method;
 use uuid::Uuid;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    IssuedCredential, PrincipalId, RevokePrincipalRequest,
+    IssuedCredential, PrincipalId, PrincipalPage, PrincipalQuery, PrincipalRoles,
+    RevokePrincipalRequest, RoleAssignmentChange,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -200,5 +201,119 @@ impl Principals {
             )
             .await?;
         Ok(())
+    }
+
+    /// Discover the tenant's assignable principals: users and Service and
+    /// Agent principals that are not deleted, ordered by id.
+    ///
+    /// Filters are exact matches. Pass the returned page's `next` as
+    /// `query.after` to read the following page; `next` is `None` on the last
+    /// page.
+    ///
+    /// # Arguments
+    /// * `query` - Optional `kind`, `email`, and `name` filters, a page size
+    ///   between 1 and 200 (default 100), and the keyset cursor.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the query is invalid, the caller lacks
+    /// principal administration, or the read fails.
+    pub async fn list(&self, query: &PrincipalQuery) -> Result<PrincipalPage, WyrdError> {
+        let query = serde_urlencoded::to_string(query)
+            .expect("a principal query of optional scalars always URL-encodes");
+        let path = if query.is_empty() {
+            "/v1/principals".to_owned()
+        } else {
+            format!("/v1/principals?{query}")
+        };
+        self.client
+            .http
+            .request_json::<(), _>(Method::GET, &path, None)
+            .await
+    }
+
+    /// List a principal's Role assignments and where each came from.
+    ///
+    /// A user may hold one Role from both its identity provider (`idp`) and
+    /// an administrator (`direct`); its effective Roles are the union.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The principal whose assignments are listed.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks principal administration or
+    /// no assignable principal has this id in the caller's tenant.
+    pub async fn roles(&self, principal_id: &PrincipalId) -> Result<PrincipalRoles, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::GET,
+                &format!("/v1/principals/{principal_id}/roles"),
+                None,
+            )
+            .await
+    }
+
+    /// Grant a principal a direct Role assignment.
+    ///
+    /// Idempotent: `changed` is `false` when the principal already held the
+    /// Role directly. The Role reaches the principal's next token.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The principal to grant the Role to.
+    /// * `role` - The built-in or tenant Role name.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a tenant administrator, the
+    /// Role does not exist, or no assignable principal has this id.
+    pub async fn grant_role(
+        &self,
+        principal_id: &PrincipalId,
+        role: &str,
+    ) -> Result<RoleAssignmentChange, WyrdError> {
+        self.change_role(Method::PUT, principal_id, role).await
+    }
+
+    /// Revoke a principal's direct Role assignment.
+    ///
+    /// Idempotent: `changed` is `false` when the principal held no direct
+    /// assignment of the Role. A user's `idp` assignment of the same Role is
+    /// left for the identity provider. Tokens already issued keep their
+    /// bounded lifetime; the next token omits the Role.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The principal to revoke the Role from.
+    /// * `role` - The built-in or tenant Role name.
+    ///
+    /// # Errors
+    /// Returns the errors documented on [`Self::grant_role`].
+    pub async fn revoke_role(
+        &self,
+        principal_id: &PrincipalId,
+        role: &str,
+    ) -> Result<RoleAssignmentChange, WyrdError> {
+        self.change_role(Method::DELETE, principal_id, role).await
+    }
+
+    /// Send one bodyless direct-assignment write.
+    ///
+    /// # Errors
+    /// Returns the server's stable Wyrd error for a refused write.
+    async fn change_role(
+        &self,
+        method: Method,
+        principal_id: &PrincipalId,
+        role: &str,
+    ) -> Result<RoleAssignmentChange, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                method,
+                &format!(
+                    "/v1/principals/{principal_id}/roles/{}",
+                    urlencoding::encode(role)
+                ),
+                None,
+            )
+            .await
     }
 }

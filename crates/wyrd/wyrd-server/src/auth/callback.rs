@@ -79,7 +79,8 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
         insert_device_authorization, insert_human_candidate, insert_login_state, insert_role,
-        insert_user, list_user_roles, lock_refresh_family, replace_user_roles, user_id_by_identity,
+        insert_user, list_user_roles, lock_refresh_family, replace_idp_user_roles,
+        user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -1072,7 +1073,7 @@ mod pg_tests {
             )
             .await
             .expect("role inserts");
-            replace_user_roles(&mut conn, user, &["connection_tester"])
+            replace_idp_user_roles(&mut conn, user, &["connection_tester"])
                 .await
                 .expect("role grants");
         }

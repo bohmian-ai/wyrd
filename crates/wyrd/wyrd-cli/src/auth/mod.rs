@@ -1,5 +1,3 @@
-/// `wyrd auth grant-role`: grant a Role to a Card-bound principal.
-pub mod grant_role;
 /// `wyrd auth issue-key`: mint an API key bound to a Card.
 pub mod issue_key;
 /// `wyrd auth login`, `logout`, and `status`: the saved human user login.
@@ -22,9 +20,6 @@ use crate::error::WyrdCliError;
 pub enum AuthCommand {
     /// Issue an API key bound to a card ref (POST /auth/issue-key).
     IssueKey(issue_key::IssueKeyArgs),
-    /// Grant a Role to the principal bound to a Service or Agent card
-    /// (POST /v1/auth/grant-role); requires tenant administration.
-    GrantRole(grant_role::GrantRoleArgs),
     /// Sign in to a tenant through the browser and save the Wyrd user login
     /// every local SDK uses; no token is printed.
     Login(login::LoginArgs),
@@ -51,7 +46,6 @@ pub enum AuthCommand {
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
-        AuthCommand::GrantRole(args) => grant_role::dispatch(args).await,
         AuthCommand::Login(args) => login::login(args).await,
         AuthCommand::Logout(args) => login::logout(args).await,
         AuthCommand::Status => login::status().await,

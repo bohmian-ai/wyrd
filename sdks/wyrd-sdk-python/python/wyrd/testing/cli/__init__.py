@@ -13,7 +13,6 @@ from __future__ import annotations
 from os import PathLike
 
 from wyrd._wyrd.testing.cli import (
-    GrantRoleResponse,
     IssueKeyResponse,
     LoadOutput,
     PlanCard,
@@ -26,7 +25,6 @@ from wyrd._wyrd.testing.cli import (
     revoke_provider_credential,
 )
 from wyrd._wyrd.testing.cli import get as _get
-from wyrd._wyrd.testing.cli import grant_role as _grant_role
 from wyrd._wyrd.testing.cli import issue_key as _issue_key
 from wyrd._wyrd.testing.cli import load as _load
 from wyrd.cards import HydrationSummary
@@ -76,21 +74,7 @@ def issue_key(
     return _issue_key((kind, name, version, space), label, expires_in_seconds, client)
 
 
-def grant_role(
-    *,
-    kind: str,
-    name: str,
-    version: str,
-    space: str,
-    role: str,
-    client: WyrdClient | None = None,
-) -> GrantRoleResponse:
-    """Grant one Role to the principal bound to a Card (``wyrd auth grant-role``)."""
-    return _grant_role((kind, name, version, space), role, client)
-
-
 __all__ = [
-    "GrantRoleResponse",
     "IssueKeyResponse",
     "LoadOutput",
     "PlanCard",
@@ -99,7 +83,6 @@ __all__ = [
     "apply",
     "delete_provider_credential",
     "get",
-    "grant_role",
     "issue_key",
     "load",
     "plan",

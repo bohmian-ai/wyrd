@@ -1,7 +1,7 @@
 //! HTTP routes for the tenant auth surfaces: the OAuth authorization
 //! server (authorization, token, device authorization, revocation, and
-//! metadata endpoints), the OIDC provider callback, Card-bound API key
-//! issuance, and Role grants to Card-bound principals.
+//! metadata endpoints), the OIDC provider callback, and Card-bound API key
+//! issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
@@ -13,19 +13,13 @@ use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::callback::{AuthorizationCodeExchange, LoginCompletion};
 use wyrd_auth_verify::{AccessTokenClaims, VerifiedToken};
-use wyrd_runtime::{Permission, RoleRef};
 use wyrd_spec::auth::{
-    CallbackQuery, ExchangeTokenType, GrantRoleRequest, GrantRoleResponse, IssueKeyRequest,
-    OAuthClientId, OAuthErrorCode, OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest,
-    TokenResponse,
+    CallbackQuery, ExchangeTokenType, IssueKeyRequest, OAuthClientId, OAuthErrorCode,
+    OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, list_service_account_roles, role_by_name,
-    service_account_by_card_ref,
-};
 
 use crate::auth::authorize::{client_redirect, error_name};
 use crate::auth::callback::exchange_authorization_code;
@@ -35,7 +29,7 @@ use crate::auth::card_scope::{
 use crate::auth::exchange_api_key::{
     DelegateToken, ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd,
 };
-use crate::auth::issue_api_key::{IssueApiKey, IssueKeyError, WyrdApiKey, principal_kind_for_card};
+use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::exchange_jwt_bearer;
 use crate::auth::oauth::{ClientForm, GRANT_TYPES, OAuthError, OAuthForm, no_store};
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
@@ -70,16 +64,6 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(callback))
         .routes(routes!(token))
         .routes(routes!(issue_key))
-}
-
-/// Build the tenant auth administration routes for the `/v1` group.
-///
-/// Mounts Role grants (`POST /auth/grant-role`). Unlike [`auth_router`], whose
-/// grants run before any session exists, these operations act on an
-/// authenticated tenant administrator and sit behind `/v1`'s default-deny
-/// authentication.
-pub fn tenant_auth_router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(grant_role))
 }
 
 /// `POST /auth/token` — the OAuth token endpoint.
@@ -630,110 +614,6 @@ async fn issue_key(
     Ok(Json(issued.response))
 }
 
-/// `POST /v1/auth/grant-role` — grant one Role to a Card-bound principal.
-///
-/// Gated on tenant administration (`*`), not `service_accounts:write`, so a
-/// credential administrator cannot raise a principal's authority. The decision
-/// is staged on the audit outbox, allowed and denied alike, before the tenant
-/// transaction opens. The target is the Service or Agent principal projected
-/// from `card_ref` in the caller's tenant; a grant already held is a no-op
-/// reported with `granted: false`. The Role reaches the principal's tokens at
-/// its next key exchange.
-///
-/// # Errors
-/// Returns `WYRD_SPEC_400_VALIDATION` for a malformed or unknown role,
-/// `WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH` for a Card kind that binds
-/// no principal, `WYRD_PERMISSION_403_DENIED_RBAC` without tenant
-/// administration, the non-enumerating `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` for
-/// an unknown or foreign Card, and `WYRD_SPEC_500_INTERNAL` when the tenant
-/// store fails.
-#[utoipa::path(
-    post,
-    path = "/auth/grant-role",
-    request_body = GrantRoleRequest,
-    responses(
-        (status = 200, description = "The principal holds the Role", body = GrantRoleResponse),
-        (status = 400, description = "The role is malformed or does not exist in this tenant \
-          (WYRD_SPEC_400_VALIDATION), or the Card kind binds no principal \
-          (WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No principal is bound to the Card in this tenant \
-          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A tenant store read or write failed \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Auth"
-)]
-#[tracing::instrument(level = "info", skip(state, caller, request))]
-async fn grant_role(
-    State(state): State<AppState>,
-    caller: Caller,
-    Json(request): Json<GrantRoleRequest>,
-) -> Result<Json<GrantRoleResponse>, WyrdErrorResponse> {
-    crate::audit::authorize(
-        &state,
-        &caller,
-        &Permission::wildcard(),
-        "auth.principal.role.grant",
-        &format!("card:{}/role:{}", request.card_ref, request.role),
-    )?;
-    let unknown_role = || {
-        WyrdErrorResponse::from(WyrdError::Validation {
-            message: "role does not exist in this tenant".to_owned(),
-            details: serde_json::json!({ "role": request.role }),
-        })
-    };
-    RoleRef::new(&request.role).map_err(|_| unknown_role())?;
-    let principal_kind = principal_kind_for_card(&request.card_ref).map_err(WyrdError::from)?;
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(grant_failure)?;
-    let principal = service_account_by_card_ref(&mut conn, principal_kind, &request.card_ref)
-        .await
-        .map_err(grant_failure)?
-        .ok_or_else(|| {
-            WyrdError::from(IssueKeyError::ServiceAccountNotFound(
-                request.card_ref.to_string(),
-            ))
-        })?;
-    let role = role_by_name(&mut conn, &request.role)
-        .await
-        .map_err(grant_failure)?
-        .ok_or_else(unknown_role)?;
-    let granted = grant_role_to_service_account(&mut conn, principal.id, role.id)
-        .await
-        .map_err(grant_failure)?;
-    let roles = list_service_account_roles(&mut conn, principal.id)
-        .await
-        .map_err(grant_failure)?;
-    conn.commit().await.map_err(grant_failure)?;
-    Ok(Json(GrantRoleResponse {
-        principal_id: wyrd_spec::auth::PrincipalId::new(principal.id),
-        card_ref: principal
-            .card_ref
-            .map_or_else(|| request.card_ref.clone(), |stored| stored.0),
-        roles,
-        granted,
-    }))
-}
-
-/// The refusal of a Role grant whose tenant store failed; the cause is
-/// logged, never returned.
-fn grant_failure(error: impl std::fmt::Display) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(crate::http::error::internal_failure(
-        "role grant store failure",
-        &error,
-    ))
-}
-
 /// The refusal of a grant the server lacks the auth configuration for.
 fn not_configured() -> WyrdError {
     crate::auth::auth_not_configured().0
@@ -806,9 +686,7 @@ mod pg_tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_sql::TenantConn;
 
-    use super::{auth_router, grant_role, issue_key, tenant_from_unverified_access_token};
-    use crate::components::auth::Caller;
-    use wyrd_spec::auth::{GrantRoleRequest, GrantRoleResponse};
+    use super::{auth_router, issue_key, tenant_from_unverified_access_token};
 
     #[test]
     fn mounts_token_and_issue_key_routes() {
@@ -1161,253 +1039,5 @@ mod pg_tests {
                 .await
                 .expect("key count reads");
         assert_eq!(keys, 0, "a failed issue leaves no key");
-    }
-
-    /// Seeds a tenant with the built-in roles, an acting user, and the
-    /// Service principal bound to [`service_card_ref`], and commits them.
-    ///
-    /// Returns the acting user and the bound principal.
-    ///
-    /// # Panics
-    /// Panics when the connection, seed, or inserts fail.
-    async fn seed_grant_target(fixture: &PgFixture, tenant: DataTenantId) -> (Uuid, Uuid) {
-        let mut conn = fixture
-            .tenant_conn_for(tenant)
-            .await
-            .expect("tenant conn opens");
-        crate::auth::seed::seed_builtin_roles_for_tenant(&mut conn, tenant)
-            .await
-            .expect("built-in roles seed");
-        let actor = insert_test_user(&mut conn, tenant).await;
-        let principal =
-            insert_test_service_account(&mut conn, tenant, actor, &service_card_ref()).await;
-        conn.commit().await.expect("seed commits");
-        (actor, principal)
-    }
-
-    /// A tenant-plane `Caller` for `id` holding exactly `permissions`.
-    fn grant_caller(id: Uuid, tenant: DataTenantId, permissions: PermissionSet) -> Caller {
-        Caller::from_authenticated(&caller_with(id, tenant, permissions), RequestId::now_v7())
-    }
-
-    /// The grant-role body naming [`service_card_ref`] and `role`.
-    fn grant_request(role: &str) -> GrantRoleRequest {
-        GrantRoleRequest {
-            card_ref: service_card_ref(),
-            role: role.to_owned(),
-        }
-    }
-
-    /// Calls the grant-role handler as `caller` and unwraps its typed result.
-    async fn call_grant(
-        state: &AppState,
-        caller: Caller,
-        role: &str,
-    ) -> Result<GrantRoleResponse, WyrdError> {
-        grant_role(State(state.clone()), caller, Json(grant_request(role)))
-            .await
-            .map(|Json(response)| response)
-            .map_err(|error| error.0)
-    }
-
-    /// Settles the audit outbox, then counts the tenant's staged
-    /// `auth.principal.role.grant` decisions with `outcome` on `resource`.
-    ///
-    /// # Panics
-    /// Panics when the outbox does not settle or the count cannot be read.
-    async fn staged_grant_decisions(
-        fixture: &PgFixture,
-        state: &AppState,
-        tenant: DataTenantId,
-        outcome: &str,
-        resource: &str,
-    ) -> i64 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        assert_eq!(
-            state.audit_outbox.settle(deadline).await,
-            0,
-            "audit settles"
-        );
-        let mut conn = fixture
-            .tenant_conn_for(tenant)
-            .await
-            .expect("verify conn opens");
-        sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = 'auth.principal.role.grant'
-                AND outcome = $2
-                AND resource = $3
-                AND permission = 'wildcard:wildcard'",
-        )
-        .bind(tenant.as_uuid())
-        .bind(outcome)
-        .bind(resource)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("staged decisions count")
-    }
-
-    /// A tenant administrator grants `workload` to a Card-bound Service: the
-    /// first call adds it, a repeat reports `granted: false` with the same
-    /// roles, and each allowed decision is staged under the Card and role.
-    ///
-    /// # Panics
-    /// Panics when a grant fails, the roles or `granted` flags differ, or the
-    /// allowed decisions were not staged.
-    #[tokio::test]
-    async fn grant_role_is_idempotent_and_stages_its_allowance() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let (actor, principal) = seed_grant_target(&fixture, tenant).await;
-        let state = fixture_state(&fixture).await;
-        let admin = || {
-            grant_caller(
-                actor,
-                tenant,
-                PermissionSet::from_iter([Permission::wildcard()]),
-            )
-        };
-
-        let first = call_grant(&state, admin(), "workload")
-            .await
-            .expect("admin grants workload");
-        let repeat = call_grant(&state, admin(), "workload")
-            .await
-            .expect("repeat grant succeeds");
-
-        assert!(first.granted, "the first grant adds the role");
-        assert!(!repeat.granted, "a held role is not granted again");
-        assert_eq!(first.principal_id.as_uuid(), principal);
-        assert_eq!(first.card_ref, service_card_ref());
-        assert_eq!(first.roles, ["workload"]);
-        assert_eq!(repeat.roles, first.roles);
-        let resource = format!("card:{}/role:workload", service_card_ref());
-        assert_eq!(
-            staged_grant_decisions(&fixture, &state, tenant, "allowed", &resource).await,
-            2
-        );
-    }
-
-    /// A caller without tenant administration is refused with the RBAC
-    /// denial, including a `runtime_admin` holding `service_accounts:write`,
-    /// and each denial is staged while no role is granted.
-    ///
-    /// # Panics
-    /// Panics when either caller is not refused, a denial is not staged, or
-    /// the principal gained a role.
-    #[tokio::test]
-    async fn grant_role_refuses_non_administrators() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let (actor, principal) = seed_grant_target(&fixture, tenant).await;
-        let state = fixture_state(&fixture).await;
-
-        for permissions in [
-            PermissionSet::new(),
-            PermissionSet::from_iter([Permission::service_accounts_write()]),
-        ] {
-            let error = call_grant(&state, grant_caller(actor, tenant, permissions), "workload")
-                .await
-                .expect_err("a non-administrator is refused");
-            assert!(
-                matches!(error, WyrdError::PermissionDeniedRbac { .. }),
-                "expected an RBAC denial, got {error:?}"
-            );
-        }
-
-        let resource = format!("card:{}/role:workload", service_card_ref());
-        assert_eq!(
-            staged_grant_decisions(&fixture, &state, tenant, "denied", &resource).await,
-            2
-        );
-        let mut conn = fixture.tenant_conn().await.expect("verify conn opens");
-        assert!(
-            wyrd_sql::queries::auth::list_service_account_roles(&mut conn, principal)
-                .await
-                .expect("roles list")
-                .is_empty(),
-            "a refused grant writes nothing"
-        );
-    }
-
-    /// An unknown role is refused with `WYRD_SPEC_400_VALIDATION`.
-    ///
-    /// # Panics
-    /// Panics when the grant succeeds or is refused with another error.
-    #[tokio::test]
-    async fn grant_role_refuses_an_unknown_role() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let (actor, _) = seed_grant_target(&fixture, tenant).await;
-        let state = fixture_state(&fixture).await;
-        let admin = grant_caller(
-            actor,
-            tenant,
-            PermissionSet::from_iter([Permission::wildcard()]),
-        );
-
-        let error = call_grant(&state, admin, "no_such_role")
-            .await
-            .expect_err("an unknown role is refused");
-
-        assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
-    }
-
-    /// A Card bound in another tenant, and a Card bound nowhere, both answer
-    /// the same non-enumerating `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`, and the
-    /// other tenant's principal gains no role.
-    ///
-    /// # Panics
-    /// Panics when either grant succeeds, the refusals differ, or the foreign
-    /// principal gained a role.
-    #[tokio::test]
-    async fn grant_role_does_not_reach_another_tenants_card() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let other = DataTenantId::new_v7();
-        fixture
-            .seed_additional_tenant_with_uuid(other, "grant-role-other")
-            .await
-            .expect("other tenant inserts");
-        let (_, foreign) = seed_grant_target(&fixture, other).await;
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        crate::auth::seed::seed_builtin_roles_for_tenant(&mut conn, tenant)
-            .await
-            .expect("built-in roles seed");
-        let actor = insert_test_user(&mut conn, tenant).await;
-        conn.commit().await.expect("seed commits");
-        let state = fixture_state(&fixture).await;
-        let admin = || {
-            grant_caller(
-                actor,
-                tenant,
-                PermissionSet::from_iter([Permission::wildcard()]),
-            )
-        };
-
-        let foreign_error = call_grant(&state, admin(), "workload")
-            .await
-            .expect_err("another tenant's Card is not reachable");
-        let mut unknown = grant_request("workload");
-        unknown.card_ref.name = CardName::new("never-registered").expect("static name is valid");
-        let unknown_error = grant_role(State(state.clone()), admin(), Json(unknown))
-            .await
-            .expect_err("an unbound Card is refused")
-            .0;
-
-        assert_eq!(foreign_error.code(), "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND");
-        assert_eq!(unknown_error.code(), foreign_error.code());
-        let mut other_conn = fixture
-            .tenant_conn_for(other)
-            .await
-            .expect("other tenant conn opens");
-        assert!(
-            wyrd_sql::queries::auth::list_service_account_roles(&mut other_conn, foreign)
-                .await
-                .expect("roles list")
-                .is_empty(),
-            "the foreign principal gained no role"
-        );
     }
 }

@@ -318,7 +318,7 @@ mod pg_tests {
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
         active_refresh, insert_human_refresh_token, insert_refresh_token, insert_role,
-        insert_service_account, list_user_roles, refresh_by_hash, replace_user_roles,
+        insert_service_account, list_user_roles, refresh_by_hash, replace_idp_user_roles,
     };
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
@@ -1081,7 +1081,7 @@ mod pg_tests {
         )
         .await
         .expect("role seeds");
-        replace_user_roles(&mut conn, user_id, &["credential_admin", "only-at-the-idp"])
+        replace_idp_user_roles(&mut conn, user_id, &["credential_admin", "only-at-the-idp"])
             .await
             .expect("login persists the asserted roles");
         assert_eq!(

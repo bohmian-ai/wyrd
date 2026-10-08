@@ -84,7 +84,7 @@ use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
 
-use wyrd_spec::auth::{TokenAudience, TokenResponse};
+use wyrd_spec::auth::{RoleSource, TokenAudience, TokenResponse};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
@@ -1462,10 +1462,7 @@ impl WyrdTestServer {
     /// bootstrapped or its API key cannot be exchanged.
     pub async fn query_denied_token(&self) -> Result<String, WyrdTestServerError> {
         let bootstrap = self
-            .bootstrap_service(
-                &format!("bifrost-denied-{}", Uuid::now_v7().simple()),
-                &[],
-            )
+            .bootstrap_service(&format!("bifrost-denied-{}", Uuid::now_v7().simple()), &[])
             .await?;
         let api_key = bootstrap.api_key().ok_or_else(|| {
             WyrdTestServerError::Auth("denied token requires a service key".to_owned())
@@ -3328,7 +3325,7 @@ impl WyrdTestServer {
         let role_id = lookup_role_id(&mut conn, role).await?;
         match principal {
             Bootstrap::User { id, .. } => {
-                revoke_role_from_user(&mut conn, id.as_uuid(), role_id)
+                revoke_role_from_user(&mut conn, id.as_uuid(), role_id, RoleSource::Idp)
                     .await
                     .map_err(sql)?;
             }
@@ -5432,7 +5429,7 @@ async fn grant_role(
 ) -> Result<(), WyrdTestServerError> {
     let role_id = lookup_role_id(conn, role).await?;
     match table {
-        PrincipalTable::User => grant_role_to_user(conn, principal_id, role_id)
+        PrincipalTable::User => grant_role_to_user(conn, principal_id, role_id, RoleSource::Idp)
             .await
             .map(|_| ())
             .map_err(sql),

@@ -7,10 +7,10 @@
 
 mod gateway_admin;
 mod gateway_inference;
-mod grant_role;
 mod observe_a_run;
 mod operator_connections;
 mod otel_export;
+mod principal_roles;
 mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;

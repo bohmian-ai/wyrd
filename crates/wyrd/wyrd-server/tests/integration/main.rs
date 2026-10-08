@@ -18,6 +18,7 @@ mod pg_openapi_contract;
 mod pg_operator_connection_routes;
 #[cfg(feature = "test-support")]
 mod pg_operator_delivery;
+mod pg_principal_roles;
 mod pg_router_smoke;
 mod pg_verification_routes;
 #[cfg(feature = "test-support")]

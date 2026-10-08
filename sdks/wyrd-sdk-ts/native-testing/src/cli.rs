@@ -80,21 +80,6 @@ pub struct NativeIssueKey {
     pub expires_in_seconds: Option<u32>,
 }
 
-/// Options for `grantRole`: the bound Card and the Role to grant it.
-#[napi(object)]
-pub struct NativeGrantRole {
-    /// Card kind, `Service` or `Agent`.
-    pub kind: String,
-    /// Card name.
-    pub name: String,
-    /// Exact Card version.
-    pub version: String,
-    /// Card space.
-    pub space: String,
-    /// Built-in or tenant Role name, such as `workload`.
-    pub role: String,
-}
-
 /// Closed result of one command: its JSON value or its problem document.
 #[napi(object, object_from_js = false)]
 pub struct NativeCliOutcome {
@@ -263,44 +248,6 @@ pub async fn cli_issue_key(
                 &options.space,
                 options.label.as_deref(),
                 options.expires_in_seconds,
-                client,
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    };
-    NativeCliOutcome::from_result(result)
-}
-
-/// Grants a Role to the principal bound to one exact Card
-/// (`wyrd auth grant-role`).
-///
-/// Requires a tenant administrator; the grant takes effect at the principal's
-/// next key exchange.
-///
-/// # Arguments
-///
-/// * `options` - The bound Card's coordinates and the Role to grant.
-/// * `connection` - The explicit client the command runs as, or `None` for
-///   the ambient credential chain.
-///
-/// # Errors
-///
-/// Returns a napi error only when the response cannot be serialized;
-/// coordinate, client, and server failures are returned in the outcome.
-#[napi]
-pub async fn cli_grant_role(
-    options: NativeGrantRole,
-    connection: Option<NativeCliConnection>,
-) -> napi::Result<NativeCliOutcome> {
-    let result = match client(connection) {
-        Ok(client) => {
-            commands::grant_role(
-                &options.kind,
-                &options.name,
-                &options.version,
-                &options.space,
-                &options.role,
                 client,
             )
             .await

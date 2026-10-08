@@ -237,9 +237,7 @@ mod pg_tests {
         assert!(gateway.credentials().await?.is_empty());
         client.cancel().await?;
 
-        let reader = server
-            .bootstrap_user("mcp-gateway-reader", &[])
-            .await?;
+        let reader = server.bootstrap_user("mcp-gateway-reader", &[]).await?;
         let reader_client = ()
             .serve_with_lifecycle(
                 transport(

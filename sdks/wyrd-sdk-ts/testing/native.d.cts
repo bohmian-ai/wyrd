@@ -221,26 +221,6 @@ export declare function cliDeleteProviderCredential(name: string, connection?: N
 export declare function cliGet(selector: NativeCardSelector, outputDir: string, metadataOnly?: boolean | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
- * Grants a Role to the principal bound to one exact Card
- * (`wyrd auth grant-role`).
- *
- * Requires a tenant administrator; the grant takes effect at the principal's
- * next key exchange.
- *
- * # Arguments
- *
- * * `options` - The bound Card's coordinates and the Role to grant.
- * * `connection` - The explicit client the command runs as, or `None` for
- *   the ambient credential chain.
- *
- * # Errors
- *
- * Returns a napi error only when the response cannot be serialized;
- * coordinate, client, and server failures are returned in the outcome.
- */
-export declare function cliGrantRole(options: NativeGrantRole, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
-
-/**
  * Issues an API key bound to one exact Card (`wyrd auth issue-key`).
  *
  * The outcome holds the plaintext key exactly once.
@@ -339,20 +319,6 @@ export interface NativeCliOutcome {
    * `remediation`, `details`), when it failed.
    */
   problemJson?: string
-}
-
-/** Options for `grantRole`: the bound Card and the Role to grant it. */
-export interface NativeGrantRole {
-  /** Card kind, `Service` or `Agent`. */
-  kind: string
-  /** Card name. */
-  name: string
-  /** Exact Card version. */
-  version: string
-  /** Card space. */
-  space: string
-  /** Built-in or tenant Role name, such as `workload`. */
-  role: string
 }
 
 /** Options for `issueKey`: the bound Card and the key's label and lifetime. */

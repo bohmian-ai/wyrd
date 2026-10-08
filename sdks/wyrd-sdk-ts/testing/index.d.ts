@@ -50,21 +50,13 @@ export interface CliCardSelector {
 /** Response of `wyrd auth issue-key`; `key` is the plaintext API key, returned exactly once. */
 export interface IssueKeyResponse {
   readonly key_id: string;
+  /** The Card's Service or Agent principal, the id its Role assignments are addressed by. */
+  readonly principal_id: string;
   readonly key: string;
   readonly prefix: string;
   readonly card_ref: CardRef;
   readonly created_at: string;
   readonly expires_at: string;
-}
-
-/** Response of `wyrd auth grant-role`: every Role the principal now holds. */
-export interface GrantRoleResponse {
-  readonly principal_id: string;
-  readonly card_ref: CardRef;
-  /** Every Role the principal holds, ordered by name. */
-  readonly roles: readonly string[];
-  /** `true` when this call added the Role, `false` when it was already held. */
-  readonly granted: boolean;
 }
 
 /** Provider credential submission for {@link cli.putProviderCredential}. */
@@ -115,22 +107,6 @@ export declare const cli: {
     },
     options?: CliClientOptions,
   ): Promise<IssueKeyResponse>;
-  /**
-   * Grant a Role to the principal bound to one exact Service or Agent Card
-   * (`wyrd auth grant-role`). Requires a tenant administrator; the grant takes
-   * effect at the principal's next key exchange, so build a fresh client from
-   * its key afterwards.
-   */
-  grantRole(
-    grant: {
-      readonly kind: string;
-      readonly name: string;
-      readonly version: string;
-      readonly space: string;
-      readonly role: string;
-    },
-    options?: CliClientOptions,
-  ): Promise<GrantRoleResponse>;
   /** Create or rotate a provider credential; a rejected body is not quoted and the view is redacted. */
   putProviderCredential(write: ProviderCredentialWrite, options?: CliClientOptions): Promise<ProviderCredentialView>;
   /** Terminally revoke a provider credential (`wyrd gateway credential revoke`). */

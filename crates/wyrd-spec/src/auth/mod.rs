@@ -52,8 +52,9 @@ pub use tenant_admin::{
 };
 pub use tenant_principals::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    CredentialMetadata, CredentialRevoked, GrantRoleRequest, GrantRoleResponse, IssuedCredential,
-    ListCredentialsArgs, RevokeCredentialArgs,
+    CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokeCredentialArgs,
+    RoleAssignment, RoleAssignmentChange, RoleSource,
 };
 pub use token::{
     AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,

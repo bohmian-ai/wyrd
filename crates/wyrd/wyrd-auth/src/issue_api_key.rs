@@ -125,6 +125,7 @@ impl IssueApiKey {
         Ok(IssuedApiKey {
             response: IssueKeyResponse {
                 key_id: api_key_id,
+                principal_id: PrincipalId::new(row.id),
                 key: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
                 prefix,
                 card_ref: request.card_ref,

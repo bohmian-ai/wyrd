@@ -40,7 +40,7 @@ use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     LoginState, approve_device_authorization, consume_login_state, delete_user,
     human_connection_is_active, insert_user, issue_authorization_code, lock_human_connection_slot,
-    lock_refresh_family, redeem_authorization_code, replace_user_roles, upsert_user_identity,
+    lock_refresh_family, redeem_authorization_code, replace_idp_user_roles, upsert_user_identity,
     user_id_by_identity,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
@@ -410,11 +410,11 @@ impl AuthorizationCodeExchange {
             .map_err(store_error)?;
         fence_bound_connection(&mut conn, login_state.connection).await?;
         let roles = role_names_to_refs(trusted, &identity.groups)?;
-        // The provider just asserted this human's authority, and nothing else
-        // in Wyrd grants a user a role. Recording it here is what makes the
-        // grant table the truth every later token is minted from.
+        // The provider just asserted this human's `idp` authority. Recording
+        // it beside any `direct` grants is what makes the grant table the
+        // truth every later token is minted from.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-        let roles_changed = replace_user_roles(&mut conn, principal_id, &role_names)
+        let roles_changed = replace_idp_user_roles(&mut conn, principal_id, &role_names)
             .await
             .map_err(store_error)?;
         let completion = match &login_state.initiation {

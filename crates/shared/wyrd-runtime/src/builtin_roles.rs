@@ -189,7 +189,11 @@ mod tests {
     /// when two adjacent Roles are equal.
     #[test]
     fn roles_are_strictly_nested() {
-        for (lower, upper) in [("viewer", "workload"), ("workload", "editor"), ("editor", "admin")] {
+        for (lower, upper) in [
+            ("viewer", "workload"),
+            ("workload", "editor"),
+            ("editor", "admin"),
+        ] {
             for permission in permissions(lower) {
                 assert!(holds(upper, permission), "{upper} lacks {permission}");
             }

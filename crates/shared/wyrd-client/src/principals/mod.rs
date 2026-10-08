@@ -19,6 +19,8 @@ pub use handle::Principals;
 // directly.
 pub use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    CredentialMetadata, IssuedCredential, PrincipalId,
+    CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RoleAssignment,
+    RoleAssignmentChange, RoleSource,
 };
 pub use wyrd_spec::error::WyrdError;

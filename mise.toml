@@ -149,7 +149,8 @@ cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_te
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^refresh::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::admin::routes::pg_tests::/)'
-cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_openapi_contract::/)'
+cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^(pg_openapi_contract|pg_principal_roles)::/)'
+cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^principal_roles::/)'
 """
 
 [tasks."test:cli:journey"]

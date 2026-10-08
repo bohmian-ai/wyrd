@@ -103,12 +103,17 @@ CREATE POLICY tenant_isolation ON wyrd.auth_service_accounts
 -- ---------------------------------------------------------------------------
 -- Role grants (user-to-role and service-account-to-role)
 -- ---------------------------------------------------------------------------
+-- A user's assignment records its source: `idp` rows are owned by federated
+-- login, which replaces only them; `direct` rows are granted and revoked by a
+-- tenant administrator. The same Role may be held from both sources, and the
+-- effective Roles are their union. Every writer names the source.
 CREATE TABLE wyrd.auth_user_roles (
     data_tenant_id  UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
     user_id         UUID NOT NULL,
     role_id         UUID NOT NULL,
+    source          TEXT NOT NULL CHECK (source IN ('idp','direct')),
     granted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (data_tenant_id, user_id, role_id),
+    PRIMARY KEY (data_tenant_id, user_id, role_id, source),
     FOREIGN KEY (data_tenant_id, user_id)
         REFERENCES wyrd.auth_users(data_tenant_id, id) ON DELETE CASCADE,
     FOREIGN KEY (data_tenant_id, role_id)

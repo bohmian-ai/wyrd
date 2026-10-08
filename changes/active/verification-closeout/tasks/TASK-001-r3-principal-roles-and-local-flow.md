@@ -206,4 +206,5 @@ collector. Broad lanes above do not replace those focused Red/Green commands.
 - `../spec.md` revision 1: REQ-001..003, AC-001..002
 - `AGENTS.md`; `architecture/agent-rules.md`;
   `architecture/wyrd-security-posture.md`; `architecture/wyrd-design.md`;
-  `TESTING.md` (definitive Wyrd test-writing and lane-selection guide)
+  `TESTING.md` (definitive Wyrd guide for test ergonomics,
+  understandability, structure, ownership, and lane selection)

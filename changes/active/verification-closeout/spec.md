@@ -382,7 +382,8 @@ None.
 - `architecture/wyrd-doctrine.mdx`
 - `architecture/bifrost-design.md`
 - `architecture/wyrd-security-posture.md`
-- `TESTING.md` — definitive Wyrd test-writing and lane-selection guide
+- `TESTING.md` — definitive Wyrd guide for test ergonomics, understandability,
+  structure, ownership, and lane selection
 - `architecture/references/languages/spec-driven-development.md`
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`

@@ -187,4 +187,5 @@ discoverable owner for each outbox.
 - `../spec.md` revision 1: REQ-004..005, INV-002..006, AC-003
 - `AGENTS.md`; `architecture/agent-rules.md`;
   `architecture/wyrd-design.md`; `architecture/bifrost-design.md`;
-  `TESTING.md` (definitive Wyrd test-writing and lane-selection guide)
+  `TESTING.md` (definitive Wyrd guide for test ergonomics,
+  understandability, structure, ownership, and lane selection)

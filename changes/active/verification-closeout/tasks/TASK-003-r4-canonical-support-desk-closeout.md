@@ -263,4 +263,5 @@ inside this task.
 - `AGENTS.md`; `architecture/agent-rules.md`;
   `architecture/wyrd-design.md`; `architecture/wyrd-doctrine.mdx`;
   `architecture/bifrost-design.md`;
-  `TESTING.md` (definitive Wyrd test-writing and lane-selection guide)
+  `TESTING.md` (definitive Wyrd guide for test ergonomics,
+  understandability, structure, ownership, and lane selection)

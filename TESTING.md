@@ -174,7 +174,17 @@ Two things the lanes deliberately do **not** do:
 
 ## Writing a test
 
-Follow `AGENTS.md` §16 for style, and these two rules specifically:
+Tests are maintained as product code. A reader must be able to understand the
+user behavior, setup, action, and expected outcome in one pass without tracing
+through unrelated helpers or knowing the task that introduced the test.
+
+Prefer the most ergonomic public surface that represents how a user actually
+works. A test that passes only through awkward setup, private APIs, internal
+state inspection, or a test-only workaround is evidence of a product or
+harness gap, not a successful user journey. Fix that gap or move the assertion
+to the internal tier that owns it.
+
+Follow `AGENTS.md` §16 for style, and these rules specifically:
 
 - **A test must assert.** A test that calls another test and prints a marker
   proves nothing, silently pays that test's full runtime a second time, and
@@ -183,6 +193,12 @@ Follow `AGENTS.md` §16 for style, and these two rules specifically:
 - **A test must not name a plan.** Task, case, and hypothesis identifiers
   (`T13`, `P27`, `D85`, `H1`) are meaningless once the plan closes and send a
   reader hunting for a document that may be private. Describe the behavior.
+- **A test must read as behavior.** Keep setup proportional, call the owning
+  public API directly, and assert typed outcomes. A helper earns its place only
+  when it removes genuine repetition without hiding the action or expectation.
+- **A test must demonstrate the intended ergonomics.** Do not preserve an
+  awkward public workflow merely because it can be made to pass. Client-facing
+  tests are executable examples of the API Wyrd intends users to adopt.
 
 Python tests use top-level `def test_*` only — never `class TestFoo:`.
 
@@ -208,14 +224,19 @@ against this checklist:
   credentials, and gRPC URLs go only to the `WyrdClient` constructor, and no
   test switches principals by editing the environment.
 - [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
-  functions, the three test controls (`flush_bifrost`,
-  `wait_for_baseline`, `make_binding_due`), and the server's credential
+  functions, the narrowly scoped test controls (`wait_for_baseline` and
+  `make_binding_due`), and the server's credential
   fixtures for principals that are not Card keys. A Service or Agent key
-  comes from the CLI `issue_key` and holds `wyrd_default`; a Role beyond it is
-  added with the CLI `grant_role`, and takes effect for a client built from
-  the key after the grant. No private or extension import,
+  comes from the CLI `issue_key` and holds `workload`; a Role beyond it is
+  assigned through the public `Principals` surface and takes effect for a
+  client built from the key after the assignment. No private or extension import,
   subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
   JSON parsing of results, sleep, or polling loop.
+- [ ] **Readable without repository archaeology.** The test body shows the
+  user action and typed assertion directly. Support code uses domain names,
+  stays close to the story, and does not force a reader through generic
+  builders, nested wrappers, or implementation-detail fixtures to understand
+  the behavior.
 - [ ] **Setup is fixtures that return domain objects** (a `WyrdState`, a
   registered Card), not helper functions in the test file. The body acts on
   the SDK and asserts on typed results.

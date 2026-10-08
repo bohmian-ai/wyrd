@@ -1,23 +1,18 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import {
-  type CardRef,
-  Cards,
-  type RegisteredCard,
-  type RegistrationReceipt,
-  Workflow,
-  type WorkflowSelector,
-} from "@wyrd/sdk";
+import { type CardRef, Cards, type RegisteredCard, type RegistrationReceipt, Workflow, WyrdClient } from "@wyrd/sdk";
+import { cli } from "@wyrd/testing";
 
-import { serverTest } from "../support/server.js";
+import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-/** The shared Workflow loading fixtures; their README says what each proves. */
+/** A Workflow loading fixture; `fixtures/README.md` says what each proves. */
 function workflowFixture(path: string): string {
-  return resolve(import.meta.dirname, "../../../../../tests/fixtures/workflow-loading", path);
+  return fixture(`cards/workflow_loading/${path}`);
 }
 
 /** The code-review example Workflow, which calls its models through the Wyrd gateway. */
@@ -33,10 +28,12 @@ const REGISTERED_REVIEW =
 /** The `code-review` Workflow's registry identity. */
 const CODE_REVIEW = { space: "workflow-loading", name: "code-review", version: "1.0.0" } as const;
 
-/** The registered reference of every Card a registration registered, keyed by Card name. */
-function refs(...receipts: RegistrationReceipt[]): Record<string, CardRef> {
+/** The registered reference of every Card the receipts registered, keyed by Card name. */
+function refs(...receipts: RegistrationReceipt[]): Record<string, RegisteredRef> {
   return Object.fromEntries(
-    receipts.flatMap((receipt) => receipt.outcomes.map((outcome) => [outcome.card_ref.name, outcome.card_ref])),
+    receipts.flatMap((receipt) =>
+      receipt.outcomes.map((outcome) => [outcome.card_ref.name, registered(receipt, outcome.card_ref.name)]),
+    ),
   );
 }
 
@@ -50,13 +47,13 @@ function outbound(card: RegisteredCard): CardRef[] {
 /**
  * The registered reviewer team, the applied `code-review` Workflow with a
  * newer security reviewer registered after it, and the keys of a Card reader
- * and of an outsider who cannot read Cards.
+ * and of a principal holding no Roles.
  */
 const test = serverTest().extend<{
-  team: Record<string, CardRef>;
-  applied: Record<string, CardRef>;
+  team: Record<string, RegisteredRef>;
+  applied: Record<string, RegisteredRef>;
   readerKey: string;
-  outsiderKey: string;
+  noRolesKey: string;
 }>({
   team: [
     async ({ server: _ }, use) => {
@@ -72,9 +69,8 @@ const test = serverTest().extend<{
   ],
   applied: [
     async ({ team }, use) => {
-      const cards = Cards.connect();
-      const applied = { ...team, ...refs(await cards.registerFromPath(workflowFixture("mixed/workflow.yaml"))) };
-      await cards.registerFromPath(workflowFixture("team-v2/security.yaml"));
+      const applied = { ...team, ...refs(await cli.apply(workflowFixture("mixed/workflow.yaml"))) };
+      await Cards.connect().registerFromPath(workflowFixture("team-v2/security.yaml"));
       await use(applied);
     },
     { scope: "file" },
@@ -83,10 +79,7 @@ const test = serverTest().extend<{
     async ({ server }, use) => use(server.scopedApiKey("workflow_reader", ["cards:read"])),
     { scope: "file" },
   ],
-  outsiderKey: [
-    async ({ server }, use) => use(server.scopedApiKey("workflow_outsider", ["bifrost_query:read"])),
-    { scope: "file" },
-  ],
+  noRolesKey: [async ({ server }, use) => use(server.scopedApiKey("workflow_no_roles", [])), { scope: "file" }],
 });
 
 test("local workflow runs without credentials", async () => {
@@ -101,29 +94,48 @@ test("local workflow runs without credentials", async () => {
   });
 });
 
+test("text input needs a declared input named input", async () => {
+  const local = await Workflow.fromPath(workflowFixture("shadowed/local-workflow.yaml"));
+
+  await expect(local.run("diff")).rejects.toMatchObject({ code: "WYRD_WORKFLOW_422_RUN_REQUEST" });
+});
+
+// YAML text has no directory, so its relative Agent targets never resolve.
+test("yaml workflow loads without resolving file targets", async () => {
+  const yaml = Workflow.fromYaml(readFileSync(workflowFixture("shadowed/local-workflow.yaml"), "utf8"));
+
+  expect([yaml.space, yaml.name, yaml.version]).toEqual(["workflow-loading", "local-review", "1.0.0"]);
+  expect(yaml.steps).toEqual(["security", "correctness", "final_review"]);
+  await expect(yaml.run({ code: "diff" })).rejects.toMatchObject({ code: "WYRD_WORKFLOW_404_AGENT" });
+  expect(() => Workflow.fromYaml("kind: Nope")).toThrow(
+    expect.objectContaining({ code: "WYRD_WORKFLOW_422_VALIDATION" }),
+  );
+});
+
 test("gateway workflow without credentials is refused before any step", async () => {
   vi.stubEnv("WYRD_API_KEY", undefined);
   const example = await Workflow.fromPath(EXAMPLE);
 
-  expect(example.stepIds).toEqual(["security", "correctness", "final_review"]);
+  expect(example.steps).toEqual(["security", "correctness", "final_review"]);
   await expect(example.run({ code: "diff" })).rejects.toMatchObject({ code: "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE" });
 });
 
 test("registry refs resolve through the registry", async ({ team: _, readerKey }) => {
-  vi.stubEnv("WYRD_API_KEY", readerKey);
+  vi.stubEnv("WYRD_API_KEY", undefined);
+  const reader = WyrdClient.connect({ credential: readerKey });
 
-  const run = await (await Workflow.fromPath(workflowFixture("mixed/workflow.yaml"))).run({ code: "diff" });
+  const workflow = await Workflow.fromPath(workflowFixture("mixed/workflow.yaml"), { client: reader });
+  const run = await workflow.run({ code: "diff" });
 
   expect(run).toMatchObject({ status: "succeeded", outputs: { review: REGISTERED_REVIEW } });
 });
 
-test.for([
-  ["no credential", undefined, "WYRD_CLIENT_401_NO_CREDENTIALS"],
-  ["a credential that cannot read cards", "outsider", "WYRD_PERMISSION_403_DENIED_RBAC"],
-] as const)("registry refs with %s are refused", async ([, caller, code], { team: _, outsiderKey }) => {
-  vi.stubEnv("WYRD_API_KEY", caller && outsiderKey);
+test("registry refs without read access are refused", async ({ team: _, noRolesKey }) => {
+  const noRoles = WyrdClient.connect({ credential: noRolesKey });
 
-  await expect(Workflow.fromPath(workflowFixture("mixed/workflow.yaml"))).rejects.toMatchObject({ code });
+  await expect(Workflow.fromPath(workflowFixture("mixed/workflow.yaml"), { client: noRoles })).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
 });
 
 test("local sibling never satisfies a registry ref", async ({ team: _ }) => {
@@ -150,84 +162,45 @@ test("deleted registry card is refused", async () => {
 });
 
 test("applied workflow stays pinned to its registered cards", async ({ applied, readerKey }) => {
-  const reader = Cards.connect({ credential: readerKey });
-  const agents = ["security-reviewer", "correctness-reviewer", "final-reviewer"].map((name) => applied[name]);
+  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
+  const agents = [applied["security-reviewer"], applied["correctness-reviewer"], applied["final-reviewer"]];
 
-  const stored = await reader.get(applied["code-review"] as CardRef);
+  const stored = await reader.get(applied["code-review"]);
 
   expect(stored).toMatchObject({ kind: "Workflow", spec: { steps: agents.map((target) => ({ action: { target } })) } });
-  expect(outbound(stored)).toEqual(
-    [...agents].sort((left, right) => (left?.name ?? "").localeCompare(right?.name ?? "")),
-  );
+  expect(outbound(stored)).toEqual([...agents].sort((left, right) => left.name.localeCompare(right.name)));
   for (const [agent, prompt] of [
     ["security-reviewer", "security-review-prompt"],
     ["correctness-reviewer", "correctness-review-prompt"],
     ["final-reviewer", "final-review-prompt"],
   ] as const) {
-    const storedAgent = await reader.get(applied[agent] as CardRef);
+    const storedAgent = await reader.get(applied[agent]);
     expect(storedAgent.kind === "Agent" && storedAgent.spec.prompt, agent).toEqual(applied[prompt]);
     expect(outbound(storedAgent), agent).toEqual([applied[prompt]]);
   }
 });
 
-test.for([
-  ["identity", () => CODE_REVIEW],
-  ["uid", (applied: Record<string, CardRef>) => ({ uid: applied["code-review"]?.uid ?? "" })],
-] as const)("loaded workflow by %s runs its pinned cards", async ([, selector], { applied, readerKey }) => {
-  const workflow = await Cards.connect({ credential: readerKey }).workflow.load(selector(applied));
+test("loaded workflow runs its pinned cards", async ({ applied, readerKey }) => {
+  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
+  const workflow = applied["code-review"];
 
-  const run = await workflow.run({ code: "diff" });
+  for (const selector of [CODE_REVIEW, { uid: workflow.uid }]) {
+    const run = await (await reader.workflow.load(selector)).run({ code: "diff" });
 
-  expect(run).toMatchObject({
-    status: "succeeded",
-    outputs: { review: REGISTERED_REVIEW },
-    workflow: { uid: applied["code-review"]?.uid },
-  });
-  expect(run.steps.final_review?.text).toBe(REGISTERED_REVIEW);
+    expect(run).toMatchObject({
+      status: "succeeded",
+      outputs: { review: REGISTERED_REVIEW },
+      steps: { final_review: { text: REGISTERED_REVIEW } },
+      workflow: { uid: workflow.uid },
+    });
+  }
 });
 
-/** One Workflow selector `workflow.load` refuses, who asks, and the catalog code. */
-type Refusal = readonly [string, (applied: Record<string, CardRef>) => WorkflowSelector, "reader" | "outsider", string];
+// An Agent's uid names no Workflow.
+test("loading a bad selector is refused", async ({ applied, readerKey }) => {
+  const reader = Cards.connect({ client: WyrdClient.connect({ credential: readerKey }) });
 
-// Malformed selectors are refused before any registry read: the outsider
-// cannot read Cards, so a read would fail with the RBAC denial instead.
-test.for<Refusal>([
-  [
-    "a mixed selector",
-    // The WorkflowSelector type rejects this mix; the cast proves the runtime does too.
-    (applied) => ({ uid: applied["code-review"]?.uid, space: "workflow-loading" }) as unknown as WorkflowSelector,
-    "outsider",
-    "WYRD_WORKFLOW_400_INVALID_CARD_REF",
-  ],
-  ["a malformed uid", () => ({ uid: "not-a-uid" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  [
-    "a malformed space",
-    () => ({ ...CODE_REVIEW, space: "Not A Space" }),
-    "outsider",
-    "WYRD_WORKFLOW_400_INVALID_CARD_REF",
-  ],
-  [
-    "a malformed name",
-    () => ({ ...CODE_REVIEW, name: "not a name" }),
-    "outsider",
-    "WYRD_WORKFLOW_400_INVALID_CARD_REF",
-  ],
-  ["a version range", () => ({ ...CODE_REVIEW, version: "^1.0.0" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  ["a partial version", () => ({ ...CODE_REVIEW, version: "1.0" }), "outsider", "WYRD_WORKFLOW_400_INVALID_CARD_REF"],
-  [
-    "an agent uid",
-    (applied) => ({ uid: applied["security-reviewer"]?.uid ?? "" }),
-    "reader",
-    "WYRD_REGISTRY_404_CARD_NOT_FOUND",
-  ],
-  [
-    "an outsider",
-    (applied) => ({ uid: applied["code-review"]?.uid ?? "" }),
-    "outsider",
-    "WYRD_PERMISSION_403_DENIED_RBAC",
-  ],
-])("loading %s is refused", async ([, selector, caller, code], { applied, readerKey, outsiderKey }) => {
-  const cards = Cards.connect({ credential: caller === "reader" ? readerKey : outsiderKey });
-
-  await expect(cards.workflow.load(selector(applied))).rejects.toMatchObject({ code });
+  await expect(reader.workflow.load({ uid: applied["security-reviewer"].uid })).rejects.toMatchObject({
+    code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+  });
 });

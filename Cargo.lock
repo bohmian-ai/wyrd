@@ -11353,6 +11353,7 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
+ "skald-agent",
  "skald-providers",
  "skald-runtime",
  "skald-spec",
@@ -11603,6 +11604,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "chrono",
  "futures-util",
  "pyo3",
  "secrecy",
@@ -11634,7 +11636,7 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
- "chrono",
+ "arrow",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -11642,7 +11644,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "skald-workflow",
  "tempfile",
  "tokio",
  "wiremock",
@@ -11683,9 +11684,12 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "secrecy",
+ "serde",
  "serde_json",
  "url",
  "vala-bifrost-redux",
+ "wyrd-cli",
+ "wyrd-client",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-testing",

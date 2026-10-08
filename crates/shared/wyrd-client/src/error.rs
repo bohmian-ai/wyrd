@@ -149,6 +149,10 @@ impl From<WyrdClientError> for WyrdError {
 /// [`WyrdError`] variant. Unknown codes are preserved in
 /// [`WyrdError::UpstreamFailure`]`::details.original_code` so the original
 /// code is never dropped. `pub` so other transport response sinks can reuse it.
+///
+/// # Arguments
+/// * `body` - Decoded problem document; missing `code`, `detail`, or `details` fields default
+///   to empty.
 pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
     let code = body["code"].as_str().unwrap_or("");
     let message = body["detail"].as_str().unwrap_or("").to_owned();
@@ -166,6 +170,9 @@ pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
 ///
 /// Falls back to [`WyrdError::Internal`] when the status carries no
 /// `ErrorInfo`.
+///
+/// # Arguments
+/// * `status` - gRPC status whose metadata or details carry the Wyrd error.
 pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
     use wyrd_tonic::tonic_types::StatusExt as _;
 

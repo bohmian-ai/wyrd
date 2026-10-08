@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,11 +9,13 @@ import pandas as pd
 import pytest
 import wyrd
 from sklearn.linear_model import LogisticRegression
-from wyrd import cli
 from wyrd.cards import CardRef, Cards
 from wyrd.data import DataCard, FieldSpec, PandasInterface
 from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInterface
 from wyrd.state import WyrdState
+from wyrd.testing import cli
+
+pytestmark = pytest.mark.integration
 
 TYPED_STATE_SOURCE = (
     Path(__file__).resolve().parents[5]
@@ -38,78 +39,77 @@ EXPECTED_ALIASES = (
 TRAINING_DATA = pd.DataFrame({"feature": [0.0, 1.0], "label": [0, 1]})
 
 
-@dataclass(frozen=True)
-class TypedService:
-    """The registered ``typed_state`` Service and the trusted hash of each executable Model alias."""
-
-    ref: CardRef
-    trusted: dict[str, str]
-
-
-def register_model(cards: Cards, name: str) -> CardRef:
-    """Register one executable scikit-learn Model the Service graph references."""
+@pytest.fixture(scope="module")
+def models(cards: Cards) -> dict[str, CardRef]:
+    """The two executable scikit-learn Models the Service graph references, by alias."""
     model = LogisticRegression(random_state=0).fit(
         TRAINING_DATA[["feature"]].to_numpy(), TRAINING_DATA["label"].to_numpy()
     )
-    card = ModelCard(
-        SklearnInterface(model=model),
-        space="default",
-        name=name,
-        version="1.0.0",
-        metadata=ModelCardMetadata(
-            task_type="other",
-            signature=ModelSignature(
-                [FieldSpec("feature", "float64")], [FieldSpec("prediction", "float64")]
-            ),
+    metadata = ModelCardMetadata(
+        task_type="other",
+        signature=ModelSignature(
+            [FieldSpec("feature", "float64")], [FieldSpec("prediction", "float64")]
         ),
     )
-    return cards.model.register(card).root
+    return {
+        alias: cards.model.register(
+            ModelCard(
+                SklearnInterface(model=model),
+                space="default",
+                name=name,
+                version="1.0.0",
+                metadata=metadata,
+            )
+        ).root
+        for alias, name in (("model_primary", "primary"), ("model_shadow", "shadow"))
+    }
 
 
 @pytest.fixture(scope="module")
-def typed_service(cards: Cards) -> TypedService:
-    """Register the Models, Data, and the ``typed_state`` Service graph once for the module.
-
-    The trusted hashes come from the registered Model Cards, not the download.
-    """
-    primary = register_model(cards, "primary")
-    shadow = register_model(cards, "shadow")
+def service(cards: Cards, models: dict[str, CardRef]) -> CardRef:
+    """The registered ``typed_state`` Service, after its Models and training Data."""
     cards.data.register(
         DataCard(
             PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
         )
     )
-    service = cards.register_from_path(str(TYPED_STATE_SOURCE / "typed-service.yaml")).root
-    trusted: dict[str, str] = {}
-    for alias, ref in (("model_primary", primary), ("model_shadow", shadow)):
-        artifact_hash = cards.get(ref)["metadata"]["artifact_hash"]
+    return cards.register_from_path(TYPED_STATE_SOURCE / "typed-service.yaml").root
+
+
+@pytest.fixture(scope="module")
+def trusted(cards: Cards, models: dict[str, CardRef]) -> dict[str, str]:
+    """The trusted artifact hash of each executable Model alias, read from the registry, not the download."""
+    hashes: dict[str, str] = {}
+    for alias, ref in models.items():
+        artifact_hash = cards.get(ref).metadata.artifact_hash
         assert artifact_hash, f"the registry derived no artifact hash for {alias}"
-        trusted[alias] = artifact_hash
-    return TypedService(service, trusted)
+        hashes[alias] = artifact_hash
+    return hashes
 
 
-def download(service: TypedService, output_dir: Path, *, metadata_only: bool = False) -> Path:
-    """Download the registered Service's graph into ``output_dir`` with in-process ``wyrd get``."""
-    cli.get(
-        output_dir=output_dir,
-        kind="Service",
-        uid=str(service.ref.uid),
-        metadata_only=metadata_only,
-    )
-    return output_dir
+@pytest.fixture
+def bundle(service: CardRef, tmp_path: Path) -> Path:
+    """The Service's complete graph, downloaded with ``wyrd get``."""
+    cli.get(output_dir=tmp_path, kind="Service", uid=str(service.uid))
+    return tmp_path
 
 
-@pytest.mark.integration
+@pytest.fixture
+def metadata_bundle(service: CardRef, tmp_path: Path) -> Path:
+    """The Service's graph downloaded metadata-only, without artifact bytes."""
+    cli.get(output_dir=tmp_path, kind="Service", uid=str(service.uid), metadata_only=True)
+    return tmp_path
+
+
 def test_service_bundle_hydrates_complete_python_runtime_offline(
-    typed_service: TypedService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    service: CardRef, trusted: dict[str, str], bundle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Hydrate the downloaded bundle into usable Python objects with no server reachable."""
-    bundle = download(typed_service, tmp_path)
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
 
-    state = WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
+    state = WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
 
-    assert state.service.card_ref == typed_service.ref
+    assert state.root_ref == state.service.card_ref == service
     assert state.aliases == EXPECTED_ALIASES
     for alias in ("model_primary", "model_shadow"):
         np.testing.assert_array_equal(
@@ -139,36 +139,26 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
         assert artifact.local_path.is_relative_to(bundle.resolve())
 
 
-@pytest.mark.integration
-def test_metadata_only_bundle_is_rejected_by_python_state(
-    typed_service: TypedService, tmp_path: Path
-) -> None:
+def test_metadata_only_bundle_is_rejected_by_python_state(metadata_bundle: Path) -> None:
     """A metadata-only download is inspectable but never hydrates."""
-    bundle = download(typed_service, tmp_path, metadata_only=True)
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(bundle)
+        WyrdState.from_path(metadata_bundle)
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
 
 
-@pytest.mark.integration
 def test_tampered_downloaded_artifact_is_rejected_offline(
-    typed_service: TypedService, tmp_path: Path
+    trusted: dict[str, str], bundle: Path
 ) -> None:
     """Downloaded artifact bytes that no longer match the inventory are refused."""
-    bundle = download(typed_service, tmp_path)
     artifacts = bundle / "cards" / "model_primary" / "artifacts"
     next(path for path in artifacts.rglob("*") if path.is_file()).write_bytes(b"tampered")
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
+        WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
 
 
-@pytest.mark.integration
-def test_missing_model_trust_returns_recoverable_runtime_error(
-    typed_service: TypedService, tmp_path: Path
-) -> None:
+def test_missing_model_trust_returns_recoverable_runtime_error(bundle: Path) -> None:
     """An executable built-in Model does not hydrate without an external trusted hash."""
-    bundle = download(typed_service, tmp_path)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
@@ -176,13 +166,11 @@ def test_missing_model_trust_returns_recoverable_runtime_error(
     assert caught.value.details["stage"] == "artifact_trust"
 
 
-@pytest.mark.integration
 def test_missing_relationship_projection_is_rejected_offline(
-    typed_service: TypedService, tmp_path: Path
+    trusted: dict[str, str], bundle: Path
 ) -> None:
     """A bundle whose root relationship projection is absent is refused."""
-    bundle = download(typed_service, tmp_path)
     (bundle / "cards" / "root" / "relationships.yaml").unlink()
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(bundle, trusted_artifact_hashes=typed_service.trusted)
+        WyrdState.from_path(bundle, trusted_artifact_hashes=trusted)
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"

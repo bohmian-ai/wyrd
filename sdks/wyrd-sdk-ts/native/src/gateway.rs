@@ -17,7 +17,8 @@ use serde_json::error::Category;
 use wyrd_client::Gateway;
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, napi_error};
+use crate::NativeLifecycleResult;
+use crate::client::NativeWyrdClient;
 
 /// Tenant gateway administration handle over the shared `wyrd_client` Gateway.
 ///
@@ -33,31 +34,19 @@ pub struct NativeGateway {
     gateway: Gateway,
 }
 
-/// Builds one gateway administration handle without performing IO.
-///
-/// Omitted arguments resolve through the same shared client configuration
-/// chain as `connectCards`, so every capability authenticates identically.
-///
-/// # Errors
-///
-/// Returns a napi error when no credential resolves or the HTTP client cannot
-/// be built.
 #[napi]
-pub fn connect_gateway(
-    server_url: Option<String>,
-    credential: Option<String>,
-) -> napi::Result<NativeGateway> {
-    let client = wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        None,
-    );
-    drop(server_url);
-    drop(credential);
-    let client = client.map_err(napi_error)?;
-    Ok(NativeGateway {
-        gateway: Gateway::new(client),
-    })
+impl NativeWyrdClient {
+    /// Builds one gateway administration handle that calls the server as this
+    /// client.
+    ///
+    /// No IO happens here; the public TypeScript `Gateway.connect` passes the
+    /// caller's client or the ambient one.
+    #[napi]
+    pub fn gateway(&self) -> NativeGateway {
+        NativeGateway {
+            gateway: Gateway::with_client(self.client.clone()),
+        }
+    }
 }
 
 #[napi]

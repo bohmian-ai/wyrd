@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
@@ -241,14 +241,15 @@ class TableConfig:
                 ``Bifrost.register()``.
 
         """
-        schema = model.model_json_schema()
-        self._native = _native.bifrost.TableConfig.from_json_schema(
+        self._native = TableConfig.from_json_schema(
             table,
-            json.dumps(schema),
-            _layout_json(partition_granularity, sort_keys, bloom_columns),
+            model.model_json_schema(),
+            partition_granularity,
+            sort_keys,
+            bloom_columns,
             compaction_target_file_size_bytes,
             compaction_type,
-        )
+        )._native
 
     @classmethod
     def _from_native(cls, native: Any) -> TableConfig:
@@ -259,9 +260,35 @@ class TableConfig:
         return config
 
     @staticmethod
-    def from_arrow(
-        schema: pyarrow.Schema,
+    def from_json_schema(
         table: str,
+        schema: Mapping[str, Any],
+        partition_granularity: str | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
+    ) -> TableConfig:
+        """Declare a table from a JSON Schema object's ``properties``.
+
+        Every argument other than ``schema`` and every error is as for
+        ``TableConfig()``, which calls this with ``model_json_schema()``.
+        """
+
+        return TableConfig._from_native(
+            _native.bifrost.TableConfig.from_json_schema(
+                table,
+                json.dumps(dict(schema)),
+                _layout_json(partition_granularity, sort_keys, bloom_columns),
+                compaction_target_file_size_bytes,
+                compaction_type,
+            )
+        )
+
+    @staticmethod
+    def from_arrow(
+        table: str,
+        schema: pyarrow.Schema,
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
@@ -289,9 +316,7 @@ class TableConfig:
     @staticmethod
     def describe(
         table: str,
-        server_url: str | None = None,
-        credential: str | None = None,
-        grpc_url: str | None = None,
+        client: WyrdClient | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name.
 
@@ -300,9 +325,8 @@ class TableConfig:
 
         Args:
             table: the ``"<namespace>.<name>"`` table to describe.
-            server_url: as for ``Bifrost()``.
-            credential: as for ``Bifrost()``.
-            grpc_url: as for ``Bifrost()``.
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves as for ``Bifrost()``.
 
         Raises:
             WyrdError: ``WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`` for an
@@ -312,9 +336,7 @@ class TableConfig:
 
         """
 
-        return TableConfig._from_native(
-            _native.bifrost.TableConfig.describe(table, server_url, credential, grpc_url)
-        )
+        return TableConfig._from_native(_native.bifrost.TableConfig.describe(table, client))
 
     @property
     def fqn(self) -> str:
@@ -372,7 +394,25 @@ class QueryResult:
     def to_arrow(self) -> pyarrow.Table:
         """Read the result as one ``pyarrow.Table``."""
 
-        return pyarrow.ipc.open_stream(self._native.to_ipc()).read_all()
+        return pyarrow.ipc.open_stream(self._native.to_bytes()).read_all()
+
+    @property
+    def batches(self) -> list[pyarrow.RecordBatch]:
+        """The result's Arrow record batches, in server order."""
+
+        return list(pyarrow.ipc.open_stream(self._native.to_bytes()))
+
+    @property
+    def schema(self) -> pyarrow.Schema:
+        """The result's Arrow schema, present even when no row matched."""
+
+        return pyarrow.ipc.open_stream(self._native.to_bytes()).schema
+
+    @property
+    def num_rows(self) -> int:
+        """Total rows across every batch."""
+
+        return len(self._native)
 
     def to_polars(self) -> Any:
         """Read the result as a Polars DataFrame, zero-copy from Arrow."""
@@ -389,7 +429,7 @@ class QueryResult:
     def to_bytes(self) -> bytes:
         """The raw Arrow IPC stream, for a caller with its own reader."""
 
-        return bytes(self._native.to_ipc())
+        return bytes(self._native.to_bytes())
 
     @property
     def terminal(self) -> QueryTerminal:
@@ -472,9 +512,6 @@ class _BifrostBase:
     def __init__(
         self,
         table: TableConfig | None = None,
-        server_url: str | None = None,
-        credential: str | None = None,
-        grpc_url: str | None = None,
         client: WyrdClient | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
@@ -483,26 +520,17 @@ class _BifrostBase:
         Args:
             table: the active write target. Omitted, the client is query-only
                 until ``use_table``.
-            server_url: the Bifrost server URL. Resolved from
-                ``WYRD_SERVER_URL`` and then the compiled default if omitted.
-            credential: the API key or bearer token. Resolved through
-                ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
-                ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
-                ``~/.config/wyrd/credentials.toml``
-                ``[default].api_key`` if omitted.
-            grpc_url: the ingest endpoint. Resolved from ``WYRD_GRPC_URL`` if
-                omitted.
-            client: an existing ``WyrdClient``, such as one returned by
-                ``on_behalf_of``. Bifrost then uses its authentication and
-                transport; it cannot be combined with ``server_url``,
-                ``credential``, or ``grpc_url``.
+            client: the ``WyrdClient`` to act as, such as one returned by
+                ``on_behalf_of``, sharing its authentication and transport.
+                Omitted, the ambient client resolves from ``[client]`` in the
+                Wyrd ``config.toml``, then the environment, then the saved
+                ``wyrd auth login``.
             client_byte_limit_bytes: the handle-wide ingestion byte budget
                 shared by every table this client writes. 256 MiB if omitted.
 
         Raises:
-            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined
-                with a transport argument; ``WYRD_CLIENT_401_NO_CREDENTIALS``
-                when the credential chain yielded nothing;
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
+                credential resolves;
                 ``WYRD_CLIENT_400_CONFIG_INVALID`` when the byte budget is too
                 small to seal one message.
 
@@ -510,9 +538,6 @@ class _BifrostBase:
 
         self._native = _native.bifrost.Bifrost(
             table._native if table is not None else None,
-            server_url,
-            credential,
-            grpc_url,
             client,
             client_byte_limit_bytes,
         )
@@ -688,7 +713,6 @@ class Bifrost(_BifrostBase):
         self,
         query: str,
         params: Sequence[QueryParam] | None = None,
-        *,
         deadline_ms: int | None = None,
     ) -> BifrostBatchIterator:
         """Run one SQL SELECT and iterate its batches as they arrive.
@@ -704,7 +728,7 @@ class Bifrost(_BifrostBase):
 
         """
 
-        return BifrostBatchIterator(self._native.stream(query, deadline_ms, params))
+        return BifrostBatchIterator(self._native.stream(query, params, deadline_ms))
 
     def running(self) -> list[RunningQuery]:
         """List the authenticated tenant's active queries."""
@@ -823,7 +847,6 @@ class AsyncBifrost(_BifrostBase):
         self,
         query: str,
         params: Sequence[QueryParam] | None = None,
-        *,
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream:
         """Start one query and iterate its batches with ``async for``.
@@ -834,8 +857,8 @@ class AsyncBifrost(_BifrostBase):
         native_stream = await asyncio.to_thread(
             self._native.stream,
             query,
-            deadline_ms,
             params,
+            deadline_ms,
         )
         return BifrostQueryStream(native_stream)
 

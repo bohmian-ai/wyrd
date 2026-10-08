@@ -16,9 +16,12 @@ arrow = { workspace = true }
 napi = { workspace = true, features = ["serde-json"] }
 napi-derive = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 vala-bifrost-redux = { workspace = true }
+wyrd-cli = { workspace = true }
+wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-runtime = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-testing = { workspace = true }

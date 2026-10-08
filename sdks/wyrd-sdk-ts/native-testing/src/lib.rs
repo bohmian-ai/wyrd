@@ -19,6 +19,8 @@ use wyrd_testing::Bootstrap;
 use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
 
+pub mod cli;
+
 /// In-process server handle used only by TypeScript integration tests.
 ///
 /// Journeys steer the server through exactly three test controls, each backed
@@ -255,6 +257,41 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Bootstrap a service principal holding exactly the built-in or seeded
+    /// `roles` in the fixture tenant and return its API key.
+    ///
+    /// The door a journey uses for a machine caller with a known role set,
+    /// such as one holding only `workload` to prove a gate from the caller's
+    /// side.
+    ///
+    /// # Arguments
+    ///
+    /// * `roles` - The role names the principal holds.
+    /// * `name` - The principal's fixture Service name, unique per harness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or bootstrapping fails.
+    #[napi]
+    pub fn bootstrap_service(&self, roles: Vec<String>, name: String) -> Result<String> {
+        let result = self.with_server(|server| {
+            let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+            match wyrd_runtime::runtime()
+                .block_on(server.bootstrap_service(&name, &roles))
+                .map_err(reason)?
+            {
+                Bootstrap::Machine { api_key, .. } => {
+                    Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+                }
+                Bootstrap::User { .. } => Err(napi::Error::from_reason(
+                    "expected a machine bootstrap".to_owned(),
+                )),
+            }
+        });
+        drop((roles, name));
+        result
+    }
+
     /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
     /// return its API key.
     ///
@@ -310,75 +347,11 @@ impl NativeWyrdTestServer {
         call(server)
     }
 
-    /// Issue an API key for the principal a registered Service Card projects.
-    ///
-    /// `card_ref` is the canonical `space/Kind/name@version` identity a
-    /// registration receipt returns. The Card must already be registered: this
-    /// credentials the service account registration projected for it rather
-    /// than minting a new one, so the key carries the registered Service's real
-    /// card-ref scope and a run may observe the component Cards its spec
-    /// references.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error for a malformed identity string, or when the
-    /// harness is closed or the Card has no projected principal.
-    #[napi]
-    pub fn credential_registered_service(
-        &self,
-        card_ref: String,
-        roles: Vec<String>,
-    ) -> Result<String> {
-        let result = self.credential_registered_service_borrowed(&card_ref, &roles);
-        drop(card_ref);
-        drop(roles);
-        result
-    }
-
-    /// Delegates the N-API-owned identity and roles without extending their
-    /// ownership into the Rust harness call.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error for a malformed identity string, or when the
-    /// harness lock is poisoned, the server is closed, or the Card has no
-    /// projected principal.
-    fn credential_registered_service_borrowed(
-        &self,
-        card_ref: &str,
-        roles: &[String],
-    ) -> Result<String> {
-        let guard = self
-            .server
-            .lock()
-            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
-        let server = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
-        let parsed: wyrd_spec::reference::CardRef = card_ref.parse().map_err(|error| {
-            napi::Error::from_reason(format!(
-                "`{card_ref}` is not a card identity string: {error}"
-            ))
-        })?;
-        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
-        let bootstrap = wyrd_runtime::runtime()
-            .block_on(server.credential_registered_service(&parsed, &roles))
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?;
-        match bootstrap {
-            Bootstrap::Machine { api_key, .. } => {
-                Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
-            }
-            Bootstrap::User { .. } => Err(napi::Error::from_reason(
-                "expected a machine bootstrap".to_owned(),
-            )),
-        }
-    }
-
     /// Activate the identity lane's Keycloak sign-in for one tenant and
     /// return its id: the fixture tenant when `tenantSlug` is absent, else a
     /// newly seeded tenant of that slug with its own administrator.
     ///
-    /// Needs `startTestServer(..., humanSso: true)` and the identity lane's
+    /// Needs `startTestServer({ humanSso: true })` and the identity lane's
     /// Keycloak.
     ///
     /// # Errors
@@ -502,27 +475,43 @@ impl NativeWyrdTestServer {
     }
 }
 
+/// Test-only capabilities a story's server starts with; every field is
+/// optional and defaults to off, except `auditPublication`.
+#[napi(object)]
+pub struct NativeTestServerOptions {
+    /// Roots built-in gateway adapters at a local mock upstream; its `/v1`
+    /// segment also serves the verification runtime's `OpenAI` Eval judge,
+    /// which calls `<providerBaseUrl>/v1/chat/completions`.
+    pub provider_base_url: Option<String>,
+    /// `false` keeps staged audit rows for assertions; defaults to `true`.
+    pub audit_publication: Option<bool>,
+    /// `true` runs Drift baseline fitting and Verifier runs.
+    pub verification_runtime: Option<bool>,
+    /// `true` serves the public origin the identity lane's Keycloak clients
+    /// register, for saved user login journeys.
+    pub human_sso: Option<bool>,
+}
+
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
-/// `auditPublication: false` keeps staged audit rows for assertions.
-/// `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
-/// `providerBaseUrl` roots built-in gateway adapters at a local mock upstream;
-/// its `/v1` segment also serves the verification runtime's `OpenAI` Eval
-/// judge, which calls `<providerBaseUrl>/v1/chat/completions`.
-/// `humanSso: true` serves the public origin the identity lane's Keycloak
-/// clients register, for saved user login journeys.
+/// `options` selects the test-only capabilities; omitted, the server keeps
+/// its default upstreams, publishes audit, and runs no verification runtime.
 ///
 /// # Errors
 ///
 /// Returns a napi error for an invalid provider URL or server setup failure.
 #[napi]
 pub fn start_test_server(
-    provider_base_url: Option<String>,
-    audit_publication: Option<bool>,
-    verification_runtime: Option<bool>,
-    human_sso: Option<bool>,
+    options: Option<NativeTestServerOptions>,
 ) -> napi::Result<NativeWyrdTestServer> {
-    let provider_root = provider_base_url
+    let options = options.unwrap_or(NativeTestServerOptions {
+        provider_base_url: None,
+        audit_publication: None,
+        verification_runtime: None,
+        human_sso: None,
+    });
+    let provider_root = options
+        .provider_base_url
         .as_deref()
         .map(|base| {
             url::Url::parse(base).map_err(|error| {
@@ -530,12 +519,11 @@ pub fn start_test_server(
             })
         })
         .transpose()?;
-    drop(provider_base_url);
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
         provider_root,
-        audit_publication.unwrap_or(true),
-        verification_runtime.unwrap_or(false),
-        human_sso.unwrap_or(false),
+        options.audit_publication.unwrap_or(true),
+        options.verification_runtime.unwrap_or(false),
+        options.human_sso.unwrap_or(false),
     )))
 }
 

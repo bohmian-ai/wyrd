@@ -39,7 +39,7 @@ use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 use wyrd_client::bifrost::Correlation;
-use wyrd_client::bifrost::{BifrostClientError, QueryResultStream, client_from_options};
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 
 /// Widens one Bifrost client failure into the shared Wyrd Python boundary error.
 ///
@@ -230,10 +230,12 @@ impl PyTableConfig {
         })
     }
 
-    /// Fetches an already-registered table's config by name.
+    /// Fetches an already-registered table's config by name, as `client`.
     ///
-    /// Every transport argument is optional and resolves through the same chain
-    /// the constructor uses when omitted.
+    /// # Arguments
+    /// * `table` - The `namespace.name` table to describe.
+    /// * `client` - The `WyrdClient` the read is sent as, or `None` for the
+    ///   ambient chain.
     ///
     /// # Errors
     ///
@@ -241,15 +243,13 @@ impl PyTableConfig {
     /// nothing resolves a credential, and the catalog code for not-found,
     /// authorization, transport, or schema-projection failures.
     #[staticmethod]
-    #[pyo3(signature = (table, server_url=None, credential=None, grpc_url=None))]
+    #[pyo3(signature = (table, client=None))]
     fn describe(
         py: Python<'_>,
         table: &str,
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        grpc_url: Option<&str>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         let inner = py
             .detach(|| wyrd_runtime::runtime().block_on(TableConfig::describe(&client, table)))
             .map_err(client_error)?;
@@ -304,7 +304,7 @@ impl PyTableConfig {
 
 /// Python-facing collected query result.
 ///
-/// Holds the decoded Rust batches; [`PyQueryResult::to_ipc`] encodes them once
+/// Holds the decoded Rust batches; [`PyQueryResult::to_bytes`] encodes them once
 /// so Python builds its own Arrow table, and the terminal is projected as a
 /// typed [`PyQueryTerminal`] over the wire frame.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
@@ -320,8 +320,8 @@ impl PyQueryResult {
     /// # Errors
     ///
     /// Raises `WyrdError` when IPC encoding fails.
-    fn to_ipc(&self) -> WyrdPyResult<Vec<u8>> {
-        self.inner.to_ipc().map_err(client_error)
+    fn to_bytes(&self) -> WyrdPyResult<Vec<u8>> {
+        self.inner.to_bytes().map_err(client_error)
     }
 
     /// The validated terminal frame the server closed the stream with.
@@ -451,9 +451,9 @@ impl PyQueryTerminal {
 /// Python-facing [`NativeBifrost`]: query any authorized table, write to the
 /// active one.
 ///
-/// Construction dials the ingest channel, so it performs IO; every transport
-/// argument is optional and falls through the existing resolution chain exactly
-/// once when omitted.
+/// Construction dials the ingest channel, so it performs IO. Its one identity
+/// argument is an optional `WyrdClient`; omitted, the ambient chain resolves
+/// exactly once.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
     /// The one native client both public Python facades drive.
@@ -464,42 +464,31 @@ pub struct Bifrost {
 impl Bifrost {
     /// Connects one client, optionally already bound to a write target.
     ///
-    /// Without `client`, the transport resolves from the explicit options and
-    /// then the environment chain exactly as before. With `client`, the
-    /// supplied Rust `WyrdClient` — plain or delegated — is used as is, so no
-    /// second credential is resolved; it cannot be combined with
-    /// `server_url`, `credential`, or `grpc_url`. `client_byte_limit_bytes`
-    /// overrides the handle-wide ingestion byte budget (256 MiB by default).
+    /// The supplied `WyrdClient`, plain or delegated, is used as is; omitted,
+    /// the ambient chain resolves once. `client_byte_limit_bytes` overrides
+    /// the handle-wide ingestion byte budget (256 MiB by default).
+    ///
+    /// # Arguments
+    /// * `table` - The active write target, or `None` for a query-only client.
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` carrying `WYRD_CLIENT_400_CONFIG_INVALID` when the
-    /// byte budget cannot seal one message, and
-    /// `WYRD_SPEC_400_VALIDATION` when `client` is
-    /// combined with a transport option, `WYRD_CLIENT_401_NO_CREDENTIALS` when
-    /// nothing in the chain resolves a credential, and the catalog code for a
-    /// failure to dial the ingest channel.
+    /// byte budget cannot seal one message, `WYRD_CLIENT_401_NO_CREDENTIALS`
+    /// when nothing in the chain resolves a credential, and the catalog code
+    /// for a failure to dial the ingest channel.
     #[new]
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None, client_byte_limit_bytes=None))]
+    #[pyo3(signature = (table=None, client=None, client_byte_limit_bytes=None))]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        grpc_url: Option<&str>,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
         client_byte_limit_bytes: Option<usize>,
     ) -> WyrdPyResult<Self> {
-        let client = match client {
-            Some(_) if server_url.is_some() || credential.is_some() || grpc_url.is_some() => {
-                return Err(invalid_argument(
-                    "client",
-                    "cannot be combined with server_url, credential, or grpc_url",
-                ));
-            }
-            Some(client) => client.inner().clone(),
-            None => client_from_options(server_url, credential, grpc_url).map_err(client_error)?,
-        };
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         let table = table.map(|table| table.inner);
         let handle = py
             .detach(|| {
@@ -649,21 +638,27 @@ impl Bifrost {
     ///
     /// `params` bind positionally exactly as in [`PyBifrost::sql`].
     ///
+    /// # Arguments
+    /// * `query` - One SQL SELECT statement.
+    /// * `params` - Values bound to `$1..$n` in order, or `None`.
+    /// * `deadline_ms` - The query deadline in milliseconds, or `None` for the
+    ///   server default.
+    ///
     /// # Errors
     ///
     /// Raises `WyrdError` with the catalog code for request-contract, bind
     /// value, or transport failures.
-    #[pyo3(signature = (sql, deadline_ms=None, params=None))]
+    #[pyo3(signature = (query, params=None, deadline_ms=None))]
     fn stream(
         &self,
         py: Python<'_>,
-        sql: &str,
-        deadline_ms: Option<i64>,
+        query: &str,
         params: Option<Vec<Bound<'_, PyAny>>>,
+        deadline_ms: Option<i64>,
     ) -> WyrdPyResult<PyBifrostQueryStream> {
         let request = BifrostQueryRequest {
             params: query_params(params)?,
-            sql: sql.to_owned(),
+            sql: query.to_owned(),
             deadline_ms,
         };
         let stream = py
@@ -730,8 +725,7 @@ impl Bifrost {
     ) -> WyrdPyResult<Py<PyAny>> {
         let description = py
             .detach(|| {
-                wyrd_runtime::runtime()
-                    .block_on(self.handle.describe(&format!("{namespace}.{name}")))
+                wyrd_runtime::runtime().block_on(self.handle.describe_table(namespace, name))
             })
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
@@ -1138,10 +1132,23 @@ impl PyBifrostQueryStream {
 /// application has bound. Queue saturation is swallowed and counted on the
 /// client's drop counter instead of being raised.
 ///
+/// The Python facade serializes the caller's schema mapping and row before
+/// this call, so `schema` and `row` arrive as JSON text.
+///
+/// # Arguments
+/// * `bifrost` - The client whose producers carry the row.
+/// * `table` - The destination `<namespace>.<name>` table.
+/// * `schema` - The table's JSON Schema as JSON text.
+/// * `row` - One row as JSON object text.
+/// * `card_ref` - The optional `space/Kind/name@version` stamped on the row.
+/// * `run_id` - The optional run identifier stamped on the row.
+///
 /// # Errors
 ///
-/// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for a malformed JSON
-/// schema, an unsupported schema node, or an invalid card reference.
+/// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for schema text that
+/// is not JSON or an invalid card reference, and the shared mapper's
+/// `WYRD_VALA_400_SCHEMA_PARSE` for a schema with no mappable columns, the
+/// same code `TableConfig.from_json_schema` raises.
 #[pyfunction]
 #[pyo3(signature = (bifrost, table, schema, row, card_ref=None, run_id=None))]
 fn record(
@@ -1155,7 +1162,7 @@ fn record(
     let schema_value: Value =
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
-        .map_err(|error| invalid_argument("schema", error))?;
+        .map_err(|error| client_error(error.into()))?;
     wyrd_client::bifrost::observe::record(
         &bifrost.borrow().handle,
         table,

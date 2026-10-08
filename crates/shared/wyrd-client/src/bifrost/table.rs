@@ -74,6 +74,10 @@ impl TableConfig {
     /// `Decimal128`, or `FixedSizeBinary` supplies Arrow directly, exactly as
     /// [`wyrd_queue::arrow_schema_to_fieldspec`] documents.
     ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    /// * `schema` - The user columns, excluding reserved and correlation columns.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
@@ -102,6 +106,10 @@ impl TableConfig {
     /// JSON-Schema-to-Arrow table, so all three languages agree on the columns
     /// one model produces.
     ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    /// * `schema` - A JSON Schema object document describing the user columns.
+    ///
     /// # Errors
     ///
     /// As [`TableConfig::from_arrow`], plus a schema-parse failure for a
@@ -126,6 +134,9 @@ impl TableConfig {
     /// struct fields; `schemars` emits a `$ref` for a nested type, which the
     /// shared mapper resolves only from a `$defs` section.
     ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    ///
     /// # Errors
     ///
     /// As [`TableConfig::from_json_schema`].
@@ -145,6 +156,10 @@ impl TableConfig {
     /// table never restates a schema it does not own. The returned config is
     /// already resolved and carries the server's own physical layout.
     ///
+    /// # Arguments
+    /// * `client` - The authenticated client the describe request is sent over.
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
+    ///
     /// # Errors
     ///
     /// Returns the stable not-found, authentication, authorization,
@@ -163,6 +178,9 @@ impl TableConfig {
     }
 
     /// As [`TableConfig::describe`], resolving the transport itself.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
     ///
@@ -205,6 +223,9 @@ impl TableConfig {
     ///
     /// Omitted, the server resolves `hour(wyrd_event_time)`, `wyrd_event_time`
     /// descending nulls-last, and the managed Bloom floor.
+    ///
+    /// # Arguments
+    /// * `layout` - The partitioning, sort, and Bloom layout to request at register.
     #[must_use]
     pub fn with_layout(mut self, layout: PhysicalLayoutWire) -> Self {
         self.physical_layout = Some(layout);
@@ -218,6 +239,9 @@ impl TableConfig {
     /// row-group target with `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET`,
     /// and a re-register whose target differs from the stored one with
     /// `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
+    ///
+    /// # Arguments
+    /// * `bytes` - The soft compaction file target, in bytes; at least 128 MiB.
     #[must_use]
     pub fn with_compaction_target_file_size_bytes(mut self, bytes: u64) -> Self {
         self.compaction_target_file_size_bytes = Some(bytes);
@@ -236,6 +260,9 @@ impl TableConfig {
     /// copy-on-write table compacts `full` whatever it declares. The server
     /// refuses a re-register whose type differs from the stored one with
     /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+    ///
+    /// # Arguments
+    /// * `compaction_type` - The compaction type Forge applies to this table.
     #[must_use]
     pub fn with_compaction_type(mut self, compaction_type: CompactionTypeWire) -> Self {
         self.compaction_type = Some(compaction_type);
@@ -368,7 +395,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
 /// One table this connected writer has described, with its cached user schema.
 ///
 /// Holding this value is the proof that the table was described once for this
-/// writer's lifetime, which is what lets [`crate::bifrost::Bifrost::insert_into`]
+/// writer's lifetime, which is what lets `Bifrost::insert_into`
 /// stay a synchronous, IO-free enqueue: there is no way to name a destination
 /// the writer has not already resolved, so no insert path can smuggle in a
 /// per-observation describe or a caller-supplied schema.

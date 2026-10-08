@@ -201,3 +201,35 @@ async fn other_tenant_sees_nothing() {
     );
     deployment.shutdown().await;
 }
+
+/// A caller holding only `operators:read` reads a connection exactly as the
+/// administrator does but cannot disable it.
+///
+/// # Panics
+/// Panics when a read fails or differs, or the disable succeeds or is
+/// refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn reader_cannot_disable_a_connection() {
+    let deployment = Deployment::start().await;
+    let (admin, slack_id) = admin_with_slack(&deployment).await;
+    let reader = OperatorConnections::with_client(
+        deployment.client(
+            &deployment
+                .scoped_key("operator_reader", &["operators:read"])
+                .await,
+        ),
+    );
+
+    assert_eq!(
+        reader.get(&slack_id).await.expect("the reader reads"),
+        admin.get(&slack_id).await.expect("the administrator reads")
+    );
+    let refused = reader
+        .disable(&slack_id)
+        .await
+        .expect_err("a reader cannot disable");
+
+    assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    deployment.shutdown().await;
+}

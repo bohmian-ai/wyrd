@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
-use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, WORKLOAD_ROLE, builtin_role_uuid};
+use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -152,7 +152,7 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: Uuid) -> Option<DateTime<Utc
 ///
 /// # Panics
 /// Panics when any identity, ordering, or persisted-key expectation fails.
-/// A Card's first principal projection grants the built-in `workload` role
+/// A Card's first principal projection grants the built-in `wyrd_default` role
 /// once; re-applying the Card neither duplicates the grant nor restores it
 /// after an administrator revoked it.
 ///
@@ -160,32 +160,32 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: Uuid) -> Option<DateTime<Utc
 ///
 /// Panics when a write fails or the principal's roles differ.
 #[tokio::test]
-async fn first_projection_grants_workload_once_and_revocation_stands() {
+async fn first_projection_grants_default_role_once_and_revocation_stands() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(&fixture);
     let tenant = fixture.data_tenant_id();
     let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-    let workload = BUILTIN_ROLES
+    let default_role = BUILTIN_ROLES
         .iter()
-        .find(|role| role.name == WORKLOAD_ROLE)
-        .expect("workload is a built-in role");
-    let role_id = builtin_role_uuid(tenant, WORKLOAD_ROLE);
+        .find(|role| role.name == DEFAULT_CARD_ROLE)
+        .expect("the default role is built in");
+    let role_id = builtin_role_uuid(tenant, DEFAULT_CARD_ROLE);
     insert_role(
         &mut conn,
         role_id,
-        WORKLOAD_ROLE,
-        &serde_json::to_value(workload.permissions).expect("permissions serialize"),
+        DEFAULT_CARD_ROLE,
+        &serde_json::to_value(default_role.permissions).expect("permissions serialize"),
         true,
     )
     .await
-    .expect("workload role seeds");
+    .expect("default role seeds");
     let card = service_card("workload-svc", "1.0.0");
     let (card_uid, principal) = register_service(&mut conn, &actor, &card).await;
     assert_eq!(
         list_service_account_roles(&mut conn, principal.as_uuid())
             .await
             .expect("roles list"),
-        [WORKLOAD_ROLE]
+        [DEFAULT_CARD_ROLE]
     );
 
     let reapplied = upsert_service_account_from_card(&mut conn, &card_uid, &card, &actor)
@@ -196,7 +196,7 @@ async fn first_projection_grants_workload_once_and_revocation_stands() {
         list_service_account_roles(&mut conn, principal.as_uuid())
             .await
             .expect("roles list"),
-        [WORKLOAD_ROLE]
+        [DEFAULT_CARD_ROLE]
     );
 
     assert!(

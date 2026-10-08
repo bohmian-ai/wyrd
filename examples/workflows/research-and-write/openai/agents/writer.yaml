@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: examples
+  name: writer
+  version: "0.1.0"
+spec:
+  prompt:
+    model: gpt-4o-mini
+    request:
+      provider: open_ai_chat_completion
+      body:
+        model: gpt-4o-mini
+        messages:
+          - role: system
+            content: You are a concise writer. Turn the research notes into a two-sentence summary.
+          - role: user
+            content: "Write a summary from: {{research}}"
+    variables: [research]
+    response_type: text
+  tool_names: []

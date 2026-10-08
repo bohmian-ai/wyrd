@@ -1,11 +1,11 @@
 import { expect, test } from "vitest";
 
-import { Gateway } from "@wyrd/sdk";
+import { Gateway, WyrdClient } from "@wyrd/sdk";
 
 /** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";
 
-const options = { serverUrl: "http://127.0.0.1:1", credential: "wyrd_unit_test_key" };
+const options = { client: WyrdClient.connect({ serverUrl: "http://127.0.0.1:1", credential: "wyrd_unit_test_key" }) };
 
 // The restriction is structural, so it must hold for a JavaScript caller with
 // no type checker.

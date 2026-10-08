@@ -88,12 +88,10 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
         .await
         .expect("the latency baseline fits");
     let bundle = hydrate(&cards, &watch.root).await;
-    let state = WyrdState::from_path(&bundle.path().join("bundle")).expect("bundle loads");
-    let key = deployment.service_key(&watch.root, &[]).await;
-    state
-        .start_bifrost_with(&deployment.client(&key), None)
-        .await
-        .expect("Bifrost starts");
+    let watcher = deployment.client(&deployment.service_key(&watch.root).await);
+    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), watcher)
+        .expect("bundle loads");
+    state.start_bifrost().await.expect("Bifrost starts");
     let run = state.run();
     for _ in 0..100 {
         run.observe()
@@ -152,13 +150,11 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
 async fn path_only_operator_without_connection_is_refused() {
     let deployment = Deployment::start().await;
 
-    let refused = Box::pin(
-        deployment
-            .cards()
-            .register_from_path(&fixture("invalid/operator-path-without-connection.yaml")),
-    )
-    .await
-    .expect_err("a path-only Operator needs a connection");
+    let refused = deployment
+        .cards()
+        .register_from_path(&fixture("invalid/operator-path-without-connection.yaml"))
+        .await
+        .expect_err("a path-only Operator needs a connection");
 
     assert_eq!(refused.code(), "WYRD_SPEC_400_INVALID_OPERATOR");
     deployment.shutdown().await;

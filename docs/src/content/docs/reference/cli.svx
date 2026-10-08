@@ -136,6 +136,37 @@ wyrd auth issue-key \
   ]}
 />
 
+### auth grant-role
+
+Grant a built-in or tenant Role to the principal bound to a Service or Agent
+Card (`POST /v1/auth/grant-role`). Requires a tenant administrator (`*`)
+credential in the ambient chain. Granting a Role the principal already holds
+succeeds with `granted: false`. The Role reaches the principal's tokens at its
+next key exchange. See [Authorization](/concepts/authorization/).
+
+```bash
+wyrd auth grant-role \
+  --kind Service --name checkout --version 1.0.0 --space prod \
+  --role workload --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--kind', 'yes', '—', 'Card kind of the target principal: Service or Agent.'],
+    ['--name', 'yes', '—', 'Card name.'],
+    ['--version', 'yes', '—', 'Card version (e.g. 1.0.0).'],
+    ['--space', 'yes', '—', 'Card space.'],
+    ['--role', 'yes', '—', 'Built-in or tenant Role to grant (e.g. workload).'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
+  ]}
+/>
+
 ## wyrd eval run
 
 Score pre-collected observations locally against an Eval-backed Verifier card

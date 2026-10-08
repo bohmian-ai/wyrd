@@ -4,6 +4,8 @@
 import builtins
 from typing import Literal, TypeAlias, TypedDict
 
+from ..client import WyrdClient
+
 #### end of imports ####
 
 OperatorProvider: TypeAlias = Literal["slack", "pager_duty", "http"]
@@ -188,25 +190,18 @@ class OperatorConnections:
     ``updated_at``. No call ever returns a secret.
     """
 
-    def __init__(
-        self,
-        server_url: str | None = None,
-        credential: str | None = None,
-    ) -> None:
+    def __init__(self, client: WyrdClient | None = None) -> None:
         """Build a handle; no network call happens here.
 
         Args:
-            server_url: the Wyrd server URL. Resolved from ``WYRD_SERVER_URL``
-                and then ``http://localhost:8080`` if omitted.
-            credential: the API key or bearer token. Resolved through
-                ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
-                ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
-                ``~/.config/wyrd/credentials.toml``
-                ``[default].api_key`` if omitted.
+            client: the ``WyrdClient`` to act as, sharing its transport and
+                token cache. Omitted, the ambient client resolves from
+                ``[client]`` in the Wyrd ``config.toml``, then the
+                environment, then the saved ``wyrd auth login``.
 
         Raises:
-            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
-                resolves, or a client configuration error.
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
+                credential resolves, or a client configuration error.
 
         """
         ...

@@ -269,7 +269,7 @@ mod pg_tests {
     ///
     /// The Service's graph is hydrated into a temporary bundle with `admin`'s
     /// registry access, observations are written as the Service's own
-    /// `admin`-role credential, and the lifetime is drained and the server
+    /// `wyrd_default`-role credential, and the lifetime is drained and the server
     /// Scribe flushed before returning, so every row is durable and readable.
     ///
     /// # Errors
@@ -301,9 +301,9 @@ mod pg_tests {
             Some(key.as_str()),
             server.grpc_url().as_deref(),
         )?;
-        let state = WyrdState::from_path(&bundle)?;
+        let state = WyrdState::from_path_with_client(&bundle, client)?;
         state
-            .start_bifrost_with_config(&client, None, QueueConfig::default())
+            .start_bifrost_with_config(None, QueueConfig::default())
             .await?;
         let run = state.run();
         for score in [1.5_f64, 2.5, 1.5, 2.5] {
@@ -422,8 +422,10 @@ mod pg_tests {
         let fixture = register_fixture(&cards).await?;
         emit_drifted_scores(&server, &cards, &fixture.service_ref).await?;
 
+        // A direct run reads the tenant's Bifrost observations, which only the
+        // explicitly granted `workload` role allows.
         let agent = server
-            .credential_registered_service(&fixture.service_ref, &["writer"])
+            .credential_registered_service(&fixture.service_ref, &["writer", "workload"])
             .await?;
         let agent_client =
             ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())

@@ -15,11 +15,11 @@ import struct
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Literal
 
-from wyrd import cli
 from wyrd.bifrost import Bifrost
-from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway, GatewayOperation, ProviderAdapter, ProviderAuth
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
+
+from ..support import Delivery, Receiver, client_of
 
 PROVIDER_KEY = "sk-native-upstream"
 
@@ -152,6 +152,9 @@ EMBEDDING = {
 
 IMAGE_BYTES = b"\x89PNG\r\n\x1a\nwyrd-gateway-journey-image"
 
+IMAGE_DIGEST = "sha256:f9356b2f6c0a4aacf9c5728186a6bb26677be8b3b0dbe951b4dd886e39e21956"
+"""The digest payload capture records for ``IMAGE_BYTES``."""
+
 IMAGE = {
     "created": 1,
     "data": [{"b64_json": base64.b64encode(IMAGE_BYTES).decode()}],
@@ -163,17 +166,16 @@ IMAGE = {
     },
 }
 
-Received = list[tuple[str, dict[str, str]]]
-
 
 class Upstream(BaseHTTPRequestHandler):
-    """Mock built-in provider API recording each request path and headers."""
+    """Mock built-in provider API recording each request into ``upstream``."""
 
-    received: Received
+    upstream: Receiver
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        self.received.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        self.upstream.record(Delivery(self.path, headers, body))
         if self.path == "/v1/chat/completions" and body.get("stream"):
             self._send("text/event-stream", _sse([*OPENAI_CHUNKS, "[DONE]"]))
         elif self.path == "/v1/chat/completions":
@@ -238,7 +240,7 @@ def deploy(
     the deployment through the public Python ``Gateway``, both as the harness
     admin, reading the operator binding the test server assigns to ``provider``.
     """
-    gateway = Gateway(server_url=server.base_url, credential=server.api_key)
+    gateway = Gateway(client_of(server))
     credential = f"{provider}-key"
     cli.put_provider_credential(
         {
@@ -246,7 +248,7 @@ def deploy(
             "provider": provider,
             "source": {"environment": {"binding": BINDINGS[provider]}},
         },
-        server=server.base_url,
+        client=client_of(server),
     )
     header = {"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(provider)
     auth: ProviderAuth = (
@@ -269,26 +271,26 @@ def deploy(
     )
 
 
-def access_token(api_key: str) -> str:
+def access_token(server: WyrdTestServer, api_key: str) -> str:
     """A Wyrd access token for ``api_key``, from the public client the way a third-party caller gets one."""
-    return WyrdClient(credential=api_key).access_token()
+    return client_of(server, api_key).access_token()
 
 
 def calls(server: WyrdTestServer, where: str, columns: str) -> list[dict[str, Any]]:
     """Publish the gateway's captured calls, then read the ``vala.gateway.calls`` rows matching ``where``."""
     server.flush_bifrost()
     query = f"SELECT {columns} FROM vala.gateway.calls WHERE {where} ORDER BY started_at"
-    return Bifrost().sql(query).to_arrow().to_pylist()
+    return Bifrost(client=client_of(server)).sql(query).to_arrow().to_pylist()
 
 
-def assert_upstream_credentials(received: Received, header: str, token: str) -> None:
-    """Every upstream request carried the provider key and never the caller token."""
-    assert received
-    for path, headers in received:
-        assert headers[header] in (PROVIDER_KEY, f"Bearer {PROVIDER_KEY}")
-        assert token not in path
-        assert all(token not in value for value in headers.values())
-        assert not any(name.startswith("x-wyrd") for name in headers)
+def assert_upstream_credentials(upstream: Receiver, header: str, value: str, token: str) -> None:
+    """Every upstream request carried ``header: value`` and never the caller token."""
+    assert upstream.deliveries
+    for delivery in upstream.deliveries:
+        assert delivery.headers[header] == value
+        assert token not in delivery.path
+        assert all(token not in value for value in delivery.headers.values())
+        assert not any(name.startswith("x-wyrd") for name in delivery.headers)
 
 
 def usage(rows: list[dict[str, Any]]) -> set[tuple[str, str]]:

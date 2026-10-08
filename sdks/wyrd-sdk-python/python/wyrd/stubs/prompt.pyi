@@ -50,6 +50,10 @@ class MediaRef:
                 file API URI.
             mime_type: the image MIME type. Gemini and Vertex require it;
                 other providers ignore it.
+
+
+        Returns:
+            the image reference.
         """
         ...
 
@@ -60,6 +64,10 @@ class MediaRef:
         Args:
             mime_type: the image MIME type, such as ``image/png``.
             data: the raw image bytes; they are not retained.
+
+
+        Returns:
+            the image reference.
         """
         ...
 
@@ -70,6 +78,10 @@ class MediaRef:
         Args:
             mime_type: the image MIME type, such as ``image/png``.
             data: the base64 payload, without a ``data:`` prefix.
+
+
+        Returns:
+            the image reference.
         """
         ...
 
@@ -80,6 +92,10 @@ class MediaRef:
         Args:
             uri: an OpenAI or Anthropic file id, or a Gemini or Vertex file URI.
             mime_type: the image MIME type. Gemini and Vertex require it.
+
+
+        Returns:
+            the image reference.
         """
         ...
 
@@ -93,6 +109,9 @@ class MediaRef:
         Args:
             path: a regular file (not a directory or symlink) of at most
                 20 MiB.
+
+        Returns:
+            the image reference, holding the base64 file content.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_MEDIA_NOT_REGULAR_FILE``,
@@ -112,6 +131,10 @@ class MediaRef:
             url: the document URL, or for Gemini and Vertex a ``gs://`` or
                 Gemini file API URI.
             mime_type: the document MIME type. Gemini and Vertex require it.
+
+
+        Returns:
+            the document reference.
         """
         ...
 
@@ -122,6 +145,10 @@ class MediaRef:
         Args:
             mime_type: the document MIME type, such as ``application/pdf``.
             data: the raw document bytes; they are not retained.
+
+
+        Returns:
+            the document reference.
         """
         ...
 
@@ -132,6 +159,10 @@ class MediaRef:
         Args:
             mime_type: the document MIME type, such as ``application/pdf``.
             data: the base64 payload, without a ``data:`` prefix.
+
+
+        Returns:
+            the document reference.
         """
         ...
 
@@ -142,6 +173,10 @@ class MediaRef:
         Args:
             uri: an OpenAI or Anthropic file id, or a Gemini or Vertex file URI.
             mime_type: the document MIME type. Gemini and Vertex require it.
+
+
+        Returns:
+            the document reference.
         """
         ...
 
@@ -150,8 +185,18 @@ class MediaRef:
         """Read a local document file now and reference it as base64 data.
 
         The MIME type comes from the extension: ``pdf``, ``txt``, ``md``,
-        ``json``, ``csv``, ``html``, or ``htm``. Size and file rules and
-        errors are as for ``MediaRef.image_path()``.
+        ``json``, ``csv``, ``html``, or ``htm``. Size and file rules are as
+        for ``MediaRef.image_path()``.
+
+        Args:
+            path: a regular file (not a directory or symlink) of at most
+                20 MiB.
+
+        Returns:
+            the document reference, holding the base64 file content.
+
+        Raises:
+            WyrdError: as for ``MediaRef.image_path()``.
         """
         ...
 
@@ -228,6 +273,12 @@ class ProviderResponse:
         answer. It is the deterministic shape the ``mock`` provider returns:
         id ``mock_response``, model ``mock-model``, finish reason ``stop``,
         and zero token usage.
+
+        Args:
+            text: the assistant message content.
+
+        Returns:
+            the finished response.
         """
         ...
 
@@ -1111,7 +1162,11 @@ class ResponseFormat:
 
     @staticmethod
     def text() -> ResponseFormat:
-        """Request plain-text output."""
+        """Request plain-text output.
+
+        Returns:
+            the plain-text format.
+        """
         ...
 
     @staticmethod
@@ -1119,6 +1174,9 @@ class ResponseFormat:
         """Request a JSON object without a schema.
 
         Anthropic has no such mode and sends no output constraint.
+
+        Returns:
+            the JSON-object format.
         """
         ...
 
@@ -1130,6 +1188,9 @@ class ResponseFormat:
             name: the schema name, sent to providers that require one.
             schema: a JSON Schema object, or a Pydantic model class whose
                 ``model_json_schema()`` is used.
+
+        Returns:
+            the JSON Schema format.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA`` when the
@@ -1152,37 +1213,6 @@ class OpenAISettings:
     field; an omitted argument is left out of the request so the provider
     default applies. Unknown keyword arguments are kept and sent as extra
     top-level fields.
-
-    Args:
-        temperature: sampling temperature.
-        top_p: nucleus sampling probability.
-        max_tokens: legacy output-token cap.
-        max_completion_tokens: output-token cap, including reasoning tokens.
-        n: number of choices to generate.
-        stop: one stop sequence or a list of them.
-        presence_penalty: presence penalty.
-        frequency_penalty: frequency penalty.
-        seed: best-effort deterministic sampling seed.
-        logit_bias: token id to bias value.
-        user: end-user identifier.
-        reasoning_effort: ``"none"``, ``"minimal"``, ``"low"``, ``"medium"``,
-            ``"high"``, or ``"xhigh"``.
-        modalities: output modalities, each ``"text"`` or ``"audio"``.
-        audio: audio output settings, ``{"voice": ..., "format": ...}``.
-        prediction: predicted output content.
-        prompt_cache_key: prompt cache key. Takes precedence over the
-            ``cache`` argument of ``Prompt()``.
-        service_tier: service tier.
-        safety_identifier: end-user safety identifier.
-        store: whether OpenAI may store the completion.
-        metadata: request metadata object.
-        logprobs: whether to return token log probabilities.
-        top_logprobs: number of most likely tokens to return per position.
-        **extra: other Chat Completions fields, sent unchanged.
-
-    Raises:
-        WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
-            fit its field.
     """
 
     def __init__(
@@ -1212,7 +1242,39 @@ class OpenAISettings:
         top_logprobs: int | None = ...,
         **extra: Any,
     ) -> None:
-        """Create OpenAI Chat settings; see the class docstring for arguments."""
+        """Create OpenAI Chat settings.
+
+        Args:
+            temperature: sampling temperature.
+            top_p: nucleus sampling probability.
+            max_tokens: legacy output-token cap.
+            max_completion_tokens: output-token cap, including reasoning tokens.
+            n: number of choices to generate.
+            stop: one stop sequence or a list of them.
+            presence_penalty: presence penalty.
+            frequency_penalty: frequency penalty.
+            seed: best-effort deterministic sampling seed.
+            logit_bias: token id to bias value.
+            user: end-user identifier.
+            reasoning_effort: ``"none"``, ``"minimal"``, ``"low"``, ``"medium"``,
+                ``"high"``, or ``"xhigh"``.
+            modalities: output modalities, each ``"text"`` or ``"audio"``.
+            audio: audio output settings, ``{"voice": ..., "format": ...}``.
+            prediction: predicted output content.
+            prompt_cache_key: prompt cache key. Takes precedence over the
+                ``cache`` argument of ``Prompt()``.
+            service_tier: service tier.
+            safety_identifier: end-user safety identifier.
+            store: whether OpenAI may store the completion.
+            metadata: request metadata object.
+            logprobs: whether to return token log probabilities.
+            top_logprobs: number of most likely tokens to return per position.
+            **extra: other Chat Completions fields, sent unchanged.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
+                fit its field.
+        """
         ...
 
     @staticmethod
@@ -1222,6 +1284,9 @@ class OpenAISettings:
         Args:
             value: the same keys the constructor accepts; unknown keys are
                 kept as extra fields.
+
+        Returns:
+            the decoded settings.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does
@@ -1246,20 +1311,6 @@ class OpenAIResponsesSettings:
 
     Arguments, omission, and unknown keyword arguments behave as for
     ``OpenAISettings``.
-
-    Args:
-        temperature: sampling temperature.
-        top_p: nucleus sampling probability.
-        max_output_tokens: output-token cap, including reasoning tokens.
-        reasoning: reasoning configuration, such as ``{"effort": "low"}``.
-        store: whether OpenAI may store the response.
-        include: additional output data to include in the response.
-        metadata: request metadata object.
-        **extra: other Responses fields, sent unchanged.
-
-    Raises:
-        WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
-            fit its field.
     """
 
     def __init__(
@@ -1274,12 +1325,39 @@ class OpenAIResponsesSettings:
         metadata: Mapping[str, Any] | None = ...,
         **extra: Any,
     ) -> None:
-        """Create OpenAI Responses settings; see the class docstring for arguments."""
+        """Create OpenAI Responses settings.
+
+        Args:
+            temperature: sampling temperature.
+            top_p: nucleus sampling probability.
+            max_output_tokens: output-token cap, including reasoning tokens.
+            reasoning: reasoning configuration, such as ``{"effort": "low"}``.
+            store: whether OpenAI may store the response.
+            include: additional output data to include in the response.
+            metadata: request metadata object.
+            **extra: other Responses fields, sent unchanged.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
+                fit its field.
+        """
         ...
 
     @staticmethod
     def from_dict(value: Mapping[str, Any]) -> OpenAIResponsesSettings:
-        """As ``OpenAISettings.from_dict()``."""
+        """Create settings from a mapping, as ``OpenAISettings.from_dict()``.
+
+        Args:
+            value: the same keys the constructor accepts; unknown keys are
+                kept as extra fields.
+
+        Returns:
+            the decoded settings.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does
+                not fit its field.
+        """
         ...
 
     def to_dict(self) -> JsonDict:
@@ -1300,21 +1378,6 @@ class AnthropicSettings:
     Arguments map to the same-named top-level request fields. Unknown keyword
     arguments are kept and sent as extra top-level fields. A prompt built
     without ``model_settings`` sends ``max_tokens`` 4096.
-
-    Args:
-        max_tokens: maximum output tokens.
-        temperature: sampling temperature.
-        top_p: nucleus sampling probability.
-        top_k: top-k sampling limit.
-        stop_sequences: custom stop sequences.
-        metadata: request metadata object.
-        thinking: extended thinking configuration, such as
-            ``{"type": "enabled", "budget_tokens": 2048}``.
-        **extra: other Messages fields, sent unchanged.
-
-    Raises:
-        WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
-            fit its field.
     """
 
     def __init__(
@@ -1329,12 +1392,40 @@ class AnthropicSettings:
         thinking: JsonDict | None = ...,
         **extra: Any,
     ) -> None:
-        """Create Anthropic settings; see the class docstring for arguments."""
+        """Create Anthropic settings.
+
+        Args:
+            max_tokens: maximum output tokens.
+            temperature: sampling temperature.
+            top_p: nucleus sampling probability.
+            top_k: top-k sampling limit.
+            stop_sequences: custom stop sequences.
+            metadata: request metadata object.
+            thinking: extended thinking configuration, such as
+                ``{"type": "enabled", "budget_tokens": 2048}``.
+            **extra: other Messages fields, sent unchanged.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
+                fit its field.
+        """
         ...
 
     @staticmethod
     def from_dict(value: Mapping[str, Any]) -> AnthropicSettings:
-        """As ``OpenAISettings.from_dict()``."""
+        """Create settings from a mapping, as ``OpenAISettings.from_dict()``.
+
+        Args:
+            value: the same keys the constructor accepts; unknown keys are
+                kept as extra fields.
+
+        Returns:
+            the decoded settings.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does
+                not fit its field.
+        """
         ...
 
     def to_dict(self) -> JsonDict:
@@ -1356,18 +1447,6 @@ class GeminiSettings:
     ``max_output_tokens``, and ``thinking_config`` go inside
     ``generation_config``. Omitted arguments are left out of the request.
     Unknown keyword arguments are kept and sent as extra top-level fields.
-
-    Args:
-        generation_config: the native generation config object.
-        safety_settings: the native safety settings, each with a
-            ``category`` and ``threshold``.
-        cached_content: the cached content resource name to reuse.
-        labels: request labels object.
-        **extra: other GenerateContent fields, sent unchanged.
-
-    Raises:
-        WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
-            fit its field.
     """
 
     def __init__(
@@ -1379,12 +1458,37 @@ class GeminiSettings:
         labels: Mapping[str, Any] | None = ...,
         **extra: Any,
     ) -> None:
-        """Create Gemini or Vertex settings; see the class docstring for arguments."""
+        """Create Gemini or Vertex settings.
+
+        Args:
+            generation_config: the native generation config object.
+            safety_settings: the native safety settings, each with a
+                ``category`` and ``threshold``.
+            cached_content: the cached content resource name to reuse.
+            labels: request labels object.
+            **extra: other GenerateContent fields, sent unchanged.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does not
+                fit its field.
+        """
         ...
 
     @staticmethod
     def from_dict(value: Mapping[str, Any]) -> GeminiSettings:
-        """As ``OpenAISettings.from_dict()``."""
+        """Create settings from a mapping, as ``OpenAISettings.from_dict()``.
+
+        Args:
+            value: the same keys the constructor accepts; unknown keys are
+                kept as extra fields.
+
+        Returns:
+            the decoded settings.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_SETTINGS_DECODE`` when a value does
+                not fit its field.
+        """
         ...
 
     def to_dict(self) -> JsonDict:
@@ -1550,9 +1654,25 @@ class Prompt:
     ) -> Prompt:
         """Build an OpenAI Chat Completions prompt.
 
-        Arguments and errors are as for ``Prompt()``, except ``messages``: a
-        string or an iterable of strings, each one user message. ``system``
-        becomes the first message.
+        ``system`` becomes the first message.
+
+        Args:
+            model: the provider model name; must not be blank.
+            system: the system instruction. Omitted, none is sent.
+            messages: a string or an iterable of strings, each one user
+                message. Omitted, no user message is added.
+            response_format: as for ``Prompt()``.
+            output: as for ``Prompt()``.
+            cache: as for ``Prompt()``.
+            model_settings: ``OpenAISettings``, or a mapping of its fields.
+            variables: as for ``Prompt()``.
+            version: as for ``Prompt()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: as for ``Prompt()``.
         """
         ...
 
@@ -1570,8 +1690,24 @@ class Prompt:
     ) -> Prompt:
         """Build an OpenAI Responses prompt.
 
-        As ``Prompt.openai_chat()``; ``instructions`` is the Responses system
-        text, and each message becomes a user input item.
+        Each message becomes a user input item.
+
+        Args:
+            model: the provider model name; must not be blank.
+            instructions: the Responses system text. Omitted, none is sent.
+            messages: a string or an iterable of strings, each one user
+                message. Omitted, no user message is added.
+            response_format: as for ``Prompt()``.
+            output: as for ``Prompt()``.
+            model_settings: ``OpenAIResponsesSettings``, or a mapping of its fields.
+            variables: as for ``Prompt()``.
+            version: as for ``Prompt()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: as for ``Prompt()``.
         """
         ...
 
@@ -1589,8 +1725,24 @@ class Prompt:
     ) -> Prompt:
         """Build an Anthropic Messages prompt.
 
-        As ``Prompt.openai_chat()``; ``system`` becomes the request's
-        ``system`` field.
+        ``system`` becomes the request's ``system`` field.
+
+        Args:
+            model: the provider model name; must not be blank.
+            system: the system instruction. Omitted, none is sent.
+            messages: a string or an iterable of strings, each one user
+                message. Omitted, no user message is added.
+            response_format: as for ``Prompt()``.
+            output: as for ``Prompt()``.
+            model_settings: ``AnthropicSettings``, or a mapping of its fields.
+            variables: as for ``Prompt()``.
+            version: as for ``Prompt()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: as for ``Prompt()``.
         """
         ...
 
@@ -1608,8 +1760,24 @@ class Prompt:
     ) -> Prompt:
         """Build a Gemini GenerateContent prompt.
 
-        As ``Prompt.openai_chat()``; ``system`` becomes
-        ``system_instruction``.
+        ``system`` becomes ``system_instruction``.
+
+        Args:
+            model: the provider model name; must not be blank.
+            system: the system instruction. Omitted, none is sent.
+            messages: a string or an iterable of strings, each one user
+                message. Omitted, no user message is added.
+            response_format: as for ``Prompt()``.
+            output: as for ``Prompt()``.
+            model_settings: ``GeminiSettings``, or a mapping of its fields.
+            variables: as for ``Prompt()``.
+            version: as for ``Prompt()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: as for ``Prompt()``.
         """
         ...
 
@@ -1625,7 +1793,27 @@ class Prompt:
         variables: list[str] | None = ...,
         version: str | None = ...,
     ) -> Prompt:
-        """Build a Vertex GenerateContent prompt. As ``Prompt.gemini()``."""
+        """Build a Vertex GenerateContent prompt.
+
+        ``system`` becomes ``system_instruction``, as for ``Prompt.gemini()``.
+
+        Args:
+            model: the provider model name; must not be blank.
+            system: the system instruction. Omitted, none is sent.
+            messages: a string or an iterable of strings, each one user
+                message. Omitted, no user message is added.
+            response_format: as for ``Prompt()``.
+            output: as for ``Prompt()``.
+            model_settings: ``GeminiSettings``, or a mapping of its fields.
+            variables: as for ``Prompt()``.
+            version: as for ``Prompt()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: as for ``Prompt()``.
+        """
         ...
 
     @staticmethod
@@ -1641,6 +1829,9 @@ class Prompt:
             model: the model name; must not be blank.
             body: the request body as UTF-8 JSON bytes, stored unchanged.
 
+        Returns:
+            the raw prompt.
+
         Raises:
             WyrdError: ``WYRD_PROMPT_400_EMPTY_MODEL`` for a blank model, or
                 ``WYRD_PROMPT_500_SERIALIZE_REQUEST`` when ``body`` is not
@@ -1653,6 +1844,12 @@ class Prompt:
 
         OpenAI Chat inserts a new first system message; the other providers
         replace their system field (``instructions`` for OpenAI Responses).
+
+        Args:
+            text: the system instruction text.
+
+        Returns:
+            the new prompt.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt,
@@ -1668,13 +1865,27 @@ class Prompt:
             content: a string, or a provider-native content part or list of
                 parts, such as ``Prompt.image_url()`` returns.
 
+        Returns:
+            the new prompt.
+
         Raises:
             WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
         """
         ...
 
     def assistant(self, content: Any) -> Prompt:
-        """As ``Prompt.user()``, appending an assistant (Gemini: ``model``) message."""
+        """Return a copy with one assistant (Gemini: ``model``) message appended.
+
+        Args:
+            content: a string, or a provider-native content part or list of
+                parts, as for ``Prompt.user()``.
+
+        Returns:
+            the new prompt.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
+        """
         ...
 
     def tool_result(self, tool_use_id: str, content: str, is_error: bool = ...) -> Prompt:
@@ -1686,6 +1897,9 @@ class Prompt:
             content: the tool output text.
             is_error: mark the result as an error. Only Anthropic sends it.
                 Defaults to ``False``.
+
+        Returns:
+            the new prompt.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for a raw prompt.
@@ -1701,6 +1915,9 @@ class Prompt:
         Args:
             **kwargs: a value for every name in ``variables``; non-string
                 values are converted with ``str()``.
+
+        Returns:
+            the rendered provider request.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_422_MISSING_VARIABLE`` when a declared
@@ -1721,6 +1938,9 @@ class Prompt:
             value: the value for ``name``, converted with ``str()``.
             **kwargs: more variable values, converted with ``str()``.
 
+        Returns:
+            the new prompt.
+
         Raises:
             WyrdError: ``WYRD_PROMPT_400_DRAFT_INVALID`` when no binding is
                 given.
@@ -1728,7 +1948,17 @@ class Prompt:
         ...
 
     def bind_mut(self, name: str | None = ..., value: Any | None = ..., **kwargs: Any) -> None:
-        """As ``Prompt.bind()``, changing this prompt in place."""
+        """Substitute some text variables in this prompt in place, as ``Prompt.bind()``.
+
+        Args:
+            name: one variable name, used together with ``value``.
+            value: the value for ``name``, converted with ``str()``.
+            **kwargs: more variable values, converted with ``str()``.
+
+        Raises:
+            WyrdError: ``WYRD_PROMPT_400_DRAFT_INVALID`` when no binding is
+                given.
+        """
         ...
 
     def bind_media(self, name: str, media: MediaRef) -> Prompt:
@@ -1737,6 +1967,9 @@ class Prompt:
         Args:
             name: the placeholder name, without the ``${media:...}`` wrapper.
             media: the media to insert.
+
+        Returns:
+            the new prompt.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_422_UNDECLARED_MEDIA_PLACEHOLDER`` when
@@ -1751,7 +1984,15 @@ class Prompt:
         ...
 
     def bind_media_mut(self, name: str, media: MediaRef) -> None:
-        """As ``Prompt.bind_media()``, changing this prompt in place."""
+        """Replace a media placeholder in this prompt in place, as ``Prompt.bind_media()``.
+
+        Args:
+            name: the placeholder name, without the ``${media:...}`` wrapper.
+            media: the media to insert.
+
+        Raises:
+            WyrdError: as for ``Prompt.bind_media()``.
+        """
         ...
 
     def model_dump(self) -> JsonDict:
@@ -1765,6 +2006,12 @@ class Prompt:
     @staticmethod
     def model_validate_json(data: str) -> Prompt:
         """Rebuild a prompt from ``model_dump_json()`` output.
+
+        Args:
+            data: the JSON text.
+
+        Returns:
+            the rebuilt prompt.
 
         Raises:
             WyrdError: when ``data`` is not a valid native prompt.
@@ -1780,6 +2027,9 @@ class Prompt:
 
         Args:
             path: a ``.json``, ``.yaml``, or ``.yml`` file.
+
+        Returns:
+            the loaded prompt.
 
         Raises:
             WyrdError: ``WYRD_PROMPT_500_LOADER_IO`` when the file cannot be
@@ -1810,6 +2060,10 @@ class Prompt:
             url: the image URL or ``data:`` URL.
             detail: ``"low"``, ``"high"``, or ``"auto"``. Omitted, OpenAI
                 chooses.
+
+
+        Returns:
+            the content part.
         """
         ...
 
@@ -1820,6 +2074,10 @@ class Prompt:
         Args:
             data: the base64 audio payload.
             format: the audio format, such as ``"wav"`` or ``"mp3"``.
+
+
+        Returns:
+            the content part.
         """
         ...
 
@@ -1830,27 +2088,61 @@ class Prompt:
         Args:
             file_data: the base64 file payload or ``data:`` URL.
             filename: the file name. Omitted, none is sent.
+
+
+        Returns:
+            the content part.
         """
         ...
 
     @staticmethod
     def openai_file_id(file_id: str) -> JsonDict:
-        """Return an OpenAI Chat ``file`` content part for an uploaded file id."""
+        """Return an OpenAI Chat ``file`` content part for an uploaded file id.
+
+        Args:
+            file_id: the uploaded file id.
+
+        Returns:
+            the content part.
+        """
         ...
 
     @staticmethod
     def anthropic_image_url(url: str) -> JsonDict:
-        """Return an Anthropic URL-sourced ``image`` content block."""
+        """Return an Anthropic URL-sourced ``image`` content block.
+
+        Args:
+            url: the image URL.
+
+        Returns:
+            the content block.
+        """
         ...
 
     @staticmethod
     def anthropic_image_file_id(file_id: str) -> JsonDict:
-        """Return an Anthropic ``image`` content block for an uploaded file id."""
+        """Return an Anthropic ``image`` content block for an uploaded file id.
+
+        Args:
+            file_id: the uploaded file id.
+
+        Returns:
+            the content block.
+        """
         ...
 
     @staticmethod
     def anthropic_document_text(media_type: str, data: str, title: str | None = None) -> JsonDict:
-        """Return an Anthropic plain-text ``document`` block. As ``Prompt.document_text()``."""
+        """Return an Anthropic plain-text ``document`` block, as ``Prompt.document_text()``.
+
+        Args:
+            media_type: the document MIME type, such as ``text/plain``.
+            data: the document text.
+            title: the document title. Omitted, none is sent.
+
+        Returns:
+            the content block.
+        """
         ...
 
     @staticmethod
@@ -1860,6 +2152,10 @@ class Prompt:
         Args:
             file_id: the uploaded file id.
             title: the document title. Omitted, none is sent.
+
+
+        Returns:
+            the content block.
         """
         ...
 
@@ -1870,6 +2166,10 @@ class Prompt:
         Args:
             mime_type: the payload MIME type.
             data: the base64 payload.
+
+
+        Returns:
+            the part.
         """
         ...
 
@@ -1880,6 +2180,10 @@ class Prompt:
         Args:
             media_type: the image MIME type, such as ``image/png``.
             data: the base64 image payload.
+
+
+        Returns:
+            the content block.
         """
         ...
 
@@ -1890,6 +2194,10 @@ class Prompt:
         Args:
             mime_type: the file MIME type.
             file_uri: a ``gs://`` or Gemini file API URI.
+
+
+        Returns:
+            the part.
         """
         ...
 
@@ -1902,6 +2210,9 @@ class Prompt:
             detail: the OpenAI detail level; Anthropic ignores it.
             provider: ``"openai"`` (the default) or ``"anthropic"``.
 
+        Returns:
+            the provider-native content value.
+
         Raises:
             WyrdError: ``WYRD_PROMPT_400_PROVIDER_MISMATCH`` for any other
                 provider.
@@ -1910,17 +2221,40 @@ class Prompt:
 
     @staticmethod
     def image_base64(media_type: str, data: str) -> JsonDict:
-        """Return an Anthropic base64 ``image`` block. As ``Prompt.anthropic_image_base64()``."""
+        """Return an Anthropic base64 ``image`` block, as ``Prompt.anthropic_image_base64()``.
+
+        Args:
+            media_type: the image MIME type, such as ``image/png``.
+            data: the base64 image payload.
+
+        Returns:
+            the content block.
+        """
         ...
 
     @staticmethod
     def file_uri(mime_type: str, file_uri: str) -> JsonDict:
-        """Return a Gemini or Vertex ``file_data`` part. As ``Prompt.google_file_data()``."""
+        """Return a Gemini or Vertex ``file_data`` part, as ``Prompt.google_file_data()``.
+
+        Args:
+            mime_type: the file MIME type.
+            file_uri: a ``gs://`` or Gemini file API URI.
+
+        Returns:
+            the part.
+        """
         ...
 
     @staticmethod
     def file_id(file_id: str) -> JsonDict:
-        """Return an OpenAI Chat ``file`` content part for an uploaded file id."""
+        """Return an OpenAI Chat ``file`` content part for an uploaded file id.
+
+        Args:
+            file_id: the uploaded file id.
+
+        Returns:
+            the content part.
+        """
         ...
 
     @staticmethod
@@ -1931,6 +2265,10 @@ class Prompt:
             media_type: the document MIME type, such as ``text/plain``.
             data: the document text.
             title: the document title. Omitted, none is sent.
+
+
+        Returns:
+            the content block.
         """
         ...
 
@@ -1966,6 +2304,9 @@ class PromptReference:
             uid: the exact card UID. Omitted, the reference is resolved by
                 space, name, and version.
 
+        Returns:
+            the Prompt Card reference.
+
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when a field is invalid.
         """
@@ -1974,6 +2315,12 @@ class PromptReference:
     @staticmethod
     def inline(prompt: Prompt) -> PromptReference:
         """Embed a copy of ``prompt``.
+
+        Args:
+            prompt: the prompt to copy.
+
+        Returns:
+            the inline reference.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` when ``prompt`` is not a
@@ -1995,6 +2342,9 @@ class PromptReference:
 
         Args:
             data: the JSON text.
+
+        Returns:
+            the rebuilt reference.
 
         Raises:
             WyrdError: when ``data`` is not a valid prompt reference.
@@ -2142,7 +2492,17 @@ class PromptCard:
 
     @staticmethod
     def load(path: PathLike) -> PromptCard:
-        """Load a card envelope from a local file. As ``PromptCard.from_path()``."""
+        """Load a card envelope from a local file, as ``PromptCard.from_path()``.
+
+        Args:
+            path: a ``.json``, ``.yaml``, or ``.yml`` file.
+
+        Returns:
+            the loaded card.
+
+        Raises:
+            WyrdError: as for ``PromptCard.from_path()``.
+        """
         ...
 
     @staticmethod
@@ -2151,6 +2511,12 @@ class PromptCard:
 
         Both the stored native ``spec`` and the declarative authoring ``spec``
         (a ``provider`` key instead of ``request``) are accepted.
+
+        Args:
+            path: a ``.json``, ``.yaml``, or ``.yml`` file.
+
+        Returns:
+            the loaded card.
 
         Raises:
             WyrdError: when the file cannot be read or parsed, or is not a
@@ -2195,6 +2561,9 @@ class PromptCard:
 
         Args:
             json_string: the JSON envelope text.
+
+        Returns:
+            the rebuilt card.
 
         Raises:
             WyrdError: when the JSON is invalid or is not a ``wyrd/v1``

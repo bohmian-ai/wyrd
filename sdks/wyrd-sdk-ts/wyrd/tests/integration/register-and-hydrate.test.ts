@@ -1,12 +1,11 @@
-import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, type RegistrationReceipt, WyrdState, cli } from "@wyrd/sdk";
+import { Cards, type RegistrationReceipt, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { cli } from "@wyrd/testing";
 
 import { fixture, serverTest } from "../support/server.js";
 
@@ -41,12 +40,24 @@ test("service graph registers and hydrates", async ({ cards, desk }) => {
 
   const state = WyrdState.fromPath(bundle);
   expect(state.rootRef).toEqual(desk.root);
+  expect(state.service.metadata.name).toBe("support-desk");
+  expect(state.model("model").metadata.name).toBe("support-model");
   expect(state.card("agent").kind).toBe("Agent");
+  expect(state.agent("agent").metadata.name).toBe("support-agent");
+  expect(() => state.data("model")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
+  expect(() => state.prompt("model")).toThrow(expect.objectContaining({ code: "WYRD_SDK_400_CARD_KIND_MISMATCH" }));
   const [artifact] = state.artifacts("model");
-  expect(artifact?.relative_path).toBe("support-model.bin");
-  expect(readFileSync(artifact?.local_path ?? "")).toEqual(
+  expect(artifact.relative_path).toBe("support-model.bin");
+  expect(readFileSync(artifact.local_path)).toEqual(
     readFileSync(fixture("cards/register_and_hydrate/support-model.bin")),
   );
+});
+
+test("latest version resolves to the registered card", async ({ cards, desk }) => {
+  expect(await cards.resolveLatest("Service", "default", "support-desk")).toMatchObject(desk.root);
+  await expect(cards.resolveLatest("Service", "default", "never-registered")).rejects.toMatchObject({
+    code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+  });
 });
 
 test("registering the graph again is idempotent", async ({ cards, desk }) => {
@@ -99,18 +110,23 @@ test("retired card kind is refused", async ({ cards }) => {
 });
 
 test("reader cannot register cards", async ({ server, desk: _ }) => {
-  const reader = Cards.connect({ credential: server.scopedApiKey("card_reader", ["cards:read"]) });
+  const reader = Cards.connect({
+    client: WyrdClient.connect({ credential: server.scopedApiKey("card_reader", ["cards:read"]) }),
+  });
 
   await expect(reader.registerFromPath(DESK)).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
 });
 
-test("cli apply and get round trip the graph", async ({ desk }) => {
-  const applied = await cli.apply(DESK);
+test("cli apply and get round trip the graph", async ({ server, desk }) => {
+  const client = WyrdClient.connect({ credential: server.apiKey });
+  const applied = await cli.apply(DESK, { client });
   const bundle = bundleDir();
 
-  const summary = await cli.get({ kind: "Service", space: "default", name: "support-desk", version: "1.0.0" }, bundle);
+  const summary = await cli.get({ kind: "Service", space: "default", name: "support-desk", version: "1.0.0" }, bundle, {
+    client,
+  });
 
   expect(applied.root).toEqual(desk.root);
   expect(summary).toMatchObject({ mode: "complete", root: desk.root });
@@ -121,17 +137,4 @@ test("refused cli command raises its catalog code", async ({ server: _ }) => {
   await expect(
     cli.get({ kind: "Service", space: "default", name: "no-such-service", version: "1.0.0" }, bundleDir()),
   ).rejects.toMatchObject({ code: "WYRD_REGISTRY_404_CARD_NOT_FOUND" });
-});
-
-/** The `wyrd` executable the package installs, resolved from its `bin` entry. */
-const WYRD_BIN = (() => {
-  const root = resolve(import.meta.dirname, "../..");
-  const { bin } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { bin: { wyrd: string } };
-  return join(root, bin.wyrd);
-})();
-
-test("installed wyrd executable applies the graph", async ({ desk }) => {
-  const { stdout } = await promisify(execFile)(process.execPath, [WYRD_BIN, "apply", DESK, "--format", "json"]);
-
-  expect(JSON.parse(stdout)).toMatchObject({ root: desk.root });
 });

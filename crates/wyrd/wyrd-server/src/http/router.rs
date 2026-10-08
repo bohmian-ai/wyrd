@@ -74,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(cards_router())
         .merge(crate::components::workflow::workflow_runs_router())
         .merge(principals_router())
+        .merge(crate::components::auth::routes::tenant_auth_router())
         .merge(verification_router())
         .merge(operator_connections_router())
         .merge(admin_router())

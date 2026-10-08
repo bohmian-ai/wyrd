@@ -78,15 +78,34 @@ The resolution path:
     ['reader', 'cards:read, artifacts:read, audit:read'],
     ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
     ['runtime_admin', 'service_accounts:write'],
-    ['workload', 'bifrost_table:read, bifrost_record:write, bifrost_query:read']
+    ['workload', 'bifrost_table:read, bifrost_record:write, bifrost_query:read'],
+    ['wyrd_default', 'bifrost_table:read, bifrost_record:write, evals:run']
   ]}
 />
 
 Built-in roles are seeded per tenant at tenant creation. A Service or Agent
-Card's principal receives `workload` when its Card is first registered, so a
-key issued for it can emit and query its own evidence without a manual grant.
-Its Card scope still bounds which Cards it may emit for. Re-registering the
-Card never re-grants a revoked `workload` role.
+Card's principal receives `wyrd_default` when its Card is first registered, so
+the key `wyrd auth issue-key` issues for it can start Bifrost, emit its
+evidence, and run its Verifiers without a manual grant. Its Card scope still
+bounds which Cards it may emit for and verify. Re-registering the Card never
+re-grants a revoked `wyrd_default` role.
+
+`wyrd_default` does not read the tenant's Bifrost tables. A Service that
+queries them needs the `workload` role, granted by a tenant administrator:
+
+```bash
+wyrd auth grant-role --kind Service --name my-svc --version 1.0.0 \
+  --space prod --role workload
+```
+
+The command calls `POST /v1/auth/grant-role` with `{ card_ref, role }` and
+prints the principal's roles. It requires tenant administration (`*`), so
+`runtime_admin` cannot use it. It names the target by its Card, so a human
+user is never a target; their roles come from federated login. A grant
+already held succeeds with `granted: false`. An unknown or foreign Card
+answers `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`, and an unknown role
+`WYRD_SPEC_400_VALIDATION`. The new role reaches the principal's tokens at its
+next key exchange. There is no revoke command.
 
 The `operators` resource has three actions. `operators:invoke` lets a
 principal register a verification binding that names an `on_failure` Operator

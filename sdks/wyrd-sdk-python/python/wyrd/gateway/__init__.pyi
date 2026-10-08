@@ -2,6 +2,8 @@
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 from typing import Literal, TypedDict
 
+from ..client import WyrdClient
+
 GatewayOperation = Literal[
     "chat_completions", "responses", "embeddings", "images", "audio", "batches"
 ]
@@ -352,25 +354,18 @@ class Gateway:
     reach a managed secret write. Use the Wyrd CLI or the scoped MCP tool.
     """
 
-    def __init__(
-        self,
-        server_url: str | None = None,
-        credential: str | None = None,
-    ) -> None:
+    def __init__(self, client: WyrdClient | None = None) -> None:
         """Connect to a Wyrd server.
 
         Args:
-            server_url: the Wyrd server URL. Resolved from ``WYRD_SERVER_URL``
-                and then ``http://localhost:8080`` if omitted.
-            credential: the API key or bearer token. Resolved through
-                ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
-                ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
-                ``~/.config/wyrd/credentials.toml``
-                ``[default].api_key`` if omitted.
+            client: the ``WyrdClient`` to act as, sharing its transport and
+                token cache. Omitted, the ambient client resolves from
+                ``[client]`` in the Wyrd ``config.toml``, then the
+                environment, then the saved ``wyrd auth login``.
 
         Raises:
-            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
-                resolves, or a client configuration error.
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
+                credential resolves, or a client configuration error.
 
         """
         ...
@@ -382,6 +377,9 @@ class Gateway:
             name: the credential name, a lowercase Wyrd name (3 to 64 of
                 ``a-z``, ``0-9``, ``_``, ``-``, starting with a letter).
 
+        Returns:
+            The redacted credential view; it never carries secret material.
+
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid name;
                 ``WYRD_GATEWAY_404_RESOURCE_NOT_FOUND`` when the tenant has
@@ -391,7 +389,15 @@ class Gateway:
         ...
 
     def credentials(self) -> list[ProviderCredentialView]:
-        """List the tenant's redacted provider credentials ordered by name."""
+        """List the tenant's redacted provider credentials ordered by name.
+
+        Returns:
+            Every redacted credential view.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def put_deployment(self, deployment: ProviderDeployment) -> ProviderDeployment:
@@ -421,6 +427,9 @@ class Gateway:
         Args:
             name: the deployment name, a lowercase Wyrd name.
 
+        Returns:
+            The stored deployment.
+
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid name;
                 ``WYRD_GATEWAY_404_RESOURCE_NOT_FOUND`` when the tenant has
@@ -430,7 +439,15 @@ class Gateway:
         ...
 
     def deployments(self) -> list[ProviderDeployment]:
-        """List the tenant's provider deployments ordered by name."""
+        """List the tenant's provider deployments ordered by name.
+
+        Returns:
+            Every stored deployment.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def delete_deployment(self, name: str) -> None:
@@ -448,6 +465,12 @@ class Gateway:
     def put_fallback_policy(self, policy: GatewayFallbackPolicy) -> GatewayFallbackPolicy:
         """Replace the whole tenant fallback policy and return it.
 
+        Args:
+            policy: the complete replacement policy; see ``GatewayFallbackPolicy``.
+
+        Returns:
+            The stored fallback policy.
+
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when the dict does not
                 decode; ``WYRD_GATEWAY_400_INVALID_CONFIGURATION`` for a
@@ -458,11 +481,24 @@ class Gateway:
         ...
 
     def fallback_policy(self) -> GatewayFallbackPolicy:
-        """Read the tenant fallback policy, or the empty default."""
+        """Read the tenant fallback policy, or the empty default.
+
+        Returns:
+            The stored fallback policy.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def delete_fallback_policy(self) -> None:
-        """Restore the empty default fallback policy; repeating succeeds."""
+        """Restore the empty default fallback policy; repeating succeeds.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def put_governance_policy(self, policy: GatewayGovernancePolicy) -> GatewayGovernancePolicy:
@@ -471,6 +507,12 @@ class Gateway:
         Pricing is never deleted: a stored version omitted from ``policy`` is
         retained inactive, so the returned policy can list more pricing than
         was sent.
+
+        Args:
+            policy: the complete replacement policy; see ``GatewayGovernancePolicy``.
+
+        Returns:
+            The stored governance policy, pricing included.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when the dict does not
@@ -483,18 +525,38 @@ class Gateway:
         ...
 
     def governance_policy(self) -> GatewayGovernancePolicy:
-        """Read the tenant governance policy, or the empty default."""
+        """Read the tenant governance policy, or the empty default.
+
+        Returns:
+            The stored governance policy.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def delete_governance_policy(self) -> None:
-        """Clear limits and budgets, restore ``"allow_unpriced"``, and retire
-        all pricing while retaining it; repeating succeeds."""
+        """Clear limits and budgets, restore ``"allow_unpriced"``, and retire pricing.
+
+        Retired pricing is retained; repeating succeeds.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
     def put_capture_policy(self, policy: GatewayCapturePolicyWrite) -> GatewayCapturePolicy:
         """Replace the tenant capture policy and return its versioned view.
 
         Writing the current content leaves ``version`` unchanged.
+
+        Args:
+            policy: the complete replacement policy; see ``GatewayCapturePolicyWrite``.
+
+        Returns:
+            The stored, versioned capture policy.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` when the dict does not
@@ -505,7 +567,15 @@ class Gateway:
         ...
 
     def capture_policy(self) -> GatewayCapturePolicy:
-        """Read the tenant capture policy, or the disabled version-1 default."""
+        """Read the tenant capture policy, or the disabled version-1 default.
+
+        Returns:
+            The stored, versioned capture policy.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the
+                permission, or the server's transport error.
+        """
         ...
 
 __all__ = [

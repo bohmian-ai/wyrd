@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import pytest
 from wyrd import WyrdError
+from wyrd.client import WyrdClient
 from wyrd.operators import OperatorConnections
 
 UNREACHABLE = "http://127.0.0.1:9"
@@ -15,7 +16,7 @@ SECRET = "xoxb-never-echoed"
 @pytest.fixture
 def connections() -> OperatorConnections:
     """A credential-complete handle whose server is never reached."""
-    return OperatorConnections(server_url=UNREACHABLE, credential="wyrd_unused")
+    return OperatorConnections(WyrdClient(server_url=UNREACHABLE, credential="wyrd_unused"))
 
 
 @pytest.mark.parametrize(

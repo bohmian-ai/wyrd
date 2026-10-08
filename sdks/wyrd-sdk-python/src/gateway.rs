@@ -68,8 +68,8 @@ pub(crate) fn decode<T: DeserializeOwned>(
 
 /// Python-facing tenant gateway administration client.
 ///
-/// Wraps one [`wyrd_client::Gateway`] bound to a client resolved from explicit
-/// options or the standard Wyrd environment/credential chain. Provider
+/// Wraps one [`wyrd_client::Gateway`] bound to an explicit `WyrdClient` or the
+/// ambient chain. Provider
 /// credential mutation is absent by construction: submitting, rotating,
 /// revoking, or deleting a credential lives on
 /// `wyrd_client::gateway_credential`, which this binding never constructs, so
@@ -123,20 +123,25 @@ impl PyGateway {
 
 #[pymethods]
 impl PyGateway {
-    /// Connects to a Wyrd server; omitted options resolve from the environment,
-    /// and `WYRD_TENANT` selects the saved user login.
+    /// Builds a gateway administration handle acting as `client`.
+    ///
+    /// Omitted, the client resolves from the ambient chain. No network call
+    /// happens here.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, or a transport error when the client cannot build.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None))]
-    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
-        let client = wyrd_client::bifrost::client_from_options(server_url, credential, None)
-            .map_err(WyrdError::from)?;
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         Ok(Self {
-            inner: wyrd_client::Gateway::new(client),
+            inner: wyrd_client::Gateway::with_client(client),
         })
     }
 

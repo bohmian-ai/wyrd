@@ -20,7 +20,23 @@ pub mod prompt;
 #[cfg(feature = "python")]
 use {pyo3::prelude::*, pyo3::types::PyModule};
 
-/// Register card Python objects under `wyrd.cards`.
+/// Builds the native `cards` submodule and attaches it to `parent`.
+///
+/// The submodule carries `CardRef`, `CardKind`, and the `data`, `model`,
+/// `prompt`, and `agent` holder submodules. The caller (the Python SDK's
+/// `_wyrd` aggregator) publishes it under `wyrd._wyrd.cards`; this function
+/// never writes `sys.modules`, so the public `wyrd.cards` package keeps its
+/// own Python exports.
+///
+/// # Arguments
+///
+/// * `py` - The interpreter token used to allocate the submodules.
+/// * `parent` - The native module the `cards` submodule is attached to.
+///
+/// # Errors
+///
+/// Returns a Python error when a submodule cannot be allocated, a class or
+/// exception cannot be added, or a submodule cannot be attached.
 #[cfg(feature = "python")]
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let cards = PyModule::new(py, "cards")?;
@@ -57,18 +73,5 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     cards.add_submodule(&prompt)?;
     cards.add_submodule(&agent)?;
     parent.add_submodule(&cards)?;
-    register_submodule(py, "wyrd.cards", &cards)?;
-    register_submodule(py, "wyrd.cards.data", &data)?;
-    register_submodule(py, "wyrd.cards.model", &model)?;
-    register_submodule(py, "wyrd.cards.prompt", &prompt)?;
-    register_submodule(py, "wyrd.cards.agent", &agent)?;
-    Ok(())
-}
-
-#[cfg(feature = "python")]
-fn register_submodule(py: Python<'_>, name: &str, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    let sys = py.import("sys")?;
-    let modules = sys.getattr("modules")?;
-    modules.set_item(name, module)?;
     Ok(())
 }

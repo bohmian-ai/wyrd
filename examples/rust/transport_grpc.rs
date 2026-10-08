@@ -1,9 +1,14 @@
-//! Configure the default gRPC transport for a Wyrd client.
+//! Point a Wyrd client's gRPC plane (Bifrost ingest) at an explicit endpoint.
+//!
+//! The endpoint settings are a field of the `ClientConfig` that
+//! `WyrdClient::with_config` takes; an omitted endpoint derives from the
+//! HTTP server URL. Building the config makes no network call.
 //!
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_grpc
 
-use wyrd_sdk::transport::{GrpcConfig, TransportConfig};
+use wyrd_sdk::config::ClientConfig;
+use wyrd_sdk::transport::GrpcConfig;
 
 fn main() -> anyhow::Result<()> {
     let grpc = GrpcConfig {
@@ -16,15 +21,11 @@ fn main() -> anyhow::Result<()> {
     };
     grpc.validate()?;
 
-    let transport = TransportConfig::Grpc(grpc);
-    transport.validate()?;
-
-    let json = serde_json::to_string_pretty(&transport)?;
-    let round_trip: TransportConfig = serde_json::from_str(&json)?;
-    anyhow::ensure!(
-        round_trip == transport,
-        "transport config did not round-trip"
-    );
-    println!("{json}");
+    // Hand this to `WyrdClient::with_config` once a credential is set.
+    let config = ClientConfig {
+        grpc,
+        ..ClientConfig::default()
+    };
+    println!("gRPC endpoint: {}", config.grpc.endpoint);
     Ok(())
 }

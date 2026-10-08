@@ -5,7 +5,7 @@
 //! origin and tenant into the `[[logins]]` tables of the one Wyrd credential
 //! file, `{wyrd_config_dir}/credentials.toml`, beside the user's own content
 //! such as `[default].api_key`. That file's protection, atomic replacement,
-//! and content preservation belong to [`crate::credentials_file`].
+//! and content preservation belong to `crate::credentials_file`.
 //!
 //! Renewal works the way `gh`, `gcloud`, and `aws` do. A client uses the saved
 //! access token until it nears expiry; then, holding the credential file's
@@ -66,6 +66,11 @@ pub struct SavedLoginSummary {
 impl SavedLogin {
     /// Build the record of a login the device-code grant just issued.
     ///
+    /// # Arguments
+    /// * `origin` - Canonical server URL the login belongs to, from [`canonical_origin`].
+    /// * `tenant_key` - Tenant route key the login was issued for.
+    /// * `token` - Token response from the device-code grant; must carry a refresh token.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `refresh_refused`
     /// when the server issued no refresh token, so the login could not renew.
@@ -115,6 +120,9 @@ impl SavedLogin {
 /// and only HTTPS or loopback HTTP is accepted, as for every secret-bearing
 /// request.
 ///
+/// # Arguments
+/// * `server_url` - Server URL as configured or typed by the user.
+///
 /// # Errors
 /// Returns [`WyrdClientError::Config`] when `server_url` is not an absolute
 /// URL, carries userinfo, or is not HTTPS or loopback HTTP.
@@ -163,6 +171,9 @@ impl SavedLogins {
     }
 
     /// The saved logins in `dir/credentials.toml`.
+    ///
+    /// # Arguments
+    /// * `dir` - Wyrd configuration directory holding `credentials.toml`.
     #[must_use]
     pub fn at(dir: PathBuf) -> Self {
         Self {
@@ -175,6 +186,9 @@ impl SavedLogins {
     ///
     /// The record is written last, so it becomes the newest login for its
     /// server.
+    ///
+    /// # Arguments
+    /// * `login` - Login record to store; replaces any record for the same origin and tenant.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or
@@ -206,6 +220,10 @@ impl SavedLogins {
     /// newest login for this origin is selected. No record for this origin
     /// selects nothing.
     ///
+    /// # Arguments
+    /// * `origin` - Canonical server URL to match.
+    /// * `tenant` - Tenant route key selector; `None` selects the newest login for `origin`.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `tenant_mismatch`,
     /// and the errors of [`Self::list`].
@@ -236,8 +254,28 @@ impl SavedLogins {
 
     /// The renewing access-token source for `login`, exchanging through
     /// `exchange`.
+    ///
+    /// # Arguments
+    /// * `login` - Saved login whose origin and tenant key identify the record to renew.
+    /// * `exchange` - Token exchange bound to the login's deployment, used for refresh.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn source(&self, login: &SavedLogin, exchange: TokenExchange) -> Arc<SavedLoginSource> {
+        self.renewing_source(login, exchange)
+    }
+
+    /// Crate-internal body of `source`, which credential resolution calls
+    /// whether or not the `internal` feature exposes the public method.
+    ///
+    /// # Arguments
+    /// * `login` - Saved login whose origin and tenant key identify the record to renew.
+    /// * `exchange` - Token exchange bound to the login's deployment, used for refresh.
+    #[must_use]
+    pub(crate) fn renewing_source(
+        &self,
+        login: &SavedLogin,
+        exchange: TokenExchange,
+    ) -> Arc<SavedLoginSource> {
         Arc::new(SavedLoginSource {
             store: self.clone(),
             origin: login.origin.clone(),
@@ -249,6 +287,10 @@ impl SavedLogins {
 
     /// Delete the login for `origin` and `tenant_key` under the file lock and
     /// return it, so the caller can revoke its refresh token.
+    ///
+    /// # Arguments
+    /// * `origin` - Canonical server URL of the login.
+    /// * `tenant_key` - Tenant route key of the login.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] when the file is unsafe or

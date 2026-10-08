@@ -2,35 +2,29 @@ import { Table, tableFromIPC, tableToIPC, type RecordBatch, type Schema } from "
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
-import type { CardRef, RegisteredCard } from "./card-types.js";
-
 import type {
-  NativeBifrostQueryStream,
-  NativeLifecycleResult,
-  NativeQueryRequest,
-  NativeQueryStep,
-} from "../index.cjs";
+  CardRef,
+  RegisteredAgentCard,
+  RegisteredCard,
+  RegisteredDataCard,
+  RegisteredModelCard,
+  RegisteredPromptCard,
+  RegisteredServiceCard,
+  RegisteredVerifierCard,
+  RegisteredWorkflowCard,
+} from "./card-types.js";
+
+import type { NativeBifrostQueryStream, NativeLifecycleResult, NativeQueryStep } from "../index.cjs";
 
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
-  cliApply,
-  cliDeleteProviderCredential,
-  cliGet,
-  cliIssueKey,
-  cliLoad,
-  cliPlan,
-  cliPutProviderCredential,
-  cliRevokeProviderCredential,
-  connectBifrost,
-  connectCards,
-  connectOperatorConnections,
-  connectGateway,
   connectWyrdClient,
-  describeTableConfig,
   loadWorkflowFromPath,
   openWyrdState,
+  tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
@@ -50,12 +44,6 @@ type NativeTableConfig = import("../index.cjs").NativeTableConfig;
  * into it. A safe integer binds as an integer and any other number as a float.
  */
 export type QueryParam = null | boolean | number | string;
-
-export interface BifrostQueryRequest {
-  sql: string;
-  params?: readonly QueryParam[];
-  deadlineMs?: number;
-}
 
 /**
  * One column's logical type: a scalar variant name, or a single-key object for
@@ -214,6 +202,7 @@ export type {
   RegisteredTriggerCard,
   RegisteredUntypedCard,
   RegisteredVerifierCard,
+  RegisteredWorkflowCard,
   Relationships as CardRelationships,
   ServiceSpec,
   Status as CardStatus,
@@ -226,6 +215,11 @@ export type {
 /** Every type generated from the `wyrd-spec` Card schema, including nested spec types. */
 export type * as CardTypes from "./card-types.js";
 
+/**
+ * Every failure the SDK raises: one stable catalog code plus its HTTP status,
+ * title, detail, remediation, and structured details, read as properties
+ * rather than parsed from the message.
+ */
 export class WyrdError extends Error {
   readonly code: WyrdErrorCode;
   readonly status: number;
@@ -235,6 +229,16 @@ export class WyrdError extends Error {
   /** JSON-safe structured diagnostics supplied by the originating Wyrd error. */
   readonly details: unknown;
 
+  /**
+   * Build one catalog error; the SDK raises these, and a test double may too.
+   *
+   * @param code - Stable catalog code, such as `WYRD_SPEC_400_VALIDATION`.
+   * @param status - HTTP-equivalent status.
+   * @param title - Stable catalog title.
+   * @param detail - Scrubbed human-readable detail, also the `message`.
+   * @param remediation - Operator-facing remediation, when the catalog has one.
+   * @param details - JSON-safe structured diagnostics, when present.
+   */
   constructor(
     code: WyrdErrorCode,
     status: number,
@@ -254,7 +258,17 @@ export class WyrdError extends Error {
   }
 }
 
+/** A query stream that ended before its validated terminal frame. */
 export class IncompleteQueryStreamError extends WyrdError {
+  /**
+   * Build the `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE` error.
+   *
+   * @param status - HTTP-equivalent status.
+   * @param title - Stable catalog title.
+   * @param detail - Scrubbed human-readable detail.
+   * @param remediation - Operator-facing remediation, when present.
+   * @param details - JSON-safe structured diagnostics, when present.
+   */
   constructor(status: number, title: string, detail: string, remediation?: string, details?: unknown) {
     super("WYRD_VALA_502_QUERY_STREAM_INCOMPLETE", status, title, detail, remediation, details);
     this.name = "IncompleteQueryStreamError";
@@ -349,6 +363,13 @@ async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   }
 }
 
+/**
+ * One running query's Arrow batches, iterated as they arrive.
+ *
+ * Returned by {@link Bifrost.stream}; `for await` drains it, and the
+ * validated terminal frame is read from {@link BifrostQueryStream.terminal}
+ * once iteration completes.
+ */
 export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
   readonly #native: NativeBifrostQueryStream;
   #terminal: QueryTerminal | undefined;
@@ -363,10 +384,12 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     return new BifrostQueryStream(native);
   }
 
+  /** The validated terminal frame, present once iteration has completed. */
   get terminal(): QueryTerminal | undefined {
     return this.#terminal;
   }
 
+  /** The server's canonical request ID, for {@link Bifrost.status} and {@link Bifrost.cancel}. */
   get requestId(): string {
     return this.#native.requestId;
   }
@@ -383,10 +406,23 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     return ipc === null || ipc === undefined ? undefined : tableFromIPC(ipc).schema;
   }
 
+  /**
+   * Iterate this stream with `for await`.
+   *
+   * @returns This stream.
+   */
   [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
     return this;
   }
 
+  /**
+   * Read the next batch, or complete once the validated terminal arrives.
+   *
+   * @returns The next batch, or `done` after the terminal frame.
+   * @throws {@link WyrdError} for a failed query, and
+   * {@link IncompleteQueryStreamError} for a stream that ends without its
+   * terminal; the stream is closed either way.
+   */
   async next(): Promise<IteratorResult<RecordBatch>> {
     if (this.#done) {
       return { done: true, value: undefined };
@@ -445,6 +481,11 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     return { done: true, value: undefined };
   }
 
+  /**
+   * Stop iterating and close the response, cancelling the transfer.
+   *
+   * @returns `done`.
+   */
   async return(): Promise<IteratorResult<RecordBatch>> {
     this.#done = true;
     await this.#native.close();
@@ -474,6 +515,12 @@ export interface Correlation {
 export interface ResolvedTable {
   readonly tableUid: string;
   readonly fingerprint: string;
+}
+
+/** A JSON Schema document, or a schema that emits one, as JSON text. */
+function jsonSchemaText(schema: Readonly<Record<string, unknown>> | JsonSchemaSource): string {
+  const source = schema as JsonSchemaSource;
+  return JSON.stringify(typeof source.toJSONSchema === "function" ? source.toJSONSchema() : schema);
 }
 
 function layoutJson(layout?: TableLayout): string | undefined {
@@ -554,6 +601,10 @@ export class TableConfig {
    * once and a later registration naming a different type is refused with
    * `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
    *
+   * @param table - The table's `namespace.name`.
+   * @param schema - A JSON Schema document, or a schema that emits one.
+   * @param options - Optional layout and Forge compaction declarations.
+   * @returns The declared, still unregistered, table config.
    * @throws {@link WyrdError} when the resulting document does not map to an
    * Arrow schema, declares a column the write path already owns, the
    * compaction target is not a non-negative integer, or the compaction type
@@ -564,13 +615,35 @@ export class TableConfig {
     schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
     options: TableConfigOptions = {},
   ): TableConfig {
-    const document =
-      typeof (schema as JsonSchemaSource).toJSONSchema === "function"
-        ? (schema as JsonSchemaSource).toJSONSchema()
-        : schema;
     const declared = tableConfigFromJsonSchema(
       table,
-      JSON.stringify(document),
+      jsonSchemaText(schema),
+      layoutJson(options.layout),
+      options.compactionTargetFileSizeBytes,
+      options.compactionType,
+    );
+    return new TableConfig(nativeHandle(declared.config, declared.error));
+  }
+
+  /**
+   * Declare a table's columns from an explicit Arrow schema.
+   *
+   * Use this for column types JSON Schema cannot express, such as `Int32`, a
+   * non-UTC timestamp, or a decimal. `schema` holds user columns only.
+   *
+   * @param table - The table's `namespace.name`.
+   * @param schema - The user columns as an `apache-arrow` schema.
+   * @param options - Optional layout and Forge compaction declarations, as
+   * for {@link TableConfig.fromJsonSchema}.
+   * @returns The declared, still unregistered, table config.
+   * @throws {@link WyrdError} `WYRD_SPEC_400_VALIDATION` when the table is
+   * not `namespace.name`, a column is one the write path already owns, or a
+   * compaction option is invalid.
+   */
+  static fromArrow(table: string, schema: Schema, options: TableConfigOptions = {}): TableConfig {
+    const declared = tableConfigFromArrowIpc(
+      table,
+      Buffer.from(tableToIPC(new Table(schema), "stream")),
       layoutJson(options.layout),
       options.compactionTargetFileSizeBytes,
       options.compactionType,
@@ -581,18 +654,15 @@ export class TableConfig {
   /**
    * Fetch an already-registered table's config by name.
    *
-   * Transport fields auto-resolve when omitted, exactly as `Bifrost.connect`
-   * does.
+   * @param table - The table's `namespace.name`.
+   * @param options - `client` to describe as; omitted, the ambient client
+   * ({@link WyrdClient.connect} with no options) is used.
+   * @returns The described config, carrying its server identity.
+   * @throws {@link WyrdError} when no credential resolves, the server is
+   * unreachable, or the table is unknown or unauthorized.
    */
-  static async describe(
-    table: string,
-    transport: {
-      readonly serverUrl?: string;
-      readonly credential?: string;
-      readonly grpcUrl?: string;
-    } = {},
-  ): Promise<TableConfig> {
-    const described = await describeTableConfig(table, transport.serverUrl, transport.credential, transport.grpcUrl);
+  static async describe(table: string, options: ClientOptions = {}): Promise<TableConfig> {
+    const described = await wyrdClientNative(clientOf(options)).describeTableConfig(table);
     return new TableConfig(nativeHandle(described.config, described.error));
   }
 
@@ -669,6 +739,13 @@ export class QueryResult {
   readonly #terminal: QueryTerminal;
   readonly #schema: Schema;
 
+  /**
+   * Hold one completed query's batches; {@link Bifrost.sql} builds these.
+   *
+   * @param batches - Every batch the query produced, in arrival order.
+   * @param terminal - The validated terminal frame.
+   * @param schema - The server-supplied result schema.
+   */
   constructor(batches: readonly RecordBatch[], terminal: QueryTerminal, schema: Schema) {
     this.#batches = batches;
     this.#terminal = terminal;
@@ -703,6 +780,8 @@ export class QueryResult {
    * caller reaching for columns, `toArray`, or `get` uses the same Arrow
    * implementation the batches were decoded with, and a zero-row result still
    * reports its selected fields.
+   *
+   * @returns The batches as one Arrow `Table`.
    */
   toArrow(): Table {
     return new Table(this.#schema, [...this.#batches]);
@@ -714,11 +793,16 @@ export class QueryResult {
    * The handoff format for anything outside this process — a file, another
    * Arrow runtime, a worker — and the exact bytes {@link QueryResult.toArrow}
    * represents, because both are built from the same retained batches.
+   *
+   * @returns One Arrow IPC stream.
    */
   toBytes(): Uint8Array {
     return tableToIPC(this.toArrow(), "stream");
   }
 }
+
+/** Reads a {@link Bifrost}'s native handle for {@link record}. */
+let bifrostNative: (bifrost: Bifrost) => NativeBifrost;
 
 /**
  * The one Bifrost client: query any authorized table, write to the active one.
@@ -731,6 +815,10 @@ export class QueryResult {
 export class Bifrost {
   readonly #native: NativeBifrost;
 
+  static {
+    bifrostNative = (bifrost) => bifrost.#native;
+  }
+
   private constructor(native: NativeBifrost) {
     this.#native = native;
   }
@@ -739,59 +827,35 @@ export class Bifrost {
    * Connect one client, optionally already bound to a write target.
    *
    * Connecting performs IO, so this is a static factory rather than a
-   * constructor. Every option is optional: `serverUrl` resolves from
-   * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
-   * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
-   * `WYRD_API_KEY` → the saved `wyrd auth login` for this server and
-   * `WYRD_TENANT` → `~/.config/wyrd/credentials.toml`.
+   * constructor.
    *
-   * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
-   * authentication and transport. It cannot be combined with `serverUrl`,
-   * `credential`, or `grpcUrl`; doing so throws `WYRD_SPEC_400_VALIDATION`.
-   *
-   * `clientByteLimitBytes` overrides the handle-wide ingestion byte budget
-   * (256 MiB by default); a budget too small to seal one message throws
-   * `WYRD_CLIENT_400_CONFIG_INVALID`.
+   * @param options - `client` to read and write as, possibly delegated;
+   * omitted, the ambient client ({@link WyrdClient.connect} with no options)
+   * is used. `table` binds the write target. `clientByteLimitBytes` overrides
+   * the handle-wide ingestion byte budget (256 MiB by default).
+   * @returns The connected client.
+   * @throws {@link WyrdError}: `WYRD_CLIENT_401_NO_CREDENTIALS` when no
+   * credential resolves, `WYRD_CLIENT_400_CONFIG_INVALID` for a byte budget
+   * too small to seal one message, or the transport error when the ingest
+   * channel cannot be dialed.
    */
   static async connect(
-    options:
-      | {
-          readonly table?: TableConfig;
-          readonly serverUrl?: string;
-          readonly credential?: string;
-          readonly grpcUrl?: string;
-          readonly client?: never;
-          readonly clientByteLimitBytes?: number;
-        }
-      | {
-          readonly table?: TableConfig;
-          readonly client: WyrdClient;
-          readonly serverUrl?: never;
-          readonly credential?: never;
-          readonly grpcUrl?: never;
-          readonly clientByteLimitBytes?: number;
-        } = {},
+    options: ClientOptions & { readonly table?: TableConfig; readonly clientByteLimitBytes?: number } = {},
   ): Promise<Bifrost> {
-    const connection =
-      options.client === undefined
-        ? await connectBifrost(
-            options.table?.native,
-            options.serverUrl,
-            options.credential,
-            options.grpcUrl,
-            options.clientByteLimitBytes,
-          )
-        : await wyrdClientNative(options.client).connectBifrost(
-            options.table?.native,
-            options.serverUrl,
-            options.credential,
-            options.grpcUrl,
-            options.clientByteLimitBytes,
-          );
+    const connection = await wyrdClientNative(clientOf(options)).connectBifrost(
+      options.table?.native,
+      options.clientByteLimitBytes,
+    );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
 
-  /** Create the active table; resolves to `created` or `already_exists`. */
+  /**
+   * Create the active table.
+   *
+   * @returns `created`, or `already_exists` for an identical registration.
+   * @throws {@link WyrdError} with no active table, for a fingerprint or
+   * compaction conflict, or for a transport or authorization failure.
+   */
   async register(): Promise<"created" | "already_exists"> {
     return lifecycleValue<"created" | "already_exists">(await this.#native.register());
   }
@@ -801,13 +865,23 @@ export class Bifrost {
    *
    * The previous table's producer stays pooled, so its buffered rows still
    * flush; a swap loses nothing.
+   *
+   * @param table - The new write target.
+   * @returns The previous binding, or undefined when there was none.
+   * @throws {@link WyrdError} only for a config this SDK did not build.
    */
   useTable(table: TableConfig): TableConfig | undefined {
     const previous = this.#native.useTable(table.native);
     return previous === null || previous === undefined ? undefined : TableConfig.fromNative(previous);
   }
 
-  /** Bind an already-registered table by name, describing it first. */
+  /**
+   * Bind an already-registered table by name, describing it first.
+   *
+   * @param table - The table's `namespace.name`.
+   * @throws {@link WyrdError} when the table is unknown or unauthorized, or
+   * for a transport failure.
+   */
   async useTableByName(table: string): Promise<void> {
     lifecycleValue<null>(await this.#native.useTableByName(table));
   }
@@ -823,6 +897,11 @@ export class Bifrost {
    *
    * Synchronous and non-blocking; durable after {@link Bifrost.flush}. A
    * saturated queue throws the stable refusal rather than dropping the row.
+   *
+   * @param row - One row object matching the active table's columns.
+   * @param correlation - Optional `cardRef` and `runId` stamped on the row.
+   * @throws {@link WyrdError} with no active table, for a malformed
+   * `cardRef`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
     lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardRef, correlation.runId));
@@ -837,18 +916,31 @@ export class Bifrost {
    * Build the batch against {@link TableConfig.schema} from
    * `describeTableConfig` - a canonical table compares an incoming block
    * against its declared fields exactly, metadata included.
+   *
+   * @param table - The destination's `namespace.name`.
+   * @param batch - One Arrow batch matching the table's declared fields.
+   * @throws {@link WyrdError} for a batch the table refuses, or for a
+   * transport or authorization failure.
    */
   async writeBatch(table: string, batch: RecordBatch): Promise<void> {
     const ipc = tableToIPC(new Table(batch), "stream");
     lifecycleValue<null>(await this.#native.writeBatch(table, Buffer.from(ipc)));
   }
 
-  /** Flush every pooled producer and await each durable acknowledgement. */
+  /**
+   * Flush every pooled producer and await each durable acknowledgement.
+   *
+   * @throws {@link WyrdError} for the first producer or sink failure.
+   */
   async flush(): Promise<void> {
     lifecycleValue<null>(await this.#native.flush());
   }
 
-  /** Drain every producer and stop its background task. */
+  /**
+   * Drain every producer and stop its background task.
+   *
+   * @throws {@link WyrdError} for the first producer or sink failure.
+   */
   async shutdown(): Promise<void> {
     lifecycleValue<null>(await this.#native.shutdown());
   }
@@ -859,6 +951,13 @@ export class Bifrost {
    * Drains {@link Bifrost.stream}, so the two cannot disagree about the rows a
    * query returns or about the terminal frame each requires. `params` bind
    * the `$1..$n` placeholders in order and are never interpolated into SQL.
+   *
+   * @param query - One SELECT statement.
+   * @param params - Values bound to `$1..$n`, in order.
+   * @returns Every batch, the terminal frame, and the result schema.
+   * @throws {@link WyrdError} for an invalid or refused query, a transport
+   * failure, or a failed query; {@link IncompleteQueryStreamError} when the
+   * stream ends without its terminal.
    */
   async sql(query: string, params?: readonly QueryParam[]): Promise<QueryResult>;
   /**
@@ -869,12 +968,17 @@ export class Bifrost {
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
    * nothing about the table's stored layout.
    *
+   * @param query - One SELECT statement.
+   * @param params - Values bound to `$1..$n`, in order.
+   * @param rows - Parses one row object, such as a Zod schema.
+   * @returns Every row, parsed.
    * @throws whatever `rows.parse` throws for the first row it rejects, so a
-   * partially valid result is never returned as success.
+   * partially valid result is never returned as success, and the errors of
+   * the raw form.
    */
   async sql<T>(query: string, params: readonly QueryParam[], rows: RowSchema<T>): Promise<T[]>;
   async sql<T>(query: string, params?: readonly QueryParam[], rows?: RowSchema<T>): Promise<QueryResult | T[]> {
-    const stream = await this.stream({ sql: query, params });
+    const stream = await this.stream(query, params);
     const batches: RecordBatch[] = [];
     for await (const batch of stream) {
       batches.push(batch);
@@ -898,13 +1002,27 @@ export class Bifrost {
       .map((row: { toJSON(): Record<string, unknown> }) => rows.parse(row.toJSON()));
   }
 
-  /** Run one SQL SELECT and iterate its batches as they arrive. */
-  async stream(request: BifrostQueryRequest | string): Promise<BifrostQueryStream> {
-    const query = typeof request === "string" ? { sql: request } : request;
-    const nativeRequest: NativeQueryRequest = {
-      sql: query.sql,
-      deadlineMs: query.deadlineMs,
-      params: query.params?.map((value) => {
+  /**
+   * Run one SQL SELECT and iterate its batches as they arrive.
+   *
+   * @param query - One SELECT statement.
+   * @param params - Values bound to `$1..$n`, in order.
+   * @param options - `deadlineMs`, the query deadline from 1 to 4294967295
+   * milliseconds; omitted, the server's default deadline applies.
+   * @returns The running stream.
+   * @throws {@link WyrdError} for an invalid request, a refused or
+   * unauthorized query, or a transport failure when the query starts; later
+   * failures throw during iteration.
+   */
+  async stream(
+    query: string,
+    params?: readonly QueryParam[],
+    options: { readonly deadlineMs?: number } = {},
+  ): Promise<BifrostQueryStream> {
+    const start = await this.#native.query({
+      sql: query,
+      deadlineMs: options.deadlineMs,
+      params: params?.map((value) => {
         switch (typeof value) {
           case "boolean":
             return { kind: "boolean", bool: value };
@@ -916,8 +1034,7 @@ export class Bifrost {
             return { kind: value === null ? "null" : typeof value };
         }
       }),
-    };
-    const start = await this.#native.query(nativeRequest);
+    });
     const error = projectedError(start);
     if (error !== undefined) {
       throw error;
@@ -938,17 +1055,44 @@ export class Bifrost {
     return this.#native.producerCount;
   }
 
-  /** List active queries visible to the authenticated tenant. */
+  /**
+   * Rows dropped by the fire-and-forget observation path; always zero for
+   * {@link Bifrost.insert}, which refuses rather than drops.
+   */
+  get dropped(): number {
+    return this.#native.dropped;
+  }
+
+  /**
+   * List active queries visible to the authenticated tenant.
+   *
+   * @returns Every active query.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async running(): Promise<RunningQuery[]> {
     return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(runningQuery);
   }
 
-  /** Return one active query by its canonical request ID. */
+  /**
+   * Return one active query by its canonical request ID.
+   *
+   * @param requestId - The query's {@link BifrostQueryStream.requestId}.
+   * @returns The query's lifecycle state and progress.
+   * @throws {@link WyrdError} for a malformed ID, an unknown query, or a
+   * transport or authorization failure.
+   */
   async status(requestId: string): Promise<RunningQuery> {
     return runningQuery(lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)));
   }
 
-  /** Request server-side cancellation without closing a local stream. */
+  /**
+   * Request server-side cancellation without closing a local stream.
+   *
+   * @param requestId - The query's {@link BifrostQueryStream.requestId}.
+   * @returns Whether cancellation started.
+   * @throws {@link WyrdError} for a malformed ID, an unknown query, or a
+   * transport or authorization failure.
+   */
   async cancel(requestId: string): Promise<CancelRunningQueryResult> {
     const wire = lifecycleValue<CancelRunningQueryWire>(await this.#native.cancel(requestId));
     return {
@@ -957,7 +1101,15 @@ export class Bifrost {
     };
   }
 
-  /** Describe one registered table's stored physical schema. */
+  /**
+   * Describe one registered table's stored physical schema.
+   *
+   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param name - The table's name within `namespace`.
+   * @returns The server's projection of the stored schema.
+   * @throws {@link WyrdError} when the table is unknown or unauthorized, or
+   * for a transport failure.
+   */
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
     return lifecycleValue<TableDescription>(await this.#native.describeTable(namespace, name));
   }
@@ -1038,8 +1190,65 @@ function cardRefText(ref: CardRef | string): string {
 /** Audience a delegated token is bound to. */
 export type TokenAudience = "wyrd" | "bifrost";
 
-/** Reads a {@link WyrdClient}'s native handle for {@link Bifrost.connect}. */
+/**
+ * Record one telemetry observation, fire-and-forget.
+ *
+ * Telemetry names its own `table` and `schema` per call rather than using the
+ * client's active binding, so an instrumented process writes its signals
+ * alongside whatever the application writes. If the producer refuses the row,
+ * for example because its queue is full, the row is dropped and counted on
+ * {@link Bifrost.dropped} instead of throwing.
+ *
+ * @param bifrost - The client whose producers carry the row.
+ * @param table - The destination table's `namespace.name`.
+ * @param schema - The table's JSON Schema, or a schema that emits one, mapped
+ * to the Arrow schema of the row.
+ * @param row - One row object matching `schema`.
+ * @param correlation - Optional `cardRef` and `runId` stamped on the row;
+ * omitted, the row is uncorrelated.
+ * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
+ * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
+ * text or a malformed `cardRef`.
+ */
+export function record(
+  bifrost: Bifrost,
+  table: string,
+  schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
+  row: Readonly<Record<string, unknown>>,
+  correlation: Correlation = {},
+): void {
+  lifecycleValue<null>(
+    bifrostNative(bifrost).record(
+      table,
+      jsonSchemaText(schema),
+      JSON.stringify(row),
+      correlation.cardRef,
+      correlation.runId,
+    ),
+  );
+}
+
+/** Reads a {@link WyrdClient}'s native handle for the surfaces that call the server. */
 let wyrdClientNative: (client: WyrdClient) => NativeWyrdClient;
+
+/**
+ * The one identity option every server-facing surface takes.
+ *
+ * The server URL, credential, and gRPC URL are {@link WyrdClient.connect}
+ * options only; every other surface takes the client built from them.
+ */
+export interface ClientOptions {
+  /**
+   * Client to call the server as; omitted, the ambient client
+   * ({@link WyrdClient.connect} with no options) is resolved.
+   */
+  readonly client?: WyrdClient;
+}
+
+/** The caller's client, or the ambient one. */
+function clientOf(options: ClientOptions): WyrdClient {
+  return options.client ?? WyrdClient.connect();
+}
 
 /**
  * Authenticated Wyrd client over the shared Rust `WyrdClient`.
@@ -1064,9 +1273,20 @@ export class WyrdClient {
    * Omitted options resolve from the environment, then the saved
    * `wyrd auth login` for this server (the one for `WYRD_TENANT` when set,
    * otherwise the newest), then
-   * `~/.config/wyrd/credentials.toml`. A `WYRD_TENANT` that matches none of this
-   * server's saved logins, or a saved login that cannot be used, raises
-   * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
+   * `~/.config/wyrd/credentials.toml`.
+   *
+   * @param options - `serverUrl`, the Wyrd server's HTTP base URL (else
+   * `WYRD_SERVER_URL`). `credential`, an API key (`wyrd_sk_…`), which is
+   * exchanged for an access token, or an access token, which is presented
+   * as-is (else `WYRD_ACCESS_TOKEN`, then `WYRD_WORKLOAD_TOKEN` with its
+   * tenant, then `WYRD_API_KEY`, then a saved login). `grpcUrl`, the Bifrost
+   * ingest endpoint (else `WYRD_GRPC_URL`, else the server's host on port
+   * `50051`).
+   * @returns The client.
+   * @throws {@link WyrdError}: `WYRD_CLIENT_401_NO_CREDENTIALS` when no
+   * credential resolves, and `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when a
+   * `WYRD_TENANT` matches none of this server's saved logins or a saved login
+   * cannot be used.
    */
   static connect(
     options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
@@ -1094,6 +1314,10 @@ export class WyrdClient {
    * Hand it to a third-party client, such as an OpenAI SDK pointed at the
    * Gateway. The token is renewed in Rust when it nears expiry, so call this
    * again rather than holding the value.
+   *
+   * @returns The current bearer.
+   * @throws {@link WyrdError} when the key exchange is refused or the server
+   * is unreachable.
    */
   async accessToken(): Promise<string> {
     const result = await this.#native.accessToken();
@@ -1107,6 +1331,13 @@ export class WyrdClient {
    * inbound principal, its actor is this client, and its permissions are the
    * intersection of both. The first exchange runs here; the returned client
    * re-exchanges before expiry.
+   *
+   * @param subjectToken - The inbound principal's bearer.
+   * @param options - `audience`, the service the token is bound to;
+   * `bifrost` by default.
+   * @returns The delegated client.
+   * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` for an unknown
+   * audience, else the server's exchange refusal or a transport failure.
    */
   async onBehalfOf(subjectToken: string, options: { readonly audience?: TokenAudience } = {}): Promise<WyrdClient> {
     const result = await this.#native.onBehalfOf(subjectToken, options.audience ?? "bifrost");
@@ -1130,14 +1361,23 @@ export class Cards {
   /**
    * Build a registry client without performing IO.
    *
-   * Omitted options resolve through the same chain as {@link Bifrost.connect}.
+   * @param options - `client` to call the registry as; omitted, the ambient
+   * client is resolved.
+   * @returns The registry client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved.
    */
-  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): Cards {
-    const connection = connectCards(options.serverUrl, options.credential);
-    return new Cards(nativeHandle(connection.cards, connection.error));
+  static connect(options: ClientOptions = {}): Cards {
+    return new Cards(wyrdClientNative(clientOf(options)).cards());
   }
 
-  /** Load a Card tree from disk and register it as one composite. */
+  /**
+   * Load a Card file or a bundle directory and register it as one composite.
+   *
+   * @param path - A Card file, or a directory of Card files.
+   * @returns The graph root and each Card's dependency-first outcome.
+   * @throws {@link WyrdError} for a file that does not load or validate, or
+   * the registry's refusal.
+   */
   async registerFromPath(path: string): Promise<RegistrationReceipt> {
     return lifecycleValue<RegistrationReceipt>(await this.#native.registerFromPath(path));
   }
@@ -1149,17 +1389,57 @@ export class Cards {
    * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
    * including a Drift Verifier's `status.verification.baseline` state. Other
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
+   *
+   * @param ref - A Card reference, or its `space/Kind/name@version` text.
+   * @returns The registered envelope.
+   * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
+   * a transport or authorization failure.
    */
   async get(ref: CardRef | string): Promise<RegisteredCard> {
     return lifecycleValue<RegisteredCard>(await this.#native.get(cardRefText(ref)));
   }
 
-  /** List metadata-only Card summaries. */
+  /**
+   * List metadata-only Card summaries.
+   *
+   * @param request - Optional filters, page size, and cursor.
+   * @returns One page of summaries and the next page's cursor.
+   * @throws {@link WyrdError} for a malformed filter or a transport or
+   * authorization failure.
+   */
   async list(request: ListCardsRequest = {}): Promise<ListCardsResponse> {
     return lifecycleValue<ListCardsResponse>(await this.#native.list(JSON.stringify(request)));
   }
 
-  /** Hydrate one Card graph into a published local bundle for {@link WyrdState}. */
+  /**
+   * Resolve the latest Active version of one named Card to its exact reference.
+   *
+   * @param kind - The Card kind, such as `Model`.
+   * @param space - The Card space.
+   * @param name - The Card name.
+   * @returns The exact reference, carrying its `uid`.
+   * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` for a malformed
+   * kind, space, or name, else the registry's not-found or a transport or
+   * authorization failure.
+   */
+  async resolveLatest(kind: string, space: string, name: string): Promise<CardRef> {
+    return lifecycleValue<CardRef>(await this.#native.resolveLatest(kind, space, name));
+  }
+
+  /**
+   * Download a registered Card's reachable graph as a local bundle for
+   * {@link WyrdState}.
+   *
+   * Publication is atomic: a failed hydration leaves any prior bundle intact.
+   *
+   * @param ref - The root Card's reference, or its text form.
+   * @param destination - The bundle directory to publish.
+   * @param options - `metadataOnly` skips artifact payload downloads.
+   * @returns What was published.
+   * @throws {@link WyrdError} for a malformed reference, an unresolvable
+   * graph, an invalid destination, or an artifact that cannot be downloaded
+   * or verified.
+   */
   async hydrate(
     ref: CardRef | string,
     destination: string,
@@ -1170,7 +1450,13 @@ export class Cards {
     );
   }
 
-  /** Soft-delete one Card by exact reference. */
+  /**
+   * Soft-delete one Card by exact reference.
+   *
+   * @param ref - A Card reference, or its text form.
+   * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
+   * a transport or authorization failure.
+   */
   async delete(ref: CardRef | string): Promise<void> {
     lifecycleValue<null>(await this.#native.delete(cardRefText(ref)));
   }
@@ -1225,6 +1511,8 @@ export class WorkflowCards {
    * const same = await cards.workflow.load({ uid: workflowUid });
    * ```
    *
+   * @param selector - `{ space, name, version }` or `{ uid }`.
+   * @returns The loaded Workflow, ready to run.
    * @throws {WyrdError} `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no such
    * Workflow exists, `WYRD_PERMISSION_403_DENIED_RBAC` when the credential
    * cannot read Cards, or `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a mixed
@@ -1317,27 +1605,67 @@ export class Workflow {
   /**
    * Load an authored Workflow file and the Cards it references.
    *
-   * Local files need no server. Registry refs are read with the ambient
-   * client configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
+   * Local files need no server. Registry refs are read, and gateway steps
+   * later run, as `options.client` when given, else with the ambient client
+   * configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
+   *
+   * @param path - The Workflow Card file.
+   * @param options - `client` to read refs and call the gateway as.
+   * @returns The loaded Workflow.
    *
    * @example
    * ```ts
    * const workflow = await Workflow.fromPath("workflows/code-review/workflow.yaml");
-   * console.log(workflow.stepIds);
+   * console.log(workflow.steps);
    * ```
    *
    * @throws {WyrdError} `WYRD_CLIENT_401_NO_CREDENTIALS` when the file
    * references a registered Card and no credential is configured, or
    * `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card is missing.
    */
-  static async fromPath(path: string): Promise<Workflow> {
-    const loaded = await loadWorkflowFromPath(path);
+  static async fromPath(path: string, options: ClientOptions = {}): Promise<Workflow> {
+    const loaded =
+      options.client === undefined
+        ? await loadWorkflowFromPath(path)
+        : await wyrdClientNative(options.client).loadWorkflowFromPath(path);
     return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
   }
 
+  /**
+   * Parse a Workflow from its Card envelope YAML text.
+   *
+   * Inline Agents and Prompts resolve eagerly; no file is read and no client
+   * is built, so a Workflow that refs a registered Card is loaded with
+   * {@link Workflow.fromPath}. Gateway steps use the ambient client at run time.
+   *
+   * @param yaml - The Workflow Card envelope text.
+   * @returns The parsed Workflow.
+   * @throws {@link WyrdError} when the text is not a valid Workflow Card or an
+   * inline Agent or Prompt does not resolve.
+   */
+  static fromYaml(yaml: string): Workflow {
+    const loaded = workflowFromYaml(yaml);
+    return Workflow.fromNative(nativeHandle(loaded.workflow, loaded.error));
+  }
+
+  /** The Workflow Card name, or undefined when the envelope declares none. */
+  get name(): string | undefined {
+    return this.#native.name ?? undefined;
+  }
+
+  /** The Workflow Card version, or undefined when the envelope declares none. */
+  get version(): string | undefined {
+    return this.#native.version ?? undefined;
+  }
+
+  /** The Workflow Card space, or undefined when the envelope declares none. */
+  get space(): string | undefined {
+    return this.#native.space ?? undefined;
+  }
+
   /** Step IDs in declaration order. */
-  get stepIds(): string[] {
-    return this.#native.stepIds();
+  get steps(): string[] {
+    return this.#native.steps();
   }
 
   /**
@@ -1345,8 +1673,14 @@ export class Workflow {
    *
    * Validation and route refusals throw before any step runs; step failures
    * are recorded in the returned run.
+   *
+   * @param input - A string, shorthand for the declared string input named
+   * `input`, or the declared inputs by name; omitted, the defaults apply.
+   * @returns The terminal run snapshot.
+   * @throws {@link WyrdError} for an invalid input or a route refusal before
+   * any step runs.
    */
-  async run(input: Record<string, JsonValue> = {}): Promise<WorkflowRun> {
+  async run(input: string | Record<string, JsonValue> = {}): Promise<WorkflowRun> {
     return lifecycleValue<WorkflowRun>(await this.#native.run(JSON.stringify(input)));
   }
 }
@@ -1492,34 +1826,70 @@ export class OperatorConnections {
   /**
    * Build an Operator connection client without performing IO.
    *
-   * Omitted options resolve through the same chain as {@link Cards.connect}.
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The connection client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved.
    */
-  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): OperatorConnections {
-    const connection = connectOperatorConnections(options.serverUrl, options.credential);
-    return new OperatorConnections(nativeHandle(connection.connections, connection.error));
+  static connect(options: ClientOptions = {}): OperatorConnections {
+    return new OperatorConnections(wyrdClientNative(clientOf(options)).operatorConnections());
   }
 
-  /** Create one connection; requires `operators:write`. */
+  /**
+   * Create one connection; requires `operators:write`.
+   *
+   * @param request - The provider config and its write-only secret.
+   * @returns The connection's redacted view.
+   * @throws {@link WyrdError} for a malformed request, a duplicate name, or
+   * a transport or authorization failure.
+   */
   async create(request: CreateOperatorConnectionRequest): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.create(JSON.stringify(request)));
   }
 
-  /** List the caller tenant's connections; requires `operators:read`. */
+  /**
+   * List the caller tenant's connections; requires `operators:read`.
+   *
+   * @returns Every connection's redacted view.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async list(): Promise<readonly OperatorConnectionView[]> {
     return lifecycleValue<readonly OperatorConnectionView[]>(await this.#native.list());
   }
 
-  /** Read one connection; requires `operators:read`. */
+  /**
+   * Read one connection; requires `operators:read`.
+   *
+   * @param connectionId - The connection's UUID.
+   * @returns The connection's redacted view.
+   * @throws {@link WyrdError} for a malformed ID, an unknown connection, or a
+   * transport or authorization failure.
+   */
   async get(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.get(connectionId));
   }
 
-  /** Update config, re-enable, or rotate the secret; requires `operators:write`. */
+  /**
+   * Update config, re-enable, or rotate the secret; requires `operators:write`.
+   *
+   * @param connectionId - The connection's UUID.
+   * @param request - The fields to replace; omitted fields are preserved.
+   * @returns The connection's redacted view.
+   * @throws {@link WyrdError} for a malformed argument, an unknown
+   * connection, a provider mismatch, or a transport or authorization failure.
+   */
   async update(connectionId: string, request: UpdateOperatorConnectionRequest): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.update(connectionId, JSON.stringify(request)));
   }
 
-  /** Disable one connection; requires `operators:write`. */
+  /**
+   * Disable one connection; requires `operators:write`.
+   *
+   * @param connectionId - The connection's UUID.
+   * @returns The connection's redacted view.
+   * @throws {@link WyrdError} for a malformed ID, an unknown connection, or a
+   * transport or authorization failure.
+   */
   async disable(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
   }
@@ -1732,6 +2102,8 @@ export class Observe {
   /**
    * Emit one Drift observation as one row per feature.
    *
+   * @param features - Feature name to string, finite number, or boolean.
+   * @param options - `sessionId`, the observed interaction's session.
    * @throws a {@link WyrdError} for a payload that is not a flat object of
    * strings, finite numbers, or booleans, before startup, after shutdown, or
    * when the producer is saturated.
@@ -1749,6 +2121,8 @@ export class Observe {
    * With neither `traceId` nor `spanId` the active OpenTelemetry span supplies
    * both; a `spanId` without its `traceId` is refused.
    *
+   * @param context - The JSON context the Eval Verifier judges.
+   * @param options - Session, media, and explicit trace identity.
    * @throws a {@link WyrdError} for a context or media descriptor the strict
    * serializer refuses, a malformed identifier,
    * before startup, after shutdown, or when the producer is saturated.
@@ -1766,6 +2140,8 @@ export class Observe {
    * The first call for a table describes it; later calls reuse the cached
    * schema and producer, so only the first awaits a lookup.
    *
+   * @param table - The table's `vala.datasets.<name>`.
+   * @param row - One JSON row matching the table's columns.
    * @throws a {@link WyrdError} for a table outside `vala.datasets`, an unknown
    * or unauthorized table, before startup, or after shutdown.
    */
@@ -1780,8 +2156,13 @@ export class Observe {
    * An Eval Verifier takes one context object plus optional media; a Drift
    * Verifier takes an array of flat feature rows. A `failed` verdict resolves
    * normally. Nothing is observed, recorded, enqueued, or dispatched, Bifrost
-   * need not be started, and the request is never replayed.
+   * need not be started, and the request is never replayed. It runs as the
+   * state's client.
    *
+   * @param verifier - The bound Verifier's name.
+   * @param input - One Eval context object, or an array of Drift feature rows.
+   * @param options - `media`, descriptors an Eval judge Prompt binds by `id`.
+   * @returns The judgment; a `failed` verdict resolves normally.
    * @throws a {@link WyrdError}: `WYRD_SDK_404_UNKNOWN_VERIFIER` for an
    * unbound Verifier and `WYRD_SDK_400_INVALID_OBSERVATION` for input of the
    * wrong shape, both before any network IO, and otherwise the server's
@@ -1840,6 +2221,8 @@ export class Run {
   /**
    * An immutable sibling view scoped to a registered alias.
    *
+   * @param alias - A bundle alias.
+   * @returns The sibling view, sharing this run's `runId`.
    * @throws a {@link WyrdError} when the bundle does not register `alias`. No
    * network IO occurs.
    */
@@ -1852,7 +2235,8 @@ export class Run {
  * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
  *
  * Reads never contact Wyrd; an unknown alias or invalid bundle throws a
- * structured {@link WyrdError}.
+ * structured {@link WyrdError}. The state's identity is fixed when it is
+ * created: Bifrost startup and every verify run as its client.
  */
 export class WyrdState {
   readonly #native: NativeWyrdState;
@@ -1861,9 +2245,21 @@ export class WyrdState {
     this.#native = native;
   }
 
-  /** Load and validate one hydrated bundle, throwing for an invalid bundle. */
-  static fromPath(path: string): WyrdState {
-    const state = new WyrdState(openWyrdState(path));
+  /**
+   * Load and validate one hydrated bundle.
+   *
+   * @param path - The bundle directory {@link Cards.hydrate} published.
+   * @param options - `client`, whose principal every server call of this
+   * state runs as; omitted, the ambient client is resolved once, at the first
+   * server call, and kept.
+   * @returns The loaded state.
+   * @throws {@link WyrdError} for an incomplete, malformed, or inconsistent
+   * bundle.
+   */
+  static fromPath(path: string, options: ClientOptions = {}): WyrdState {
+    const state = new WyrdState(
+      options.client === undefined ? openWyrdState(path) : wyrdClientNative(options.client).openWyrdState(path),
+    );
     void state.rootRef;
     return state;
   }
@@ -1873,73 +2269,151 @@ export class WyrdState {
     return lifecycleValue<CardRef>(this.#native.rootRef());
   }
 
+  /** The root Service Card the bundle was hydrated from, as stored. */
+  get service(): RegisteredServiceCard {
+    return lifecycleValue<RegisteredServiceCard>(this.#native.service());
+  }
+
   /** Every persisted alias in stable sorted order. */
   get aliases(): readonly string[] {
     return lifecycleValue<string[]>(this.#native.aliases());
   }
 
-  /** The stored Card envelope for an alias. */
+  /**
+   * The stored Card envelope for an alias.
+   *
+   * @param alias - A bundle alias.
+   * @returns The envelope.
+   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
+   */
   card(alias: string): RegisteredCard {
     return lifecycleValue<RegisteredCard>(this.#native.card(alias));
   }
 
-  /** The exact Card reference for an alias. */
+  /**
+   * The exact Card reference for an alias.
+   *
+   * @param alias - A bundle alias.
+   * @returns The exact reference.
+   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
+   */
   cardRef(alias: string): CardRef {
     return lifecycleValue<CardRef>(this.#native.cardRef(alias));
   }
 
-  /** The verified local artifacts for an alias. */
+  /**
+   * The verified local artifacts for an alias.
+   *
+   * @param alias - A bundle alias.
+   * @returns Each artifact's local path and digest; no payload is read.
+   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias.
+   */
   artifacts(alias: string): readonly HydratedArtifact[] {
     return lifecycleValue<HydratedArtifact[]>(this.#native.artifacts(alias));
   }
 
   /**
+   * The Verifier Card an alias names.
+   *
+   * @param alias - A bundle alias of a Verifier Card.
+   * @returns The envelope; its Drift or Eval body is `spec.implementation`.
+   * @throws {@link WyrdError} `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown
+   * alias, or `WYRD_SDK_400_CARD_KIND_MISMATCH` for another kind.
+   */
+  verifier(alias: string): RegisteredVerifierCard {
+    return lifecycleValue<RegisteredVerifierCard>(this.#native.verifier(alias));
+  }
+
+  /**
+   * The Workflow Card an alias names.
+   *
+   * @param alias - A bundle alias of a Workflow Card.
+   * @returns The envelope.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  workflow(alias: string): RegisteredWorkflowCard {
+    return lifecycleValue<RegisteredWorkflowCard>(this.#native.workflow(alias));
+  }
+
+  /**
+   * The Agent Card an alias names.
+   *
+   * @param alias - A bundle alias of an Agent Card.
+   * @returns The envelope.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  agent(alias: string): RegisteredAgentCard {
+    return lifecycleValue<RegisteredAgentCard>(this.#native.agent(alias));
+  }
+
+  /**
+   * The Prompt Card an alias names.
+   *
+   * @param alias - A bundle alias of a Prompt Card.
+   * @returns The envelope.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  prompt(alias: string): RegisteredPromptCard {
+    return lifecycleValue<RegisteredPromptCard>(this.#native.prompt(alias));
+  }
+
+  /**
+   * The Model Card an alias names.
+   *
+   * @param alias - A bundle alias of a Model Card.
+   * @returns The envelope.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  model(alias: string): RegisteredModelCard {
+    return lifecycleValue<RegisteredModelCard>(this.#native.model(alias));
+  }
+
+  /**
+   * The Data Card an alias names.
+   *
+   * @param alias - A bundle alias of a Data Card.
+   * @returns The envelope.
+   * @throws {@link WyrdError} as {@link WyrdState.verifier}.
+   */
+  data(alias: string): RegisteredDataCard {
+    return lifecycleValue<RegisteredDataCard>(this.#native.data(alias));
+  }
+
+  /**
    * Connect this state's one Bifrost writer and describe the fixed tables.
    *
-   * The options are {@link Bifrost.connect}'s and resolve through the same
-   * chain when omitted. Startup describes `vala.drift.observations` and
-   * `vala.eval.observations` before resolving, so a run can never enqueue
-   * against a missing, unauthorized, or incompatible system table. `table`
-   * keeps its existing Bifrost meaning and does not choose a run's destination.
+   * Runs as the state's client. Startup describes `vala.drift.observations`
+   * and `vala.eval.observations` before resolving, so a run can never enqueue
+   * against a missing, unauthorized, or incompatible system table.
+   *
+   * @param options - `table` keeps its {@link Bifrost.connect} meaning as the
+   * active write binding and does not choose a run's destination.
    * `clientByteLimitBytes` overrides the handle-wide ingestion byte budget
    * (256 MiB by default).
-   *
-   * @throws a {@link WyrdError} for a second start, a closed state, a byte
+   * @throws {@link WyrdError} for a second start, a closed state, a byte
    * budget too small to seal one message (`WYRD_CLIENT_400_CONFIG_INVALID`), a
    * missing credential, an undialable ingest channel, or a fixed table that is
    * absent, unauthorized, or incompatible.
    */
   async startBifrost(
-    options: {
-      readonly table?: TableConfig;
-      readonly serverUrl?: string;
-      readonly credential?: string;
-      readonly grpcUrl?: string;
-      readonly clientByteLimitBytes?: number;
-    } = {},
+    options: { readonly table?: TableConfig; readonly clientByteLimitBytes?: number } = {},
   ): Promise<void> {
-    lifecycleValue<null>(
-      await this.#native.startBifrost(
-        options.table?.native,
-        options.serverUrl,
-        options.credential,
-        options.grpcUrl,
-        options.clientByteLimitBytes,
-      ),
-    );
+    lifecycleValue<null>(await this.#native.startBifrost(options.table?.native, options.clientByteLimitBytes));
   }
 
   /**
-   * Open one invocation over this state, targeting `card` or the root Service.
+   * Open one invocation over this state, targeting `alias` or the root Service.
    *
-   * Local only: no network IO and no server-side Run resource. `card` selects
-   * a registered alias before the run mints its `runId`; later
+   * Local only: no network IO and no server-side Run resource. `alias`
+   * selects a registered Card before the run mints its `runId`; later
    * {@link Run.forCard} views share that id.
    *
-   * @throws a {@link WyrdError} when `card` is not registered in this bundle.
+   * @param alias - A bundle alias; omitted, the root Service.
+   * @returns The run's view of that Card.
+   * @throws {@link WyrdError} when `alias` is not registered in this bundle.
    */
-  run(card?: string): Run {
-    return Run.fromOpen(this.#native.run(card));
+  run(alias?: string): Run {
+    return Run.fromOpen(this.#native.run(alias));
   }
 
   /**
@@ -2150,225 +2624,163 @@ export class Gateway {
   /**
    * Build an administration client without performing IO.
    *
-   * Omitted options resolve through the same chain as {@link Bifrost.connect}.
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The administration client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved.
    */
-  static connect(options: { readonly serverUrl?: string; readonly credential?: string } = {}): Gateway {
-    return new Gateway(connectGateway(options.serverUrl, options.credential));
+  static connect(options: ClientOptions = {}): Gateway {
+    return new Gateway(wyrdClientNative(clientOf(options)).gateway());
   }
 
-  /** Read one redacted provider credential. */
+  /**
+   * Read one redacted provider credential.
+   *
+   * @param name - The credential's name.
+   * @returns The redacted view.
+   * @throws {@link WyrdError} for an invalid name, an unknown credential, or a
+   * transport or authorization failure.
+   */
   async credential(name: string): Promise<ProviderCredentialView> {
     return lifecycleValue(await this.#native.credential(name));
   }
 
-  /** List redacted provider credentials ordered by name. */
+  /**
+   * List redacted provider credentials ordered by name.
+   *
+   * @returns Every redacted view.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async credentials(): Promise<ProviderCredentialView[]> {
     return lifecycleValue(await this.#native.credentials());
   }
 
-  /** Create or replace a provider deployment. */
+  /**
+   * Create or replace a provider deployment.
+   *
+   * @param deployment - The deployment to store under its `name`.
+   * @returns The stored deployment.
+   * @throws {@link WyrdError} for a malformed body (the body is never quoted),
+   * an unknown credential, or a transport or authorization failure.
+   */
   async putDeployment(deployment: ProviderDeployment): Promise<ProviderDeployment> {
     return lifecycleValue(await this.#native.putDeployment(JSON.stringify(deployment)));
   }
 
-  /** Read one provider deployment. */
+  /**
+   * Read one provider deployment.
+   *
+   * @param name - The deployment's name.
+   * @returns The deployment.
+   * @throws {@link WyrdError} for an invalid name, an unknown deployment, or a
+   * transport or authorization failure.
+   */
   async deployment(name: string): Promise<ProviderDeployment> {
     return lifecycleValue(await this.#native.deployment(name));
   }
 
-  /** List provider deployments ordered by name. */
+  /**
+   * List provider deployments ordered by name.
+   *
+   * @returns Every deployment.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async deployments(): Promise<ProviderDeployment[]> {
     return lifecycleValue(await this.#native.deployments());
   }
 
-  /** Delete a provider deployment; an absent name succeeds. */
+  /**
+   * Delete a provider deployment; an absent name succeeds.
+   *
+   * @param name - The deployment's name.
+   * @throws {@link WyrdError} for an invalid name or a transport or
+   * authorization failure.
+   */
   async deleteDeployment(name: string): Promise<void> {
     lifecycleValue<null>(await this.#native.deleteDeployment(name));
   }
 
-  /** Replace the tenant fallback policy. */
+  /**
+   * Replace the tenant fallback policy.
+   *
+   * @param policy - The complete new policy.
+   * @returns The stored policy.
+   * @throws {@link WyrdError} for a malformed policy or a transport or
+   * authorization failure.
+   */
   async putFallbackPolicy(policy: GatewayFallbackPolicy): Promise<GatewayFallbackPolicy> {
     return lifecycleValue(await this.#native.putFallbackPolicy(JSON.stringify(policy)));
   }
 
-  /** Read the tenant fallback policy, or the default. */
+  /**
+   * Read the tenant fallback policy, or the default.
+   *
+   * @returns The stored policy, or the default with no rules.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async fallbackPolicy(): Promise<GatewayFallbackPolicy> {
     return lifecycleValue(await this.#native.fallbackPolicy());
   }
 
-  /** Restore the default fallback policy. */
+  /**
+   * Restore the default fallback policy.
+   *
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async deleteFallbackPolicy(): Promise<void> {
     lifecycleValue<null>(await this.#native.deleteFallbackPolicy());
   }
 
-  /** Replace the tenant governance policy. */
+  /**
+   * Replace the tenant governance policy.
+   *
+   * @param policy - The complete new policy.
+   * @returns The stored policy.
+   * @throws {@link WyrdError} for a malformed policy or a transport or
+   * authorization failure.
+   */
   async putGovernancePolicy(policy: GatewayGovernancePolicy): Promise<GatewayGovernancePolicy> {
     return lifecycleValue(await this.#native.putGovernancePolicy(JSON.stringify(policy)));
   }
 
-  /** Read the tenant governance policy, or the default. */
+  /**
+   * Read the tenant governance policy, or the default.
+   *
+   * @returns The stored policy, or the default.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async governancePolicy(): Promise<GatewayGovernancePolicy> {
     return lifecycleValue(await this.#native.governancePolicy());
   }
 
-  /** Restore the default governance policy. */
+  /**
+   * Restore the default governance policy.
+   *
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async deleteGovernancePolicy(): Promise<void> {
     lifecycleValue<null>(await this.#native.deleteGovernancePolicy());
   }
 
-  /** Replace the tenant capture policy; returns its versioned view. */
+  /**
+   * Replace the tenant capture policy.
+   *
+   * @param policy - The capture mode and, in payload mode, its fields.
+   * @returns The stored policy with its version.
+   * @throws {@link WyrdError} for a malformed policy or a transport or
+   * authorization failure.
+   */
   async putCapturePolicy(policy: GatewayCapturePolicyWrite): Promise<GatewayCapturePolicy> {
     return lifecycleValue(await this.#native.putCapturePolicy(JSON.stringify(policy)));
   }
 
-  /** Read the tenant capture policy, or the disabled default. */
+  /**
+   * Read the tenant capture policy, or the disabled default.
+   *
+   * @returns The stored policy, or the disabled default.
+   * @throws {@link WyrdError} for a transport or authorization failure.
+   */
   async capturePolicy(): Promise<GatewayCapturePolicy> {
     return lifecycleValue(await this.#native.capturePolicy());
   }
 }
-
-/** One loader diagnostic reported by {@link cli.plan}. */
-export interface PlanDiagnostic {
-  readonly code: string;
-  readonly status: number;
-  readonly severity: string;
-  readonly path: string;
-  readonly span?: unknown;
-  readonly message: string;
-  readonly remediation: string;
-  readonly details?: unknown;
-}
-
-/** Deterministic local registration plan printed by `wyrd plan --format json`. */
-export interface PlanReport {
-  readonly ok: boolean;
-  readonly cards: readonly {
-    readonly kind: string;
-    readonly space: string | null;
-    readonly name: string;
-    readonly version: string | null;
-  }[];
-  readonly diagnostics: readonly PlanDiagnostic[];
-}
-
-/** Result of `wyrd load --format json`. */
-export interface LoadOutput {
-  readonly card_ref: CardRef;
-  readonly materialized: boolean;
-}
-
-/** Card selector: a `uid` with `kind`, or `kind`, `space`, and `name`; `version` narrows either. */
-export interface CliCardSelector {
-  readonly kind?: string;
-  readonly space?: string;
-  readonly name?: string;
-  readonly version?: string;
-  readonly uid?: string;
-}
-
-/** Response of `wyrd auth issue-key`; `key` is the plaintext API key, returned exactly once. */
-export interface IssueKeyResponse {
-  readonly key_id: string;
-  readonly key: string;
-  readonly prefix: string;
-  readonly card_ref: CardRef;
-  readonly created_at: string;
-  readonly expires_at: string;
-}
-
-/** Provider credential submission for {@link cli.putProviderCredential}. */
-export interface ProviderCredentialWrite {
-  readonly name: string;
-  readonly provider: string;
-  readonly source:
-    | { readonly environment: { readonly binding: string } }
-    | {
-        readonly external_secret: {
-          readonly backend: string;
-          readonly reference: string;
-        };
-      }
-    | { readonly managed_secret: { readonly secret: string } };
-}
-
-/** Endpoint override shared by the networked {@link cli} commands. */
-export interface CliServerOptions {
-  /** Wyrd server base URL; the credential always comes from the ambient chain. */
-  readonly server?: string;
-}
-
-/**
- * The `wyrd` CLI in process: the same Rust command implementation the
- * installed `wyrd` executable runs.
- *
- * Each command takes its options as typed arguments, returns the value the
- * command prints with `--format json`, and throws a {@link WyrdError} instead
- * of exiting. Networked commands read their credential from the ambient chain
- * (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
- * `credentials.toml`), never from an argument; `server` re-points only the
- * endpoint.
- */
-export const cli = {
-  /** Validate a local Card tree without contacting a server (`wyrd plan`). */
-  plan(path: string): PlanReport {
-    return lifecycleValue(cliPlan(path));
-  },
-
-  /** Register a local Card tree and return its receipt (`wyrd apply`). */
-  async apply(path: string, options: CliServerOptions = {}): Promise<RegistrationReceipt> {
-    return lifecycleValue(await cliApply(path, options.server));
-  },
-
-  /** Hydrate a Card's reachable graph into `outputDir` (`wyrd get`). */
-  async get(
-    selector: CliCardSelector,
-    outputDir: string,
-    options: CliServerOptions & { readonly metadataOnly?: boolean } = {},
-  ): Promise<HydrationSummary> {
-    return lifecycleValue(await cliGet(selector, outputDir, options.metadataOnly, options.server));
-  },
-
-  /** Load one Card and materialize its artifacts (`wyrd load`). */
-  async load(
-    selector: CliCardSelector,
-    options: CliServerOptions & { readonly path?: string } = {},
-  ): Promise<LoadOutput> {
-    return lifecycleValue(await cliLoad(selector, options.path, options.server));
-  },
-
-  /** Issue an API key bound to one exact Card (`wyrd auth issue-key`). */
-  async issueKey(
-    card: {
-      readonly kind: string;
-      readonly name: string;
-      readonly version: string;
-      readonly space: string;
-      readonly label?: string;
-      readonly expiresInSeconds?: number;
-    },
-    options: CliServerOptions = {},
-  ): Promise<IssueKeyResponse> {
-    return lifecycleValue(await cliIssueKey(card, options.server));
-  },
-
-  /**
-   * Create or rotate a provider credential (`wyrd gateway credential put`).
-   * A rejected body is reported without quoting it; the view is redacted.
-   */
-  async putProviderCredential(
-    write: ProviderCredentialWrite,
-    options: CliServerOptions = {},
-  ): Promise<ProviderCredentialView> {
-    return lifecycleValue(await cliPutProviderCredential(JSON.stringify(write), options.server));
-  },
-
-  /** Terminally revoke a provider credential (`wyrd gateway credential revoke`). */
-  async revokeProviderCredential(name: string, options: CliServerOptions = {}): Promise<ProviderCredentialView> {
-    return lifecycleValue(await cliRevokeProviderCredential(name, options.server));
-  },
-
-  /** Delete an unreferenced provider credential; an absent name succeeds. */
-  async deleteProviderCredential(name: string, options: CliServerOptions = {}): Promise<void> {
-    lifecycleValue<null>(await cliDeleteProviderCredential(name, options.server));
-  },
-};

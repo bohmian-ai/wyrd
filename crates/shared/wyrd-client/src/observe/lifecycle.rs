@@ -170,6 +170,10 @@ impl StartClaim<'_> {
     /// missing, unauthorized, or unreachable never reaches `Started`, and no
     /// run can enqueue an observation the server would refuse per row.
     ///
+    /// # Arguments
+    /// * `bifrost` - The started client whose writer is published once both
+    ///   fixed observation tables describe.
+    ///
     /// # Errors
     /// Returns the server's not-found, authentication, authorization, or
     /// availability error for either fixed table, a validation error when a
@@ -180,9 +184,13 @@ impl StartClaim<'_> {
     /// # Panics
     /// Panics if the phase lock is poisoned.
     pub async fn complete(self, bifrost: Bifrost) -> Result<(), WyrdError> {
-        let drift = bifrost.writer_table(DRIFT_OBSERVATIONS_TABLE).await?;
+        let drift = bifrost
+            .resolve_writer_table(DRIFT_OBSERVATIONS_TABLE)
+            .await?;
         crate::observe::drift::require_projection_columns(&drift)?;
-        let eval = bifrost.writer_table(EVAL_OBSERVATIONS_TABLE).await?;
+        let eval = bifrost
+            .resolve_writer_table(EVAL_OBSERVATIONS_TABLE)
+            .await?;
         crate::observe::eval::require_projection_columns(&eval)?;
         let started = Arc::new(StartedBifrost {
             bifrost,

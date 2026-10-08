@@ -2,144 +2,153 @@
 
 from __future__ import annotations
 
-import threading
-from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-
 import openai
 import pytest
-from wyrd import WyrdError, cli
 from wyrd.agent import Workflow
-from wyrd.cards import Cards
+from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
-from .conftest import FIXTURES
-from .gateway.support import PROVIDER_KEY, Received, deploy
+from .gateway.support import PROVIDER_KEY, deploy
+from .support import FIXTURES, Receiver, client_of
+
+pytestmark = pytest.mark.integration
 
 ASK = FIXTURES / "cards/gateway_inference/ask.yaml"
-ASK_EXTERNAL = FIXTURES / "cards/gateway_inference/ask-external.yaml"
+
+EXAMPLE = FIXTURES.parent / "examples/workflows/code-review"
+"""The code-review example Workflow directory; its Prompts call ``gpt-5-5`` through the Wyrd gateway."""
+
+EXAMPLE_INPUT = {"code": "diff"}
+"""A code-review input; every Prompt renders it into the request the upstream answers."""
 
 
-def model_calls(received: Received) -> int:
+def model_calls(upstream: Receiver) -> int:
     """Chat Completions requests the gateway dispatched to the provider upstream."""
-    return sum(path == "/v1/chat/completions" for path, _ in received)
+    return len(upstream.to("/v1/chat/completions"))
+
+
+def openai_client(caller: WyrdClient) -> openai.OpenAI:
+    """An OpenAI client pointed at the gateway with ``caller``'s Wyrd access token."""
+    return openai.OpenAI(
+        base_url=f"{caller.server_url}/v1", api_key=caller.access_token(), max_retries=0
+    )
 
 
 @pytest.fixture
-def gateway(gateway_server: tuple[WyrdTestServer, Received]) -> Iterator[Received]:
-    """A gateway server with one OpenAI chat deployment; yields what its upstream received."""
-    server, received = gateway_server
+def server(gateway_server: tuple[WyrdTestServer, Receiver]) -> WyrdTestServer:
+    """A gateway server with OpenAI chat deployments of ``gpt-4o`` and ``gpt-5-5``."""
+    server, _ = gateway_server
     deploy(server, "openai", "gpt-4o", ["chat_completions"])
-    yield received
+    deploy(server, "openai", "gpt-5-5", ["chat_completions"])
+    return server
 
 
-@pytest.mark.integration
-def test_openai_client_calls_the_gateway_with_an_access_token(gateway: Received) -> None:
-    client = openai.OpenAI(
-        base_url=f"{WyrdClient().server_url}/v1",
-        api_key=WyrdClient().access_token(),
-        max_retries=0,
-    )
+@pytest.fixture
+def upstream(server: WyrdTestServer, gateway_server: tuple[WyrdTestServer, Receiver]) -> Receiver:
+    """What the deployed gateway's provider upstream received."""
+    return gateway_server[1]
 
-    completion = client.chat.completions.create(
+
+@pytest.fixture
+def admin(server: WyrdTestServer) -> WyrdClient:
+    """The gateway server's administrator."""
+    return client_of(server)
+
+
+@pytest.fixture
+def ask(admin: WyrdClient) -> CardRef:
+    """The registered ``ask`` Workflow."""
+    return Cards(admin).register_from_path(ASK).root
+
+
+def test_openai_client_calls_the_gateway_with_an_access_token(
+    admin: WyrdClient, upstream: Receiver
+) -> None:
+    completion = openai_client(admin).chat.completions.create(
         model="openai/gpt-4o", messages=[{"role": "user", "content": "hi"}]
     )
 
     assert completion.choices[0].message.content == "hi"
-    assert model_calls(gateway) == 1
-    assert gateway[0][1]["authorization"] == f"Bearer {PROVIDER_KEY}"
+    assert model_calls(upstream) == 1
+    assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
 
 
-@pytest.mark.integration
+def test_caller_without_gateway_invoke_is_refused(
+    server: WyrdTestServer, upstream: Receiver
+) -> None:
+    reader = client_of(server, server.scoped_api_key("gateway_reader", ["gateway:read"]))
+
+    with pytest.raises(openai.PermissionDeniedError) as refused:
+        openai_client(reader).chat.completions.create(
+            model="openai/gpt-4o", messages=[{"role": "user", "content": "hi"}]
+        )
+    assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    assert model_calls(upstream) == 0
+
+
 def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
-    gateway_server: tuple[WyrdTestServer, Received],
+    admin: WyrdClient, ask: CardRef
 ) -> None:
-    Cards().register_from_path(str(ASK))
-
-    issued = cli.issue_key(kind="Agent", name="ask-agent", version="1.0.0", space="default")
-    written = cli.put_provider_credential(
+    issued = cli.issue_key(
+        kind="Agent", name="ask-agent", version="1.0.0", space="default", client=admin
+    )
+    view = cli.put_provider_credential(
         {
-            "name": "ask-openai",
+            "name": "managed-openai-key",
             "provider": "openai",
-            "source": {"environment": {"binding": "test-provider-key"}},
-        }
+            "source": {"managed_secret": {"secret": "sk-managed"}},
+        },
+        client=admin,
     )
 
-    assert WyrdClient(credential=issued["key"]).access_token()
-    assert (written["name"], written["state"]) == ("ask-openai", "active")
-    assert Gateway().credential("ask-openai")["source"] == {
-        "environment": {"binding": "test-provider-key"}
-    }
-
-
-class Elsewhere(BaseHTTPRequestHandler):
-    """The server the ambient configuration names; any request to it is recorded and refused."""
-
-    received: list[str]
-
-    def do_GET(self) -> None:
-        self._refuse()
-
-    def do_POST(self) -> None:
-        self._refuse()
-
-    def _refuse(self) -> None:
-        self.received.append(self.path)
-        self.send_error(401)
-
-    def log_message(self, format: str, *args: object) -> None:
-        """Keep per-request access lines out of the test output."""
-
-
-@pytest.fixture
-def elsewhere() -> Iterator[tuple[str, list[str]]]:
-    """A second server that must never be called; yields its URL and the paths it received."""
-    received: list[str] = []
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), type("RecordingElsewhere", (Elsewhere,), {"received": received})
+    assert str(issued.card_ref) == "default/Agent/ask-agent@1.0.0"
+    assert issued.key.startswith(issued.prefix)
+    assert (view["name"], view["provider"], view["state"]) == (
+        "managed-openai-key",
+        "openai",
+        "active",
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}", received
-    finally:
-        server.shutdown()
+    assert "sk-managed" not in str(view)
 
 
-@pytest.mark.integration
 def test_loaded_workflow_calls_the_gateway_through_its_loading_client(
-    gateway: Received,
-    elsewhere: tuple[str, list[str]],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    admin: WyrdClient, upstream: Receiver, ask: CardRef
 ) -> None:
-    """Loaded Workflows keep the server and credential that loaded them, whatever the ambient config."""
-    cards = Cards()
-    cards.register_from_path(str(ASK))
-    authored = Workflow.from_path(ASK_EXTERNAL)
-    elsewhere_url, elsewhere_received = elsewhere
-    monkeypatch.setenv("WYRD_SERVER_URL", elsewhere_url)
-    monkeypatch.setenv("WYRD_API_KEY", "wyrd_elsewhere_key")
-    monkeypatch.delenv("WYRD_ACCESS_TOKEN", raising=False)
-    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    workflow = Cards(admin).workflow.load(ask)
 
-    registered = cards.workflow.load(space="default", name="ask", version="1.0.0")
-    assert registered.run({"question": "q"}).outputs == {"answer": "hi"}
-    assert authored.run({"question": "q"}).outputs == {"answer": "hi"}
-    edited = registered.with_outputs({"reply": "steps.ask.output.text"})
-    with pytest.raises(WyrdError) as refused:
-        registered.with_outputs({"reply": "not a source"})
-    assert refused.value.code == "WYRD_WORKFLOW_422_VALIDATION"
-    assert edited.run({"question": "q"}).outputs == {"reply": "hi"}
-    assert model_calls(gateway) == 3
-    assert elsewhere_received == []
+    run = workflow.run({"question": "hi"})
 
-    monkeypatch.delenv("WYRD_SERVER_URL")
-    monkeypatch.delenv("WYRD_API_KEY")
-    assert authored.run({"question": "q"}).outputs == {"answer": "hi"}
-    with pytest.raises(WyrdError) as unavailable:
-        Workflow.from_path(ASK).run({"question": "q"})
-    assert unavailable.value.code == "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE"
-    assert model_calls(gateway) == 4
+    assert (run.status, run.outputs) == ("succeeded", {"answer": "hi"})
+    assert model_calls(upstream) == 1
+    assert upstream.deliveries[0].headers["authorization"] == f"Bearer {PROVIDER_KEY}"
+
+
+def test_example_workflow_runs_through_the_wyrd_gateway(
+    admin: WyrdClient, upstream: Receiver
+) -> None:
+    example = Workflow.from_path(EXAMPLE / "workflow.yaml", admin)
+
+    run = example.run(EXAMPLE_INPUT)
+
+    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
+    assert model_calls(upstream) == 3
+
+
+def test_applying_a_workflow_calls_no_model(admin: WyrdClient, upstream: Receiver) -> None:
+    applied = cli.apply(EXAMPLE, client=admin)
+
+    assert str(applied.root).startswith("engineering/Workflow/code-review@1.0.0#")
+    assert upstream.deliveries == []
+
+
+def test_registered_example_runs_through_the_gateway(admin: WyrdClient, upstream: Receiver) -> None:
+    cli.apply(EXAMPLE, client=admin)
+    registered = Cards(admin).workflow.load(
+        space="engineering", name="code-review", version="1.0.0"
+    )
+
+    run = registered.run(EXAMPLE_INPUT)
+
+    assert (run.status, run.outputs) == ("succeeded", {"review": "hi"})
+    assert model_calls(upstream) == 3

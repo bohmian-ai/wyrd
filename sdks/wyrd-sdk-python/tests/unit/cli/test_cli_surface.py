@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 
 import pytest
+import wyrd.cli
 from wyrd import WyrdError
-from wyrd.cli import plan, run_wyrd_cli
+from wyrd.cli import run_wyrd_cli
+from wyrd.testing.cli import plan
 
 EX_FAILURE = 1
 EX_VERIFICATION_FAILED = 2
@@ -36,6 +38,11 @@ def eval_run(fixtures_dir: Path, tmp_path: Path) -> list[str]:
         "--out",
         str(tmp_path / "out"),
     ]
+
+
+def test_production_cli_exposes_only_the_console_script() -> None:
+    assert wyrd.cli.__all__ == ["run_wyrd_cli"]
+    assert not hasattr(wyrd.cli, "apply")
 
 
 def test_help_exits_zero(run_cli) -> None:

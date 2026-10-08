@@ -68,6 +68,7 @@ pub(crate) async fn upload(
         reqwest::Body::wrap_stream(reader.stream())
     };
     let response = client
+        .http
         .request_external_stream(reqwest::Method::PUT, put_url, Some(body), &headers)
         .await
         .map_err(|_| StorageClientError::Transport {

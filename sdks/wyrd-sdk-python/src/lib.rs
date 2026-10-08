@@ -20,7 +20,8 @@ mod operators;
 mod state;
 #[cfg(feature = "testing")]
 mod testing;
-#[cfg(feature = "python")]
+#[cfg(feature = "testing")]
+mod testing_cli;
 #[cfg(feature = "python")]
 mod workflow;
 
@@ -140,6 +141,10 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         testing::register(&testing)?;
         m.add_submodule(&testing)?;
         register_submodule(py, "wyrd._wyrd.testing", &testing)?;
+        let testing_cli = PyModule::new(py, "cli")?;
+        testing_cli::register(&testing_cli)?;
+        testing.add_submodule(&testing_cli)?;
+        register_submodule(py, "wyrd._wyrd.testing.cli", &testing_cli)?;
     }
 
     Ok(())

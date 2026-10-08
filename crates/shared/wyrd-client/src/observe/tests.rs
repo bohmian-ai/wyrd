@@ -1487,3 +1487,33 @@ async fn plain_inserts_leave_event_time_to_the_server() {
         "the observation is stamped and the plain write is not"
     );
 }
+
+/// A state created with a client keeps it for every server call: its clones
+/// resolve the same client, which Bifrost startup connects over, and
+/// `observe.verify` sends its request to that client's server without
+/// reading the ambient configuration.
+///
+/// # Panics
+/// Panics when the bundle does not load, the state resolves another client,
+/// or the judgment request does not reach the bound client's server.
+#[tokio::test]
+async fn a_state_created_with_a_client_keeps_it_for_every_server_call() {
+    let bundle = TestBundle::with_typed_cards();
+    let (url, bodies) = execute_server();
+    let state = WyrdState::from_path_with_client(bundle.path(), client_for(&url))
+        .expect("fixture bundle loads");
+    let clone = state.clone();
+
+    assert_eq!(
+        clone.client().expect("the bound client").server_url(),
+        url,
+        "Bifrost startup connects over the client the state was created with"
+    );
+    clone
+        .run()
+        .observe()
+        .verify("quality", &json!({ "answer": "yes" }))
+        .await
+        .expect("the bound client's server judges");
+    assert_eq!(bodies.lock().expect("body lock").len(), 1);
+}

@@ -31,9 +31,10 @@ def test_gateway_invalid_body_raises_validation_without_echoing_it():
     transport: the unroutable port would fail with a different code.
     """
     from wyrd import WyrdError
+    from wyrd.client import WyrdClient
     from wyrd.gateway import Gateway
 
-    gateway = Gateway(server_url="http://127.0.0.1:9", credential="unused")
+    gateway = Gateway(WyrdClient(server_url="http://127.0.0.1:9", credential="unused"))
     with pytest.raises(WyrdError) as captured:
         gateway.put_deployment(
             {  # ty: ignore[invalid-argument-type]

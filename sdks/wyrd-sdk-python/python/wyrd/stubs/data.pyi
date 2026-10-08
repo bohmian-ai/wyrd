@@ -17,12 +17,26 @@ class Dim:
 
     @staticmethod
     def fixed(length: int) -> Dim:
-        """Declare a dimension with a fixed length."""
+        """Declare a dimension with a fixed length.
+
+        Args:
+            length: the dimension length.
+
+        Returns:
+            The fixed dimension.
+        """
         ...
 
     @staticmethod
     def dynamic(name: str | None = ...) -> Dim:
-        """Declare a variable-length dimension, optionally named (e.g. `batch`)."""
+        """Declare a variable-length dimension, optionally named (e.g. `batch`).
+
+        Args:
+            name: the axis name. Omitted, the dimension is unnamed.
+
+        Returns:
+            The dynamic dimension.
+        """
         ...
 
     @property
@@ -118,6 +132,12 @@ class DataSchema:
     def contains_column(self, name: str) -> bool:
         """Return whether a field named ``name`` exists.
 
+        Args:
+            name: the column name.
+
+        Returns:
+            Whether the field exists.
+
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``name`` is not a
                 valid column name.
@@ -126,6 +146,12 @@ class DataSchema:
 
     def column(self, name: str) -> FieldSpec | None:
         """Return the field named ``name``, or ``None`` when it is absent.
+
+        Args:
+            name: the column name.
+
+        Returns:
+            The field, or ``None``.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` if ``name`` is not a
@@ -190,6 +216,10 @@ class DataInterface:
 
         Accepting anything lets a subclass call ``super().__init__(...)``
         with its own arguments.
+
+        Args:
+            *args: ignored.
+            **kwargs: ignored.
         """
         ...
 
@@ -213,6 +243,9 @@ class DataInterface:
 
         Args:
             metadata: metadata parsed from the stored DataCard.
+
+        Returns:
+            The reconstructed interface.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` if the default
@@ -245,6 +278,9 @@ class DataInterface:
             save_kwargs: interface-specific options. The image and text
                 interfaces read ``copy_bytes`` (default ``False``) to copy
                 referenced files into the card; other built-ins ignore it.
+
+        Returns:
+            Statistics for the bytes written.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` if the interface holds no
@@ -611,6 +647,9 @@ class Split:
             value: a ``bool``, ``int``, ``float``, ``str``, ``datetime``, or
                 a list of those (for ``"in"``).
 
+        Returns:
+            The predicate split.
+
         Raises:
             WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` for an invalid
                 column name, unknown operator, or unsupported value type.
@@ -624,6 +663,9 @@ class Split:
         Args:
             card_ref: a CardRef, or a mapping that serializes to one, whose
                 ``kind`` is ``Artifact``.
+
+        Returns:
+            The materialized split.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if ``card_ref``
@@ -639,6 +681,9 @@ class Split:
             start: first included index; not negative.
             stop: first excluded index; at least ``start``.
 
+        Returns:
+            The index-range split.
+
         Raises:
             WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if a bound is
                 negative or ``start > stop``.
@@ -651,6 +696,9 @@ class Split:
 
         Args:
             values: non-empty, unique, non-negative row indices.
+
+        Returns:
+            The explicit-index split.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_INVALID_SPLIT_RULE`` if ``values`` is
@@ -739,6 +787,16 @@ class DataCard(Generic[_DataInterfaceT]):
         data is loaded through the interface. A file is parsed as one Card
         envelope; no data is loaded.
 
+        Args:
+            path: a saved Card directory or a Card YAML or JSON file.
+            interface: the interface instance or class that rebuilds a custom
+                interface, as for ``model_validate_json``.
+            load_kwargs: arguments forwarded to the interface load of a saved
+                directory.
+
+        Returns:
+            The loaded DataCard.
+
         Raises:
             WyrdError: If the file cannot be read, is not a Data Card envelope,
                 or interface loading fails.
@@ -777,6 +835,9 @@ class DataCard(Generic[_DataInterfaceT]):
                 fill keys not given here.
             metadata: metadata to start from. Its interface, schema, and SQL
                 entries are replaced from ``data``. Omitted, it starts empty.
+            splits: named split strategies recorded on the DataCard spec.
+            target_columns: supervised target column names; each must exist
+                in the schema when one is known.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_VALIDATION`` for an interface class or
@@ -815,6 +876,8 @@ class DataCard(Generic[_DataInterfaceT]):
             labels: as for the interface overload.
             annotations: as for the interface overload.
             metadata: as for the interface overload.
+            splits: as for the interface overload.
+            target_columns: as for the interface overload.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_UNKNOWN_DATA_TYPE`` if the path is not
@@ -896,6 +959,8 @@ class DataCard(Generic[_DataInterfaceT]):
             labels: as for the interface overload.
             annotations: as for the interface overload.
             metadata: as for the interface overload.
+            splits: as for the interface overload.
+            target_columns: as for the interface overload.
 
         Raises:
             WyrdError: ``WYRD_DATA_400_UNKNOWN_DATA_TYPE`` if no interface

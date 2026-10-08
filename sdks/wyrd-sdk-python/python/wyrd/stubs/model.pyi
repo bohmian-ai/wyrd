@@ -35,6 +35,10 @@ class ModelInterface:
 
         Accepting anything lets a subclass call ``super().__init__(...)``
         with its own arguments.
+
+        Args:
+            *args: ignored.
+            **kwargs: ignored.
         """
         ...
 
@@ -49,6 +53,9 @@ class ModelInterface:
 
         Args:
             metadata: metadata parsed from the stored ModelCard.
+
+        Returns:
+            The reconstructed interface.
 
         Raises:
             WyrdError: ``WYRD_MODEL_400_VALIDATION`` if the default
@@ -114,11 +121,27 @@ class SklearnInterface(ModelInterface):
         ...
 
     def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.save()``."""
+        """As ``ModelInterface.save()``.
+
+        Args:
+            path: local card directory.
+            save_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.save()``.
+        """
         ...
 
     def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.load()``."""
+        """As ``ModelInterface.load()``.
+
+        Args:
+            path: local card directory.
+            load_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.load()``.
+        """
         ...
 
 class XgboostInterface(ModelInterface):
@@ -132,15 +155,38 @@ class XgboostInterface(ModelInterface):
     model_subtype: str | None
 
     def __init__(self, *, model: Any = ..., preprocessor: Any = ...) -> None:
-        """As ``SklearnInterface.__init__()``."""
+        """As ``SklearnInterface.__init__()``.
+
+        Args:
+            model: the model. Omitted, the interface has no model until
+                ``load``.
+            preprocessor: an optional object saved and loaded beside the
+                model.
+        """
         ...
 
     def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.save()``."""
+        """As ``ModelInterface.save()``.
+
+        Args:
+            path: local card directory.
+            save_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.save()``.
+        """
         ...
 
     def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.load()``."""
+        """As ``ModelInterface.load()``.
+
+        Args:
+            path: local card directory.
+            load_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.load()``.
+        """
         ...
 
 class LightgbmInterface(ModelInterface):
@@ -154,15 +200,38 @@ class LightgbmInterface(ModelInterface):
     model_subtype: str | None
 
     def __init__(self, *, model: Any = ..., preprocessor: Any = ...) -> None:
-        """As ``SklearnInterface.__init__()``."""
+        """As ``SklearnInterface.__init__()``.
+
+        Args:
+            model: the model. Omitted, the interface has no model until
+                ``load``.
+            preprocessor: an optional object saved and loaded beside the
+                model.
+        """
         ...
 
     def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.save()``."""
+        """As ``ModelInterface.save()``.
+
+        Args:
+            path: local card directory.
+            save_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.save()``.
+        """
         ...
 
     def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.load()``."""
+        """As ``ModelInterface.load()``.
+
+        Args:
+            path: local card directory.
+            load_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.load()``.
+        """
         ...
 
 class CatboostInterface(ModelInterface):
@@ -176,15 +245,38 @@ class CatboostInterface(ModelInterface):
     model_subtype: str | None
 
     def __init__(self, *, model: Any = ..., preprocessor: Any = ...) -> None:
-        """As ``SklearnInterface.__init__()``."""
+        """As ``SklearnInterface.__init__()``.
+
+        Args:
+            model: the model. Omitted, the interface has no model until
+                ``load``.
+            preprocessor: an optional object saved and loaded beside the
+                model.
+        """
         ...
 
     def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.save()``."""
+        """As ``ModelInterface.save()``.
+
+        Args:
+            path: local card directory.
+            save_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.save()``.
+        """
         ...
 
     def load(self, path: PathLike, load_kwargs: dict[str, Any] | None = ...) -> None:
-        """As ``ModelInterface.load()``."""
+        """As ``ModelInterface.load()``.
+
+        Args:
+            path: local card directory.
+            load_kwargs: accepted and ignored.
+
+        Raises:
+            WyrdError: as ``ModelInterface.load()``.
+        """
         ...
 
 class TorchInterface(ModelInterface):
@@ -487,6 +579,9 @@ class ModelSignature:
             inputs: sample model input.
             outputs: sample model output.
 
+        Returns:
+            The inferred signature.
+
         Raises:
             WyrdError: ``WYRD_MODEL_400_MISSING_SIGNATURE`` for an
                 unsupported object, or the errors of ``ModelSignature()``.
@@ -530,6 +625,12 @@ class SampleInput:
         """Create a sample input whose kind is detected from ``value``.
 
         ``None`` gives kind ``none``.
+
+        Args:
+            value: the sample value.
+
+        Returns:
+            The sample input.
 
         Raises:
             WyrdError: ``WYRD_MODEL_400_VALIDATION`` if ``value`` is not a
@@ -873,6 +974,16 @@ class ModelCard(Generic[_ModelInterfaceT]):
         A directory is read through the `card.json` that `save` wrote, and its
         model is loaded through the interface. A file is parsed as one Card
         envelope; no model is loaded.
+
+        Args:
+            path: a saved Card directory or a Card YAML or JSON file.
+            interface: the interface instance or class that rebuilds a custom
+                interface, as for ``model_validate_json``.
+            load_kwargs: arguments forwarded to the interface load of a saved
+                directory.
+
+        Returns:
+            The loaded ModelCard.
 
         Raises:
             WyrdError: If the file cannot be read, is not a Model Card

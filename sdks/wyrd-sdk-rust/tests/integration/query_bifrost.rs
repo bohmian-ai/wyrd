@@ -1,10 +1,13 @@
 //! A caller reads published Bifrost rows with parameterized SQL; bound values
-//! stay data, and a built-in table nothing wrote reads as empty.
+//! stay data, a built-in table nothing wrote reads as empty, and results
+//! stream as Arrow batches closed by a terminal frame.
 
+use arrow::array::AsArray;
+use arrow::datatypes::Int64Type;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wyrd_sdk::Bifrost;
 use wyrd_sdk::bifrost::{Correlation, QueryParam, TableConfig};
+use wyrd_sdk::{Bifrost, QueryTerminalOutcome, WyrdError};
 
 use crate::support::Deployment;
 
@@ -66,7 +69,10 @@ async fn published() -> (Deployment, Bifrost) {
         .flush_bifrost()
         .await
         .expect("rows publish");
-    (deployment, Bifrost::query_only(&admin))
+    (
+        deployment,
+        Bifrost::connect(&admin).await.expect("Bifrost connects"),
+    )
 }
 
 /// A bound `$1` filters the caller's rows.
@@ -133,11 +139,77 @@ async fn bound_sql_text_is_treated_as_data() {
 async fn unwritten_builtin_table_reads_as_empty() {
     let deployment = Deployment::start().await;
 
-    let rows: Vec<Count> = Bifrost::query_only(&deployment.admin())
+    let rows: Vec<Count> = Bifrost::connect(&deployment.admin())
+        .await
+        .expect("Bifrost connects")
         .sql_as("SELECT COUNT(*) AS n FROM vala.eval.result_items", &[])
         .await
         .expect("query runs");
 
     assert_eq!(rows, [Count { n: 0 }]);
+    deployment.shutdown().await;
+}
+
+/// A streamed query yields its rows as Arrow batches, then a successful
+/// terminal frame counting them.
+///
+/// # Panics
+/// Panics when the stream fails, a batch lacks `id`, or the rows or the
+/// terminal differ.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn stream_yields_arrow_batches_and_a_terminal() {
+    let (deployment, bifrost) = published().await;
+    let mut stream = bifrost
+        .stream(
+            &format!("SELECT id FROM {QUERY_ROWS} ORDER BY id"),
+            &[],
+            None,
+        )
+        .await
+        .expect("query starts");
+
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next_batch().await.expect("batch decodes") {
+        let column = batch.column_by_name("id").expect("batch has id");
+        ids.extend(column.as_primitive::<Int64Type>().values().iter().copied());
+    }
+
+    assert_eq!(ids, [1, 2, 3]);
+    let terminal = stream.terminal().expect("the stream ended with a terminal");
+    assert_eq!(
+        (
+            terminal.outcome,
+            terminal.row_count,
+            terminal.warnings.len()
+        ),
+        (QueryTerminalOutcome::Success, 3, 0)
+    );
+    deployment.shutdown().await;
+}
+
+/// A caller holding only `cards:read` cannot query Bifrost.
+///
+/// # Panics
+/// Panics when the query succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn caller_without_bifrost_read_is_refused() {
+    let (deployment, _) = published().await;
+    let denied = Bifrost::connect(
+        &deployment.client(&deployment.scoped_key("query_denied", &["cards:read"]).await),
+    )
+    .await
+    .expect("Bifrost connects");
+
+    let refused = denied
+        .sql(&format!("SELECT id FROM {QUERY_ROWS}"), &[])
+        .await
+        .expect_err("the query is refused");
+
+    assert_eq!(
+        WyrdError::from(refused).code(),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
     deployment.shutdown().await;
 }

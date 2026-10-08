@@ -6,6 +6,7 @@ from typing import Any
 
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
+from ..client import WyrdClient
 from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
@@ -58,11 +59,21 @@ class CardEnvelope:
         ...
 
     def model_dump(self) -> dict[str, Any]:
-        """Return the complete Card envelope as a JSON-compatible mapping."""
+        """Return the complete Card envelope as a JSON-compatible mapping.
+
+        Returns:
+            The envelope as plain Python values.
+
+        Raises:
+            WyrdError: If the retained native envelope cannot be converted.
+        """
         ...
 
     def model_dump_json(self) -> str:
         """Serialize the complete Card envelope to canonical public JSON.
+
+        Returns:
+            The envelope as a JSON string.
 
         Raises:
             WyrdError: If the retained native envelope cannot be serialized.
@@ -121,6 +132,7 @@ class WyrdState:
     @staticmethod
     def from_path(
         path: str | Path,
+        client: WyrdClient | None = None,
         *,
         interfaces: Mapping[str, object] | None = None,
         load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]
@@ -129,10 +141,14 @@ class WyrdState:
     ) -> WyrdState:
         """Load, validate, and eagerly hydrate a complete local bundle.
 
-        This method performs no network access.
+        Hydration performs no network access; ``client`` is held for the
+        state's later server calls, such as ``start_bifrost``.
 
         Args:
-            path: Directory produced by complete ``wyrd get`` hydration.
+            path: Directory produced by complete hydration, such as
+                ``Cards.hydrate``.
+            client: the ``WyrdClient`` this state acts as. Omitted, the
+                ambient client resolves when the state first needs one.
             interfaces: Custom Model/Data interface classes or instances keyed
                 by friendly alias.
             load_kwargs: Model/Data loader arguments keyed by friendly alias.
@@ -155,21 +171,21 @@ class WyrdState:
     def start_bifrost(
         self,
         table: TableConfig | None = None,
-        server_url: str | None = None,
-        credential: str | None = None,
-        grpc_url: str | None = None,
         client_byte_limit_bytes: int | None = None,
     ) -> None:
         """Connect this state's one Bifrost writer and describe the fixed tables.
 
-        The transport arguments are ``Bifrost(...)``'s and pass straight through,
-        including its environment and default resolution.
-        ``client_byte_limit_bytes`` overrides the handle-wide ingestion byte
-        budget (256 MiB by default). Startup describes
+        The writer acts as the state's client: the one given to ``from_path``,
+        else the ambient client. Startup describes
         ``vala.drift.observations`` and ``vala.eval.observations`` before
         succeeding, so a run can never enqueue against a missing, unauthorized,
-        or incompatible system table. ``table`` keeps its existing Bifrost
-        meaning and does not choose a run's destination.
+        or incompatible system table.
+
+        Args:
+            table: the Bifrost write binding, as for ``Bifrost()``. It does
+                not choose a run's destination.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget.
+                256 MiB if omitted.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_BIFROST_ALREADY_STARTED`` when this state
@@ -189,6 +205,12 @@ class WyrdState:
         ``run_id``; omitting it opens the root Service Card's view. Later
         ``for_card`` views share that id. Use ``with state.run("alias")`` to
         correlate OpenTelemetry spans created inside the block.
+
+        Args:
+            alias: A friendly alias from this bundle. Omitted, the root Service Card.
+
+        Returns:
+            A local `Run` whose first view observes the selected Card.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when ``alias`` is not
@@ -224,6 +246,11 @@ class WyrdState:
         ...
 
     @property
+    def root_ref(self) -> CardRef:
+        """Return the exact root `CardRef` of this bundle, independent of aliases."""
+        ...
+
+    @property
     def service(self) -> CardEnvelope:
         """Return the exact root Service envelope, independent of aliases."""
         ...
@@ -236,6 +263,12 @@ class WyrdState:
     def card(self, alias: str) -> CardEnvelope:
         """Return the complete Card envelope selected by ``alias``.
 
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The complete read-only Card envelope.
+
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
         """
@@ -243,6 +276,12 @@ class WyrdState:
 
     def card_ref(self, alias: str) -> CardRef:
         """Return the exact CardRef selected by ``alias``.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            The exact `CardRef` of the selected Card.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.
@@ -252,6 +291,12 @@ class WyrdState:
     def model(self, alias: str) -> ModelCard:
         """Return the eagerly loaded Model holder selected by ``alias``.
 
+        Args:
+            alias: A friendly alias of a Model Card.
+
+        Returns:
+            The loaded `ModelCard` holder.
+
         Raises:
             WyrdError: For an unknown alias or non-Model Card.
         """
@@ -259,6 +304,12 @@ class WyrdState:
 
     def data(self, alias: str) -> DataCard:
         """Return the eagerly loaded Data holder selected by ``alias``.
+
+        Args:
+            alias: A friendly alias of a Data Card.
+
+        Returns:
+            The loaded `DataCard` holder.
 
         Raises:
             WyrdError: For an unknown alias or non-Data Card.
@@ -268,6 +319,12 @@ class WyrdState:
     def agent(self, alias: str) -> AgentCard:
         """Return the Agent holder with its inline or resolved typed prompt.
 
+        Args:
+            alias: A friendly alias of an Agent Card.
+
+        Returns:
+            The `AgentCard` holder.
+
         Raises:
             WyrdError: For an unknown alias or non-Agent Card.
         """
@@ -275,6 +332,12 @@ class WyrdState:
 
     def prompt(self, alias: str) -> PromptCard:
         """Return the hydrated Prompt holder selected by ``alias``.
+
+        Args:
+            alias: A friendly alias of a Prompt Card.
+
+        Returns:
+            The hydrated `PromptCard` holder.
 
         Raises:
             WyrdError: For an unknown alias or non-Prompt Card.
@@ -286,6 +349,12 @@ class WyrdState:
 
         The typed Drift or Eval body lives under ``spec["implementation"]``.
 
+        Args:
+            alias: A friendly alias of a Verifier Card.
+
+        Returns:
+            The Verifier Card envelope.
+
         Raises:
             WyrdError: For an unknown alias or non-Verifier Card.
         """
@@ -294,6 +363,12 @@ class WyrdState:
     def workflow(self, alias: str) -> CardEnvelope:
         """Return the kind-checked Workflow envelope selected by ``alias``.
 
+        Args:
+            alias: A friendly alias of a Workflow Card.
+
+        Returns:
+            The Workflow Card envelope.
+
         Raises:
             WyrdError: For an unknown alias or non-Workflow Card.
         """
@@ -301,6 +376,12 @@ class WyrdState:
 
     def artifacts(self, alias: str) -> tuple[HydratedArtifact, ...]:
         """Return verified artifact descriptors without reading payload bytes.
+
+        Args:
+            alias: A friendly alias from this bundle.
+
+        Returns:
+            One verified descriptor per artifact, without payload bytes.
 
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when no Card has the alias.

@@ -2668,7 +2668,7 @@ impl FilteringFixture {
             .register()
             .await?;
         let resolved = wyrd_client::Bifrost::query_only(self.writer.client())
-            .describe(&self.custom_fqn())
+            .describe_table("vala.datasets", &self.custom)
             .await?
             .physical_layout;
         if resolved.partition_granularity != TimeGranularityWire::Hour
@@ -3141,8 +3141,11 @@ impl FilteringFixture {
             ("vala.logs.records".to_owned(), records, "severity_text"),
             ("vala.metrics.points".to_owned(), points, "unit"),
         ] {
+            let (namespace, name) = fqn
+                .rsplit_once('.')
+                .expect("a journey table fqn names its namespace");
             let layout = wyrd_client::Bifrost::query_only(client)
-                .describe(&fqn)
+                .describe_table(namespace, name)
                 .await?
                 .physical_layout;
             for object in objects {

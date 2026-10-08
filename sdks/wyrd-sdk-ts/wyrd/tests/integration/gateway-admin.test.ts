@@ -1,6 +1,7 @@
 import { expect, vi } from "vitest";
 
-import { Gateway, type ProviderDeployment, cli } from "@wyrd/sdk";
+import { Gateway, type ProviderDeployment, WyrdClient } from "@wyrd/sdk";
+import { cli } from "@wyrd/testing";
 
 import { serverTest } from "../support/server.js";
 
@@ -81,7 +82,9 @@ test("deployment without capabilities is refused", async ({ gateway }) => {
 test("gateway reader cannot delete a deployment", async ({ server, gateway }) => {
   await cli.putProviderCredential(environmentCredential("reader-key"));
   await gateway.putDeployment(deployment("read-only", "reader-key"));
-  const reader = Gateway.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) });
+  const reader = Gateway.connect({
+    client: WyrdClient.connect({ credential: server.scopedApiKey("gateway_reader", ["gateway:read"]) }),
+  });
 
   expect(await reader.deployment("read-only")).toMatchObject({ name: "read-only" });
   await expect(reader.deleteDeployment("read-only")).rejects.toMatchObject({

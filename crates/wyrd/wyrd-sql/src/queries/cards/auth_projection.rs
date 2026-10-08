@@ -3,7 +3,7 @@
 
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
-use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
+use wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE;
 use wyrd_runtime::principal::{Principal, PrincipalId};
 use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::envelope::{Card, Spec};
@@ -30,8 +30,8 @@ RETURNING id, (xmax = 0) AS inserted
 /// Upsert the principal row backing a newly registered Service or Agent card.
 ///
 /// The first projection of a Card also grants the built-in
-/// [`WORKLOAD_ROLE`] in the caller's transaction, so a key issued for the
-/// principal can emit and query its own evidence. A re-registration only
+/// [`DEFAULT_CARD_ROLE`] in the caller's transaction, so a key issued for the
+/// principal can emit and verify its own evidence. A re-registration only
 /// refreshes the row's Card projection: it never grants the Role again, so an
 /// administrator's revocation stands. `xmax = 0` identifies the freshly
 /// inserted row of an `INSERT ... ON CONFLICT DO UPDATE`.
@@ -96,12 +96,12 @@ pub async fn upsert_service_account_from_card(
             WyrdError::registry_unavailable("card registry unavailable")
         })?;
     if inserted {
-        grant_workload_role(conn, id).await?;
+        grant_default_role(conn, id).await?;
     }
     Ok(PrincipalId::new(id))
 }
 
-/// Grants the tenant's built-in [`WORKLOAD_ROLE`] to a newly projected principal.
+/// Grants the tenant's built-in [`DEFAULT_CARD_ROLE`] to a newly projected principal.
 ///
 /// Every provisioned tenant carries the built-in roles (seeded at
 /// provisioning, backfilled by migration); a bare tenant without them, such as
@@ -110,16 +110,16 @@ pub async fn upsert_service_account_from_card(
 /// # Errors
 ///
 /// Returns `registry_unavailable` when Postgres rejects the lookup or grant.
-async fn grant_workload_role(conn: &mut TenantConn<'_>, principal: Uuid) -> Result<(), WyrdError> {
+async fn grant_default_role(conn: &mut TenantConn<'_>, principal: Uuid) -> Result<(), WyrdError> {
     let unavailable = |error: sqlx::Error| {
-        tracing::error!(%error, "workload role grant failed");
+        tracing::error!(%error, "default role grant failed");
         WyrdError::registry_unavailable("card registry unavailable")
     };
-    let Some(role) = role_by_name(conn, WORKLOAD_ROLE)
+    let Some(role) = role_by_name(conn, DEFAULT_CARD_ROLE)
         .await
         .map_err(unavailable)?
     else {
-        tracing::warn!("tenant has no built-in workload role; principal projected without it");
+        tracing::warn!("tenant has no built-in default role; principal projected without it");
         return Ok(());
     };
     grant_role_to_service_account(conn, principal, role.id)

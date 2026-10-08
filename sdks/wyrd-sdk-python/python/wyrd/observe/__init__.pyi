@@ -41,6 +41,12 @@ class Run:
     def for_card(self, alias: str) -> Run:
         """Return an immutable sibling view scoped to a registered alias.
 
+        Args:
+            alias: a Card alias registered in the state's bundle.
+
+        Returns:
+            A view sharing this run's ``run_id``, scoped to ``alias``.
+
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_ALIAS`` when the bundle does not
                 register ``alias``. No network IO occurs.
@@ -218,6 +224,16 @@ class Observe:
         observed, recorded, enqueued, or dispatched, and Bifrost need not be
         started.
 
+        Args:
+            verifier: the name of a Verifier bound to this view's subject.
+            input: one context mapping, dataclass, or Pydantic model for an
+                Eval Verifier; a list of flat feature rows for a Drift
+                Verifier.
+            media: ``MediaRef`` items for an Eval judge Prompt's media slots.
+
+        Returns:
+            The Verifier's judgment.
+
         Raises:
             WyrdError: ``WYRD_SDK_404_UNKNOWN_VERIFIER`` for an unbound
                 Verifier and ``WYRD_SDK_400_INVALID_OBSERVATION`` for input of
@@ -250,8 +266,8 @@ class Observe:
 def record(
     bifrost: Bifrost,
     table: str,
-    schema: str,
-    row: str,
+    schema: Mapping[str, Any] | type[Any],
+    row: Mapping[str, Any] | Any,
     correlation: Correlation | None = None,
 ) -> None:
     """Record one telemetry observation, fire-and-forget.
@@ -265,15 +281,19 @@ def record(
     Args:
         bifrost: the ``Bifrost`` client whose producers carry the row.
         table: the destination table name.
-        schema: the table's JSON Schema text, mapped to the Arrow schema of
-            the row.
-        row: the row as JSON object text.
+        schema: the table's JSON Schema mapping, or a Pydantic model class
+            whose ``model_json_schema()`` is used.
+        row: the row as a mapping or a Pydantic model instance.
         correlation: optional ``card_ref`` (``space/Kind/name@version``) and
             ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
 
+    Returns:
+        ``None``; a refused row is counted on ``bifrost.dropped``.
+
     Raises:
-        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for malformed or unsupported
-            ``schema`` text or an invalid ``card_ref``.
+        WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` for a schema with no
+            mappable columns, as ``TableConfig.from_json_schema`` raises;
+            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_ref``.
     """
     ...
 

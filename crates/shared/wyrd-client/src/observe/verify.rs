@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use reqwest::Method;
+#[cfg(feature = "internal")]
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use wyrd_spec::card::verifier::VerifierImplementation;
@@ -83,6 +84,7 @@ pub(crate) fn direct_input(
 ///
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` naming the first such feature.
+#[cfg(feature = "internal")]
 pub(crate) fn check_drift_integer_literals(text: &str) -> Result<(), WyrdError> {
     let Ok(rows) = serde_json::from_str::<Vec<Box<RawValue>>>(text) else {
         return Ok(());
@@ -167,6 +169,7 @@ pub(crate) async fn execute(
     request.validate()?;
     client
         .with_min_request_timeout(EXECUTION_DEADLINE + EXECUTE_RESPONSE_GRACE)
+        .http
         .request_json(Method::POST, "/v1/verification/execute", Some(request))
         .await
 }

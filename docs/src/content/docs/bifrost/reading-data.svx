@@ -82,9 +82,10 @@ The first-class clients expose the same query and terminal contract.
 
 ```python
 from wyrd.bifrost import AsyncBifrost
+from wyrd.client import WyrdClient
 
-client = AsyncBifrost(server_url="https://wyrd.example", credential=token)
-stream = await client.stream(
+bifrost = AsyncBifrost(client=WyrdClient(server_url="https://wyrd.example", credential=token))
+stream = await bifrost.stream(
     'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
 )
 rows = []
@@ -104,12 +105,13 @@ if terminal["outcome"] != "success":
 ### TypeScript
 
 ```ts
-import { Bifrost } from "@wyrd/sdk";
+import { Bifrost, WyrdClient } from "@wyrd/sdk";
 
-const client = await Bifrost.connect({ serverUrl, credential: accessToken });
-const stream = await client.stream({
-  sql: 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
-});
+const client = WyrdClient.connect({ serverUrl, credential: accessToken });
+const bifrost = await Bifrost.connect({ client });
+const stream = await bifrost.stream(
+  'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
+);
 const rows = [];
 for await (const batch of stream) rows.push(...batch.toArray());
 const terminal = stream.terminal;

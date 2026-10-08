@@ -8,11 +8,14 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
+#[cfg(feature = "internal")]
+use wyrd_queue::ClientByteMetrics;
 use wyrd_queue::{
-    BatchSink, ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, QueueConfig,
-    SealedBatchSender, WyrdQueueError,
+    BatchSink, ClientByteBudget, ClientByteGuard, Producer, QueueConfig, SealedBatchSender,
+    WyrdQueueError,
 };
 use wyrd_spec::reference::CardRef;
+#[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -100,6 +103,7 @@ impl WriterPool {
 
     /// The scope every producer in this handle is keyed under.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub(crate) fn scope(&self) -> &ClientScope {
         &self.scope
     }
@@ -128,6 +132,7 @@ impl WriterPool {
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub(crate) fn metrics(&self) -> BifrostMetrics {
         let ClientByteMetrics {
             owned_bytes,
@@ -153,6 +158,7 @@ impl WriterPool {
 
     /// Registers the observer told the row count of every loss this handle's
     /// producers settle; see [`ClientByteBudget::observe_losses`].
+    #[cfg(feature = "internal")]
     pub(crate) fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
         self.budget.observe_losses(observer);
     }
@@ -234,6 +240,7 @@ impl WriterPool {
     /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
     /// producer channel is full, and [`WyrdQueueError::Backpressure`] when the
     /// producer ceiling or handle byte budget cannot admit the batch.
+    #[cfg(feature = "internal")]
     pub(crate) fn enqueue_batch(
         &self,
         table: &str,

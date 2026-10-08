@@ -11,6 +11,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, Stri
 use arrow::compute::cast;
 use arrow_schema::DataType;
 use chrono::Utc;
+#[cfg(feature = "internal")]
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use wyrd_spec::error::WyrdError;
@@ -278,6 +279,7 @@ fn check_scalar_values(object: &Map<String, Value>) -> Result<(), WyrdError> {
 ///
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` naming the first such feature.
+#[cfg(feature = "internal")]
 pub(crate) fn check_integer_literals(text: &str) -> Result<(), WyrdError> {
     let Ok(object) = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(text) else {
         return Ok(());

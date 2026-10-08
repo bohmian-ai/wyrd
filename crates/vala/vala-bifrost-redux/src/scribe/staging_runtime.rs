@@ -33,8 +33,8 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{
-    AssemblyError, ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig,
-    StagingBacklog, StagingClaim, StagingClaimId,
+    AssemblyError, ClaimCause, OwnedMembers, ScribeAssemblyKey, StagingAssembler,
+    StagingAssemblerConfig, StagingBacklog, StagingClaim, StagingClaimId,
 };
 use crate::scribe::claim_assembly::{
     AssembleClaimRequest, AssembledClaim, ClaimAssembler, ClaimRuns,
@@ -812,6 +812,28 @@ impl ScribeStagingRuntime {
             .lock()
             .map_err(|_| poisoned("staged ready index"))?
             .ready_keys())
+    }
+
+    /// Snapshots every member this pod owns that has not yet published.
+    ///
+    /// Ready and claimed members are both included, whoever drives the claim,
+    /// so a flush can wait for exactly the rows that were durable when it
+    /// began. See [`StagingAssembler::owned_members`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready index is unavailable.
+    pub fn owned_members(&self) -> Result<OwnedMembers, ScribeError> {
+        Ok(self.lock_assembly()?.owned_members())
+    }
+
+    /// Returns whether any member of `snapshot` is still unpublished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready index is unavailable.
+    pub fn owns_any(&self, snapshot: &OwnedMembers) -> Result<bool, ScribeError> {
+        Ok(self.lock_assembly()?.owns_any(snapshot))
     }
 
     /// Re-validates a claim's members and returns its runs in merge order.
@@ -1598,6 +1620,67 @@ mod tests {
                 .is_empty(),
             "a retried claim is driven by its one retrier"
         );
+    }
+
+    /// A flush snapshot is still owned exactly while one of its members is
+    /// unpublished.
+    ///
+    /// A member durable at the snapshot keeps it owned while ready and while
+    /// claimed, and only its settlement releases it. A member staged after the
+    /// snapshot never makes it owned, whether ready or claimed, so a flush
+    /// waiting on the snapshot is not held open by newer data.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging, claiming, or settlement fails, or when
+    /// [`ScribeStagingRuntime::owns_any`] disagrees with the snapshot members
+    /// still unpublished.
+    #[tokio::test]
+    async fn owns_any_tracks_only_snapshot_members() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0x5a75));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(stage, &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+        let now = chrono::Utc::now();
+        let (durable, _) =
+            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
+        let snapshot = runtime.owned_members().expect("owned snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert!(runtime.owns_any(&snapshot).expect("ready snapshot member"));
+
+        let (newer, _) =
+            stage_durable_members(&runtime, DataTenantId::new_v7(), node_id, 1..=1, now).await;
+        let claim = runtime
+            .take_residue(&durable, ClaimCause::Drain)
+            .expect("the durable key releases a residue claim")
+            .expect("a residue claim is due");
+        assert!(
+            runtime
+                .owns_any(&snapshot)
+                .expect("claimed snapshot member"),
+            "a claimed member stays owned until its claim settles"
+        );
+        runtime.settle(claim.id()).expect("the claim settles");
+        let newer_claim = runtime
+            .take_residue(&newer, ClaimCause::Drain)
+            .expect("the newer key releases a residue claim")
+            .expect("a residue claim is due");
+        assert!(
+            !runtime.owns_any(&snapshot).expect("settled snapshot"),
+            "members staged after the snapshot never hold it"
+        );
+        assert_eq!(runtime.backlog().expect("backlog").outstanding_claims, 1);
+        drop(newer_claim);
     }
 
     /// Concurrent registration, claim, and settlement leave the published

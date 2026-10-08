@@ -64,16 +64,19 @@ def test_wyrd_server_url_alone_sets_both_endpoints(monkeypatch: pytest.MonkeyPat
 def test_wyrd_tenant_is_refused_beside_a_self_naming_credential(monkeypatch):
     """``WYRD_TENANT`` is the only tenant selector, and both client doors read it.
 
-    Constructors take no ``tenant``: an explicit key already names its tenant,
-    so a configured selector beside it is refused by the shared resolver. The
-    refusal from ``WyrdClient`` and ``Cards`` proves the selector reaches it.
-    No call here reaches a server.
+    Constructors take no ``tenant``: a key already names its tenant, so a
+    configured selector beside it is refused by the shared resolver. The
+    refusal from an explicit ``WyrdClient`` and from the ambient client
+    ``Cards()`` resolves proves the selector reaches both. No call here
+    reaches a server.
     """
     from wyrd import WyrdClient, WyrdError
     from wyrd.cards import Cards
 
     monkeypatch.setenv("WYRD_TENANT", "acme")
-    for build in (WyrdClient, Cards):
+    monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("WYRD_ACCESS_TOKEN", "wyrd_test_actor")
+    for build in (lambda: WyrdClient(credential="wyrd_test_actor"), Cards):
         with pytest.raises(WyrdError) as captured:
-            build(server_url="http://127.0.0.1:9", credential="wyrd_test_actor")
+            build()
         assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"

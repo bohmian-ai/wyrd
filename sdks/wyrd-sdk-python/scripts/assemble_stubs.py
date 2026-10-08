@@ -26,6 +26,7 @@ PUBLIC_MODULE_STUBS = {
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
     "state.pyi": PACKAGE_DIR / "state" / "__init__.pyi",
     "testing.pyi": PACKAGE_DIR / "testing" / "__init__.pyi",
+    "testing_cli.pyi": PACKAGE_DIR / "testing" / "cli" / "__init__.pyi",
 }
 
 ROOT_STUB_FILES = ["header.pyi", "error.pyi"]
@@ -41,32 +42,137 @@ def validate_source_stub(filename: str, raw_text: str) -> None:
         )
     missing = undocumented_public_members(ast.parse(raw_text))
     if missing:
-        raise SystemExit(f"{STUB_DIR / filename}: missing docstrings: {', '.join(missing)}")
+        raise SystemExit(
+            f"{STUB_DIR / filename}: missing docstrings or Args entries: {', '.join(missing)}"
+        )
 
 
 def undocumented_public_members(tree: ast.Module) -> list[str]:
-    """Return public classes and methods without a docstring.
+    """Return public stub members whose docstring is missing or incomplete.
 
     Stubs are the help text editors show, so every public class, ``__init__``,
-    and public method needs one. ``@overload`` variants share the docstring of
-    their documented sibling.
+    public method, and module function needs a docstring, and every
+    parameter other than ``self`` or ``cls`` needs one ``Args:`` entry.
+    ``@overload`` variants of one name are checked together: each parameter
+    of any variant must be documented by some variant's docstring.
+
+    Args:
+        tree: The parsed stub source.
+
+    Returns:
+        ``name`` for a member without a docstring and ``name(param)`` for a
+        parameter without an ``Args:`` entry, in source order.
     """
     missing: list[str] = []
+    module_functions = [node for node in tree.body if isinstance(node, FUNCTION_NODES)]
+    missing.extend(undocumented_callables(module_functions, prefix="", is_method=False))
     for node in tree.body:
         if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
             continue
         if ast.get_docstring(node) is None:
             missing.append(node.name)
-        for child in node.body:
-            if not isinstance(child, ast.FunctionDef):
-                continue
-            if child.name != "__init__" and child.name.startswith("_"):
-                continue
-            if any(getattr(d, "id", None) == "overload" for d in child.decorator_list):
-                continue
-            if ast.get_docstring(child) is None:
-                missing.append(f"{node.name}.{child.name}")
+        methods = [child for child in node.body if isinstance(child, FUNCTION_NODES)]
+        missing.extend(undocumented_callables(methods, prefix=f"{node.name}.", is_method=True))
     return missing
+
+
+FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def undocumented_callables(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef], *, prefix: str, is_method: bool
+) -> list[str]:
+    """Check one scope's public callables, grouping ``@overload`` variants by name.
+
+    Args:
+        functions: The scope's function definitions in source order.
+        prefix: ``"Class."`` for methods, empty for module functions.
+        is_method: Whether a leading ``self`` or ``cls`` parameter is implicit.
+
+    Returns:
+        The missing docstrings and ``Args:`` entries, as for
+        ``undocumented_public_members``.
+    """
+    groups: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for function in functions:
+        if function.name != "__init__" and function.name.startswith("_"):
+            continue
+        groups.setdefault(function.name, []).append(function)
+    missing: list[str] = []
+    for name, variants in groups.items():
+        docstrings = [doc for doc in map(ast.get_docstring, variants) if doc is not None]
+        if not docstrings:
+            missing.append(f"{prefix}{name}")
+            continue
+        documented = set().union(*map(documented_args, docstrings))
+        parameters: list[str] = []
+        for variant in variants:
+            for parameter in signature_parameters(variant, is_method=is_method):
+                if parameter not in parameters:
+                    parameters.append(parameter)
+        missing.extend(
+            f"{prefix}{name}({parameter})"
+            for parameter in parameters
+            if parameter not in documented
+        )
+    return missing
+
+
+def signature_parameters(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, *, is_method: bool
+) -> list[str]:
+    """Return a callable's parameter names, without an implicit ``self`` or ``cls``.
+
+    Args:
+        function: The function definition.
+        is_method: Whether the callable is defined in a class body.
+
+    Returns:
+        Positional, ``*args``, keyword-only, and ``**kwargs`` names in order.
+    """
+    arguments = function.args
+    names = [argument.arg for argument in [*arguments.posonlyargs, *arguments.args]]
+    is_static = any(getattr(d, "id", None) == "staticmethod" for d in function.decorator_list)
+    if is_method and not is_static and names and names[0] in {"self", "cls"}:
+        names = names[1:]
+    if arguments.vararg is not None:
+        names.append(arguments.vararg.arg)
+    names.extend(argument.arg for argument in arguments.kwonlyargs)
+    if arguments.kwarg is not None:
+        names.append(arguments.kwarg.arg)
+    return names
+
+
+ARGS_ENTRY = re.compile(r"^\s+\**(\w+)(?:\s*\([^)]*\))?\s*:")
+
+
+def documented_args(docstring: str) -> set[str]:
+    """Return the parameter names one Google-style ``Args:`` section documents.
+
+    Args:
+        docstring: The cleaned docstring.
+
+    Returns:
+        Each entry's name; empty when the docstring has no ``Args:`` section.
+    """
+    names: set[str] = set()
+    in_args = False
+    entry_indent: int | None = None
+    for line in docstring.splitlines():
+        if line.strip() == "Args:":
+            in_args, entry_indent = True, None
+            continue
+        if not in_args or not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_args = False
+            continue
+        entry_indent = indent if entry_indent is None else entry_indent
+        match = ARGS_ENTRY.match(line)
+        if indent == entry_indent and match is not None:
+            names.add(match.group(1))
+    return names
 
 
 def literal_all(tree: ast.Module) -> set[str]:
@@ -174,10 +280,15 @@ def rewrite_public_imports(filename: str, content: str) -> str:
             ),
             "from .prompt import Prompt": "from ..prompt import Prompt",
             "from .cards import AgentCard": "from ..cards import AgentCard",
+            "from .client import WyrdClient": "from ..client import WyrdClient",
         },
-        "cli.pyi": {
+        "testing_cli.pyi": {
+            "from .cards import CardRef, HydrationSummary, RegistrationReceipt": (
+                "from ...cards import CardRef, HydrationSummary, RegistrationReceipt"
+            ),
+            "from .client import WyrdClient": "from ...client import WyrdClient",
             "from .gateway import ProviderCredentialView": (
-                "from ..gateway import ProviderCredentialView"
+                "from ...gateway import ProviderCredentialView"
             ),
         },
         "observe.pyi": {

@@ -15,6 +15,7 @@ from typing import (
 )
 
 from .cards import AgentCard
+from .client import WyrdClient
 from .error import WyrdError
 from .header import JsonDict, PathLike
 from .prompt import Prompt, ProviderResponse
@@ -92,6 +93,13 @@ class SessionTurn:
     def model_validate(value: SessionTurn | Mapping[str, Any]) -> SessionTurn:
         """Build a turn from a ``SessionTurn`` or a ``model_dump()``-shaped mapping.
 
+        Args:
+            value: a ``SessionTurn`` or a ``{"role", "content", "call_id"}``
+                mapping.
+
+        Returns:
+            The validated turn.
+
         Raises:
             WyrdError: when the mapping is not one valid turn.
         """
@@ -100,6 +108,12 @@ class SessionTurn:
     @staticmethod
     def model_validate_json(data: str) -> SessionTurn:
         """Build a turn from ``model_dump_json()`` text.
+
+        Args:
+            data: JSON text in the ``model_dump()`` shape.
+
+        Returns:
+            The validated turn.
 
         Raises:
             WyrdError: when the text is not one valid turn.
@@ -157,11 +171,24 @@ class NoSession:
     """Session memory that stores nothing; ``recent`` always returns ``[]``."""
 
     def recent(self, session_id: str, limit: int) -> list[SessionTurn]:
-        """Return ``[]``; both arguments are ignored."""
+        """Return ``[]``; both arguments are ignored.
+
+        Args:
+            session_id: ignored.
+            limit: ignored.
+
+        Returns:
+            An empty list.
+        """
         ...
 
     def append(self, session_id: str, turn: SessionTurn) -> None:
-        """Discard ``turn``; both arguments are ignored."""
+        """Discard ``turn``; both arguments are ignored.
+
+        Args:
+            session_id: ignored.
+            turn: ignored.
+        """
         ...
 
 if True:
@@ -360,11 +387,20 @@ class MockProvider:
     """
 
     def __init__(self, responses: Sequence[str] | None = ...) -> None:
-        """Create a mock provider returning `responses` in order, then echoing."""
+        """Create a mock provider returning `responses` in order, then echoing.
+
+        Args:
+            responses: canned assistant responses, consumed in order. Omitted,
+                the queue starts empty.
+        """
         ...
 
     def push(self, text: str) -> None:
-        """Queue one more canned assistant response."""
+        """Queue one more canned assistant response.
+
+        Args:
+            text: the response text.
+        """
         ...
 
     @property
@@ -485,6 +521,9 @@ class Agent:
     def save(self, path: PathLike) -> None:
         """Write this Agent Card to ``path`` as YAML.
 
+        Args:
+            path: the destination file.
+
         Raises:
             WyrdError: ``WYRD_AGENT_422_MISSING_NAME`` or
                 ``WYRD_AGENT_422_MISSING_VERSION`` when identity is incomplete,
@@ -498,6 +537,12 @@ class Agent:
 
         Tool names in the Card resolve against the process-wide tool registry,
         so decorate the tools before loading.
+
+        Args:
+            path: the Agent Card YAML file.
+
+        Returns:
+            The loaded Agent.
 
         Raises:
             WyrdError: ``WYRD_AGENT_404_RUNTIME_LOCAL_TOOL_NOT_FOUND`` for an
@@ -521,6 +566,12 @@ class Agent:
     @staticmethod
     def model_validate_json(data: str) -> Agent:
         """Build an Agent from Agent Card JSON text.
+
+        Args:
+            data: Agent Card JSON text.
+
+        Returns:
+            The loaded Agent.
 
         Raises:
             WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` for invalid JSON,
@@ -559,6 +610,9 @@ class Agent:
             output_type: as ``Agent(output_type=)``, for this call only; it
                 takes precedence over the Agent's and the Prompt's class.
 
+        Returns:
+            The completed run, with its output and turns.
+
         Raises:
             WyrdError: ``WYRD_AGENT_500_MAX_ITERATIONS``,
                 ``WYRD_AGENT_502_PROVIDER``, ``WYRD_AGENT_504_TIMEOUT``,
@@ -583,13 +637,23 @@ class Agent:
         ...
 
     def set_tools(self, tools: Sequence[object]) -> None:
-        """Replace every runtime-local tool in place; raises as ``add_tool()``."""
+        """Replace every runtime-local tool in place.
+
+        Args:
+            tools: the decorated tool callables that replace the current set.
+
+        Raises:
+            WyrdError: as ``add_tool()``.
+        """
         ...
 
     def with_prompt(self, prompt: Prompt) -> None:
         """Replace the Prompt in place.
 
         Unlike ``Agent(prompt=)``, only a ``Prompt`` instance is accepted.
+
+        Args:
+            prompt: the replacement Prompt.
 
         Raises:
             WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``prompt`` is
@@ -600,6 +664,9 @@ class Agent:
     def with_session(self, session: SessionMemory) -> None:
         """Replace the session memory in place.
 
+        Args:
+            session: an object with ``recent`` and ``append`` methods.
+
         Raises:
             WyrdError: ``WYRD_AGENT_422_INVALID_ARGUMENT`` when ``session``
                 lacks callable ``recent`` and ``append`` methods.
@@ -607,7 +674,11 @@ class Agent:
         ...
 
     def with_run_config(self, run_config: RunConfig) -> None:
-        """Replace the loop limits in place."""
+        """Replace the loop limits in place.
+
+        Args:
+            run_config: the replacement limits.
+        """
         ...
 
     def add_before_agent(self, callback: Callable[..., object]) -> None:
@@ -616,27 +687,50 @@ class Agent:
         Callbacks of one hook run in registration order, each seeing the
         previous one's replacement; the first that raises stops the chain with
         that hook's raise behavior from ``Agent()``.
+
+        Args:
+            callback: the callback to append.
         """
         ...
 
     def add_after_agent(self, callback: Callable[..., object]) -> None:
-        """Append an ``after_agent_callback``, chained as ``add_before_agent()``."""
+        """Append an ``after_agent_callback``, chained as ``add_before_agent()``.
+
+        Args:
+            callback: the callback to append.
+        """
         ...
 
     def add_before_model(self, callback: Callable[..., object]) -> None:
-        """Append a ``before_model_callback``, chained as ``add_before_agent()``."""
+        """Append a ``before_model_callback``, chained as ``add_before_agent()``.
+
+        Args:
+            callback: the callback to append.
+        """
         ...
 
     def add_after_model(self, callback: Callable[..., object]) -> None:
-        """Append an ``after_model_callback``, chained as ``add_before_agent()``."""
+        """Append an ``after_model_callback``, chained as ``add_before_agent()``.
+
+        Args:
+            callback: the callback to append.
+        """
         ...
 
     def add_before_tool(self, callback: Callable[..., object]) -> None:
-        """Append a ``before_tool_callback``, chained as ``add_before_agent()``."""
+        """Append a ``before_tool_callback``, chained as ``add_before_agent()``.
+
+        Args:
+            callback: the callback to append.
+        """
         ...
 
     def add_after_tool(self, callback: Callable[..., object]) -> None:
-        """Append an ``after_tool_callback``, chained as ``add_before_agent()``."""
+        """Append an ``after_tool_callback``, chained as ``add_before_agent()``.
+
+        Args:
+            callback: the callback to append.
+        """
         ...
 
     def as_tool(self, *, description: str | None = ...) -> Callable[[Mapping[str, Any]], Any]:
@@ -775,153 +869,11 @@ class WorkflowRun:
         ...
 
 class Workflow:
-    """Authoring and run surface for a DAG of Agent steps.
+    """A YAML-authored DAG of Agent steps, loaded with ``from_path`` or ``from_yaml``.
 
     Each step is identified by its Agent's ``name``, or its ``id`` when the
     Agent is unnamed.
     """
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        version: str | None = ...,
-        space: str | None = ...,
-        labels: Mapping[str, str] | None = ...,
-        annotations: Mapping[str, str] | None = ...,
-    ) -> None:
-        """Build an empty Workflow with the given name and optional metadata.
-
-        Args:
-            name (str): Workflow name.
-            version (str | None): Optional semantic version.
-            space (str | None): Optional logical space.
-            labels (Mapping[str, str] | None): Optional queryable labels.
-            annotations (Mapping[str, str] | None): Optional free-form annotations.
-        """
-        ...
-
-    @staticmethod
-    def sequential(
-        name: str,
-        *agents: Agent,
-    ) -> Workflow:
-        """Build a workflow whose steps run in the given order.
-
-        Args:
-            name (str): Workflow name.
-            *agents (Agent): One or more Agent values to chain.
-
-        Returns:
-            Workflow: Workflow with each agent depending on the previous one.
-
-        Raises:
-            WyrdError: When the resulting DAG is invalid.
-        """
-        ...
-
-    @staticmethod
-    def parallel(
-        name: str,
-        *agents: Agent,
-    ) -> Workflow:
-        """Build a workflow whose steps are independent roots that run in parallel.
-
-        Args:
-            name (str): Workflow name.
-            *agents (Agent): One or more Agent values to run in parallel.
-
-        Returns:
-            Workflow: Workflow with each agent as an independent root step.
-
-        Raises:
-            WyrdError: When the resulting DAG is invalid.
-        """
-        ...
-
-    def add(self, agent: Agent) -> Workflow:
-        """Append ``agent`` as a new step with no dependencies and return this workflow.
-
-        Raises:
-            WyrdError: When the resulting DAG is invalid.
-        """
-        ...
-
-    def add_after(self, agent: Agent, after: Agent | str | Sequence[Agent | str]) -> Workflow:
-        """Append ``agent`` as a step depending on ``after`` and return this workflow.
-
-        Args:
-            agent: the Agent to append.
-            after: the predecessor steps, as step ids or Agents.
-
-        Raises:
-            WyrdError: When the resulting DAG is invalid.
-        """
-        ...
-
-    def with_inputs(self, inputs: Mapping[str, Any]) -> Workflow:
-        """Declare the Workflow inputs and their defaults, replacing any previous declaration.
-
-        Args:
-            inputs (Mapping[str, Any]): Input name to default value. `bool`,
-                `int`, `float`, and `str` declare scalar inputs; any other JSON
-                value declares a JSON input.
-
-        Returns:
-            Workflow: This workflow (for chaining).
-
-        Raises:
-            WyrdError: When a name is not an identifier or a value is not JSON.
-        """
-        ...
-
-    def with_step_inputs(self, step_id: str, inputs: Mapping[str, str]) -> Workflow:
-        """Bind one step's unresolved Prompt variables, replacing its previous bindings.
-
-        Args:
-            step_id (str): Step to bind.
-            inputs (Mapping[str, str]): Variable name to source: `input.<name>`
-                or a dependency's `steps.<id>.output.text` /
-                `steps.<id>.output.structured[.<field>...]`.
-
-        Returns:
-            Workflow: This workflow (for chaining).
-
-        Raises:
-            WyrdError: For an unknown step, a non-identifier name, or an invalid source.
-        """
-        ...
-
-    def with_outputs(self, outputs: Mapping[str, str]) -> Workflow:
-        """Declare the named Workflow outputs, replacing any previous declaration.
-
-        Args:
-            outputs (Mapping[str, str]): Output name to source, in the step-input grammar.
-
-        Returns:
-            Workflow: This workflow (for chaining).
-
-        Raises:
-            WyrdError: For a non-identifier name or an invalid source.
-        """
-        ...
-
-    def validate(self) -> None:
-        """Validate the complete Workflow against its resolved Agents.
-
-        Raises:
-            WyrdError: For any contract, binding, Prompt-variable, output, or
-                route error that would fail a run before dispatch.
-        """
-        ...
-
-    def set_version(self, version: str) -> None:
-        """Set the workflow's semantic version in place."""
-        ...
-
-    def set_space(self, space: str) -> None:
-        """Set the workflow's space in place."""
-        ...
 
     @property
     def name(self) -> str | None:
@@ -943,37 +895,25 @@ class Workflow:
         """Return the ordered step ids."""
         ...
 
-    def to_yaml(self) -> str:
-        """Serialize this workflow to a canonical envelope YAML string.
-
-        Raises:
-            WyrdError: When identity or codec fails.
-        """
-        ...
-
-    def save(self, path: PathLike) -> None:
-        """Save this workflow to ``path`` as canonical envelope YAML.
-
-        Raises:
-            WyrdError: When identity, IO, or codec fails.
-        """
-        ...
-
     @staticmethod
-    def from_path(path: PathLike) -> Workflow:
+    def from_path(path: PathLike, client: WyrdClient | None = None) -> Workflow:
         """Load an authored Workflow file and the Cards it references.
 
         Relative paths and sibling Agents and Prompts in the same bundle load
         locally; a wholly local file needs no server or credentials. Registry
-        Card refs are read exactly through the ambient Wyrd client
-        configuration (`WYRD_SERVER_URL` and `WYRD_API_KEY` or
-        `WYRD_ACCESS_TOKEN`).
+        Card refs are read exactly as ``client``; omitted, they are read
+        through the ambient Wyrd client configuration (`WYRD_SERVER_URL` and
+        `WYRD_API_KEY` or `WYRD_ACCESS_TOKEN`). A given ``client`` also makes
+        the loaded Workflow's gateway calls, so a program serving several
+        principals passes each one's client.
 
         Loading only reads files and Cards; it registers and runs nothing. A
         failure after some reads returns no partial Workflow.
 
         Args:
             path (PathLike): Workflow entry file.
+            client (WyrdClient | None): Principal that reads registry refs and
+                calls the gateway; the ambient configuration when omitted.
 
         Returns:
             Workflow: Fully hydrated and validated workflow.
@@ -999,6 +939,12 @@ class Workflow:
     @staticmethod
     def from_yaml(yaml: str) -> Workflow:
         """Parse a workflow from envelope YAML text, resolving inline Agents eagerly.
+
+        Args:
+            yaml: the workflow envelope YAML text.
+
+        Returns:
+            The parsed workflow.
 
         Raises:
             WyrdError: When parse or resolution fails.

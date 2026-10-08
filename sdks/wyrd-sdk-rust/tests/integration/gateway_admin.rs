@@ -5,64 +5,63 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use serde_json::json;
-use wyrd_sdk::Gateway;
 use wyrd_sdk::cli;
 use wyrd_sdk::gateway::{
     CredentialBindingName, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
-    ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
+    GatewayPayloadField, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialState, ProviderCredentialView, ProviderCredentialWrite,
     ProviderCredentialWriteSource, ProviderDeployment, ProviderDeploymentName, ProviderId,
 };
+use wyrd_sdk::{Gateway, WyrdClient};
 use wyrd_testing::server::TEST_GATEWAY_CREDENTIAL_BINDING;
 
-use crate::support::{self, Deployment};
+use crate::support::Deployment;
 
-/// The credential every story writes.
+/// The provider credential `name`.
 ///
 /// # Panics
-/// Panics when the fixed name is invalid.
-fn credential_name() -> ProviderCredentialName {
-    ProviderCredentialName::new("openai-key").expect("credential name")
+/// Panics when `name` is not a valid credential name.
+fn credential(name: &str) -> ProviderCredentialName {
+    ProviderCredentialName::new(name).expect("credential name")
 }
 
-/// Write [`credential_name`], resolved from the server's environment
-/// binding, with the CLI, and [`support::report`] its view.
+/// Write the credential `name`, resolved from the server's
+/// `test-provider-key` environment binding, with the CLI as `client`, and
+/// return its redacted view.
 ///
 /// # Panics
 /// Panics when the write is refused.
-async fn put_credential() {
-    let view = cli::put_provider_credential(
+async fn put_credential(client: WyrdClient, name: &str) -> ProviderCredentialView {
+    cli::put_provider_credential(
         &ProviderCredentialWrite {
-            name: credential_name(),
+            name: credential(name),
             provider: ProviderId::new("openai").expect("provider"),
             source: ProviderCredentialWriteSource::Environment {
                 binding: CredentialBindingName::new(TEST_GATEWAY_CREDENTIAL_BINDING)
                     .expect("binding"),
             },
         },
-        None,
+        Some(client),
     )
     .await
-    .expect("the CLI writes the credential");
-    support::report(&serde_json::to_value(view).expect("view serializes"));
+    .expect("the CLI writes the credential")
 }
 
-/// An `openai` Chat Completions deployment that authenticates with
-/// [`credential_name`].
+/// An `openai` Chat Completions deployment `name` that authenticates with
+/// the credential `credential_name`.
 ///
 /// # Panics
-/// Panics when a fixed name is invalid.
-fn deployment() -> ProviderDeployment {
+/// Panics when a name is invalid.
+fn deployment(name: &str, credential_name: &str) -> ProviderDeployment {
     ProviderDeployment {
-        name: ProviderDeploymentName::new("gpt-4o").expect("deployment name"),
+        name: ProviderDeploymentName::new(name).expect("deployment name"),
         model: ModelRef {
             provider: ProviderId::new("openai").expect("provider"),
             model: ModelId::new("gpt-4o").expect("model"),
         },
         adapter: ProviderAdapter::OpenAi,
         auth: ProviderAuth::Bearer {
-            credential: credential_name(),
+            credential: credential(credential_name),
         },
         capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
         routing_weight: NonZeroU32::MIN,
@@ -77,28 +76,15 @@ fn deployment() -> ProviderDeployment {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cli_written_credential_reads_back_through_the_gateway() {
-    if support::is_child() {
-        put_credential().await;
-        return;
-    }
     let deployment = Deployment::start().await;
-    let gateway = Gateway::new(deployment.admin());
+    let gateway = Gateway::with_client(deployment.admin());
 
-    let written: ProviderCredentialView = serde_json::from_value(
-        deployment
-            .run_child(
-                "gateway_admin::cli_written_credential_reads_back_through_the_gateway",
-                &deployment.key("cli_admin", &["admin"]).await,
-                &[],
-            )
-            .await,
-    )
-    .expect("the child reports the view");
+    let written = put_credential(deployment.admin(), "read-back-key").await;
 
     assert_eq!(written.state, ProviderCredentialState::Active);
     assert_eq!(
         gateway
-            .credential(&credential_name())
+            .credential(&credential("read-back-key"))
             .await
             .expect("credential reads"),
         written
@@ -110,71 +96,151 @@ async fn cli_written_credential_reads_back_through_the_gateway() {
     deployment.shutdown().await;
 }
 
-/// A deployment round trips through the Gateway, and the CLI cannot delete
-/// the credential it uses.
+/// A deployment written through the Gateway reads back and lists, and once
+/// deleted is gone.
 ///
 /// # Panics
-/// Panics when a write or read differs, or the delete is not refused with
-/// the conflict code.
+/// Panics when a write, read, or delete differs, or the deleted deployment
+/// is not refused with the not-found code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn credential_in_use_cannot_be_deleted() {
-    if support::is_child() {
-        if std::env::var("PHASE").as_deref() == Ok("delete") {
-            let refused = cli::delete_provider_credential(&credential_name(), None)
-                .await
-                .expect_err("a referenced credential is kept");
-            support::report(&json!(refused.code()));
-        } else {
-            put_credential().await;
-        }
-        return;
-    }
+async fn deployment_round_trips() {
     let deployment = Deployment::start().await;
-    let gateway = Gateway::new(deployment.admin());
-    let key = deployment.key("cli_admin", &["admin"]).await;
-    let test = "gateway_admin::credential_in_use_cannot_be_deleted";
-    deployment.run_child(test, &key, &[("PHASE", "put")]).await;
+    let gateway = Gateway::with_client(deployment.admin());
+    put_credential(deployment.admin(), "round-trip-key").await;
+    let primary = self::deployment("round-trip", "round-trip-key");
 
     assert_eq!(
         gateway
-            .put_deployment(&self::deployment())
+            .put_deployment(&primary)
             .await
             .expect("deployment puts"),
-        self::deployment()
+        primary
+    );
+    assert_eq!(
+        gateway
+            .deployment(&primary.name)
+            .await
+            .expect("deployment reads"),
+        primary
     );
     assert_eq!(
         gateway.deployments().await.expect("deployments list"),
-        [self::deployment()]
+        std::slice::from_ref(&primary)
     );
-    assert_eq!(
-        deployment
-            .run_child(test, &key, &[("PHASE", "delete")])
-            .await,
-        "WYRD_GATEWAY_409_RESOURCE_CONFLICT"
-    );
+    gateway
+        .delete_deployment(&primary.name)
+        .await
+        .expect("deployment deletes");
+    let gone = gateway
+        .deployment(&primary.name)
+        .await
+        .expect_err("a deleted deployment is gone");
+    assert_eq!(gone.code(), "WYRD_GATEWAY_404_RESOURCE_NOT_FOUND");
     deployment.shutdown().await;
 }
 
-/// The capture policy the administrator writes is the one read back.
+/// A deployment that offers no operation is refused.
 ///
 /// # Panics
-/// Panics when the write or read fails or the policies differ.
+/// Panics when the write succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn deployment_without_capabilities_is_refused() {
+    let deployment = Deployment::start().await;
+    put_credential(deployment.admin(), "no-capability-key").await;
+
+    let refused = Gateway::with_client(deployment.admin())
+        .put_deployment(&ProviderDeployment {
+            capabilities: BTreeSet::new(),
+            ..self::deployment("no-capability", "no-capability-key")
+        })
+        .await
+        .expect_err("a deployment needs a capability");
+
+    assert_eq!(refused.code(), "WYRD_GATEWAY_400_INVALID_CONFIGURATION");
+    deployment.shutdown().await;
+}
+
+/// The CLI cannot delete a credential a deployment uses.
+///
+/// # Panics
+/// Panics when a setup step fails, or the delete succeeds or is refused with
+/// another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn credential_in_use_cannot_be_deleted() {
+    let deployment = Deployment::start().await;
+    put_credential(deployment.admin(), "in-use-key").await;
+    Gateway::with_client(deployment.admin())
+        .put_deployment(&self::deployment("in-use", "in-use-key"))
+        .await
+        .expect("deployment puts");
+
+    let refused =
+        cli::delete_provider_credential(&credential("in-use-key"), Some(deployment.admin()))
+            .await
+            .expect_err("a referenced credential is kept");
+
+    assert_eq!(refused.code(), "WYRD_GATEWAY_409_RESOURCE_CONFLICT");
+    deployment.shutdown().await;
+}
+
+/// Deleting a credential, then deleting it again, succeeds both times and
+/// leaves it gone.
+///
+/// # Panics
+/// Panics when a delete fails or the credential still reads.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn deleting_a_credential_twice_succeeds() {
+    let deployment = Deployment::start().await;
+    put_credential(deployment.admin(), "deleted-key").await;
+
+    for _ in 0..2 {
+        cli::delete_provider_credential(&credential("deleted-key"), Some(deployment.admin()))
+            .await
+            .expect("the delete succeeds");
+    }
+
+    let gone = Gateway::with_client(deployment.admin())
+        .credential(&credential("deleted-key"))
+        .await
+        .expect_err("a deleted credential is gone");
+    assert_eq!(gone.code(), "WYRD_GATEWAY_404_RESOURCE_NOT_FOUND");
+    deployment.shutdown().await;
+}
+
+/// Capture starts disabled, and the payload policy the administrator writes
+/// is the one read back.
+///
+/// # Panics
+/// Panics when a write or read fails or the policies differ.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn capture_policy_round_trips() {
     let deployment = Deployment::start().await;
-    let gateway = Gateway::new(deployment.admin());
+    let gateway = Gateway::with_client(deployment.admin());
+    assert_eq!(
+        gateway.capture_policy().await.expect("capture reads").mode,
+        GatewayCaptureMode::Disabled
+    );
 
     let capture = gateway
         .put_capture_policy(&GatewayCapturePolicyWrite {
-            mode: GatewayCaptureMode::Metadata,
-            payload_fields: BTreeSet::new(),
+            mode: GatewayCaptureMode::Payload,
+            payload_fields: BTreeSet::from([GatewayPayloadField::Request]),
         })
         .await
         .expect("capture puts");
 
-    assert_eq!(capture.mode, GatewayCaptureMode::Metadata);
+    assert_eq!(
+        (capture.mode, &capture.payload_fields),
+        (
+            GatewayCaptureMode::Payload,
+            &BTreeSet::from([GatewayPayloadField::Request])
+        )
+    );
     assert_eq!(
         gateway.capture_policy().await.expect("capture reads"),
         capture
@@ -182,26 +248,41 @@ async fn capture_policy_round_trips() {
     deployment.shutdown().await;
 }
 
-/// A caller without `gateway:read` cannot list credentials.
+/// A caller holding only `gateway:read` reads a deployment but cannot delete
+/// it.
 ///
 /// # Panics
-/// Panics when the listing succeeds or is refused with another code.
+/// Panics when the read fails, or the delete succeeds or is refused with
+/// another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn caller_without_gateway_read_is_refused() {
+async fn gateway_reader_cannot_delete_a_deployment() {
     let deployment = Deployment::start().await;
-    let denied = Gateway::new(
+    put_credential(deployment.admin(), "reader-key").await;
+    let read_only = self::deployment("read-only", "reader-key");
+    Gateway::with_client(deployment.admin())
+        .put_deployment(&read_only)
+        .await
+        .expect("deployment puts");
+    let reader = Gateway::with_client(
         deployment.client(
             &deployment
-                .scoped_key("query_only", &["bifrost_query:read"])
+                .scoped_key("gateway_reader", &["gateway:read"])
                 .await,
         ),
     );
 
-    let refused = denied
-        .credentials()
+    assert_eq!(
+        reader
+            .deployment(&read_only.name)
+            .await
+            .expect("the reader reads"),
+        read_only
+    );
+    let refused = reader
+        .delete_deployment(&read_only.name)
         .await
-        .expect_err("the listing is refused");
+        .expect_err("a reader cannot delete");
 
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;

@@ -24,12 +24,18 @@ pub trait IngestTransport<G>: Send + Sync + 'static {
 
 /// The Record queue sink that forwards each non-cloneable batch to gRPC.
 pub struct BifrostIngestSink {
-    transport: Arc<dyn IngestTransport<ClientByteGuard>>,
+    /// The transport every sealed batch is forwarded to; crate-visible so the
+    /// facade assembles the sink without the internal-only constructor.
+    pub(crate) transport: Arc<dyn IngestTransport<ClientByteGuard>>,
 }
 
 impl BifrostIngestSink {
     /// Builds a sink over the ordinary Rust owned-batch transport.
+    ///
+    /// # Arguments
+    /// * `transport` - The gRPC ingest transport each sealed batch is forwarded to.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn new(transport: Arc<dyn IngestTransport<ClientByteGuard>>) -> Self {
         Self { transport }
     }

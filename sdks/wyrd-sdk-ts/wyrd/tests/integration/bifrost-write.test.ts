@@ -1,8 +1,8 @@
-import { RecordBatch, Struct, makeBuilder, makeData, tableFromIPC, type Schema } from "apache-arrow";
+import { Field, Int32, RecordBatch, Schema, Struct, makeBuilder, makeData, tableFromIPC } from "apache-arrow";
 import { expect, vi } from "vitest";
 import { ZodError, z } from "zod";
 
-import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, TableConfig, type TableConfigOptions, WyrdClient, record } from "@wyrd/sdk";
 
 import { serverTest } from "../support/server.js";
 
@@ -133,6 +133,40 @@ test("compaction type is recorded and a different one is refused", async () => {
   expect((await TableConfig.describe("vala.datasets.kind")).compactionType).toBe("small-files");
 });
 
+test("recorded telemetry row reads back", async ({ server, reader }) => {
+  const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema("vala.datasets.recorded", Value) });
+  expect(await writer.register()).toBe("created");
+
+  record(writer, "vala.datasets.recorded", Value, { value: 7 });
+  await writer.shutdown();
+  server.flushBifrost();
+
+  expect(writer.dropped).toBe(0);
+  const rows = await reader.sql("SELECT value FROM vala.datasets.recorded", [], z.object({ value: z.bigint() }));
+  expect(rows).toEqual([{ value: 7n }]);
+});
+
+test("recorded telemetry with an unmappable schema is refused", async ({ reader }) => {
+  expect(() => record(reader, "vala.datasets.recorded", { type: "object" }, { value: 7 })).toThrow(
+    expect.objectContaining({ code: "WYRD_VALA_400_SCHEMA_PARSE" }),
+  );
+});
+
+// Arrow declares a column type JSON Schema cannot: a 32-bit integer.
+test("arrow declared table keeps its column types", async ({ server, reader }) => {
+  const schema = new Schema([new Field("small", new Int32(), false)]);
+  const writer = await Bifrost.connect({ table: TableConfig.fromArrow("vala.datasets.arrow_declared", schema) });
+  expect(await writer.register()).toBe("created");
+
+  writer.insert({ small: 32 });
+  await writer.shutdown();
+  server.flushBifrost();
+
+  const read = await reader.sql("SELECT small FROM vala.datasets.arrow_declared");
+  expect(read.toArrow().schema.fields.map((field) => [field.name, String(field.type)])).toEqual([["small", "Int32"]]);
+  expect(read.toArrow().getChild("small")?.toArray()).toEqual(Int32Array.from([32]));
+});
+
 test("described table accepts writes without restating its schema", async ({ server, reader }) => {
   await registerValueTable("vala.datasets.described");
   const writer = await Bifrost.connect({ table: await TableConfig.describe("vala.datasets.described") });
@@ -141,6 +175,7 @@ test("described table accepts writes without restating its schema", async ({ ser
   await writer.shutdown();
   server.flushBifrost();
 
+  expect(writer.dropped).toBe(0);
   expect((await reader.sql("SELECT value FROM vala.datasets.described")).numRows).toBe(1);
 });
 
@@ -200,20 +235,16 @@ test("delegated client reads with the callers authority", async ({ reader: _, a,
 
 test("delegated client cannot write with the services authority", async ({ a, b }) => {
   await registerValueTable("vala.datasets.delegated");
-  const { arrowSchema } = await TableConfig.describe("vala.datasets.delegated", { credential: b });
+  const { arrowSchema } = await TableConfig.describe("vala.datasets.delegated", {
+    client: WyrdClient.connect({ credential: b }),
+  });
   const asA = await onBehalfOfA(a, b);
 
   await expect(asA.writeBatch("vala.datasets.delegated", valueBatch(arrowSchema, 41n))).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
-  await (await Bifrost.connect({ credential: b })).writeBatch("vala.datasets.delegated", valueBatch(arrowSchema, 42n));
-});
-
-test("client and transport options conflict", async ({ b }) => {
-  const client = WyrdClient.connect({ credential: b });
-
-  // @ts-expect-error `client` is mutually exclusive with every transport option.
-  await expect(Bifrost.connect({ client, credential: b })).rejects.toMatchObject({
-    code: "WYRD_SPEC_400_VALIDATION",
-  });
+  await (await Bifrost.connect({ client: WyrdClient.connect({ credential: b }) })).writeBatch(
+    "vala.datasets.delegated",
+    valueBatch(arrowSchema, 42n),
+  );
 });

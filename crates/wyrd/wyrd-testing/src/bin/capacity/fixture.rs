@@ -9,7 +9,7 @@
 //! Eval-verified on `observations_ready`. It waits for both baselines to fit
 //! and seeds one window of [`SAMPLES`] Drift observations that every queued
 //! Drift run reads.
-//! Registration gives each Service principal the `workload` role, so its
+//! Registration gives each Service principal the `wyrd_default` role, so its
 //! Card-bound key emits; the administrator runs and executes Verifiers.
 
 use std::fmt::Write as _;
@@ -396,9 +396,9 @@ impl Tenant {
     /// not returned, so no queued Drift step reads it.
     async fn seed(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
         let start = Utc::now();
-        let state = WyrdState::from_path(&self.bundle)?;
+        let state = WyrdState::from_path_with_client(&self.bundle, self.service(SERVER_URL)?)?;
         state
-            .start_bifrost_with_config(&self.service(SERVER_URL)?, None, QueueConfig::default())
+            .start_bifrost_with_config(None, QueueConfig::default())
             .await?;
         let run = state.run();
         let model = run.for_card("model")?;

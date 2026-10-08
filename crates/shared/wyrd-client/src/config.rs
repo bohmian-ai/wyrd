@@ -107,6 +107,10 @@ impl ClientConfig {
     }
 
     /// Overlay global config values with environment values and defaults.
+    ///
+    /// # Arguments
+    /// * `global` - Loaded global config whose values take precedence over environment
+    ///   variables.
     #[must_use]
     pub fn from_global_with_env(global: &GlobalConfig) -> Self {
         Self::from_global_with_overrides(global, None, None)
@@ -118,6 +122,13 @@ impl ClientConfig {
     /// environment variable. The HTTP base URL then falls back to its default;
     /// the gRPC endpoint falls back to [`grpc_endpoint_for`] of the *effective*
     /// HTTP base URL, so re-pointing only `server_url` re-points gRPC with it.
+    ///
+    /// # Arguments
+    /// * `global` - Loaded global config consulted after the explicit endpoints.
+    /// * `server_url` - Explicit HTTP base URL; `None` falls back to global config,
+    ///   `WYRD_SERVER_URL`, then the default.
+    /// * `grpc_url` - Explicit gRPC endpoint; `None` falls back to global config,
+    ///   `WYRD_GRPC_URL`, then one derived from the HTTP base URL.
     #[must_use]
     pub fn from_global_with_overrides(
         global: &GlobalConfig,
@@ -132,6 +143,14 @@ impl ClientConfig {
     ///
     /// Resolution follows [`ClientConfig::from_global_with_overrides`] with
     /// every ambient value read from `environment` instead of the process.
+    ///
+    /// # Arguments
+    /// * `environment` - Source of every ambient variable, retained for credential resolution.
+    /// * `global` - Loaded global config consulted after the explicit endpoints.
+    /// * `server_url` - Explicit HTTP base URL; `None` falls back to global config,
+    ///   `WYRD_SERVER_URL`, then the default.
+    /// * `grpc_url` - Explicit gRPC endpoint; `None` falls back to global config,
+    ///   `WYRD_GRPC_URL`, then one derived from the HTTP base URL.
     #[must_use]
     pub fn from_environment(
         environment: Environment,
@@ -224,7 +243,7 @@ impl ClientConfig {
             if let Some(login) = store.select(&origin, self.tenant.as_deref())? {
                 let exchange = TokenExchange::new(&self.http.base_url, self.http.timeout_ms)?;
                 return Ok(ResolvedCredential::Renewable(
-                    store.source(&login, exchange),
+                    store.renewing_source(&login, exchange),
                 ));
             }
         }

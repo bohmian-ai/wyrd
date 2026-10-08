@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use wyrd_sdk::bifrost::QueryParam;
 use wyrd_sdk::state::WyrdState;
-use wyrd_sdk::{Bifrost, QueueConfig};
-use wyrd_spec::vala::ids::SessionId;
+use wyrd_sdk::{Bifrost, QueueConfig, SessionId, WyrdClient};
 
 use crate::support::{Deployment, hydrate, register};
 
@@ -58,7 +57,27 @@ async fn observed() -> (Deployment, TempDir) {
 /// # Panics
 /// Panics when the bundle does not load.
 fn state(dir: &TempDir) -> WyrdState {
-    WyrdState::from_path(&dir.path().join("bundle")).expect("bundle loads offline")
+    WyrdState::from_path(dir.path().join("bundle")).expect("bundle loads offline")
+}
+
+/// The hydrated bundle under `dir`, loaded with its server calls fixed to
+/// `client`.
+///
+/// # Panics
+/// Panics when the bundle does not load.
+fn state_as(dir: &TempDir, client: WyrdClient) -> WyrdState {
+    WyrdState::from_path_with_client(dir.path().join("bundle"), client)
+        .expect("bundle loads offline")
+}
+
+/// The observed Service's own client, from a key the `issue_key` CLI
+/// function issues for the Service registered in `dir`'s bundle.
+///
+/// # Panics
+/// Panics when the bundle does not load or the key is not issued.
+async fn service_client(deployment: &Deployment, dir: &TempDir) -> WyrdClient {
+    let service = state(dir).root_ref().clone();
+    deployment.client(&deployment.service_key(&service).await)
 }
 
 /// A drift emit on the run's Model view reads back by run id, one row per
@@ -70,12 +89,8 @@ fn state(dir: &TempDir) -> WyrdState {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn run_observations_read_back_by_run_id() {
     let (deployment, dir) = observed().await;
-    let state = state(&dir);
-    let service = deployment.service_key(state.root_ref(), &[]).await;
-    state
-        .start_bifrost_with(&deployment.client(&service), None)
-        .await
-        .expect("Bifrost starts");
+    let state = state_as(&dir, service_client(&deployment, &dir).await);
+    state.start_bifrost().await.expect("Bifrost starts");
     let run = state.run();
 
     run.for_card("model")
@@ -97,7 +112,9 @@ async fn run_observations_read_back_by_run_id() {
         .expect("rows publish");
 
     let run_id = run.run_id().to_string();
-    let rows: Vec<DriftRow> = Bifrost::query_only(&deployment.admin())
+    let rows: Vec<DriftRow> = Bifrost::connect(&deployment.admin())
+        .await
+        .expect("Bifrost connects")
         .sql_as(
             "SELECT series, num_value, str_value, session_id, card_uid, run_id \
              FROM vala.drift.observations WHERE run_id = $1 ORDER BY series",
@@ -163,11 +180,8 @@ async fn run_view_exposes_its_alias() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn card_scoped_key_cannot_write_another_cards_observations() {
     let (deployment, dir) = observed().await;
-    let state = state(&dir);
-    state
-        .start_bifrost_with(&deployment.admin(), None)
-        .await
-        .expect("Bifrost starts");
+    let state = state_as(&dir, deployment.admin());
+    state.start_bifrost().await.expect("Bifrost starts");
 
     state
         .run_for_card("model")
@@ -196,15 +210,10 @@ async fn card_scoped_key_cannot_write_another_cards_observations() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn unsealable_byte_budget_is_refused_at_connect() {
     let (deployment, dir) = observed().await;
-    let state = state(&dir);
-    let service = deployment.service_key(state.root_ref(), &[]).await;
+    let state = state_as(&dir, service_client(&deployment, &dir).await);
 
     let refused = state
-        .start_bifrost_with_config(
-            &deployment.client(&service),
-            None,
-            QueueConfig::with_client_byte_limit(Some(1024)),
-        )
+        .start_bifrost_with_config(None, QueueConfig::with_client_byte_limit(Some(1024)))
         .await
         .expect_err("the budget is refused");
 

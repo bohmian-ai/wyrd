@@ -160,6 +160,10 @@ impl CredentialSource {
     /// as a bearer access token. Routing it in one place is what keeps the
     /// Rust, Python, and TypeScript clients from disagreeing about what a
     /// credential is.
+    ///
+    /// # Arguments
+    /// * `credential` - Credential string; an [`API_KEY_PREFIX`] value is an API key, anything
+    ///   else an access token.
     #[must_use]
     pub fn explicit(credential: SecretString) -> Self {
         if credential.expose_secret().starts_with(API_KEY_PREFIX) {
@@ -217,6 +221,10 @@ impl CredentialChain {
 
     /// Build a credential chain using an optional file-configured tenant:
     /// [`Self::env_only`] followed by [`Self::credentials_file`].
+    ///
+    /// # Arguments
+    /// * `tenant_override` - Tenant for the workload-token tier; `None` or empty falls back to
+    ///   `WYRD_TENANT`.
     #[must_use]
     pub fn from_env_with_tenant(tenant_override: Option<&str>) -> Self {
         let mut chain = Self::env_only(&Environment::Process, tenant_override);
@@ -228,6 +236,11 @@ impl CredentialChain {
     /// `WYRD_WORKLOAD_TOKEN` with its tenant, then `WYRD_API_KEY` — read from
     /// `environment`, without the `credentials.toml` floor, so a caller can
     /// rank a saved user login between them.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables the tiers are read from.
+    /// * `tenant_override` - Tenant for the workload-token tier; `None` or empty falls back to
+    ///   `WYRD_TENANT`.
     #[must_use]
     pub fn env_only(environment: &Environment, tenant_override: Option<&str>) -> Self {
         Self {
@@ -245,6 +258,9 @@ impl CredentialChain {
     /// The `credentials.toml` `[default].api_key` floor alone, in the
     /// configuration directory `environment` resolves; empty when the file is
     /// absent, unreadable, or has no key.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables that resolve the configuration directory.
     #[must_use]
     pub fn credentials_file(environment: &Environment) -> Self {
         Self {
@@ -255,11 +271,17 @@ impl CredentialChain {
     }
 
     /// Append a credential source to the chain.
+    ///
+    /// # Arguments
+    /// * `source` - Source appended at the lowest priority.
     pub fn push(&mut self, source: CredentialSource) {
         self.sources.push(source);
     }
 
     /// Append all sources from `other` to the end of this chain.
+    ///
+    /// # Arguments
+    /// * `other` - Chain whose sources are appended in order, below this chain's.
     pub fn extend(&mut self, other: CredentialChain) {
         self.sources.extend(other.sources);
     }

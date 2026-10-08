@@ -6,16 +6,16 @@ journey lanes, not here.
 """
 
 import asyncio
-import subprocess
+import importlib
 import sys
 import threading
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
 import wyrd
+import wyrd.otel
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -466,42 +466,22 @@ def test_run_exit_never_suppresses(
     assert run.__exit__(exc_type, exc_value, None) is False
 
 
-MISSING_OPENTELEMETRY = """\
-import sys
-
-sys.modules["opentelemetry"] = None
-bundle, support = sys.argv[1:]
-sys.path.insert(0, support)
-from support import TinyDataInterface, TinyModelInterface
-from wyrd.otel import install_run_correlation
-from wyrd.state import WyrdState
-
-assert install_run_correlation() is False
-state = WyrdState.from_path(
-    bundle,
-    interfaces={
-        "model": TinyModelInterface(),
-        "backup": TinyModelInterface(),
-        "training_data": TinyDataInterface(),
-    },
-)
-with state.run("model") as run:
-    assert run.alias == "model"
-"""
+@pytest.fixture
+def without_opentelemetry() -> Iterator[None]:
+    """``wyrd.otel`` re-imported as though the optional package were not installed, then restored."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "opentelemetry", None)
+        importlib.reload(wyrd.otel)
+        yield
+    importlib.reload(wyrd.otel)
 
 
-def test_missing_opentelemetry_is_a_no_op(complete_bundle: Path) -> None:
+@pytest.mark.usefixtures("without_opentelemetry")
+def test_missing_opentelemetry_is_a_no_op(state: WyrdState) -> None:
     """Without the optional package, installation reports False and a run still scopes."""
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            MISSING_OPENTELEMETRY,
-            str(complete_bundle),
-            str(Path(__file__).parent),
-        ],
-        check=True,
-    )
+    assert wyrd.otel.install_run_correlation() is False
+    with state.run("model") as run:
+        assert run.alias == "model"
 
 
 def _drift_reaches_the_ordinary_boundary(run: Run) -> None:

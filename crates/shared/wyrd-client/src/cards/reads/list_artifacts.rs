@@ -20,6 +20,7 @@ pub(crate) async fn list_artifacts(
     card_uid: &CardUid,
 ) -> Result<ArtifactInventoryResponse, RegistryEngineError> {
     client
+        .http
         .request_json(
             reqwest::Method::GET,
             &format!("/v1/cards/{card_uid}/artifacts"),

@@ -12,12 +12,12 @@
 //!   requested physical layout, built from Arrow or JSON Schema or fetched by
 //!   name. The server stays authoritative for the uid and fingerprint it
 //!   reports back through [`ResolvedTable`].
-//! - [`BifrostIngestSink`] — the `wyrd-queue` [`BatchSink`] that maps one sealed
+//! - `BifrostIngestSink` — the `wyrd-queue` [`BatchSink`] that maps one sealed
 //!   batch onto the ingest RPC (`table`, `wyrd_batch_id`, Arrow IPC frames),
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
 //! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
-//! Query streaming and lifecycle — [`Bifrost::query`], [`Bifrost::collect_bounded`],
+//! Query streaming and lifecycle — [`Bifrost::sql`], [`Bifrost::stream`],
 //! [`Bifrost::running`], [`Bifrost::status`], and [`Bifrost::cancel`] — and the
 //! ingest transport are reached only through the facade; the query mechanic
 //! behind them is not publicly nameable:
@@ -30,7 +30,7 @@
 //! use wyrd_client::bifrost::RawQueryStream;
 //! ```
 //!
-//! [`ClientScope`] is a credential fingerprint the **token-opaque** client tier
+//! `ClientScope` is a credential fingerprint the **token-opaque** client tier
 //! computes without ever decoding a JWT: `(server_url, SHA-256 of the resolved
 //! credential's secret material)`. Backpressure is asymmetric — [`Bifrost::insert`]
 //! propagates queue-full to the caller, while [`observe::record`] swallows it,
@@ -48,7 +48,11 @@ mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, QueryResult, client_from_options, register_outcome_name};
+pub use facade::{Bifrost, QueryResult};
+/// Binding plumbing: the explicit-option client door and the shared register
+/// outcome spelling the Python and TypeScript bindings project.
+#[cfg(feature = "internal")]
+pub use facade::{client_from_options, register_outcome_name};
 /// Raw ingest transport, exposed only to test harnesses that must submit exact
 /// sealed batches (replay and deduplication journeys) without the facade.
 #[cfg(feature = "test-support")]
@@ -57,7 +61,12 @@ pub use handle::BifrostMetrics;
 pub use query::{
     BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryResultStream,
 };
-pub use scope::{ClientScope, SinkKind};
+/// The producer-pool scope key, nameable only by internal consumers.
+#[cfg(feature = "internal")]
+pub use scope::ClientScope;
+pub use scope::SinkKind;
+/// The owned-batch ingest seam, nameable only by internal test harnesses.
+#[cfg(feature = "internal")]
 pub use sink::{BifrostIngestSink, IngestTransport};
 pub use table::{Correlation, ResolvedTable, TableConfig, WriterTable};
 /// The bounded producer-queue configuration a Bifrost writer is connected with.
@@ -67,11 +76,6 @@ pub use wyrd_queue::QueueConfig;
 pub use wyrd_spec::vala::api::CompactionTypeWire;
 /// One typed positional bind value for [`Bifrost::sql`] and its siblings.
 pub use wyrd_spec::vala::api::QueryParam;
-
-// C4a forward schema helpers, re-exported so SDK users build the user Arrow
-// schema from a `FieldSpec` set or a JSON-Schema value without reaching into
-// `wyrd-queue` directly.
-pub use wyrd_queue::{fieldspec_to_arrow, json_schema_to_arrow};
 
 /// Server-free unit lane for the Bifrost client: scope identity, producer pooling, and
 /// the asymmetric backpressure contract — all driven through mock/stall sinks.
@@ -805,7 +809,7 @@ mod sdk {
             Bifrost::running,
             Bifrost::status,
             Bifrost::cancel,
-            Bifrost::describe,
+            Bifrost::describe_table,
         );
         let _ = (
             crate::bifrost::blocking::Bifrost::query,
@@ -815,7 +819,7 @@ mod sdk {
             crate::bifrost::blocking::Bifrost::running,
             crate::bifrost::blocking::Bifrost::status,
             crate::bifrost::blocking::Bifrost::cancel,
-            crate::bifrost::blocking::Bifrost::describe,
+            crate::bifrost::blocking::Bifrost::describe_table,
         );
     }
 }

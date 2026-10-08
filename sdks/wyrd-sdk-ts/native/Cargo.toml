@@ -22,7 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 wyrd-cli = { workspace = true }
-wyrd-client = { workspace = true }
+wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 

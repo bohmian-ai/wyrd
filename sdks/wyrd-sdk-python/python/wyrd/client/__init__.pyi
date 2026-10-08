@@ -29,7 +29,11 @@ class WyrdClient:
             server_url: the HTTP server URL; a trailing ``/`` is dropped.
                 Resolved from ``WYRD_SERVER_URL`` and then
                 ``http://localhost:8080`` if omitted.
-            credential: the API key or bearer token. Resolved through
+            credential: the client's own credential, in one of two forms.
+                A Wyrd API key (``wyrd_sk_…``) is exchanged with the server
+                for a short-lived access token on first use and renewed
+                before expiry. Any other value is an access token and is
+                presented as-is until it expires. Resolved through
                 ``WYRD_ACCESS_TOKEN`` → ``WYRD_WORKLOAD_TOKEN`` + tenant →
                 ``WYRD_API_KEY`` → this server's saved ``wyrd auth login`` →
                 ``~/.config/wyrd/credentials.toml``

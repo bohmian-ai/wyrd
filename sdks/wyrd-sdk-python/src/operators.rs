@@ -12,7 +12,6 @@ use pyo3::types::PyModule;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use wyrd_client::bifrost::client_from_options;
 use wyrd_client::operator_connections::{
     CreateOperatorConnectionRequest, OperatorConnectionId,
     OperatorConnections as NativeOperatorConnections, UpdateOperatorConnectionRequest,
@@ -57,18 +56,22 @@ pub struct OperatorConnections {
 
 #[pymethods]
 impl OperatorConnections {
-    /// Build a handle; omitted arguments fall through the client configuration,
-    /// and `WYRD_TENANT` selects the saved user login.
+    /// Build a handle acting as `client`; omitted, the client resolves from
+    /// the ambient chain.
     ///
     /// No network call happens here.
     ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    ///
     /// # Errors
-    /// Raises `WyrdError` when the server URL or credential cannot be resolved.
+    /// Raises `WyrdError` when the ambient server URL or credential cannot be
+    /// resolved.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None))]
-    fn __new__(server_url: Option<&str>, credential: Option<&str>) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, None)
-            .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         Ok(Self {
             inner: NativeOperatorConnections::with_client(client),
         })

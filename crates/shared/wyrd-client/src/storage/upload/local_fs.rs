@@ -53,6 +53,7 @@ pub(crate) async fn upload(
         reqwest::Body::wrap_stream(reader.stream())
     };
     client
+        .http
         .request_stream(reqwest::Method::PUT, put_url, body)
         .await
         .map_err(from_authenticated)?;

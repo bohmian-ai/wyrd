@@ -75,6 +75,21 @@ if rg -q '^[^/]*gateway_credential' sdks/wyrd-sdk-rust/src; then
   exit 1
 fi
 
+# The Rust SDK projects only the parity surface: wyrd-client's `internal`
+# feature (raw requests, writer internals, bundle introspection) is never
+# enabled by its manifest, directly or through one of its own features, nor
+# reached by its production graph. The test-only `testing` feature reaches it
+# through the in-process CLI and is absent from production builds.
+if rg -q 'wyrd-client/internal|^wyrd-client\s*=.*"internal"' sdks/wyrd-sdk-rust/Cargo.toml; then
+  echo 'FAIL: wyrd-sdk-rust enables wyrd-client/internal'
+  exit 1
+fi
+if cargo tree --locked -p wyrd-sdk-rust -e features,normal,build --prefix none |
+  rg -q '^wyrd-client feature "internal"'; then
+  echo 'FAIL: the wyrd-sdk-rust production graph enables wyrd-client/internal'
+  exit 1
+fi
+
 # One version each of the tightly coupled Arrow/DataFusion stack.
 duplicates=$(cargo tree --locked --workspace --all-features -e no-dev -d --prefix none |
   rg -o '^(object_store|datafusion|arrow|parquet) v\S+' | sort -u |

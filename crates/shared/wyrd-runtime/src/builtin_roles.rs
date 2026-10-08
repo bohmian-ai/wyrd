@@ -61,11 +61,19 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         permissions: &[Permission::service_accounts_write()],
     },
     BuiltinRole {
-        name: WORKLOAD_ROLE,
+        name: "workload",
         permissions: &[
             Permission::bifrost_table_read(),
             Permission::bifrost_record_write(),
             Permission::bifrost_query_read(),
+        ],
+    },
+    BuiltinRole {
+        name: DEFAULT_CARD_ROLE,
+        permissions: &[
+            Permission::bifrost_table_read(),
+            Permission::bifrost_record_write(),
+            Permission::eval_run(),
         ],
     },
 ];
@@ -73,12 +81,14 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
 /// Built-in Role a Card-bound Service or Agent principal receives at its first
 /// projection.
 ///
-/// It lets the workload emit and read back its own evidence: Bifrost table
-/// read (the describe every writer performs before admission), record write,
-/// and query read, nothing else. The principal's Card scope
-/// still bounds which Cards it may emit for, and an administrator who revokes
-/// the Role is not overridden by a later re-registration.
-pub const WORKLOAD_ROLE: &str = "workload";
+/// It lets the workload emit and verify its own evidence: Bifrost table read
+/// (the describe every writer performs before admission), record write, and
+/// Verifier runs, nothing else. Tenant-wide Bifrost query reads are withheld;
+/// they come from an explicit grant of the `workload` Role. The principal's
+/// Card scope still bounds which Cards it may emit for and verify, and an
+/// administrator who revokes the Role is not overridden by a later
+/// re-registration.
+pub const DEFAULT_CARD_ROLE: &str = "wyrd_default";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]
@@ -93,7 +103,7 @@ pub fn builtin_role_uuid(data_tenant_id: DataTenantId, role_name: &str) -> Uuid 
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BUILTIN_ROLES, builtin_role_uuid};
+    use super::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
     use crate::Permission;
 
     #[test]
@@ -138,6 +148,35 @@ mod tests {
             let expected = matches!(role.name, "admin" | "writer" | "agent");
             assert_eq!(granted, expected, "role {}", role.name);
         }
+    }
+
+    /// Proves the default Card role lets a Service emit and verify its own
+    /// evidence while withholding tenant-wide Bifrost query reads, which stay
+    /// with the explicitly granted `workload` role.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either role is missing or its grants differ from that split.
+    #[test]
+    fn default_card_role_emits_and_verifies_without_tenant_reads() {
+        let held = |name: &str, required: &Permission| {
+            BUILTIN_ROLES
+                .iter()
+                .find(|role| role.name == name)
+                .expect("role is built in")
+                .permissions
+                .iter()
+                .any(|permission| permission.covers(required))
+        };
+        for required in [
+            Permission::bifrost_table_read(),
+            Permission::bifrost_record_write(),
+            Permission::eval_run(),
+        ] {
+            assert!(held(DEFAULT_CARD_ROLE, &required), "{required}");
+        }
+        assert!(!held(DEFAULT_CARD_ROLE, &Permission::bifrost_query_read()));
+        assert!(held("workload", &Permission::bifrost_query_read()));
     }
 
     #[test]

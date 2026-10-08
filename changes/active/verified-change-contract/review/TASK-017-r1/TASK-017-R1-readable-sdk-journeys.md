@@ -227,11 +227,29 @@ persistent-data decision.
 
 ## Implementation evidence
 
+Diff: uncommitted on `wyrd/verified-change-contract/TASK-017` over `b2d118450`.
+Status: implemented; the cumulative gate is carried into
+[TASK-017-R2](../TASK-017-r2/TASK-017-R2-one-client-one-surface.md), which
+revision 67 opened from the persona review of this candidate.
+
 | Finding | Implementation | Verification | Result |
 |---|---|---|---|
-| FIND-TASK-017-01 | | | |
-| FIND-TASK-017-02 | | | |
-| FIND-TASK-017-03 | | | |
-| FIND-TASK-017-04 | | | |
-| FIND-TASK-017-05 | | | |
-| FIND-TASK-017-06 | | | |
+| FIND-TASK-017-01 | `wyrd_cli::commands` networked functions take `client: Option<WyrdClient>`; `Workflow::from_path_with_client` (`crates/shared/wyrd-client/src/workflow/mod.rs`); Python `Workflow.from_path(path, client=None)`; TS `Workflow.fromPath(path, { client })`; Rust journeys use explicit clients | `workflow_loading::registry_refs_resolve_through_the_registry` in all three SDKs; only `otel_export.rs:102` spawns a child (grep of `Command::new\|current_exe` over `sdks/wyrd-sdk-rust/tests`) | PASS |
+| FIND-TASK-017-02 | Python `wyrd.testing.cli` (`sdks/wyrd-sdk-python/src/testing_cli.rs`, stubs regenerated); TS `@wyrd/testing` `cli` (`sdks/wyrd-sdk-ts/native-testing/src/cli.rs`, `testing/index.js`); Rust `testing` feature replaces `cli`; `@wyrd/sdk` `index.d.ts` regenerated without `cli*` | `test_production_cli_exposes_only_the_console_script`; TS unit "the published sdk exports no in-process cli"; `mise run codegen:check` exit 0; `mise run verify:python-sdk` (includes `check:py-wheel-no-testing`) exit 0 | PASS |
+| FIND-TASK-017-03 | `wyrd_sdk` re-exports `Card`, `Spec`, `VerifierImplementation`, `WorkflowRun`, `WorkflowRunStatus`, `VerifierCounts`, `Judgment`, `VerificationVerdict`, `VerifierKind`, `SessionId`, `QueryTerminalOutcome`; journeys import only `wyrd_sdk` and support; `CardKind` compared; no `Box::pin` | grep: no `wyrd_client::`/`wyrd_spec::` and 0 `Box::pin` under `sdks/wyrd-sdk-rust/tests`; `mise run verify:rust-sdk` exit 0 (61 journeys + 6 identity) | PASS |
+| FIND-TASK-017-04 | 9 `workflow_loading` tests and 3 moved `gateway_inference` tests per SDK; Card YAML moved to `fixtures/cards/workflow_loading/`; external-gateway journey deleted | name-parity script over `fixtures/README.md` vs all three SDKs: 0 mismatches; `mise run test:workflow:journey` via `verify:*` lanes | PASS |
+| FIND-TASK-017-05 | `fixtures/README.md` lists every story's test names; bodies, inputs, and codes aligned (observe_a_run, saved_user_auth, refused CLI, Agent-as-Workflow uid → 404) | name-parity script: 11 stories × 3 SDKs match exactly | PASS |
+| FIND-TASK-017-06 | Python: uuid/message/`status == 403` removed, `details["reason"]` asserts removed, observe split, subprocess removed, state journey fixtures; TS: `startTestServer(options)`, `registered()`, `agent` key, real Card-scoped key, `execFile` out of story set, `fromNative` tests labelled internal | grep of the 33 story files for `uuid\|json\.loads\|while True\|hashlib\|subprocess\|execFile\|as CardRef\|?? ""`: 0 hits | PASS |
+
+Diagnosis — CLI journey lane (`mise run test:cli:journey`):
+- **Symptom:** `card_lifecycle::pg_tests::apply_completes_when_completion_decision_audit_fails` panicked `metrics recorder installs` when run after another test in one `cargo test` process.
+- **Cause:** `WyrdTestServerBuilder::start_in_process` installs the process-global recorder via `shared_process_telemetry_for_test`; `AuditCommitFailures::install` tried to install a second one.
+- **Fix site:** `crates/wyrd/wyrd-testing/src/server.rs` `AuditCommitFailures` borrows the shared capture and counts from a baseline. Its other callers (`audit_publication.rs:542,1146`) are covered by `test:bifrost`. The diagnostician's report concurred.
+- **Result:** the lane passed, 36 passed.
+
+Other verification:
+- **Passed:** `mise run fmt`, `mise run lints`, `mise run check:deps` and `git diff --check`.
+- **`verify:typescript-sdk`:** passed with the regenerated `index.d.ts` staged (17 files, 95 tests). `ts:napi:check` compares against the git index.
+- **`mise run test:bifrost`:** FAILED. `production_closeout::compaction_geometry_exact_rows_and_non_destructive_second_pass` saw one hot file. The cause is a production Scribe flush race, not this diff, and the fix is carried to TASK-017-R2 (W3).
+
+Out of scope, recorded: `wyrd_sdk`'s `pub use wyrd_client::*` re-exports `gateway_credential` despite the crate doc.

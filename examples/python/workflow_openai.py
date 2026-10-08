@@ -1,8 +1,18 @@
-"""OpenAI sequential workflow example; run with `uv run python examples/python/workflow_openai.py`."""
+"""OpenAI research-and-write workflow example; run with `uv run python examples/python/workflow_openai.py`."""
 
 from __future__ import annotations
 
-from wyrd import Agent, Prompt, Workflow, tool
+from pathlib import Path
+
+from wyrd import Workflow, tool
+
+WORKFLOW = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "research-and-write"
+    / "openai"
+    / "workflow.yaml"
+)
 
 
 @tool(name="web_search", description="Search the web and return result snippets.")
@@ -11,42 +21,9 @@ def web_search(query: str) -> list[str]:
 
 
 def main() -> None:
-    researcher = Agent(
-        name="researcher",
-        version="0.1.0",
-        prompt=Prompt.openai_chat(
-            "gpt-4o-mini",
-            system=(
-                "You are a concise researcher. Use the web_search tool to find "
-                "3 key facts about the topic, then summarise them."
-            ),
-            messages=["Research: {{topic}}"],
-            variables=["topic"],
-        ),
-        tools=[web_search],
-    )
-    writer = Agent(
-        name="writer",
-        version="0.1.0",
-        prompt=Prompt.openai_chat(
-            "gpt-4o-mini",
-            system=(
-                "You are a concise writer. Turn the research notes into "
-                "a two-sentence summary."
-            ),
-            messages=["Write a summary from: {{research}}"],
-            variables=["research"],
-        ),
-    )
-
-    workflow = (
-        Workflow.sequential("research-and-write", researcher, writer)
-        .with_inputs({"input": ""})
-        .with_step_inputs("researcher", {"topic": "input.input"})
-        .with_step_inputs("writer", {"research": "steps.researcher.output.text"})
-        .with_outputs({"summary": "steps.writer.output.text"})
-    )
-    workflow.set_version("0.1.0")
+    # The researcher Agent names `web_search` in its `tool_names`; the
+    # decorator above registers it before the Workflow loads.
+    workflow = Workflow.from_path(WORKFLOW)
     run = workflow.run("renewable energy storage")
 
     print(f"status: {run.status}")

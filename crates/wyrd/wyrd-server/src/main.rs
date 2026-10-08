@@ -2,7 +2,9 @@ use std::io::Write;
 
 use clap::{Args, Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_client::Platform;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::HttpConfig;
+use wyrd_client::{Platform, WyrdClient};
 use wyrd_spec::auth::CreateTenantRequest;
 use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::platform::tenants::list_tenants;
@@ -271,7 +273,16 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
     }
 
     let credential = root_credential(&pool).await?;
-    let created = Platform::connect(&args.server, &credential)
+    let client = WyrdClient::with_config(ClientConfig {
+        http: HttpConfig {
+            base_url: args.server.trim_end_matches('/').to_owned(),
+            ..HttpConfig::default()
+        },
+        credential: Some(credential),
+        ..ClientConfig::default()
+    })
+    .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let created = Platform::with_client(&client)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?
         .create_tenant(&CreateTenantRequest {

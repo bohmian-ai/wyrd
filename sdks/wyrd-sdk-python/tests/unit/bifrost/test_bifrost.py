@@ -34,12 +34,21 @@ def test_pydantic_table_config_carries_a_compaction_target() -> None:
 
 def test_arrow_table_config_carries_a_compaction_target() -> None:
     config = TableConfig.from_arrow(
-        pyarrow.schema([("id", pyarrow.int64())]),
         TABLE,
+        pyarrow.schema([("id", pyarrow.int64())]),
         compaction_target_file_size_bytes=TARGET_FILE_SIZE_BYTES,
     )
 
     assert config.compaction_target_file_size_bytes == TARGET_FILE_SIZE_BYTES
+
+
+def test_json_schema_table_config_declares_the_same_columns_as_its_model() -> None:
+    schema = {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
+
+    config = TableConfig.from_json_schema(TABLE, schema)
+
+    assert config.fqn == TABLE
+    assert config.arrow_schema == TableConfig(Event, TABLE).arrow_schema
 
 
 def test_table_config_has_no_compaction_type_by_default() -> None:
@@ -56,7 +65,7 @@ def test_table_config_carries_a_compaction_type(compaction_type: str) -> None:
 
 def test_arrow_table_config_carries_a_compaction_type() -> None:
     config = TableConfig.from_arrow(
-        pyarrow.schema([("id", pyarrow.int64())]), TABLE, compaction_type="files-with-delete"
+        TABLE, pyarrow.schema([("id", pyarrow.int64())]), compaction_type="files-with-delete"
     )
 
     assert config.compaction_type == "files-with-delete"

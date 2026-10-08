@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use wyrd_client::WyrdClient;
 use wyrd_client::cards::RegistrationReceipt;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_loader::{
@@ -260,11 +261,14 @@ struct DeleteOutput {
 /// without constructing credentials or contacting a Wyrd server. The value is
 /// exactly what `wyrd plan --format json` prints.
 ///
+/// # Arguments
+/// - `path`: a Card file or a bundle directory to plan.
+///
 /// # Errors
 /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE`, with the loader diagnostics as
 /// details, when the tree cannot be loaded or resolved.
-pub fn plan(path: &Path) -> Result<PlanReport, WyrdError> {
-    plan_tree(path).map_err(WyrdError::from)
+pub fn plan(path: impl AsRef<Path>) -> Result<PlanReport, WyrdError> {
+    plan_tree(path.as_ref()).map_err(WyrdError::from)
 }
 
 /// Load and resolve a local Card tree into its registration plan.
@@ -312,9 +316,13 @@ pub fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
 ///
 /// The in-process form of `wyrd apply`; the receipt is exactly what
 /// `wyrd apply --format json` prints. Local loading and validation complete
-/// before the client is constructed from the ambient credential chain, which
-/// `server` re-points. Registration then performs the remote artifact and Card
-/// lifecycle operations owned by `wyrd_client::cards`.
+/// before registration runs as `client`, or, when it is omitted, as a client
+/// built from the ambient credential chain. Registration then performs the
+/// remote artifact and Card lifecycle operations owned by `wyrd_client::cards`.
+///
+/// # Arguments
+/// - `path`: a Card file or a bundle directory to register.
+/// - `client`: the principal to register as; `None` resolves the ambient chain.
 ///
 /// # Errors
 /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE` for invalid local input, a
@@ -325,23 +333,31 @@ pub fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
 /// Cancellation may stop the command during artifact transfer or server
 /// completion. Retry behavior follows the registry operation's idempotency
 /// contract.
-pub async fn apply(path: &Path, server: Option<&str>) -> Result<RegistrationReceipt, WyrdError> {
-    register_tree(path, server).await.map_err(WyrdError::from)
+pub async fn apply(
+    path: impl AsRef<Path>,
+    client: Option<WyrdClient>,
+) -> Result<RegistrationReceipt, WyrdError> {
+    register_tree(path.as_ref(), || crate::client::explicit_or_ambient(client))
+        .await
+        .map_err(WyrdError::from)
 }
 
 /// Load, resolve, and register one local Card tree.
 ///
+/// `connect` supplies the client only after the tree loads and resolves, so
+/// invalid local input never resolves a credential.
+///
 /// # Errors
-/// Returns a CLI load error for invalid local input, a client error when
-/// configuration or credentials cannot be prepared, or a server error when
-/// registration fails.
+/// Returns a CLI load error for invalid local input, the error of `connect`
+/// when configuration or credentials cannot be prepared, or a server error
+/// when registration fails.
 async fn register_tree(
     path: &Path,
-    server: Option<&str>,
+    connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
 ) -> Result<RegistrationReceipt, WyrdCliError> {
     let tree = load_tree(path).map_err(WyrdCliError::CardLoad)?;
     let input = build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
-    build_cards(server)?
+    Cards::with_client(connect()?)
         .register(&input)
         .await
         .map_err(|source| WyrdCliError::Server { source })
@@ -353,7 +369,8 @@ async fn register_tree(
 /// Returns the errors of [`register_tree`], or an output error when JSON
 /// serialization fails.
 pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
-    let receipt = register_tree(&args.path, args.connection.server.as_deref()).await?;
+    let server = args.connection.server.as_deref();
+    let receipt = register_tree(&args.path, || crate::client::from_global(server)).await?;
     match args.format {
         OutputFormat::Text => print_apply_text(&receipt),
         OutputFormat::Json => print_json(&receipt)?,
@@ -366,8 +383,15 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
 /// The in-process form of `wyrd get`; the summary is exactly what
 /// `wyrd get --format json` prints. Complete hydration is the default;
 /// `metadata_only` writes an inspectable, non-runnable bundle without artifact
-/// payloads. The client comes from the ambient credential chain, which
-/// `server` re-points.
+/// payloads. Reads run as `client`, or, when it is omitted, as a client built
+/// from the ambient credential chain.
+///
+/// # Arguments
+/// - `selector`: the Card to resolve, by kind, space, name, and version, or
+///   by UID.
+/// - `output_dir`: the directory the hydrated bundle is written to.
+/// - `metadata_only`: write Card metadata without artifact payloads.
+/// - `client`: the principal to read as; `None` resolves the ambient chain.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for an invalid selector, a `WYRD_CLIENT_*`
@@ -380,13 +404,15 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
 /// errors; a dropped task may require later staging cleanup.
 pub async fn get(
     selector: &SelectorArgs,
-    output_dir: &Path,
+    output_dir: impl AsRef<Path>,
     metadata_only: bool,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<HydrationSummary, WyrdError> {
-    hydrate(selector, Some(output_dir), metadata_only, server)
-        .await
-        .map_err(WyrdError::from)
+    hydrate(selector, Some(output_dir.as_ref()), metadata_only, || {
+        crate::client::explicit_or_ambient(client)
+    })
+    .await
+    .map_err(WyrdError::from)
 }
 
 /// Validate a selector and destination, then hydrate the selected graph.
@@ -396,13 +422,13 @@ pub async fn get(
 ///
 /// # Errors
 /// Returns a CLI argument error for an invalid selector or missing output
-/// directory, a client error when configuration or credentials fail, or a
-/// server error when reads or hydration fail.
+/// directory, the error of `connect` when configuration or credentials fail,
+/// or a server error when reads or hydration fail.
 async fn hydrate(
     selector: &SelectorArgs,
     output_dir: Option<&Path>,
     metadata_only: bool,
-    server: Option<&str>,
+    connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
 ) -> Result<HydrationSummary, WyrdCliError> {
     let selector = selector_from_args(selector, false)?;
     let output_dir = output_dir.ok_or_else(|| {
@@ -412,7 +438,7 @@ async fn hydrate(
             "required for hydrated get output",
         )
     })?;
-    let cards = build_cards(server)?;
+    let cards = Cards::with_client(connect()?);
     let mode = if metadata_only {
         HydrationMode::MetadataOnly
     } else {
@@ -430,11 +456,12 @@ async fn hydrate(
 /// Returns the errors of [`hydrate`], or an output error when JSON
 /// serialization fails.
 pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
+    let server = args.connection.server.as_deref();
     let output = hydrate(
         &args.selector,
         args.output_dir.as_deref(),
         args.metadata_only,
-        args.connection.server.as_deref(),
+        || crate::client::from_global(server),
     )
     .await?;
     match args.format {
@@ -541,9 +568,18 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
 ///
 /// The in-process form of `wyrd load`; the output is exactly what
 /// `wyrd load --format json` prints. Card and artifact reads go through the
-/// shared registry handle, built from the ambient credential chain that
-/// `server` re-points. A caller-provided `path` receives the artifacts;
+/// shared registry handle and run as `client`, or, when it is omitted, as a
+/// client built from the ambient credential chain. A caller-provided `path`
+/// receives the artifacts;
 /// otherwise the registry handle manages a temporary directory.
+///
+/// # Arguments
+/// - `selector`: the Card to resolve, by kind, space, name, and version, or
+///   by UID.
+/// - `path`: the directory that receives the artifacts; `None` uses a managed
+///   temporary directory. It stays `Option<&Path>` rather than
+///   `Option<impl AsRef<Path>>` so a caller can pass a bare `None`.
+/// - `client`: the principal to read as; `None` resolves the ambient chain.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` for an invalid selector, a `WYRD_CLIENT_*`
@@ -557,26 +593,28 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
 pub async fn load(
     selector: &SelectorArgs,
     path: Option<&Path>,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<LoadOutput, WyrdError> {
-    materialize(selector, path, server)
-        .await
-        .map_err(WyrdError::from)
+    materialize(selector, path, || {
+        crate::client::explicit_or_ambient(client)
+    })
+    .await
+    .map_err(WyrdError::from)
 }
 
 /// Resolve one Card, materialize its artifacts, and pin the exact reference.
 ///
 /// # Errors
-/// Returns a CLI argument error for an invalid selector, a client error when
-/// configuration or credentials fail, or a server error when the load fails or
-/// the response names no exact version.
+/// Returns a CLI argument error for an invalid selector, the error of
+/// `connect` when configuration or credentials fail, or a server error when
+/// the load fails or the response names no exact version.
 async fn materialize(
     selector: &SelectorArgs,
     path: Option<&Path>,
-    server: Option<&str>,
+    connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
 ) -> Result<LoadOutput, WyrdCliError> {
     let selector = selector_from_args(selector, false)?;
-    let loaded = build_cards(server)?
+    let loaded = Cards::with_client(connect()?)
         .load(selector, path)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -592,11 +630,10 @@ async fn materialize(
 /// Returns the errors of [`materialize`], or an output error when JSON
 /// serialization fails.
 pub async fn dispatch_load(args: LoadArgs) -> Result<ExitCode, WyrdCliError> {
-    let output = materialize(
-        &args.selector,
-        args.path.as_deref(),
-        args.connection.server.as_deref(),
-    )
+    let server = args.connection.server.as_deref();
+    let output = materialize(&args.selector, args.path.as_deref(), || {
+        crate::client::from_global(server)
+    })
     .await?;
     match args.format {
         OutputFormat::Text => println!("loaded: {}", output.card_ref),

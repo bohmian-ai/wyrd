@@ -18,6 +18,9 @@ pub const GRPC_DEFAULT_PORT: u16 = 50051;
 /// the gRPC listener of the same deployment. An unparseable or host-less
 /// `server_url` is returned unchanged so the transport reports it rather than
 /// silently dialing a different address.
+///
+/// # Arguments
+/// * `server_url` - HTTP base URL whose scheme and host the gRPC endpoint keeps.
 #[must_use]
 pub fn grpc_endpoint_for(server_url: &str) -> String {
     match reqwest::Url::parse(server_url) {
@@ -119,6 +122,9 @@ impl GrpcConfig {
     /// Validate the config. Returns `Err` if `endpoint` is empty or
     /// `timeout_ms` is zero. `connect_retries == 0` is permitted; it means
     /// fail on the first connect attempt.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] when `endpoint` is empty or `timeout_ms` is zero.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         if self.endpoint.is_empty() {
             return Err(WyrdClientError::Config {

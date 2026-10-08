@@ -13,9 +13,10 @@ name = "wyrd_sdk"
 path = "src/lib.rs"
 
 [features]
-# In-process `wyrd` CLI commands (`wyrd_sdk::cli`), the same implementation
-# the executable renders.
-cli = ["dep:wyrd-cli"]
+# Test-only surface: the in-process `wyrd` CLI commands (`wyrd_sdk::cli`),
+# the same implementation the executable renders. Never enabled by a
+# production build.
+testing = ["dep:wyrd-cli"]
 
 [dependencies]
 wyrd-cli = { workspace = true, optional = true }
@@ -25,8 +26,9 @@ wyrd-spec = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 # The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
-wyrd-sdk-rust = { path = ".", features = ["cli"] }
-chrono = { workspace = true }
+wyrd-sdk-rust = { path = ".", features = ["testing"] }
+# Reads the Arrow batches a streamed Bifrost query yields.
+arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from
 # `OTEL_EXPORTER_OTLP_*`.
 opentelemetry = { workspace = true }
@@ -37,7 +39,6 @@ reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Local judge, model upstream, and Operator hook the stories call through the

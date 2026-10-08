@@ -12,7 +12,6 @@ EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
     "example",
     [
         "from_yaml",
-        "from_builder",
         "structured_pipeline",
         "transport_grpc",
         "transport_http",

@@ -1,6 +1,7 @@
 //! Callers reach a model through the Wyrd Gateway: an OpenAI-compatible
-//! client with a Wyrd access token, and a registered Workflow loaded through
-//! Cards. The upstream sees only the operator's provider key.
+//! client with a Wyrd access token, a registered Workflow loaded through
+//! Cards, and the code-review example run from its file. The upstream sees
+//! only the operator's provider key.
 //!
 //! No OpenAI Rust SDK is a dependency, so the OpenAI-compatible caller is a
 //! plain Chat Completions request with a bearer token, which is the whole of
@@ -8,13 +9,12 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
-use skald_workflow::WorkflowRunStatus;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::Gateway;
-use wyrd_sdk::cards::{CardSelector, RegistrationReceipt};
+use wyrd_sdk::cards::{CardKind, CardSelector, RegistrationReceipt};
 use wyrd_sdk::cli;
 use wyrd_sdk::gateway::{
     GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderCredentialName,
@@ -22,18 +22,39 @@ use wyrd_sdk::gateway::{
     ProviderDeploymentName, ProviderId,
 };
 use wyrd_sdk::operator_connections::SecretBearer;
+use wyrd_sdk::{Gateway, Workflow, WorkflowRunStatus, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{self, Deployment, register};
+use crate::support::{Deployment, register};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
+
+/// The code-review example directory, whose Workflow calls `openai/gpt-5-5`
+/// through the Wyrd gateway.
+fn example() -> PathBuf {
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/workflows/code-review"
+    ))
+}
+
+/// The example's checked-in run input.
+///
+/// # Panics
+/// Panics when `input.json` cannot be read or is not a JSON object.
+fn example_input() -> Map<String, Value> {
+    serde_json::from_str(
+        &std::fs::read_to_string(example().join("input.json")).expect("example input reads"),
+    )
+    .expect("example input is an object")
+}
 
 /// A Gateway in front of a local upstream that answers `hi`.
 struct Inference {
     /// The deployment.
     deployment: Deployment,
-    /// The upstream the `openai` deployment reaches.
+    /// The upstream every deployment reaches.
     upstream: MockServer,
     /// The registered `ask` Workflow.
     ask: RegistrationReceipt,
@@ -41,12 +62,12 @@ struct Inference {
 
 impl Inference {
     /// Start the upstream and the server, write the `openai-key` credential
-    /// with the CLI from the `test` child, deploy `gpt-4o` on it, and
-    /// register `ask`.
+    /// with the CLI as the administrator, deploy `gpt-4o` and `gpt-5-5` on
+    /// it, and register `ask`.
     ///
     /// # Panics
     /// Panics when a setup step fails.
-    async fn start(test: &str) -> Self {
+    async fn start() -> Self {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -70,29 +91,26 @@ impl Inference {
             ),
         )
         .await;
-        deployment
-            .run_child(
-                test,
-                &deployment.key("cli_admin", &["admin"]).await,
-                &[("PHASE", "setup")],
-            )
-            .await;
-        Gateway::new(deployment.admin())
-            .put_deployment(&ProviderDeployment {
-                name: ProviderDeploymentName::new("gpt-4o").expect("deployment name"),
-                model: ModelRef {
-                    provider: ProviderId::new("openai").expect("provider"),
-                    model: ModelId::new("gpt-4o").expect("model"),
-                },
-                adapter: ProviderAdapter::OpenAi,
-                auth: ProviderAuth::Bearer {
-                    credential: ProviderCredentialName::new("openai-key").expect("credential"),
-                },
-                capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
-                routing_weight: NonZeroU32::MIN,
-            })
-            .await
-            .expect("deployment puts");
+        put_managed(deployment.admin(), "openai-key", PROVIDER_KEY).await;
+        let gateway = Gateway::with_client(deployment.admin());
+        for model in ["gpt-4o", "gpt-5-5"] {
+            gateway
+                .put_deployment(&ProviderDeployment {
+                    name: ProviderDeploymentName::new(model).expect("deployment name"),
+                    model: ModelRef {
+                        provider: ProviderId::new("openai").expect("provider"),
+                        model: ModelId::new(model).expect("model"),
+                    },
+                    adapter: ProviderAdapter::OpenAi,
+                    auth: ProviderAuth::Bearer {
+                        credential: ProviderCredentialName::new("openai-key").expect("credential"),
+                    },
+                    capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
+                    routing_weight: NonZeroU32::MIN,
+                })
+                .await
+                .expect("deployment puts");
+        }
         let ask = register(&deployment.cards(), "cards/gateway_inference/ask.yaml").await;
         Self {
             deployment,
@@ -120,14 +138,43 @@ impl Inference {
             })
             .collect()
     }
+
+    /// Send one Chat Completions turn to `openai/gpt-4o` through the
+    /// Gateway, the way an OpenAI client does, with `client`'s access token,
+    /// and return the HTTP status and JSON body.
+    ///
+    /// # Panics
+    /// Panics when no token mints or the Gateway does not answer with JSON.
+    async fn ask_openai(&self, client: &WyrdClient) -> (u16, Value) {
+        let token = client.access_token().await.expect("access token mints");
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                self.deployment
+                    .server()
+                    .base_url()
+                    .expect("bound server has a URL")
+            ))
+            .bearer_auth(token.expose())
+            .json(&json!({
+                "model": "openai/gpt-4o",
+                "max_completion_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }))
+            .send()
+            .await
+            .expect("the Gateway answers");
+        let status = response.status().as_u16();
+        (status, response.json().await.expect("the reply is JSON"))
+    }
 }
 
 /// Write the managed provider credential `name` holding `secret` with the
-/// CLI, and return its redacted view as JSON.
+/// CLI as `client`, and return its redacted view as JSON.
 ///
 /// # Panics
 /// Panics when the write is refused.
-async fn put_managed(name: &str, secret: &str) -> Value {
+async fn put_managed(client: WyrdClient, name: &str, secret: &str) -> Value {
     let view = cli::put_provider_credential(
         &ProviderCredentialWrite {
             name: ProviderCredentialName::new(name).expect("credential name"),
@@ -136,19 +183,11 @@ async fn put_managed(name: &str, secret: &str) -> Value {
                 secret: SecretBearer::new(secret.to_owned()),
             },
         },
-        None,
+        Some(client),
     )
     .await
     .expect("the CLI writes the credential");
     serde_json::to_value(view).expect("view serializes")
-}
-
-/// The setup a [`Inference::start`] child runs: the CLI writes `openai-key`.
-///
-/// # Panics
-/// Panics when the write is refused.
-async fn setup_child() {
-    put_managed("openai-key", PROVIDER_KEY).await;
 }
 
 /// An OpenAI-compatible Chat Completions call with the caller's Wyrd access
@@ -160,44 +199,13 @@ async fn setup_child() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn openai_client_calls_the_gateway_with_an_access_token() {
-    if support::is_child() {
-        setup_child().await;
-        return;
-    }
-    let inference =
-        Inference::start("gateway_inference::openai_client_calls_the_gateway_with_an_access_token")
-            .await;
-    let token = inference
-        .deployment
-        .admin()
-        .access_token()
-        .await
-        .expect("access token mints");
+    let inference = Inference::start().await;
+    let admin = inference.deployment.admin();
+    let token = admin.access_token().await.expect("access token mints");
 
-    let reply: Value = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/chat/completions",
-            inference
-                .deployment
-                .server()
-                .base_url()
-                .expect("bound server has a URL")
-        ))
-        .bearer_auth(token.expose())
-        .json(&json!({
-            "model": "openai/gpt-4o",
-            "max_completion_tokens": 16,
-            "messages": [{ "role": "user", "content": "hi" }],
-        }))
-        .send()
-        .await
-        .expect("the Gateway answers")
-        .error_for_status()
-        .expect("the call succeeds")
-        .json()
-        .await
-        .expect("the reply is JSON");
+    let (status, reply) = inference.ask_openai(&admin).await;
 
+    assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["choices"][0]["message"]["content"], "hi");
     assert_eq!(reply["usage"]["total_tokens"], 15);
     let upstream = inference
@@ -218,11 +226,36 @@ async fn openai_client_calls_the_gateway_with_an_access_token() {
             !name.as_str().starts_with("x-wyrd"),
             "{name} reached upstream"
         );
-        assert!(
-            !value.to_str().unwrap_or_default().contains(token.expose()),
+        assert_ne!(
+            value.to_str().ok(),
+            Some(token.expose()),
             "the access token reached upstream in {name}"
         );
     }
+    inference.deployment.shutdown().await;
+}
+
+/// A caller holding only `gateway:read` cannot invoke a model.
+///
+/// # Panics
+/// Panics when the call succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn caller_without_gateway_invoke_is_refused() {
+    let inference = Inference::start().await;
+    let reader = inference.deployment.client(
+        &inference
+            .deployment
+            .scoped_key("gateway_reader", &["gateway:read"])
+            .await,
+    );
+
+    let (_, refused) = inference.ask_openai(&reader).await;
+
+    assert_eq!(
+        refused["error"]["code"], "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{refused}"
+    );
     inference.deployment.shutdown().await;
 }
 
@@ -235,51 +268,46 @@ async fn openai_client_calls_the_gateway_with_an_access_token() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
-    if support::is_child() {
-        if std::env::var("PHASE").as_deref() == Ok("setup") {
-            setup_child().await;
-            return;
-        }
-        let issued = cli::issue_key("Agent", "ask-agent", "1.0.0", "default", None, None, None)
-            .await
-            .expect("the CLI issues a key");
-        support::report(&json!({
-            "card_ref": issued.card_ref,
-            "prefixed": issued.key.expose().starts_with(&issued.prefix),
-            "view": put_managed("managed-openai-key", "sk-managed").await,
-        }));
-        return;
-    }
-    let test = "gateway_inference::cli_issues_a_card_scoped_key_and_writes_a_provider_credential";
-    let inference = Inference::start(test).await;
+    let inference = Inference::start().await;
+    let admin = inference.deployment.admin();
 
-    let outcome = inference
-        .deployment
-        .run_child(
-            test,
-            &inference.deployment.key("cli_issuer", &["admin"]).await,
-            &[("PHASE", "issue")],
-        )
-        .await;
+    let issued = cli::issue_key(
+        "Agent",
+        "ask-agent",
+        "1.0.0",
+        "default",
+        None,
+        None,
+        Some(admin.clone()),
+    )
+    .await
+    .expect("the CLI issues a key");
+    let view = put_managed(admin, "managed-openai-key", "sk-managed").await;
 
-    assert_eq!(
-        outcome["card_ref"],
-        json!({ "kind": "Agent", "name": "ask-agent", "version": "1.0.0", "space": "default" })
-    );
-    assert_eq!(outcome["prefixed"], true);
     assert_eq!(
         (
-            &outcome["view"]["name"],
-            &outcome["view"]["provider"],
-            &outcome["view"]["state"]
+            issued.card_ref.kind,
+            issued.card_ref.name.as_str(),
+            issued.card_ref.version.to_string(),
+            issued.card_ref.space.as_ref().map(ToString::to_string)
         ),
+        (
+            CardKind::Agent,
+            "ask-agent",
+            "1.0.0".to_owned(),
+            Some("default".to_owned())
+        )
+    );
+    assert!(issued.key.expose().starts_with(&issued.prefix));
+    assert_eq!(
+        (&view["name"], &view["provider"], &view["state"]),
         (
             &json!("managed-openai-key"),
             &json!("openai"),
             &json!("active")
         )
     );
-    assert!(!outcome.to_string().contains("sk-managed"), "{outcome}");
+    assert!(!view.to_string().contains("sk-managed"), "{view}");
     inference.deployment.shutdown().await;
 }
 
@@ -292,14 +320,7 @@ async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
-    if support::is_child() {
-        setup_child().await;
-        return;
-    }
-    let inference = Inference::start(
-        "gateway_inference::loaded_workflow_calls_the_gateway_through_its_loading_client",
-    )
-    .await;
+    let inference = Inference::start().await;
     let workflow = inference
         .deployment
         .cards()
@@ -318,6 +339,88 @@ async fn loaded_workflow_calls_the_gateway_through_its_loading_client() {
     assert_eq!(
         inference.upstream_authorizations().await,
         [Some(format!("Bearer {PROVIDER_KEY}"))]
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// The code-review example runs from its file through the Wyrd gateway as
+/// the client it is loaded with: each of its three steps reaches the
+/// upstream with the provider key.
+///
+/// # Panics
+/// Panics when the load or run fails, the outputs differ, or the upstream
+/// calls differ.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn example_workflow_runs_through_the_wyrd_gateway() {
+    let inference = Inference::start().await;
+    let example = Workflow::from_path_with_client(
+        example().join("workflow.yaml"),
+        inference.deployment.admin(),
+    )
+    .await
+    .expect("the example loads");
+
+    let run = example.run(example_input()).await.expect("the run starts");
+
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
+    assert_eq!(json!(run.outputs), json!({ "review": "hi" }));
+    assert_eq!(
+        inference.upstream_authorizations().await,
+        vec![Some(format!("Bearer {PROVIDER_KEY}")); 3]
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// Applying the example registers it without calling any model.
+///
+/// # Panics
+/// Panics when the apply fails or the upstream received a call.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn applying_a_workflow_calls_no_model() {
+    let inference = Inference::start().await;
+
+    let applied = cli::apply(&example(), Some(inference.deployment.admin()))
+        .await
+        .expect("the example applies");
+
+    assert_eq!(applied.root.kind, CardKind::Workflow);
+    assert_eq!(inference.upstream_authorizations().await, []);
+    inference.deployment.shutdown().await;
+}
+
+/// The applied example, loaded back through Cards, runs through the Wyrd
+/// gateway.
+///
+/// # Panics
+/// Panics when the apply, load, or run fails, the outputs differ, or the
+/// upstream calls differ.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn registered_example_runs_through_the_gateway() {
+    let inference = Inference::start().await;
+    let applied = cli::apply(&example(), Some(inference.deployment.admin()))
+        .await
+        .expect("the example applies");
+    let registered = inference
+        .deployment
+        .cards()
+        .workflow()
+        .load(&CardSelector::exact(applied.root))
+        .await
+        .expect("the registered example loads");
+
+    let run = registered
+        .run(example_input())
+        .await
+        .expect("the run starts");
+
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded, "{:?}", run.error);
+    assert_eq!(json!(run.outputs), json!({ "review": "hi" }));
+    assert_eq!(
+        inference.upstream_authorizations().await,
+        vec![Some(format!("Bearer {PROVIDER_KEY}")); 3]
     );
     inference.deployment.shutdown().await;
 }

@@ -16,6 +16,10 @@ path = "src/lib.rs"
 # Exposes the raw Bifrost ingest transport to test harnesses. Never enabled by
 # an SDK package.
 test-support = []
+# Exposes the low-level surface outside the SDK parity contract: raw requests,
+# writer internals, and bundle introspection. Enabled by the CLI, MCP, testing,
+# and language-binding crates; never by wyrd-sdk-rust (`check:deps`).
+internal = []
 
 [dependencies]
 arrow = { workspace = true }
@@ -39,6 +43,7 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-agent = { workspace = true }
 skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }

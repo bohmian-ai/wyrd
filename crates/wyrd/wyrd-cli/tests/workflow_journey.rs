@@ -211,7 +211,7 @@ fn chat_completion(text: &str) -> Value {
 async fn workflow_cli_contract() {
     let config_home = tempfile::tempdir().expect("config home");
     let home = config_home.path();
-    let local = repo("tests/fixtures/workflow-loading/shadowed/local-workflow.yaml");
+    let local = repo("fixtures/cards/workflow_loading/shadowed/local-workflow.yaml");
     let local = local.to_str().expect("utf-8 fixture path");
     let uid = "0190d6a0-0000-7000-8000-000000000000";
 
@@ -989,7 +989,7 @@ async fn workflow_file_apply_registered_local() {
         assert_eq!(journey.upstream.calls().len(), after);
     }
 
-    let loading = |relative: &str| repo(&format!("tests/fixtures/workflow-loading/{relative}"));
+    let loading = |relative: &str| repo(&format!("fixtures/cards/workflow_loading/{relative}"));
     let team = journey.apply(&loading("team/security.yaml"));
     journey.apply(&loading("team/correctness.yaml"));
     let mixed = loading("mixed/workflow.yaml");
@@ -1378,7 +1378,7 @@ async fn workflow_registered_route_protocol_matrix() {
         "refused before dispatch"
     );
 
-    let native = repo("tests/fixtures/workflow-loading/shadowed/local-workflow.yaml");
+    let native = repo("fixtures/cards/workflow_loading/shadowed/local-workflow.yaml");
     journey.apply(&native);
     let (code, run) = journey
         .run(&[

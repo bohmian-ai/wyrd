@@ -156,8 +156,9 @@ struct ClaimPublicationProbe {
     hold: bool,
     /// Claim publications currently waiting at the hold.
     held: usize,
-    /// Times a publisher found every claim slot held by another publication
-    /// and waited for one to be released.
+    /// Times a publisher with no claim of its own in flight waited for
+    /// another publication's drive to end: because every claim slot was held,
+    /// or because that publication still owned members its flush snapshot.
     claim_slot_waits: usize,
     /// Claims whose publication committed and settled.
     published_claims: usize,
@@ -215,7 +216,7 @@ impl PersistenceFaults {
         self.claim_probe.send_modify(|probe| probe.held -= 1);
     }
 
-    /// Records that a publisher waited for another publication's claim slot.
+    /// Records that a publisher waited for another publication's drive to end.
     fn note_claim_slot_wait(&self) {
         self.claim_probe
             .send_modify(|probe| probe.claim_slot_waits += 1);
@@ -1316,14 +1317,19 @@ fn merge_lane_threads(
         .min(claim_budget.max(1))
 }
 
-/// How a publisher reacts when every claim slot is held and it has no claim
-/// of its own in flight.
+/// How a publisher reacts when it has no claim of its own in flight while
+/// another publisher may still hold work it is responsible for.
 #[derive(Debug, Clone, Copy)]
-enum ClaimSlotWait {
+enum ClaimSlotWait<'a> {
     /// End the pass; a periodic caller takes the remaining work next time.
     Yield,
-    /// Wait for another publisher's claim to settle or become retryable.
-    Await,
+    /// Wait for another publisher's claim to settle or become retryable,
+    /// both when every claim slot is held and while another publisher still
+    /// drives a claim over a member of this snapshot.
+    ///
+    /// The snapshot is the set of unpublished members taken when the flush
+    /// began, so claims over members that arrived later never hold it.
+    Await(&'a crate::scribe::assembly::OwnedMembers),
 }
 
 /// Owns the dependencies and durable workflow for one persistence worker.
@@ -2186,7 +2192,10 @@ impl PersistenceWorker {
     /// stops taking claims and lets its own in-flight claims settle; when it
     /// has none, `slots` decides whether it ends the pass
     /// ([`ClaimSlotWait::Yield`]) or waits for another publisher's claim to
-    /// end its drive ([`ClaimSlotWait::Await`]).
+    /// end its drive ([`ClaimSlotWait::Await`]). An awaiting publisher with
+    /// nothing left to take also waits while any member of its snapshot is
+    /// still unpublished, because another publisher is then driving a claim
+    /// over rows it must not return before.
     ///
     /// # Errors
     ///
@@ -2196,7 +2205,8 @@ impl PersistenceWorker {
     /// abandoned between its fenced commit and its retirement. A failed claim
     /// stays outstanding with durable members and retries. A waiting
     /// publisher fails when the budget is exhausted and no publisher in this
-    /// process drives a claim, because no slot can then be released.
+    /// process drives a claim, because no slot can then be released, and when
+    /// the ready index is unavailable while it checks its snapshot.
     ///
     /// # Cancellation
     ///
@@ -2206,7 +2216,7 @@ impl PersistenceWorker {
     async fn publish_claims(
         &self,
         staging: &Arc<ScribeStagingRuntime>,
-        slots: ClaimSlotWait,
+        slots: ClaimSlotWait<'_>,
         mut next: impl FnMut() -> Result<Option<DrivenClaim>, ClaimTakeError>,
     ) -> Result<usize, ScribeError> {
         use futures_util::FutureExt as _;
@@ -2245,19 +2255,37 @@ impl PersistenceWorker {
                 }
             }
             if in_flight.is_empty() {
-                let (Some(budget), ClaimSlotWait::Await, None) = (exhausted, slots, &failure)
-                else {
+                let (ClaimSlotWait::Await(snapshot), None) = (slots, &failure) else {
                     break;
                 };
-                if !staging.drives_no_claims() {
-                    #[cfg(any(test, feature = "test-support"))]
-                    self.faults.note_claim_slot_wait();
-                    released.await;
-                } else if released.as_mut().now_or_never().is_none() {
-                    failure = Some(ClaimTakeError::BudgetExhausted { budget }.into());
-                    break;
+                if let Some(budget) = exhausted {
+                    if !staging.drives_no_claims() {
+                        #[cfg(any(test, feature = "test-support"))]
+                        self.faults.note_claim_slot_wait();
+                        released.await;
+                    } else if released.as_mut().now_or_never().is_none() {
+                        failure = Some(ClaimTakeError::BudgetExhausted { budget }.into());
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                // Another publisher may be driving a claim over members that
+                // were durable when this flush began; the flush is not done
+                // until they publish. `released` was registered before this
+                // pass looked, so a drive ending meanwhile still wakes it.
+                match staging.owns_any(snapshot) {
+                    Ok(true) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        self.faults.note_claim_slot_wait();
+                        released.await;
+                        continue;
+                    }
+                    Ok(false) => break,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
             }
             match in_flight.next().await {
                 Some(Ok(())) => published += 1,
@@ -2283,19 +2311,34 @@ impl PersistenceWorker {
     /// An outstanding claim whose publication was refused is resumed before
     /// the ready sweep, because settlement is what returns members to the
     /// budget and a refused claim never settled. When every claim slot is held
-    /// by another publisher, the flush waits for one rather than failing.
+    /// by another publisher, the flush waits for one rather than failing. A
+    /// member that was durable when the flush began but is claimed by another
+    /// publisher, such as the lifecycle tick's `publish_due`, is waited for
+    /// too: the flush returns only once every such member has published.
+    /// Members staged after the flush began never hold it open.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the staging capability is absent, when the
-    /// assembler refuses a residue claim, when every claim slot is held by a
-    /// claim no publisher can run again, or when a claim fails to publish. The
-    /// remaining keys stay staged and the WAL stays authoritative for them.
+    /// ready index is unavailable, when the assembler refuses a residue claim,
+    /// when every claim slot is held by a claim no publisher can run again, or
+    /// when a claim fails to publish. The remaining keys stay staged and the
+    /// WAL stays authoritative for them.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future while it waits for another publisher's claim
+    /// abandons only the wait; that claim keeps publishing under its driver.
     async fn publish_residue(
         &self,
         cause: crate::scribe::assembly::ClaimCause,
     ) -> Result<usize, ScribeError> {
         let staging = self.staging()?;
+        // Taken before the sweep: every member durable now must publish before
+        // the flush returns, including members a concurrent `publish_due`
+        // already claimed, while members staged after this point never hold
+        // the flush open.
+        let snapshot = staging.owned_members()?;
         // A claim whose publication was refused keeps its slot and its members;
         // nothing returns it to the ready index, so the sweep below cannot see
         // it. `publish_claims` drives those claims first, under their original
@@ -2303,7 +2346,7 @@ impl PersistenceWorker {
         // to the claim budget.
         let mut keys = staging.ready_keys()?.into_iter();
         let mut key = keys.next();
-        self.publish_claims(&staging, ClaimSlotWait::Await, || {
+        self.publish_claims(&staging, ClaimSlotWait::Await(&snapshot), || {
             while let Some(current) = &key {
                 if let Some(claim) = staging.take_residue(current, cause)? {
                     return Ok(Some(claim));
@@ -2893,14 +2936,27 @@ mod tests {
             .expect("test Bifrost resources")
         }
 
+        /// Starts one real persistence runtime with one worker and no faults.
+        ///
+        /// # Panics
+        ///
+        /// Panics when [`Self::start_with`] cannot set up the fixture.
+        async fn start() -> Self {
+            Self::start_with(PersistenceFaults::default(), 1).await
+        }
+
         /// Starts one real persistence runtime before it accepts work.
+        ///
+        /// `faults` is shared with the runtime, so a test can hold and observe
+        /// claim publication through it. `workers` sets both the persistence
+        /// worker count and the claim budget, which staging derives from it.
         ///
         /// # Panics
         ///
         /// Panics when the Postgres fixture, its superuser pool, the temporary
         /// WAL or scratch roots, the cluster-node seed row, or the persistence
         /// runtime itself cannot be set up.
-        async fn start() -> Self {
+        async fn start_with(faults: PersistenceFaults, workers: usize) -> Self {
             let database = wyrd_dev_fixtures::pg::PgFixture::start()
                 .await
                 .expect("Postgres fixture");
@@ -2952,9 +3008,13 @@ mod tests {
             let output_scratch = memory.output_scratch().expect("test Scribe output scratch");
             let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
             let runtime = PersistenceRuntime::start(
-                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1)
-                    .with_operator_pool(database.operator_pool().clone())
-                    .with_output_scratch(output_scratch),
+                ScribePersistenceConfig::new(
+                    Arc::new(database.vala_postgres().clone()),
+                    1,
+                    workers,
+                )
+                .with_operator_pool(database.operator_pool().clone())
+                .with_output_scratch(output_scratch),
                 PersistenceRuntimeContext {
                     operator: Arc::new(
                         Operator::new(opendal::services::Memory::default())
@@ -2969,7 +3029,7 @@ mod tests {
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
                     hot_sources: Arc::clone(&hot_sources),
-                    faults: PersistenceFaults::default(),
+                    faults,
                 },
                 &Handle::current(),
             );
@@ -2985,11 +3045,13 @@ mod tests {
             }
         }
 
-        /// Builds the one bounded generation this fixture submits.
+        /// Builds one bounded generation of shard 0 for the fixture to submit.
         ///
-        /// Every field is fixed — one row, one audit event, one append meta,
-        /// LSN 1, shard 0 — so the queue gauges the caller asserts on move by a
-        /// known amount rather than by whatever a randomized fixture produced.
+        /// Every field but `generation` is fixed — one row, one audit event,
+        /// one append meta, shard 0 — so the queue gauges the caller asserts on
+        /// move by a known amount rather than by whatever a randomized fixture
+        /// produced. `generation` is both the generation identity and its one
+        /// LSN, so successive generations stage as distinct members.
         /// The WAL handle is taken from the fixture's real writer so the
         /// persistence worker exercises a genuine durable path.
         ///
@@ -3003,14 +3065,16 @@ mod tests {
             rows: Vec<arrow::record_batch::RecordBatch>,
             schema: Arc<arrow::datatypes::Schema>,
             batch_id: uuid::Uuid,
+            generation: u64,
         ) -> Arc<ImmutableGeneration> {
+            let lsn = WalLsn::new(generation);
             Arc::new(ImmutableGeneration {
                 table_key: (self.tenant, table),
                 seal_key: seal_key.clone(),
-                generation_id: GenerationId(1),
+                generation_id: GenerationId(generation),
                 stream: self.stream,
-                wal_lsn_min: WalLsn::new(1),
-                wal_lsn_max: WalLsn::new(1),
+                wal_lsn_min: lsn,
+                wal_lsn_max: lsn,
                 wal_segments: Vec::new(),
                 wal: self.wal.handle_for_shard(0).expect("WAL handle"),
                 rows,
@@ -3025,8 +3089,8 @@ mod tests {
                     slice_index: 0,
                     slice_count: 1,
                     rows_accepted: 1,
-                    wal_lsn_min: WalLsn::new(1),
-                    wal_lsn_max: WalLsn::new(1),
+                    wal_lsn_min: lsn,
+                    wal_lsn_max: lsn,
                     seal_key: seal_key.to_string(),
                 }],
                 row_count: 1,
@@ -3089,12 +3153,38 @@ mod tests {
             conn.commit().await.expect("commit the fixture control row");
         }
 
-        /// Submits one bounded generation and waits for its real worker completion.
-        async fn submit_and_drain(&self) {
-            let table = crate::catalog::TableRef::new(
+        /// Returns the one table every fixture generation writes.
+        fn fixture_table() -> crate::catalog::TableRef {
+            crate::catalog::TableRef::new(
                 crate::namespaces::BifrostNamespace::Bifrost,
                 "idle_queue",
-            );
+            )
+        }
+
+        /// Submits one bounded generation, waits for its real worker
+        /// completion, then closes and drains the runtime.
+        ///
+        /// # Panics
+        ///
+        /// Panics when [`Self::stage_generation`] fails.
+        async fn submit_and_drain(&self) {
+            self.register_control_row(&Self::fixture_table()).await;
+            self.stage_generation(1).await;
+            self.shut_down().await;
+        }
+
+        /// Submits generation `generation` and waits until the worker reports
+        /// it durable as a staged member, acknowledging its visibility.
+        ///
+        /// The caller registers the table's control row first, once. The
+        /// member stays ready: no claim is published here.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the generation cannot register, submit, or stage, or
+        /// when the worker reports a failed completion.
+        async fn stage_generation(&self, generation: u64) {
+            let table = Self::fixture_table();
             let seal_key = SealKey::new(
                 self.tenant,
                 table.clone(),
@@ -3105,11 +3195,10 @@ mod tests {
             self.hot_sources
                 .register_memtable(
                     &seal_key,
-                    crate::scribe::hot_source::GenerationOrdinal::new(0, 1),
+                    crate::scribe::hot_source::GenerationOrdinal::new(0, generation),
                 )
                 .expect("the fixture generation registers once");
             let batch_id = uuid::Uuid::now_v7();
-            self.register_control_row(&table).await;
             let schema = Self::fixture_schema();
             let rows = vec![
                 arrow::record_batch::RecordBatch::try_new(
@@ -3126,7 +3215,8 @@ mod tests {
             let (completion_tx, mut completion_rx) = mpsc::channel(1);
             self.runtime
                 .try_submit(PersistenceJob {
-                    generation: self.fixture_generation(table, &seal_key, rows, schema, batch_id),
+                    generation: self
+                        .fixture_generation(table, &seal_key, rows, schema, batch_id, generation),
                     binding,
                     completion_tx,
                     completion_waiter: None,
@@ -3150,6 +3240,10 @@ mod tests {
             visibility_result
                 .send(Ok(()))
                 .expect("visibility acknowledgment");
+        }
+
+        /// Closes the runtime, drains accepted work, and releases its workers.
+        async fn shut_down(&self) {
             self.runtime.close();
             self.runtime.drain().await;
             self.runtime.abort_retained();
@@ -3213,6 +3307,152 @@ mod tests {
             encoded_bytes.is_some_and(|bytes| bytes > 0),
             "encoded bytes must be counted after persist_once"
         );
+    }
+
+    /// A flush returns only after a member durable at its drain publishes,
+    /// even when another publisher, not the flush, claimed that member.
+    ///
+    /// The lifecycle tick's `publish_due` can claim members the flush's own
+    /// drain made durable; the flush then has nothing to take and nothing in
+    /// flight. Here the test holds that outside claim itself, so the flush must
+    /// wait for it rather than return while its rows are unpublished. The wait
+    /// is observed through the claim-slot probe, then the outside claim
+    /// publishes and the flush ends with nothing left staged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or publish, or when the flush
+    /// returns before the outside claim over its durable member publishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "test-support")]
+    async fn flush_waits_for_an_outside_claim_over_members_durable_at_drain() {
+        let faults = PersistenceFaults::default();
+        let fixture = IdlePersistenceFixture::start_with(faults.clone(), 1).await;
+        fixture
+            .register_control_row(&IdlePersistenceFixture::fixture_table())
+            .await;
+        fixture.stage_generation(1).await;
+        let worker = fixture.runtime.worker.as_ref().expect("persistence worker");
+        let staging = worker.staging().expect("staging runtime");
+        let key = staging
+            .ready_keys()
+            .expect("ready keys")
+            .pop()
+            .expect("the staged member's key is ready");
+        let outside = staging
+            .take_residue(&key, crate::scribe::assembly::ClaimCause::Drain)
+            .expect("the ready key releases a claim")
+            .expect("the durable member is claimable");
+
+        let flush = fixture
+            .runtime
+            .publish_residue(crate::scribe::assembly::ClaimCause::Drain);
+        tokio::pin!(flush);
+        tokio::select! {
+            result = &mut flush => panic!(
+                "the flush returned {result:?} while a member durable at its drain was unpublished"
+            ),
+            () = faults.wait_for_claim_contention_for_test(1) => {}
+        }
+        worker
+            .publish_claim(&staging, &outside)
+            .await
+            .expect("the outside claim publishes");
+        drop(outside);
+        assert_eq!(
+            flush
+                .await
+                .expect("the flush ends once the outside claim publishes"),
+            0,
+            "the flush published nothing itself"
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .staging_backlog_for_test()
+                .expect("staging backlog")
+                .live_members,
+            0,
+            "every member durable at the drain published before the flush returned"
+        );
+        fixture.shut_down().await;
+    }
+
+    /// A flush is not held open by a claim over members staged after it began.
+    ///
+    /// The flush claims the one member durable at its drain and that
+    /// publication is held at the object write. A second member is then
+    /// staged and claimed by the test, standing in for a concurrent
+    /// `publish_due`. Once the flush's own claim publishes, the flush returns
+    /// even though the later claim is still driven and unpublished: under
+    /// continuous ingest a flush that waited for newer members would never end.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or publish, when the flush does not
+    /// publish its own claim, or when it does not return while the later claim
+    /// is still outstanding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "test-support")]
+    async fn flush_ignores_an_outside_claim_taken_after_its_snapshot() {
+        let faults = PersistenceFaults::default();
+        let fixture = IdlePersistenceFixture::start_with(faults.clone(), 2).await;
+        fixture
+            .register_control_row(&IdlePersistenceFixture::fixture_table())
+            .await;
+        fixture.stage_generation(1).await;
+        faults.hold_object_writes_for_test();
+
+        let flush = fixture
+            .runtime
+            .publish_residue(crate::scribe::assembly::ClaimCause::Drain);
+        tokio::pin!(flush);
+        tokio::select! {
+            result = &mut flush => panic!(
+                "the flush returned {result:?} before its own claim reached the object write"
+            ),
+            () = faults.wait_for_held_object_writes_for_test(1) => {}
+        }
+        fixture.stage_generation(2).await;
+        let worker = fixture.runtime.worker.as_ref().expect("persistence worker");
+        let staging = worker.staging().expect("staging runtime");
+        let key = staging
+            .ready_keys()
+            .expect("ready keys")
+            .pop()
+            .expect("the later member's key is ready");
+        let outside = staging
+            .take_residue(&key, crate::scribe::assembly::ClaimCause::Drain)
+            .expect("a claim slot is free for the later member")
+            .expect("the later member is claimable");
+        faults.release_object_writes_for_test();
+
+        // A bound on a hang, not a synchronization point: the flush must end
+        // on its own claim's settlement while `outside` is still driven.
+        let published = tokio::time::timeout(Duration::from_mins(2), &mut flush)
+            .await
+            .expect("the flush must not wait for a claim over a later member")
+            .expect("the flush publishes its own claim");
+        assert_eq!(
+            published, 1,
+            "the flush published the member durable at its drain"
+        );
+        let backlog = fixture
+            .runtime
+            .staging_backlog_for_test()
+            .expect("staging backlog");
+        assert_eq!(
+            (backlog.live_members, backlog.outstanding_claims),
+            (1, 1),
+            "the later member stays claimed and unpublished"
+        );
+
+        worker
+            .publish_claim(&staging, &outside)
+            .await
+            .expect("the later claim publishes");
+        drop(outside);
+        fixture.shut_down().await;
     }
 
     /// Poisons a registry to prove shutdown recovers its retained state.

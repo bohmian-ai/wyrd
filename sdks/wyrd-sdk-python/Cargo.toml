@@ -29,7 +29,7 @@ python = [
     "wyrd-config/python",
     "wyrd-utils/python",
 ]
-testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url"]
+testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url", "dep:chrono"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"], optional = true }
@@ -44,7 +44,7 @@ wyrd-config = { workspace = true }
 wyrd-utils = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
-wyrd-client = { workspace = true }
+wyrd-client = { workspace = true, features = ["internal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
@@ -59,6 +59,7 @@ wyrd-semver = { workspace = true }
 wyrd-testing = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [lints]
 workspace = true

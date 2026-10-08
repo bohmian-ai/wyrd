@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: examples
+  name: writer
+  version: "0.1.0"
+spec:
+  prompt:
+    model: claude-3-5-haiku-20241022
+    request:
+      provider: anthropic_message
+      body:
+        model: claude-3-5-haiku-20241022
+        system: You are a concise writer. Turn the research notes into a two-sentence summary.
+        max_tokens: 4096
+        messages:
+          - role: user
+            content:
+              - type: text
+                text: "Write a summary from: {{research}}"
+    variables: [research]
+    response_type: text
+  tool_names: []

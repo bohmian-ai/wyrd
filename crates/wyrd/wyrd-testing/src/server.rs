@@ -20,7 +20,6 @@ use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
-use metrics_exporter_prometheus::PrometheusHandle;
 use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -316,34 +315,58 @@ pub struct BifrostQueryResourceSnapshot {
 /// Every audited surface stages its decision on one non-blocking outbox. A
 /// tenant batch that cannot commit is retried, never dropped, and each failed
 /// attempt is counted in `outbox_write_failures_total{outbox="audit"}` rather
-/// than refusing the request. A journey proving that installs the server's
+/// than refusing the request. A journey proving that borrows the server's
 /// process-global Prometheus recorder through this owner, waits for a failed
 /// attempt, then restores the database and proves the decision commits.
-/// Installation succeeds once per process, which matches the
-/// one-process-per-test lanes that run these journeys.
-#[derive(Debug, Clone)]
+///
+/// The recorder is the one [`crate::bifrost::shared_process_telemetry_for_test`]
+/// installs, which every in-process test server also shares, so this works
+/// whether or not another test in the process started first. The counter is
+/// process-wide, so [`Self::count`] reports only failures since
+/// [`Self::install`].
+#[derive(Clone)]
 pub struct AuditCommitFailures {
-    /// Render handle of the installed process-global recorder.
-    handle: PrometheusHandle,
+    /// Read-only capture over the shared process recorder.
+    capture: crate::bifrost::BifrostTelemetryCapture,
+    /// Process-wide failure count when this owner was installed.
+    baseline: u64,
+}
+
+impl std::fmt::Debug for AuditCommitFailures {
+    /// Formats the baseline only; the capture holds no printable state.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditCommitFailures")
+            .field("baseline", &self.baseline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuditCommitFailures {
-    /// Installs the server's process-global metrics recorder.
+    /// Borrows the shared process recorder, installing it on first use, and
+    /// records the current failure count as this owner's baseline.
     ///
     /// # Errors
-    /// Returns [`WyrdTestServerError::Audit`] when a recorder is already
-    /// installed in this process or bucket setup fails.
+    /// Returns [`WyrdTestServerError::Audit`] when the shared process
+    /// telemetry cannot be installed, for example because a recorder outside
+    /// the shared owner already holds the process.
     pub fn install() -> Result<Self, WyrdTestServerError> {
-        wyrd_server::app::metrics::install_recorder()
-            .map(|handle| Self { handle })
-            .map_err(|error| WyrdTestServerError::Audit(error.to_string()))
+        let (_guard, capture) = crate::bifrost::shared_process_telemetry_for_test()
+            .map_err(|error| WyrdTestServerError::Audit(error.to_string()))?;
+        let baseline = Self::total(&capture);
+        Ok(Self { capture, baseline })
     }
 
-    /// Returns the failed audit write attempts so far; a series never recorded
-    /// reads zero.
+    /// Returns the failed audit write attempts since [`Self::install`]; a
+    /// series never recorded reads zero.
     #[must_use]
     pub fn count(&self) -> u64 {
-        self.handle
+        Self::total(&self.capture).saturating_sub(self.baseline)
+    }
+
+    /// Reads the process-wide `outbox_write_failures_total{outbox="audit"}`
+    /// sample from `capture`, or zero when the series was never recorded.
+    fn total(capture: &crate::bifrost::BifrostTelemetryCapture) -> u64 {
+        capture
             .render()
             .lines()
             .find_map(|line| line.strip_prefix("outbox_write_failures_total{outbox=\"audit\"} "))

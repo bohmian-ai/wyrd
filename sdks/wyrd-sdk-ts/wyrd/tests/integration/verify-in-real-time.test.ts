@@ -4,9 +4,10 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Bifrost, Cards, type CardRef, WyrdState } from "@wyrd/sdk";
+import { Bifrost, Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { cli } from "@wyrd/testing";
 
-import { fixture, serverTest } from "../support/server.js";
+import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -26,13 +27,20 @@ const HEALTHY_LATENCIES = Array.from({ length: 100 }, (_, row) => ({ latency: (r
 /** One hundred latencies all at the slow end of the baseline. */
 const SLOW_LATENCIES = Array.from({ length: 100 }, () => ({ latency: 99 }));
 
+/** The key `issueKey` mints for a registered Service, with no Role grant. */
+async function serviceKey(name: string): Promise<string> {
+  const issued = await cli.issueKey({ kind: "Service", name, version: "1.0.0", space: "default" });
+  return issued.key;
+}
+
 /**
  * The assistant Service, registered after its latency baseline and Model,
  * and the unfitted assistant whose `tier-drift` baseline never fits. Each test
- * gets a fresh offline state that verifies as its Service's own principal.
+ * gets a fresh offline state that verifies as its Service's own principal,
+ * through a key `issueKey` minted with no Role grant.
  */
 const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }), verificationRuntime: true }).extend<{
-  assistant: { readonly bundle: string; readonly latencyDrift: CardRef };
+  assistant: { readonly bundle: string; readonly latencyDrift: RegisteredRef };
   unfittedBundle: { readonly bundle: string; readonly key: string };
   unfitted: WyrdState;
   assistantKey: string;
@@ -46,35 +54,25 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
       const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
       await cards.hydrate(receipt.root, bundle);
-      const latencyDrift = receipt.outcomes.find((outcome) => outcome.card_ref.name === "latency-drift");
-      await use({ bundle, latencyDrift: latencyDrift?.card_ref as CardRef });
+      await use({ bundle, latencyDrift: registered(receipt, "latency-drift") });
     },
     { scope: "file" },
   ],
-  assistantKey: [
-    async ({ server, assistant: _ }, use) =>
-      use(server.credentialRegisteredService("default/Service/assistant@1.0.0", ["admin"])),
-    { scope: "file" },
-  ],
+  assistantKey: [async ({ assistant: _ }, use) => use(await serviceKey("assistant")), { scope: "file" }],
   unfittedBundle: [
-    async ({ server, assistant: _ }, use) => {
+    async ({ assistant: _ }, use) => {
       const cards = Cards.connect();
       const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
       await cards.hydrate(receipt.root, bundle);
-      const key = server.credentialRegisteredService("default/Service/unfitted-assistant@1.0.0", ["admin"]);
-      await use({ bundle, key });
+      await use({ bundle, key: await serviceKey("unfitted-assistant") });
     },
     { scope: "file" },
   ],
-  unfitted: async ({ deployment: _, unfittedBundle }, use) => {
-    vi.stubEnv("WYRD_API_KEY", unfittedBundle.key);
-    await use(WyrdState.fromPath(unfittedBundle.bundle));
-  },
-  state: async ({ deployment: _, assistant, assistantKey }, use) => {
-    vi.stubEnv("WYRD_API_KEY", assistantKey);
-    await use(WyrdState.fromPath(assistant.bundle));
-  },
+  unfitted: async ({ unfittedBundle }, use) =>
+    use(WyrdState.fromPath(unfittedBundle.bundle, { client: WyrdClient.connect({ credential: unfittedBundle.key }) })),
+  state: async ({ assistant, assistantKey }, use) =>
+    use(WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential: assistantKey }) })),
 });
 
 // `tier-drift` control-charts a text column, so its baseline never fits.
@@ -114,7 +112,7 @@ test("judged answer passes the llm judge", async ({ provider, state }) => {
 });
 
 test("model latency like the baseline passes its verifier", async ({ server, assistant, state }) => {
-  server.waitForBaseline(assistant.latencyDrift.uid ?? "", 90_000);
+  server.waitForBaseline(assistant.latencyDrift.uid, 90_000);
 
   const judgment = await state.run("model").observe.verify("latency-drift", HEALTHY_LATENCIES);
 
@@ -122,7 +120,7 @@ test("model latency like the baseline passes its verifier", async ({ server, ass
 });
 
 test("model latency drift is judged failed", async ({ server, assistant, state }) => {
-  server.waitForBaseline(assistant.latencyDrift.uid ?? "", 90_000);
+  server.waitForBaseline(assistant.latencyDrift.uid, 90_000);
 
   const judgment = await state.run("model").observe.verify("latency-drift", SLOW_LATENCIES);
 
@@ -146,17 +144,21 @@ test("input of the wrong shape fails locally", async ({ state }) => {
   });
 });
 
-test("caller without evals run is refused", async ({ server, state }) => {
-  vi.stubEnv("WYRD_API_KEY", server.scopedApiKey("assistant_reader", ["cards:read"]));
+test("caller without evals run is refused", async ({ server, assistant }) => {
+  const workload = WyrdClient.connect({ credential: server.bootstrapService(["workload"], "workload_only") });
+  const state = WyrdState.fromPath(assistant.bundle, { client: workload });
 
   await expect(state.run("agent").observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
 });
 
-test("another tenant cannot verify the assistant", async ({ server, state }) => {
+test("another tenant cannot verify the assistant", async ({ server, assistant }) => {
   const otherTenant = server.seedTenant("other-tenant");
-  vi.stubEnv("WYRD_API_KEY", server.bootstrapServiceInTenant(otherTenant, ["admin"], "other-service"));
+  const other = WyrdClient.connect({
+    credential: server.bootstrapServiceInTenant(otherTenant, ["admin"], "other-service"),
+  });
+  const state = WyrdState.fromPath(assistant.bundle, { client: other });
 
   await expect(state.run("agent").observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject({
     code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",

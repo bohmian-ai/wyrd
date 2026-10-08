@@ -163,6 +163,11 @@ impl HttpTransport {
     /// `config.timeout_ms`; the same duration becomes the per-attempt total
     /// deadline of retried JSON and control requests.
     ///
+    /// # Arguments
+    /// * `config` - HTTP settings; `base_url` sets the request origin and `timeout_ms` the
+    ///   connect and per-attempt deadline.
+    /// * `auth` - Shared authentication middleware that supplies bearers and request ids.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] when `config` fails validation, and
     /// [`WyrdClientError::TransportDown`] when the underlying
@@ -231,6 +236,13 @@ impl HttpTransport {
     /// A caller-supplied `wyrd-request-id` is preserved; otherwise one is
     /// minted through the same path every other request uses. Headers the
     /// caller's own protocol needs are passed through untouched.
+    ///
+    /// # Arguments
+    /// * `custom_headers` - Caller protocol headers; the bearer and a missing `wyrd-request-id`
+    ///   are added.
+    /// * `status_of` - Reads the HTTP status from the operation's error; `401` triggers the one
+    ///   replay.
+    /// * `operation` - Runs one attempt with the decorated headers; called at most twice.
     ///
     /// # Errors
     /// Returns [`AuthenticatedReplayError::Credential`] when the middleware
@@ -302,6 +314,12 @@ impl HttpTransport {
     /// errors (up to 3 attempts with exponential backoff 100 ms → 1 s). A
     /// single `401` triggers exactly one [`AuthMiddleware::force_refresh`] and
     /// one additional retry without consuming the normal retry budget.
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body serialized as JSON; `None` sends no body.
     ///
     /// # Errors
     /// Non-`2xx` server responses are mapped to [`WyrdError`] via
@@ -443,6 +461,12 @@ impl HttpTransport {
     /// wrapper. On non-`2xx` the body is parsed as `application/problem+json`
     /// via the commit-03 mapper.
     ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body serialized as JSON; `None` sends no body.
+    ///
     /// # Errors
     /// Non-`2xx` server responses are mapped to [`WyrdError`] via
     /// `application/problem+json`. Transport failures become
@@ -482,6 +506,12 @@ impl HttpTransport {
     /// replayed without re-opening its source. Only connection establishment
     /// is bounded by `HttpConfig::timeout_ms`; a healthy slow transfer is not
     /// cut off by a total deadline. Dropping the future abandons the transfer.
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - One-shot streaming body; it is never retried.
     ///
     /// # Errors
     /// Returns a stable Wyrd error for URL, authentication, transport, or HTTP
@@ -530,6 +560,12 @@ impl HttpTransport {
     /// (`Content-Range`, `Content-Type`, ETag validators, …) applied verbatim.
     /// Only connection establishment is bounded by `HttpConfig::timeout_ms`.
     ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `url` - Absolute cross-origin URL, such as a presigned backend URL.
+    /// * `body` - Optional streaming body; `None` sends no body.
+    /// * `headers` - Name/value pairs applied verbatim to the request.
+    ///
     /// # Errors
     /// Transport failures become [`WyrdError::Internal`]. Non-`2xx`
     /// responses are returned untouched so callers can inspect response
@@ -559,6 +595,11 @@ impl HttpTransport {
     ///
     /// Only connection establishment is bounded by `HttpConfig::timeout_ms`;
     /// the caller owns the unbuffered body's lifetime and may drop it to stop.
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
     ///
     /// # Errors
     /// Returns a stable Wyrd error for URL, authentication, transport, or HTTP
@@ -603,6 +644,12 @@ impl HttpTransport {
     /// Cancelling this future abandons connection setup; dropping the returned
     /// response stops unbuffered body consumption.
     ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body, serialized as JSON.
+    ///
     /// # Errors
     ///
     /// Returns a stable Wyrd error for request serialization, authentication,
@@ -627,6 +674,14 @@ impl HttpTransport {
     /// server echoes the exact UUIDv7 request ID in its response headers.
     /// Cancelling this future abandons connection setup; dropping the returned
     /// response stops unbuffered body consumption.
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body, serialized as JSON.
+    /// * `request_id` - Caller-owned request id sent as `wyrd-request-id`; the response must
+    ///   echo it.
     ///
     /// # Errors
     ///
@@ -731,6 +786,12 @@ impl HttpTransport {
     /// job via `ON CONFLICT (idempotency_key)`, never a duplicate. (Minting
     /// inside the loop would defeat the conflict key.)
     ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body, serialized as JSON.
+    ///
     /// # Errors
     /// Non-`2xx` server responses are mapped to [`WyrdError`] via
     /// `application/problem+json`. Transport failures become
@@ -754,6 +815,17 @@ impl HttpTransport {
     /// The key is passed unchanged to every retry attempt. This is intended
     /// for deterministic saga keys; callers that do not need deterministic
     /// replay should use [`Self::submit_idempotent`].
+    ///
+    /// # Arguments
+    /// * `method` - HTTP method of the request.
+    /// * `path` - Server-relative request path (leading `/`), joined to the validated
+    ///   deployment origin.
+    /// * `body` - Request body, serialized as JSON.
+    /// * `key` - Idempotency key sent verbatim as `Idempotency-Key` on every attempt.
+    ///
+    /// # Errors
+    /// Non-`2xx` server responses are mapped to [`WyrdError`] via `application/problem+json`.
+    /// Serialization and transport failures become [`WyrdError::Internal`].
     pub async fn submit_with_idempotency_key<S, D>(
         &self,
         method: Method,

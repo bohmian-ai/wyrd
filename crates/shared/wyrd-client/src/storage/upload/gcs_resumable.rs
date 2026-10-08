@@ -66,6 +66,7 @@ pub(crate) async fn upload(
             ("Idempotency-Key", hooks.idempotency_key),
         ];
         let response = client
+            .http
             .request_external_stream(
                 reqwest::Method::PUT,
                 session_uri,

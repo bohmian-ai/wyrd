@@ -473,81 +473,93 @@ pub fn table_config_from_json_schema(
     compaction_target_file_size_bytes: Option<f64>,
     compaction_type: Option<String>,
 ) -> Result<NativeTableConfigResult> {
-    match declared_table_config(
-        &table,
-        &schema_json,
-        layout_json.as_deref(),
-        compaction_target_file_size_bytes,
-        compaction_type.as_deref(),
-    ) {
-        Ok(config) => Ok(NativeTableConfigResult {
-            config: Some(NativeTableConfig::project(&config)?),
-            error: None,
-        }),
-        Err(error) => Ok(NativeTableConfigResult {
-            config: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        }),
-    }
+    let declared = serde_json::from_str::<Value>(&schema_json)
+        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))
+        .and_then(|schema| TableConfig::from_json_schema(&table, &schema))
+        .and_then(|config| {
+            declare(
+                config,
+                layout_json.as_deref(),
+                compaction_target_file_size_bytes,
+                compaction_type.as_deref(),
+            )
+        });
+    NativeTableConfigResult::declared(declared)
 }
 
-/// Builds one declared table config from its serialized JavaScript inputs.
+/// Builds one table config from an explicit Arrow schema.
+///
+/// This is the door for column types JSON Schema cannot express. The schema
+/// crosses as one schema-only Arrow IPC stream, the framing
+/// [`NativeTableConfig::schema_ipc`] uses in the other direction; layout and
+/// compaction apply as in [`table_config_from_json_schema`].
 ///
 /// # Errors
 ///
-/// Returns the shared validation refusal for unparsable schema or layout
-/// text, a non-integer compaction target, and an unknown compaction type, and
-/// the owner's mapping error for a schema that does not map to the table.
-fn declared_table_config(
-    table: &str,
-    schema_json: &str,
+/// Returns a napi error only when the declared config cannot be encoded. Bytes
+/// that are not one Arrow IPC stream and every refusal
+/// [`table_config_from_json_schema`] lists are returned as catalog metadata.
+#[napi]
+pub fn table_config_from_arrow_ipc(
+    table: String,
+    schema_ipc: Buffer,
+    layout_json: Option<String>,
+    compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<String>,
+) -> Result<NativeTableConfigResult> {
+    let declared =
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(schema_ipc.as_ref()), None)
+            .map_err(|error| validation_error(format!("invalid Arrow schema: {error}"), "schema"))
+            .and_then(|reader| TableConfig::from_arrow(&table, reader.schema()))
+            .and_then(|config| {
+                declare(
+                    config,
+                    layout_json.as_deref(),
+                    compaction_target_file_size_bytes,
+                    compaction_type.as_deref(),
+                )
+            });
+    NativeTableConfigResult::declared(declared)
+}
+
+impl NativeTableConfigResult {
+    /// Projects one declaration outcome, its refusal as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the declared config cannot be encoded.
+    fn declared(declared: StdResult<TableConfig, BifrostClientError>) -> Result<Self> {
+        match declared {
+            Ok(config) => Ok(Self {
+                config: Some(NativeTableConfig::project(&config)?),
+                error: None,
+            }),
+            Err(error) => Ok(Self {
+                config: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            }),
+        }
+    }
+}
+
+/// Applies a declaration's serialized layout and compaction options to its
+/// base config, whichever schema door built it.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal for unparsable layout text, a
+/// non-integer compaction target, and an unknown compaction type.
+fn declare(
+    config: TableConfig,
     layout_json: Option<&str>,
     compaction_target_file_size_bytes: Option<f64>,
     compaction_type: Option<&str>,
 ) -> StdResult<TableConfig, BifrostClientError> {
-    let schema: Value = serde_json::from_str(schema_json)
-        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
-    let config = apply_layout(TableConfig::from_json_schema(table, &schema)?, layout_json)?;
+    let config = apply_layout(config, layout_json)?;
     apply_compaction_type(
         apply_compaction_target(config, compaction_target_file_size_bytes)?,
         compaction_type,
     )
-}
-
-/// Fetches an already-registered table's config by name.
-///
-/// Every transport argument is optional and resolves through the same chain the
-/// client constructor uses when omitted.
-///
-/// # Errors
-///
-/// Returns a napi error only when the described config cannot be encoded;
-/// credential, transport, and server refusals are returned as catalog metadata.
-#[napi]
-pub async fn describe_table_config(
-    table: String,
-    server_url: Option<String>,
-    credential: Option<String>,
-    grpc_url: Option<String>,
-) -> Result<NativeTableConfigResult> {
-    let described = match wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        grpc_url.as_deref(),
-    ) {
-        Ok(client) => TableConfig::describe(&client, &table).await,
-        Err(error) => Err(error),
-    };
-    match described {
-        Ok(config) => Ok(NativeTableConfigResult {
-            config: Some(NativeTableConfig::project(&config)?),
-            error: None,
-        }),
-        Err(error) => Ok(NativeTableConfigResult {
-            config: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        }),
-    }
 }
 
 /// Applies one optional serialized physical layout to a config.
@@ -654,40 +666,6 @@ pub struct NativeBifrost {
     /// Shared through an [`Arc`] so a blocking drain can move it onto a
     /// blocking worker without stalling the Node event loop.
     client: Arc<Bifrost>,
-}
-
-/// Connects one Bifrost client, optionally already bound to a write target.
-///
-/// A free function rather than a constructor because connecting is asynchronous
-/// and a napi constructor cannot be. Every transport argument is optional and
-/// falls through the existing resolution chain exactly once when omitted.
-///
-/// # Errors
-///
-/// Returns a napi error only when the supplied table config is not one
-/// serialized `TableConfig`; credential, byte-budget, and ingest-dial failures
-/// are returned as catalog metadata.
-#[napi]
-pub async fn connect_bifrost(
-    table: Option<NativeTableConfig>,
-    server_url: Option<String>,
-    credential: Option<String>,
-    grpc_url: Option<String>,
-    client_byte_limit_bytes: Option<i64>,
-) -> Result<NativeBifrostConnection> {
-    let table = table.map(|table| table.parse()).transpose()?;
-    let connected = match wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        grpc_url.as_deref(),
-    ) {
-        Ok(client) => {
-            Bifrost::connect_with_config(&client, table, queue_config(client_byte_limit_bytes))
-                .await
-        }
-        Err(error) => Err(error),
-    };
-    Ok(NativeBifrostConnection::from_outcome(connected))
 }
 
 #[napi]
@@ -840,6 +818,55 @@ impl NativeBifrost {
         u32::try_from(self.client.producer_count()).unwrap_or(u32::MAX)
     }
 
+    /// Rows dropped by the fire-and-forget observation path, saturating at
+    /// `i64::MAX`.
+    ///
+    /// Always zero for [`NativeBifrost::insert`], which refuses rather than
+    /// drops.
+    #[napi(getter)]
+    pub fn dropped(&self) -> i64 {
+        i64::try_from(self.client.dropped()).unwrap_or(i64::MAX)
+    }
+
+    /// Records one telemetry row fire-and-forget through
+    /// [`wyrd_client::bifrost::observe::record`].
+    ///
+    /// The row names its own `table` and JSON Schema rather than this client's
+    /// bound table, so instrumentation never disturbs the application's
+    /// binding. A producer refusal, such as a full queue, is counted on
+    /// [`NativeBifrost::dropped`] instead of returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be encoded; an
+    /// unparsable or unmappable schema and an invalid card reference are
+    /// returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn record(
+        &self,
+        table: String,
+        schema_json: String,
+        row: String,
+        card_ref: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let recorded = telemetry_schema(&schema_json).and_then(|schema| {
+            let correlation = correlation(card_ref.as_deref(), run_id)?;
+            wyrd_client::bifrost::observe::record(
+                &self.client,
+                &table,
+                &schema,
+                row.into_bytes(),
+                correlation,
+            );
+            Ok(())
+        });
+        match recorded {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
     /// Starts one terminal-safe query through the Rust SDK owner.
     ///
     /// Expected request, Gate, authentication, and transport failures are
@@ -964,7 +991,7 @@ impl NativeBifrost {
         namespace: String,
         name: String,
     ) -> Result<NativeLifecycleResult> {
-        match self.client.describe(&format!("{namespace}.{name}")).await {
+        match self.client.describe_table(&namespace, &name).await {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
             ),
@@ -1144,6 +1171,19 @@ impl NativeBifrostQueryStream {
             .map(|terminal| terminal.clone())
             .map_err(|_| napi::Error::from_reason("terminal lock poisoned".to_owned()))
     }
+}
+
+/// Maps one telemetry row's JSON Schema text to its Arrow schema through the
+/// shared `wyrd-queue` mapper.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal for unparsable text and the mapper's
+/// error for a document that does not map to Arrow.
+fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientError> {
+    let schema: Value = serde_json::from_str(schema_json)
+        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
+    Ok(Arc::new(wyrd_queue::json_schema_to_arrow(&schema)?))
 }
 
 /// Parses the optional per-row correlation at the Node boundary.

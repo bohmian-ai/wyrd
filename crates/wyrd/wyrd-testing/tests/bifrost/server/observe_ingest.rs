@@ -91,10 +91,10 @@ impl Observed {
                     .expect("the Service is credentialed"),
             ),
         );
-        let state =
-            WyrdState::from_path(&bundle.path().join("bundle")).expect("bundle loads offline");
+        let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), service.clone())
+            .expect("bundle loads offline");
         state
-            .start_bifrost_with_config(&service, None, queue)
+            .start_bifrost_with_config(None, queue)
             .await
             .expect("Bifrost starts");
         Self {

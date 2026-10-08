@@ -524,6 +524,7 @@ mod pg_tests {
             .stream(
                 &format!("SELECT id, value FROM {second_fqn} ORDER BY id"),
                 &[],
+                None,
             )
             .await
             .expect("stream the second table");
@@ -661,7 +662,7 @@ mod pg_tests {
         assert_eq!(id_value_rows(collected.batches()), rows);
 
         let streamed = bifrost
-            .stream(&select, &[])
+            .stream(&select, &[], None)
             .expect("stream through the blocking door")
             .collect::<Result<Vec<_>, _>>()
             .expect("every streamed batch");
@@ -672,8 +673,9 @@ mod pg_tests {
             .expect("deserialize through the blocking door");
         assert_eq!(typed, rows);
 
+        let (namespace, name) = fqn.rsplit_once('.').expect("the fqn names a namespace");
         let described = bifrost
-            .describe(&fqn)
+            .describe_table(namespace, name)
             .expect("describe through the blocking door");
         assert_eq!(described.entry.table_uid, resolved.table_uid);
         assert_eq!(described.entry.fingerprint, resolved.fingerprint);

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{PrincipalId, SecretBearer};
+use crate::reference::CardRef;
 
 /// Request to create a tenant-scoped machine principal.
 ///
@@ -115,4 +116,37 @@ pub struct CredentialRevoked {
     pub revoked: bool,
     /// The credential that was retired.
     pub credential_id: Uuid,
+}
+
+/// Body of `POST /v1/auth/grant-role`: grant one Role to a Card-bound principal.
+///
+/// The target is named by its Card because a Service or Agent principal is the
+/// Card's projection; a human user is never a target, since federated login
+/// replaces their roles on every sign-in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GrantRoleRequest {
+    /// Service or Agent Card whose principal receives the Role.
+    pub card_ref: CardRef,
+    /// Name of a built-in or tenant Role, such as `workload`.
+    pub role: String,
+}
+
+/// Response from `POST /v1/auth/grant-role`.
+///
+/// The grant takes effect at the principal's next key exchange; tokens already
+/// minted keep the roles they were issued with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GrantRoleResponse {
+    /// Principal the Role was granted to.
+    pub principal_id: PrincipalId,
+    /// The principal's stored Card binding.
+    pub card_ref: CardRef,
+    /// Every Role the principal now holds, ordered by name.
+    pub roles: Vec<String>,
+    /// `true` when this call added the Role, `false` when it was already held.
+    pub granted: bool,
 }

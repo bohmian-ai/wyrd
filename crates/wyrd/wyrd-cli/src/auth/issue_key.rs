@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use clap::Args;
 use reqwest::Method;
 use url::Url;
+use wyrd_client::WyrdClient;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
@@ -44,9 +45,8 @@ pub struct IssueKeyArgs {
 
 /// Issue an API key bound to one exact Card and return it.
 ///
-/// The in-process form of `wyrd auth issue-key`. The client comes from the
-/// ambient credential chain, which `server` re-points; no credential is ever
-/// an argument. The response carries the plaintext key exactly once, behind a
+/// The in-process form of `wyrd auth issue-key`. The request runs as
+/// `client`, or, when it is omitted, as the ambient credential chain. The response carries the plaintext key exactly once, behind a
 /// redacting `Debug`; the caller owns where it goes next.
 ///
 /// # Errors
@@ -61,10 +61,11 @@ pub async fn issue_key(
     space: &str,
     label: Option<&str>,
     expires_in_seconds: Option<u32>,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<IssueKeyResponse, WyrdError> {
     let card_ref = card_ref(kind, name, version, space)?;
-    request(card_ref, label, expires_in_seconds, server)
+    let client = crate::client::explicit_or_ambient(client)?;
+    request(client, card_ref, label, expires_in_seconds)
         .await
         .map_err(WyrdError::from)
 }
@@ -74,7 +75,12 @@ pub async fn issue_key(
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] naming `card` when the
 /// coordinates do not form a `CardRef`.
-fn card_ref(kind: &str, name: &str, version: &str, space: &str) -> Result<CardRef, WyrdCliError> {
+pub(crate) fn card_ref(
+    kind: &str,
+    name: &str,
+    version: &str,
+    space: &str,
+) -> Result<CardRef, WyrdCliError> {
     let card_ref = format!("{space}/{kind}/{name}@{version}");
     card_ref
         .parse()
@@ -85,18 +91,17 @@ fn card_ref(kind: &str, name: &str, version: &str, space: &str) -> Result<CardRe
         })
 }
 
-/// Send one issue-key request through the shared client.
+/// Send one issue-key request as `client`.
 ///
 /// # Errors
-/// Returns a client-construction error for a rejected endpoint or missing
-/// credential, and [`WyrdCliError::Server`] for the server's refusal.
+/// Returns [`WyrdCliError::Server`] for the server's refusal.
 async fn request(
+    client: WyrdClient,
     card_ref: CardRef,
     label: Option<&str>,
     expires_in_seconds: Option<u32>,
-    server: Option<&str>,
 ) -> Result<IssueKeyResponse, WyrdCliError> {
-    crate::client::from_global(server)?
+    client
         .request_json(
             Method::POST,
             "/auth/issue-key",
@@ -122,11 +127,12 @@ async fn request(
 /// unknown.
 pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
     let card_ref = card_ref(&args.kind, &args.name, &args.version, &args.space)?;
+    let client = crate::client::from_global(Some(args.server.as_str()))?;
     let response = request(
+        client,
         card_ref,
         args.label.as_deref(),
         args.expires_in_seconds,
-        Some(args.server.as_str()),
     )
     .await?;
 

@@ -213,7 +213,7 @@ def live_server(
         declared: list[tuple[str, Sequence[GatewayOperation]]] = list(
             deployments or [(model(provider), ["chat_completions"])]
         )
-        gateway = Gateway(server_url=server.base_url, credential=server.api_key)
+        gateway = Gateway(WyrdClient(server_url=server.base_url, credential=server.api_key))
         for index, (native, capabilities) in enumerate(declared):
             deployment: ProviderDeployment = {
                 "name": f"{provider}-live-{index}",

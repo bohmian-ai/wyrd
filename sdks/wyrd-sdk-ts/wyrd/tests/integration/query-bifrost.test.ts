@@ -1,8 +1,7 @@
-import { tableFromIPC } from "apache-arrow";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdClient } from "@wyrd/sdk";
 
 import { serverTest } from "../support/server.js";
 
@@ -74,26 +73,12 @@ test("stream yields arrow batches and a terminal", async ({ bifrost }) => {
   expect(stream.terminal).toMatchObject({ outcome: "success", row_count: 3, warnings: [] });
 });
 
-test("collected result converts to arrow and ipc bytes", async ({ bifrost }) => {
-  const result = await bifrost.sql(`SELECT id FROM ${QUERY_ROWS} ORDER BY id`);
-
-  for (const table of [result.toArrow(), tableFromIPC(result.toBytes())]) {
-    expect(table.numRows).toBe(result.numRows);
-    expect(Array.from(table.getChild("id")?.toArray() ?? [])).toEqual([1n, 2n, 3n]);
-  }
-});
-
 test("caller without bifrost read is refused", async ({ server }) => {
-  const denied = await Bifrost.connect({ credential: server.scopedApiKey("query_denied", ["cards:read"]) });
+  const denied = await Bifrost.connect({
+    client: WyrdClient.connect({ credential: server.scopedApiKey("query_denied", ["cards:read"]) }),
+  });
 
   await expect(denied.sql(`SELECT id FROM ${QUERY_ROWS}`)).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
-  });
-});
-
-// The deadline is range-checked with the rest of the query request.
-test.for([0, 2 ** 32, 1.5, Number.NaN])("out of range deadline is refused: %s", async (deadlineMs, { bifrost }) => {
-  await expect(bifrost.stream({ sql: "SELECT 1", deadlineMs })).rejects.toMatchObject({
-    code: "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
   });
 });

@@ -4,10 +4,11 @@ import { join } from "node:path";
 
 import { expect, vi } from "vitest";
 
-import { Cards, OperatorConnections, type RegistrationReceipt, WyrdState } from "@wyrd/sdk";
+import { Cards, OperatorConnections, type RegistrationReceipt, WyrdClient, WyrdState } from "@wyrd/sdk";
+import { cli } from "@wyrd/testing";
 
 import { Receiver } from "../support/http-receiver.js";
-import { fixture, serverTest } from "../support/server.js";
+import { fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -48,14 +49,12 @@ const test = serverTest({ verificationRuntime: true }).extend<{
 });
 
 test("failed schedule alerts its operator on the connection origin", async ({ server, hooks, cards, watch }) => {
-  const latencyShift = watch.outcomes.find((outcome) => outcome.card_ref.name === "latency-shift");
-  server.waitForBaseline(latencyShift?.card_ref.uid ?? "", 90_000);
+  server.waitForBaseline(registered(watch, "latency-shift").uid, 90_000);
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
   await cards.hydrate(watch.root, bundle);
-  const state = WyrdState.fromPath(bundle);
-  await state.startBifrost({
-    credential: server.credentialRegisteredService("default/Service/latency-watch@1.0.0", []),
-  });
+  const watchKey = await cli.issueKey({ kind: "Service", name: "latency-watch", version: "1.0.0", space: "default" });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
+  await state.startBifrost();
   const run = state.run();
   for (let request = 0; request < 100; request += 1) {
     run.observe.drift({ latency: 99 });
@@ -64,7 +63,7 @@ test("failed schedule alerts its operator on the connection origin", async ({ se
   server.flushBifrost();
 
   const [binding] = (await cards.get(watch.root)).status?.verification?.binding_ids ?? [];
-  server.makeBindingDue(binding ?? "");
+  server.makeBindingDue(binding);
 
   const [alert] = await hooks.requests(1);
   expect(alert).toMatchObject({

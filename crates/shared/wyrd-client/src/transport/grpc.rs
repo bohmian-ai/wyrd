@@ -55,6 +55,11 @@ impl GrpcConnection {
     /// condition per-request as [`WyrdError::Internal`][wyrd_spec::error::WyrdError::Internal]
     /// (500). The divergence is intentional and documented in both modules.
     ///
+    /// # Arguments
+    /// * `config` - Endpoint, timeouts, connect-retry budget, keepalive, and message-size
+    ///   settings.
+    /// * `auth` - Shared authentication middleware that supplies each call's bearer.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
     /// already owns the process, the endpoint URI is invalid, or the dial fails

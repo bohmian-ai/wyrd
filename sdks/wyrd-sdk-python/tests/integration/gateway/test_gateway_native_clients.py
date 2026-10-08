@@ -17,31 +17,41 @@ from google.genai import types as genai_types
 from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
-from .support import Received, access_token, assert_upstream_credentials, calls, deploy, usage
+from ..support import Receiver, client_of
+from .support import (
+    PROVIDER_KEY,
+    access_token,
+    assert_upstream_credentials,
+    calls,
+    deploy,
+    usage,
+)
+
+pytestmark = pytest.mark.integration
 
 MESSAGES: list[MessageParam] = [{"role": "user", "content": "hi"}]
 
 
 @pytest.fixture
 def anthropic_gateway(
-    gateway_server: tuple[WyrdTestServer, Received],
-) -> tuple[WyrdTestServer, Received]:
+    gateway_server: tuple[WyrdTestServer, Receiver],
+) -> tuple[WyrdTestServer, Receiver]:
     """A server with one Anthropic chat deployment and metadata capture."""
-    server, received = gateway_server
+    server, upstream = gateway_server
     deploy(server, "anthropic", "claude-sonnet-5", ["chat_completions"])
-    Gateway().put_capture_policy({"mode": "metadata", "payload_fields": []})
-    return server, received
+    Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
+    return server, upstream
 
 
 @pytest.fixture
 def gemini_gateway(
-    gateway_server: tuple[WyrdTestServer, Received],
-) -> tuple[WyrdTestServer, Received]:
+    gateway_server: tuple[WyrdTestServer, Receiver],
+) -> tuple[WyrdTestServer, Receiver]:
     """A server with one Gemini chat deployment and metadata capture."""
-    server, received = gateway_server
+    server, upstream = gateway_server
     deploy(server, "gemini", "gemini-2.5-flash", ["chat_completions"])
-    Gateway().put_capture_policy({"mode": "metadata", "payload_fields": []})
-    return server, received
+    Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
+    return server, upstream
 
 
 def anthropic_client(
@@ -61,11 +71,10 @@ def gemini_client(server: WyrdTestServer, token: str, **headers: str) -> genai.C
     return genai.Client(api_key=token, http_options=options)
 
 
-@pytest.mark.integration
 def test_anthropic_client_calls_and_streams_through_the_gateway(
-    anthropic_gateway: tuple[WyrdTestServer, Received],
+    anthropic_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
-    server, received = anthropic_gateway
+    server, upstream = anthropic_gateway
     token = server.access_token()
     client = anthropic_client(server, token)
 
@@ -81,20 +90,19 @@ def test_anthropic_client_calls_and_streams_through_the_gateway(
     assert block.text == "hi"
     assert (message.usage.input_tokens, message.usage.output_tokens) == (5, 3)
     assert (streamed, final.stop_reason, final.usage.output_tokens) == ("hi", "end_turn", 3)
-    assert len(received) == 2
-    assert_upstream_credentials(received, "x-api-key", token)
+    assert len(upstream.deliveries) == 2
+    assert_upstream_credentials(upstream, "x-api-key", PROVIDER_KEY, token)
 
 
-@pytest.mark.integration
 def test_anthropic_refusals_never_reach_the_provider(
-    anthropic_gateway: tuple[WyrdTestServer, Received],
+    anthropic_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
-    server, received = anthropic_gateway
+    server, upstream = anthropic_gateway
     token = server.access_token()
     reader_key = server.bootstrap_service(["reader"], name="native-reader")
 
     with pytest.raises(anthropic.PermissionDeniedError) as denied:
-        anthropic_client(server, access_token(reader_key)).messages.create(
+        anthropic_client(server, access_token(server, reader_key)).messages.create(
             model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
         )
     ambiguous_client = anthropic_client(
@@ -105,12 +113,11 @@ def test_anthropic_refusals_never_reach_the_provider(
 
     assert denied.value.response.json()["error"]["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
     assert ambiguous.value.response.json()["error"]["code"] == "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
-    assert received == []
+    assert upstream.deliveries == []
 
 
-@pytest.mark.integration
 def test_anthropic_calls_are_recorded_with_their_usage(
-    anthropic_gateway: tuple[WyrdTestServer, Received],
+    anthropic_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
     server, _ = anthropic_gateway
     client = anthropic_client(server, server.access_token())
@@ -132,11 +139,10 @@ def test_anthropic_calls_are_recorded_with_their_usage(
     assert usage(rows) == {("input_tokens", "5"), ("output_tokens", "3")}
 
 
-@pytest.mark.integration
 def test_gemini_client_calls_and_streams_through_the_gateway(
-    gemini_gateway: tuple[WyrdTestServer, Received],
+    gemini_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
-    server, received = gemini_gateway
+    server, upstream = gemini_gateway
     token = server.access_token()
     client = gemini_client(server, token)
 
@@ -150,22 +156,21 @@ def test_gemini_client_calls_and_streams_through_the_gateway(
     final_candidates = chunks[-1].candidates
     assert final_candidates is not None
     assert final_candidates[0].finish_reason == genai_types.FinishReason.STOP
-    assert [path for path, _ in received] == [
+    assert [delivery.path for delivery in upstream.deliveries] == [
         "/v1beta/models/gemini-2.5-flash:generateContent",
         "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
     ]
-    assert_upstream_credentials(received, "x-goog-api-key", token)
+    assert_upstream_credentials(upstream, "x-goog-api-key", PROVIDER_KEY, token)
 
 
-@pytest.mark.integration
 def test_gemini_refusals_never_reach_the_provider(
-    gemini_gateway: tuple[WyrdTestServer, Received],
+    gemini_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
-    server, received = gemini_gateway
+    server, upstream = gemini_gateway
     token = server.access_token()
     reader_key = server.bootstrap_service(["reader"], name="native-reader")
 
-    reader = gemini_client(server, access_token(reader_key))
+    reader = gemini_client(server, access_token(server, reader_key))
     ambiguous_client = gemini_client(server, token, Authorization=f"Bearer {token}")
     with pytest.raises(genai_errors.ClientError) as denied:
         reader.models.generate_content(model="gemini-2.5-flash", contents="hi")
@@ -179,12 +184,11 @@ def test_gemini_refusals_never_reach_the_provider(
     assert ambiguous.value.details["error"]["details"][0]["reason"] == (
         "WYRD_AUTH_400_BAD_TOKEN_FORMAT"
     )
-    assert received == []
+    assert upstream.deliveries == []
 
 
-@pytest.mark.integration
 def test_gemini_calls_are_recorded_with_their_usage(
-    gemini_gateway: tuple[WyrdTestServer, Received],
+    gemini_gateway: tuple[WyrdTestServer, Receiver],
 ) -> None:
     server, _ = gemini_gateway
     client = gemini_client(server, server.access_token())

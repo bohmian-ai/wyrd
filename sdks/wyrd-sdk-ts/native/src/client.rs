@@ -7,17 +7,17 @@
 use napi_derive::napi;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
-use wyrd_client::bifrost::Bifrost;
+use wyrd_client::bifrost::{Bifrost, TableConfig};
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeBifrostConnection, NativeTableConfig, NativeWyrdError};
+use crate::{NativeBifrostConnection, NativeTableConfig, NativeTableConfigResult, NativeWyrdError};
 
 /// Node-facing handle to one authenticated [`WyrdClient`].
 #[napi]
 pub struct NativeWyrdClient {
     /// Shared transport plus authentication state.
-    client: WyrdClient,
+    pub(crate) client: WyrdClient,
 }
 
 /// Closed result of building or delegating one client: a handle or a catalog error.
@@ -145,35 +145,27 @@ impl NativeWyrdClient {
     /// Connects one Bifrost client over this client's authentication and
     /// transport, optionally already bound to a write target.
     ///
-    /// A delegated client therefore reads and writes as its subject with its
-    /// actor attributed. The transport arguments exist only so a caller that
-    /// also supplies them is refused with `WYRD_SPEC_400_VALIDATION` rather
-    /// than having them silently ignored.
+    /// Every public Bifrost surface connects through here, so a delegated
+    /// client reads and writes as its subject with its actor attributed, and
+    /// an omitted TypeScript client is the ambient [`connect_wyrd_client`].
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - The serialized write target to bind, or `None` for none.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget, or
+    ///   `None` for the 256 MiB default.
     ///
     /// # Errors
     ///
     /// Returns a napi error only when the supplied table config is not one
-    /// serialized `TableConfig`; the conflict, byte-budget, and ingest-dial
-    /// failures are returned as catalog metadata.
+    /// serialized `TableConfig`; the byte-budget and ingest-dial failures are
+    /// returned as catalog metadata.
     #[napi]
     pub async fn connect_bifrost(
         &self,
         table: Option<NativeTableConfig>,
-        server_url: Option<String>,
-        credential: Option<String>,
-        grpc_url: Option<String>,
         client_byte_limit_bytes: Option<i64>,
     ) -> napi::Result<NativeBifrostConnection> {
-        if server_url.is_some() || credential.is_some() || grpc_url.is_some() {
-            return Ok(NativeBifrostConnection {
-                bifrost: None,
-                error: Some(NativeWyrdError::from_wyrd(&WyrdError::Validation {
-                    message: "client cannot be combined with serverUrl, credential, or grpcUrl"
-                        .to_owned(),
-                    details: serde_json::json!({ "field": "client" }),
-                })),
-            });
-        }
         let table = table.map(|table| table.parse()).transpose()?;
         Ok(NativeBifrostConnection::from_outcome(
             Bifrost::connect_with_config(
@@ -183,5 +175,32 @@ impl NativeWyrdClient {
             )
             .await,
         ))
+    }
+
+    /// Fetches an already-registered table's config by name as this client.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - The table's `namespace.name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the described config cannot be encoded;
+    /// transport and server refusals are returned as catalog metadata.
+    #[napi]
+    pub async fn describe_table_config(
+        &self,
+        table: String,
+    ) -> napi::Result<NativeTableConfigResult> {
+        match TableConfig::describe(&self.client, &table).await {
+            Ok(config) => Ok(NativeTableConfigResult {
+                config: Some(NativeTableConfig::project(&config)?),
+                error: None,
+            }),
+            Err(error) => Ok(NativeTableConfigResult {
+                config: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            }),
+        }
     }
 }

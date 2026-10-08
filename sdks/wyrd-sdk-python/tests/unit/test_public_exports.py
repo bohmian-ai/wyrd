@@ -22,6 +22,7 @@ PUBLIC_MODULES = [
     "wyrd.prompt",
     "wyrd.state",
     "wyrd.testing",
+    "wyrd.testing.cli",
 ]
 
 

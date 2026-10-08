@@ -7,6 +7,7 @@
 
 mod gateway_admin;
 mod gateway_inference;
+mod grant_role;
 mod observe_a_run;
 mod operator_connections;
 mod otel_export;

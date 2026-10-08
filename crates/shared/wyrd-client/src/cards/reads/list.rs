@@ -26,6 +26,7 @@ pub(crate) async fn list(
         format!("/v1/cards?{query}")
     };
     client
+        .http
         .request_json(reqwest::Method::GET, &path, None::<&()>)
         .await
         .map_err(Into::into)

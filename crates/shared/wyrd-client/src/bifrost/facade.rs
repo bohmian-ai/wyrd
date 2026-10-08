@@ -9,14 +9,19 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::WyrdClient;
 use crate::config::ClientConfig;
+use crate::environment::Environment;
+use crate::error::WyrdClientError;
+use crate::global_config::GlobalConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 use wyrd_queue::QueueConfig;
+#[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -24,12 +29,13 @@ use wyrd_spec::vala::api::{
     QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
 
+#[cfg(feature = "internal")]
 use crate::bifrost::BifrostMetrics;
 use crate::bifrost::grpc::BifrostGrpcTransport;
 use crate::bifrost::handle::WriterPool;
-use crate::bifrost::query::{
-    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream,
-};
+use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
+#[cfg(feature = "internal")]
+use crate::bifrost::query::{CollectedQueryLimits, CollectedQueryResult};
 use crate::bifrost::scope::ClientScope;
 use crate::bifrost::sink::BifrostIngestSink;
 use crate::bifrost::table::{Correlation, TableConfig, WriterTable};
@@ -68,16 +74,18 @@ pub struct Bifrost {
 impl Bifrost {
     /// Build a client with no arguments, resolving its own transport.
     ///
-    /// Endpoints come from `WYRD_GRPC_URL` / `WYRD_SERVER_URL` or the compiled
-    /// defaults, and the credential from the `ClientConfig::resolve_credential`
-    /// chain whose floor is `~/.config/wyrd/credentials.toml` `[default].api_key`.
-    /// This is [`WyrdClient::from_env`] plus a connect; it adds no resolution of
-    /// its own, so an explicitly built client and this one reach the same place.
+    /// Endpoints come from the global config file, then `WYRD_GRPC_URL` /
+    /// `WYRD_SERVER_URL`, then the compiled defaults, and the credential from
+    /// the `ClientConfig::resolve_credential` chain whose floor is
+    /// `~/.config/wyrd/credentials.toml` `[default].api_key`. This is
+    /// [`WyrdClient::from_global`] plus a connect; it adds no resolution of its
+    /// own, so an explicitly built client and this one reach the same place.
     ///
     /// # Errors
     ///
-    /// Returns the stable no-credentials error when the chain yields nothing,
-    /// or a transport error when the ingest channel cannot be dialled.
+    /// Returns a configuration error when the global config file cannot be
+    /// read or parsed, the stable no-credentials error when the chain yields
+    /// nothing, or a transport error when the ingest channel cannot be dialled.
     pub async fn from_env() -> Result<Self, BifrostClientError> {
         let client = client_from_env()?;
         Self::connect(&client).await
@@ -89,6 +97,10 @@ impl Bifrost {
     /// connection pool, and the API-key-to-bearer exchange the read and write
     /// planes already share.
     ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose credential and connection pools
+    ///   both planes share; it is borrowed, not owned.
+    ///
     /// # Errors
     ///
     /// Returns a transport error when the ingest channel cannot be dialled.
@@ -97,6 +109,10 @@ impl Bifrost {
     }
 
     /// Build a client already bound to `table` for writes.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose transport both planes share.
+    /// * `table` - The table bound as the initial write target.
     ///
     /// # Errors
     ///
@@ -114,6 +130,11 @@ impl Bifrost {
     /// linger for a deterministic journey, or a different send concurrency,
     /// without making [`QueueConfig`] part of the ordinary constructor.
     ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose transport both planes share.
+    /// * `table` - The initial write target, or `None` to bind one later.
+    /// * `config` - Producer tuning, validated before the ingest channel is dialled.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] carrying
@@ -129,11 +150,18 @@ impl Bifrost {
 
     /// Build a client over a caller-supplied batch sink.
     ///
-    /// The seam that was [`WriterPool::new`] before the facade existed: it
+    /// The seam that was `WriterPool::new` before the facade existed: it
     /// performs no IO, so a `wyrd-queue` mock or stall sink stands in for the
     /// gRPC transport while the pooling, backpressure, and drop-counting
     /// behavior under test stays the production one.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client the query plane and producer scope use.
+    /// * `table` - The initial write target, or `None` to bind one later.
+    /// * `sink` - The batch sink every pooled producer seals batches into.
+    /// * `config` - Producer tuning; not validated by this constructor.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn with_sink(
         client: &WyrdClient,
         table: Option<TableConfig>,
@@ -159,7 +187,11 @@ impl Bifrost {
     /// `wyrd query` command, for example — and must not require a reachable
     /// gRPC endpoint. It performs no IO. Any write reaches a sink that refuses
     /// it with a stable validation error instead of sending a batch.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client the query plane uses.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn query_only(client: &WyrdClient) -> Self {
         Self::with_sink(
             client,
@@ -195,7 +227,9 @@ impl Bifrost {
             query: QueryClient::new(client),
             writer: Arc::new(WriterPool::new(
                 ClientScope::from_client(client),
-                Arc::new(BifrostIngestSink::new(Arc::new(transport))),
+                Arc::new(BifrostIngestSink {
+                    transport: Arc::new(transport),
+                }),
                 config,
             )),
             active: Mutex::new(table),
@@ -241,6 +275,7 @@ impl Bifrost {
         let response: RegisterTableResponse = self
             .query
             .client()
+            .http
             .request_json(reqwest::Method::POST, "/v1/bifrost/tables", Some(&request))
             .await?;
         // The lock is released for the network round trip, so `use_table` may
@@ -264,6 +299,9 @@ impl Bifrost {
     /// its first row. The previous table's producer stays in the pool, so its
     /// buffered rows still flush.
     ///
+    /// # Arguments
+    /// * `table` - The table to bind as the new write target.
+    ///
     /// # Panics
     ///
     /// Panics if the active-table lock is poisoned, which indicates an
@@ -276,6 +314,9 @@ impl Bifrost {
     }
 
     /// Bind an already-registered table by name, describing it first.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
     ///
@@ -307,6 +348,9 @@ impl Bifrost {
     /// the server checks the registered fingerprint, so this returning is not a
     /// durability or whole-row-validation acknowledgement.
     ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`; also the cache key.
+    ///
     /// # Errors
     ///
     /// Returns the stable not-found, authentication, authorization,
@@ -323,12 +367,41 @@ impl Bifrost {
     /// # Panics
     ///
     /// Panics if the described-table lock is poisoned.
+    #[cfg(feature = "internal")]
     pub async fn writer_table(&self, fqn: &str) -> Result<WriterTable, BifrostClientError> {
-        if let Some(table) = self.cached_writer_table(fqn) {
+        self.resolve_writer_table(fqn).await
+    }
+
+    /// Crate-internal body of [`Self::writer_table`], which the Run observe
+    /// path calls whether or not the `internal` feature exposes the public
+    /// method.
+    ///
+    /// Serves a cached destination without network IO; a miss takes the
+    /// describe gate, rechecks the cache, then describes and caches once.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`; also the cache key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`TableConfig::describe`].
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future caches nothing and releases the gate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    pub(crate) async fn resolve_writer_table(
+        &self,
+        fqn: &str,
+    ) -> Result<WriterTable, BifrostClientError> {
+        if let Some(table) = self.described_table(fqn) {
             return Ok(table);
         }
         let _gate = self.describe_gate.lock().await;
-        if let Some(table) = self.cached_writer_table(fqn) {
+        if let Some(table) = self.described_table(fqn) {
             return Ok(table);
         }
         let config = TableConfig::describe(self.query.client(), fqn).await?;
@@ -342,11 +415,27 @@ impl Bifrost {
 
     /// The cached destination for `fqn`, if this writer has described it.
     ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`, as passed to `writer_table`.
+    ///
     /// # Panics
     ///
     /// Panics if the described-table lock is poisoned.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn cached_writer_table(&self, fqn: &str) -> Option<WriterTable> {
+        self.described_table(fqn)
+    }
+
+    /// Look up `fqn` in this writer's described-table cache.
+    ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    fn described_table(&self, fqn: &str) -> Option<WriterTable> {
         self.described
             .lock()
             .expect("described table lock poisoned")
@@ -366,11 +455,17 @@ impl Bifrost {
     /// bounded, non-blocking channel send — and durable only after
     /// [`Self::flush`] or [`Self::shutdown`] resolves.
     ///
+    /// # Arguments
+    /// * `table` - The described destination returned by `writer_table`.
+    /// * `row` - One JSON-encoded row whose fields match `table`'s schema.
+    /// * `correlation` - The card and run identities stamped onto the row.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
     /// when the producer channel, its staging ring, and the byte budget are all
     /// occupied.
+    #[cfg(feature = "internal")]
     pub fn insert_into(
         &self,
         table: &WriterTable,
@@ -398,12 +493,18 @@ impl Bifrost {
     /// duplicating any row. Durable only after [`Self::flush`] or
     /// [`Self::shutdown`] resolves.
     ///
+    /// # Arguments
+    /// * `table` - The described destination returned by `writer_table`.
+    /// * `rows` - Every JSON-encoded row of the record; admitted all-or-none.
+    /// * `correlation` - The card and run identities stamped onto every row.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
     /// when the producer cannot admit every row now, and with
     /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` when the record has more rows than
     /// one producer can ever admit at once.
+    #[cfg(feature = "internal")]
     pub fn insert_rows_into(
         &self,
         table: &WriterTable,
@@ -473,6 +574,10 @@ impl Bifrost {
     /// non-blocking channel send. The row is durable only after
     /// [`Self::flush`] or [`Self::shutdown`] resolves.
     ///
+    /// # Arguments
+    /// * `row` - One JSON-encoded row whose fields match the active table's schema.
+    /// * `correlation` - The card and run identities stamped onto the row.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::NoActiveTable`] when no table is bound, or
@@ -505,7 +610,7 @@ impl Bifrost {
     /// express — binary payloads, fixed-size identities, and nested list or
     /// struct columns — which is what the canonical signal tables are made of.
     /// Build the batch from the table's own published contract
-    /// ([`Self::describe`] plus `wyrd_queue::schema::writable_schema`) rather
+    /// ([`Self::describe_table`] plus `wyrd_queue::schema::writable_schema`) rather
     /// than from a restated schema.
     ///
     /// The table is named explicitly instead of taken from the bound active
@@ -520,6 +625,10 @@ impl Bifrost {
     ///
     /// Unlike [`Self::insert`], durability is complete when this resolves — the
     /// batch is not buffered and needs no [`Self::flush`].
+    ///
+    /// # Arguments
+    /// * `table` - The destination table's `<namespace>.<name>`.
+    /// * `batch` - The Arrow batch, sent verbatim in the table's writable schema.
     ///
     /// # Errors
     ///
@@ -549,11 +658,18 @@ impl Bifrost {
     /// and drains it like buffered rows; it is durable only after that owner,
     /// [`Self::flush`], or [`Self::shutdown`] settles it.
     ///
+    /// # Arguments
+    /// * `table` - The destination table's `<namespace>.<name>`.
+    /// * `batch` - The owned Arrow batch, sealed alone in the table's writable schema.
+    /// * `request_id` - The request the batch publishes under, or `None` for a
+    ///   fresh one.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] with backpressure or
     /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer, channel, or byte
     /// envelope cannot admit the batch, or the client is shutting down.
+    #[cfg(feature = "internal")]
     pub fn enqueue_batch(
         &self,
         table: &str,
@@ -627,6 +743,10 @@ impl Bifrost {
     /// `params[i]` binds placeholder `$(i + 1)` in `query`; values travel as
     /// typed data beside the SQL text and are never interpolated into it.
     ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values; `params[i]` binds `$(i + 1)`.
+    ///
     /// # Errors
     ///
     /// Returns the stable invalid-SQL error, the floor's non-SELECT or
@@ -643,7 +763,7 @@ impl Bifrost {
         query: &str,
         params: &[QueryParam],
     ) -> Result<QueryResult, BifrostClientError> {
-        let mut stream = self.stream(query, params).await?;
+        let mut stream = self.stream(query, params, None).await?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.next_batch().await? {
             batches.push(batch);
@@ -670,6 +790,10 @@ impl Bifrost {
     /// selects; it is never sent to the server and says nothing about how a
     /// table is stored.
     ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values; `params[i]` binds `$(i + 1)`.
+    ///
     /// # Errors
     ///
     /// As [`Self::sql`], plus [`BifrostClientError::RowDeserialization`] when any row
@@ -692,11 +816,19 @@ impl Bifrost {
     /// The stream owns the HTTP response body: dropping it propagates
     /// cancellation. The terminal frame is required, so a stream that ends
     /// without one fails rather than presenting partial rows as success.
-    /// `params` bind positionally exactly as in [`Self::sql`].
+    ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values, exactly as in [`Self::sql`].
+    /// * `deadline` - The server-side query deadline, or `None` for the
+    ///   server default. Whole milliseconds are sent; the server accepts 1 ms
+    ///   to `u32::MAX` ms.
     ///
     /// # Errors
     ///
-    /// As [`Self::sql`], plus a decode error on a malformed Arrow IPC frame.
+    /// As [`Self::sql`], plus `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for a
+    /// deadline outside the accepted range and a decode error on a malformed
+    /// Arrow IPC frame.
     ///
     /// # Cancellation
     ///
@@ -705,13 +837,16 @@ impl Bifrost {
         &self,
         query: &str,
         params: &[QueryParam],
+        deadline: Option<Duration>,
     ) -> Result<QueryResultStream, BifrostClientError> {
-        self.query(&BifrostQueryRequest {
-            params: params.to_vec(),
-            sql: query.to_owned(),
-            deadline_ms: None,
-        })
-        .await
+        self.query
+            .query(&BifrostQueryRequest {
+                params: params.to_vec(),
+                sql: query.to_owned(),
+                deadline_ms: deadline
+                    .map(|deadline| i64::try_from(deadline.as_millis()).unwrap_or(i64::MAX)),
+            })
+            .await
     }
 
     /// Start one query from a complete request and return its batches as they arrive.
@@ -719,6 +854,9 @@ impl Bifrost {
     /// The raw form [`Self::stream`] and [`Self::sql`] wrap: the caller chooses
     /// the deadline. The request is validated before any
     /// IO, and the returned stream owns the HTTP response body.
+    ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
     ///
     /// # Errors
     ///
@@ -730,6 +868,7 @@ impl Bifrost {
     ///
     /// Abandoning the future abandons the request; dropping the returned stream
     /// cancels response-body consumption.
+    #[cfg(feature = "internal")]
     pub async fn query(
         &self,
         request: &BifrostQueryRequest,
@@ -738,6 +877,10 @@ impl Bifrost {
     }
 
     /// Run one query and collect it within explicit row and encoded-byte limits.
+    ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
+    /// * `limits` - The row and encoded-byte ceilings the collected result must fit.
     ///
     /// # Errors
     ///
@@ -748,6 +891,7 @@ impl Bifrost {
     /// # Cancellation
     ///
     /// Abandoning the future drops the response stream and its HTTP body.
+    #[cfg(feature = "internal")]
     pub async fn collect_bounded(
         &self,
         request: &BifrostQueryRequest,
@@ -772,6 +916,9 @@ impl Bifrost {
 
     /// Get one active query visible to the authenticated tenant.
     ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to look up.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, authorization, not-found, availability,
@@ -790,6 +937,9 @@ impl Bifrost {
     /// Request server-side cancellation of one active query.
     ///
     /// Does not close any local response stream.
+    ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to cancel.
     ///
     /// # Errors
     ///
@@ -810,26 +960,31 @@ impl Bifrost {
     /// Read one registered table's server-owned description.
     ///
     /// The canonical introspection door on this client: schema, identity, and
-    /// physical layout exactly as the server holds them. `fqn` is
-    /// `<namespace>.<name>`, the same form [`Bifrost::use_table_by_name`] and
-    /// SQL take, so a caller never restates the name in two shapes.
+    /// physical layout exactly as the server holds them.
+    ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace, such as `vala.traces`.
+    /// * `name` - The table's name within `namespace`, such as `spans`.
     ///
     /// # Errors
     ///
-    /// Returns a schema-parse error when `fqn` is not `<namespace>.<name>`, and
-    /// the stable not-found, authentication, authorization, availability, or
-    /// protocol error the server reported.
+    /// Returns the stable not-found, authentication, authorization,
+    /// availability, or protocol error the server reported.
     ///
     /// # Cancellation
     ///
     /// Abandoning the future leaves no server state behind; describe is a read.
-    pub async fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, BifrostClientError> {
-        let (namespace, name) = crate::bifrost::table::split_fqn(fqn)?;
-        self.query.describe_table(&namespace, &name).await
+    pub async fn describe_table(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
+        self.query.describe_table(namespace, name).await
     }
 
     /// The client scope every pooled producer is keyed under.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn scope(&self) -> &ClientScope {
         self.writer.scope()
     }
@@ -854,6 +1009,7 @@ impl Bifrost {
 
     /// Point-in-time bounded-ownership accounting for this client's producers.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn metrics(&self) -> BifrostMetrics {
         self.writer.metrics()
     }
@@ -866,6 +1022,11 @@ impl Bifrost {
     ///
     /// The observer runs on the producer task and must not block. Only the
     /// first registration takes effect.
+    ///
+    /// # Arguments
+    /// * `observer` - Callback receiving the row count of each settled loss; it
+    ///   runs on the producer task and must not block.
+    #[cfg(feature = "internal")]
     pub fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
         self.writer.observe_losses(observer);
     }
@@ -971,7 +1132,7 @@ impl QueryResult {
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Arrow`] when IPC encoding fails.
-    pub fn to_ipc(&self) -> Result<Vec<u8>, BifrostClientError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, BifrostClientError> {
         let mut buffer = Vec::new();
         {
             let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &self.schema)
@@ -995,7 +1156,11 @@ impl QueryResult {
 /// client presents the snake_case names its users read. Naming them once here
 /// is what keeps the Python and TypeScript surfaces from disagreeing about
 /// what a successful registration answered.
+///
+/// # Arguments
+/// * `outcome` - The wire outcome of one registration.
 #[must_use]
+#[cfg(feature = "internal")]
 pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
     match outcome {
         RegisterOutcome::Created => "created",
@@ -1005,26 +1170,31 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
 
 /// Assemble the ambient [`WyrdClient`] every no-argument constructor uses.
 ///
-/// Delegates to [`client_from_options`] with nothing overridden, so
+/// Delegates to `client_from_options_in` over the process environment with
+/// nothing overridden, so
 /// [`Bifrost::from_env`] and [`crate::bifrost::TableConfig::describe_from_env`] cannot
 /// resolve their endpoints or credential differently from each other or from an
 /// explicitly-configured client.
 ///
 /// # Errors
 ///
-/// Returns the stable no-credentials error when the chain yields nothing, or a
-/// transport error when the HTTP client cannot be built.
+/// Returns a configuration error when the global config file exists but cannot
+/// be read or parsed, the stable no-credentials error when nothing in the chain
+/// yields a credential, or a transport error when the HTTP client cannot be
+/// built.
 pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
-    client_from_options(None, None, None)
+    client_from_options_in(Environment::Process, None, None, None)
 }
 
 /// Assemble a [`WyrdClient`] from optionally-overridden transport values.
 ///
 /// Every argument is optional and every omitted one falls through to the
-/// existing chain exactly once: [`ClientConfig::from_global_with_overrides`]
-/// for the two endpoints (an omitted gRPC endpoint derives from the effective
-/// `server_url`), `ClientConfig::resolve_credential` for the credential, whose
-/// floor is `~/.config/wyrd/credentials.toml` `[default].api_key`. An explicit
+/// existing chain exactly once, the same resolution as
+/// [`WyrdClient::from_global`]: the global config file, then
+/// [`ClientConfig::from_global_with_overrides`] for the two endpoints (an
+/// omitted gRPC endpoint derives from the effective `server_url`), then
+/// `ClientConfig::resolve_credential` for the credential, whose floor is
+/// `~/.config/wyrd/credentials.toml` `[default].api_key`. An explicit
 /// value is written into the config's tier-0 slot, so it wins over the
 /// environment rather than racing it. The tenant selector stays
 /// `WYRD_TENANT`/configuration: a credential already names its tenant.
@@ -1033,20 +1203,68 @@ pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
 /// "omitted resolves, explicit overrides" behavior is the Rust one and cannot
 /// drift per language.
 ///
+/// # Arguments
+/// * `server_url` - The HTTP endpoint, or `None` to resolve it from the
+///   environment and configuration.
+/// * `credential` - The API key or token, or `None` to resolve it from the
+///   credential chain.
+/// * `grpc_url` - The gRPC endpoint, or `None` to derive it from the
+///   effective `server_url`.
+///
 /// # Errors
 ///
-/// Returns the stable no-credentials error when nothing in the chain yields a
-/// credential, or a transport error when the HTTP client cannot be built.
+/// Returns `WYRD_CLIENT_400_CONFIG_INVALID` naming `server_url`, `grpc_url`,
+/// or `credential` when that argument is given but empty or whitespace, a
+/// configuration error when the global config file exists but cannot
+/// be read or parsed, the stable no-credentials error when nothing in the chain
+/// yields a credential, or a transport error when the HTTP client cannot be
+/// built.
+#[cfg(feature = "internal")]
 pub fn client_from_options(
     server_url: Option<&str>,
     credential: Option<&str>,
     grpc_url: Option<&str>,
 ) -> Result<WyrdClient, BifrostClientError> {
-    let mut config = ClientConfig::from_global_with_overrides(
-        &crate::global_config::GlobalConfig::default(),
-        server_url,
-        grpc_url,
-    );
+    client_from_options_in(Environment::Process, server_url, credential, grpc_url)
+}
+
+/// Assemble a [`WyrdClient`] as `client_from_options` does, reading every
+/// ambient value, including the config directory, from `environment`.
+///
+/// # Arguments
+/// * `environment` - Source of every ambient variable: the config directory,
+///   endpoint fallbacks, and credential chain.
+/// * `server_url` - The HTTP endpoint, or `None` to resolve it.
+/// * `credential` - The API key or token, or `None` to resolve it.
+/// * `grpc_url` - The gRPC endpoint, or `None` to derive it.
+///
+/// # Errors
+///
+/// Returns `WYRD_CLIENT_400_CONFIG_INVALID` naming `server_url`, `grpc_url`,
+/// or `credential` when that argument is given but blank, a configuration
+/// error when the global config file cannot be read or parsed, the stable
+/// no-credentials error when nothing yields a credential, or a transport
+/// error when the HTTP client cannot be built.
+fn client_from_options_in(
+    environment: Environment,
+    server_url: Option<&str>,
+    credential: Option<&str>,
+    grpc_url: Option<&str>,
+) -> Result<WyrdClient, BifrostClientError> {
+    for (field, value) in [
+        ("server_url", server_url),
+        ("grpc_url", grpc_url),
+        ("credential", credential),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(BifrostClientError::Client(WyrdClientError::Config {
+                field: field.to_owned(),
+                reason: "must not be empty".to_owned(),
+            }));
+        }
+    }
+    let global = GlobalConfig::load_in(&environment).map_err(BifrostClientError::from)?;
+    let mut config = ClientConfig::from_environment(environment, &global, server_url, grpc_url);
     if let Some(credential) = credential {
         config.credential = Some(secrecy::SecretString::from(credential.to_owned()));
     }
@@ -1058,8 +1276,10 @@ pub fn client_from_options(
 /// A read-only client has no ingest channel, so a write that reaches the sink
 /// settles terminally with a stable validation error rather than dialling a
 /// transport or reporting success.
+#[cfg(feature = "internal")]
 struct QueryOnlySink;
 
+#[cfg(feature = "internal")]
 #[async_trait::async_trait]
 impl BatchSink<ClientByteGuard> for QueryOnlySink {
     /// Refuse `batch` without sending it.
@@ -1078,5 +1298,65 @@ impl BatchSink<ClientByteGuard> for QueryOnlySink {
                 details: serde_json::json!({ "table": batch.table }),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_from_options_in;
+    use crate::environment::Environment;
+
+    /// An omitted `server_url` resolves from the global config file in the
+    /// Wyrd config directory, the same file [`crate::WyrdClient::from_global`]
+    /// reads, so a language `WyrdClient()` and Rust `Cards::from_env` reach the
+    /// same server.
+    #[test]
+    fn omitted_server_url_comes_from_the_global_config_file() {
+        let config_dir = tempfile::tempdir().expect("temporary config directory");
+        std::fs::write(
+            config_dir.path().join("config.toml"),
+            "[client]\nhttp_url = \"http://127.0.0.1:9711\"\n",
+        )
+        .expect("write config.toml");
+        let config_home = config_dir.path().to_str().expect("utf-8 temp path");
+        let environment =
+            Environment::from([("WYRD_CONFIG_HOME", config_home), ("HOME", config_home)]);
+
+        let client = client_from_options_in(environment, None, Some("wyrd_sk_test"), None)
+            .expect("client from the configured server");
+
+        assert_eq!(client.server_url(), "http://127.0.0.1:9711");
+    }
+
+    /// An explicitly empty or blank `server_url`, `grpc_url`, or `credential`
+    /// is refused with `WYRD_CLIENT_400_CONFIG_INVALID` naming the public
+    /// parameter, never an internal config path.
+    ///
+    /// # Panics
+    /// Panics when a blank value is accepted or the refusal names another field.
+    #[test]
+    fn blank_explicit_options_are_refused_by_their_public_name() {
+        let cases = [
+            ("server_url", Some(""), Some("wyrd_sk_test"), None),
+            ("server_url", Some("  "), Some("wyrd_sk_test"), None),
+            ("grpc_url", None, Some("wyrd_sk_test"), Some(" ")),
+            ("credential", None, Some(""), None),
+        ];
+        for (field, server_url, credential, grpc_url) in cases {
+            let error = client_from_options_in(
+                Environment::from([("HOME", "/nonexistent")]),
+                server_url,
+                credential,
+                grpc_url,
+            )
+            .expect_err("a blank explicit option is refused");
+            let error = wyrd_spec::error::WyrdError::from(error);
+
+            assert_eq!(error.code(), "WYRD_CLIENT_400_CONFIG_INVALID", "{field}");
+            assert_eq!(
+                error.problem().details,
+                serde_json::json!({ "field": field, "reason": "must not be empty" }),
+            );
+        }
     }
 }

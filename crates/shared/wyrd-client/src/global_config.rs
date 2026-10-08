@@ -72,6 +72,9 @@ impl GlobalConfig {
     ///
     /// A missing directory or file is equivalent to an empty configuration.
     /// Invalid TOML or an unknown field is returned to the caller.
+    ///
+    /// # Errors
+    /// Returns the errors of [`GlobalConfig::load_from`].
     pub fn load() -> Result<Self, WyrdClientError> {
         Self::load_in(&Environment::Process)
     }
@@ -80,6 +83,9 @@ impl GlobalConfig {
     /// resolves.
     ///
     /// A missing directory or file is equivalent to an empty configuration.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables that resolve the Wyrd config directory.
     ///
     /// # Errors
     /// Returns the errors of [`GlobalConfig::load_from`].
@@ -91,6 +97,9 @@ impl GlobalConfig {
     }
 
     /// Load a global config from an explicit path.
+    ///
+    /// # Arguments
+    /// * `path` - Path of the TOML config file to read.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] when the file cannot be read or

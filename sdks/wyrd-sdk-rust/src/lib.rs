@@ -1,8 +1,8 @@
 //! First-class Rust Wyrd SDK.
 //!
 //! A thin projection of `wyrd-client`, the sole shared client implementation:
-//! authentication and transport, [`cards::Cards`], [`principals::Principals`],
-//! [`platform::Platform`], [`state::WyrdState`], [`storage::WyrdStorageClient`],
+//! client configuration, [`cards::Cards`], [`principals::Principals`],
+//! [`platform::Platform`], [`state::WyrdState`],
 //! [`operator_connections::OperatorConnections`], and [`Bifrost`], plus the
 //! [`WyrdError`] every capability returns. This
 //! package adds no transport, validation, registry, storage, or lifecycle
@@ -20,29 +20,81 @@
 //! invokes the gateway. `check:deps` fails if the module is added
 //! back. Add a module to this list only after deciding it belongs on a public
 //! SDK. Provider credential writes and Card-scoped key issuance are reachable
-//! only as CLI commands, through the optional `cli` feature's [`cli`] module
-//! when it is enabled.
+//! only as CLI commands. Their in-process form, `cli`, is a test surface
+//! behind the `testing` feature and is absent from production builds.
+//!
+//! The list also holds the projection to the surface every SDK shares
+//! (REQ-210): the `wyrd_client::workflow` module is left off, so the remote
+//! `Workflows` handle and the gateway caller are not reachable here; Workflows
+//! are YAML-authored through [`Workflow`]. The `auth` and `storage` modules
+//! are left off too: the authentication middleware and the artifact-transfer
+//! client are mechanics behind [`WyrdClient`] and [`cards::Cards`]. [`transport`]
+//! carries only the endpoint and credential types [`config::ClientConfig`]
+//! names. Raw requests, writer internals, and
+//! bundle introspection on the re-exported types exist only under
+//! `wyrd-client`'s `internal` feature, which this package never enables
+//! (`check:deps` fails if it does).
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-pub use wyrd_client::*;
+pub use wyrd_client::{
+    Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
+    Workflow, WorkflowCards, WyrdClient, bifrost, cards, client, config, environment, error,
+    gateway, global_config, observe, operator_connections, platform, principals, state,
+};
 
-/// In-process `wyrd` CLI commands, behind the optional `cli` feature.
+/// Endpoint and credential types the client configuration names.
+///
+/// Only the types a parity signature uses: [`config::ClientConfig`]'s `grpc`
+/// and `http` fields and its `resolve_credential` result. The transports
+/// themselves are mechanics behind [`WyrdClient`] and are not projected.
+pub mod transport {
+    pub use wyrd_client::transport::{GrpcConfig, HttpConfig, ResolvedCredential};
+}
+
+/// In-process `wyrd` CLI commands: a test surface behind the `testing`
+/// feature.
 ///
 /// Each function runs the same command implementation as the `wyrd`
 /// executable, takes the command's options as typed arguments, returns the
 /// value the command prints with `--format json`, and returns a
-/// [`WyrdError`](crate::WyrdError) instead of an exit code. Networked
-/// commands read their credential from the ambient chain; `server` re-points
-/// only the endpoint.
-#[cfg(feature = "cli")]
+/// [`WyrdError`] instead of an exit code. A networked
+/// command takes an optional [`WyrdClient`] and runs as
+/// its principal; omitted, it resolves the server and credential from the
+/// ambient chain exactly as the executable does.
+#[cfg(feature = "testing")]
 pub mod cli {
     pub use wyrd_cli::commands::*;
 }
 
 /// The stable, catalogued error every SDK capability returns.
 pub use wyrd_spec::error::WyrdError;
+
+/// A registered Card envelope, as [`cards::Cards::get`] returns it, and its
+/// typed spec.
+pub use wyrd_spec::envelope::{Card, Spec};
+
+/// How a Verifier Card judges: an Eval or a Drift implementation.
+pub use wyrd_spec::card::verifier::VerifierImplementation;
+
+/// The record of one Workflow run, as [`Workflow::run`] returns it, and its
+/// final status.
+pub use wyrd_spec::card::workflow::{WorkflowRun, WorkflowRunStatus};
+
+/// The count rollup a [`Judgment`] carries.
+pub use wyrd_spec::card::operator::VerifierCounts;
+
+/// The judgment `observe().verify` returns, with its verdict and Verifier
+/// classification.
+pub use wyrd_spec::verification::{Judgment, VerificationVerdict, VerifierKind};
+
+/// The session an emitted observation belongs to.
+pub use wyrd_spec::vala::ids::SessionId;
+
+/// The outcome the terminal frame of a [`bifrost::QueryResultStream`]
+/// reports.
+pub use wyrd_spec::vala::api::QueryTerminalOutcome;
 
 /// SDK root re-export shape.
 #[cfg(test)]
@@ -53,18 +105,20 @@ mod tests {
     /// and the error they return.
     #[test]
     fn sdk_root_exposes_the_supported_surface() {
-        let _ = super::Bifrost::query_only;
+        let _ = super::Bifrost::connect;
         let _ = super::cards::Cards::with_client;
         let _ = super::principals::Principals::with_client;
         let _ = super::operator_connections::OperatorConnections::with_client;
-        let _ = super::platform::Platform::connect;
-        let _ = super::state::WyrdState::from_path;
-        let _ = super::storage::WyrdStorageClient::new;
-        let _ = super::WyrdClient::from_parts;
-        let _ = super::Gateway::new;
-        let _ = super::Workflow::as_skald;
-        let _ = super::Workflows::new;
-        let _ = super::PublicWyrdGatewayCaller::new;
+        let _ = super::platform::Platform::with_client;
+        let _ = |path: &std::path::Path| super::state::WyrdState::from_path(path);
+        let _ = |path: &std::path::Path, client| {
+            super::state::WyrdState::from_path_with_client(path, client)
+        };
+        let _ = super::WyrdClient::with_config;
+        let _ = super::Gateway::with_client;
+        let _ = super::Gateway::from_env;
+        let _ = super::Workflow::from_yaml;
+        let _ = super::Workflow::steps;
         let _ = super::cards::Cards::workflow;
         let _ = super::WyrdError::code;
     }

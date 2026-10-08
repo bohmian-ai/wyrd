@@ -31,11 +31,13 @@ pub use cli::{Cli, Command};
 /// renders, returning the typed value it prints with `--format json` and a
 /// [`wyrd_spec::error::WyrdError`] instead of an exit code.
 ///
-/// Networked commands read their credential from the ambient chain
-/// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
-/// `credentials.toml`), never from an argument; `server` re-points only the
-/// endpoint.
+/// Networked commands take an optional [`wyrd_client::WyrdClient`] and run
+/// as its principal; omitted, they resolve the server and credential from the
+/// ambient chain (`WYRD_SERVER_URL`, then `WYRD_ACCESS_TOKEN`, workload
+/// identity, `WYRD_API_KEY`, or `credentials.toml`) exactly as the executable
+/// does. No credential is ever a string argument.
 pub mod commands {
+    pub use crate::auth::grant_role::grant_role;
     pub use crate::auth::issue_key::issue_key;
     pub use crate::card::{LoadOutput, PlanCard, PlanReport, SelectorArgs, apply, get, load, plan};
     pub use crate::gateway::{

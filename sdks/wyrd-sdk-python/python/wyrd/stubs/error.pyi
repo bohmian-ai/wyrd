@@ -43,6 +43,9 @@ class WyrdError(Exception):
         ``build_wyrd_error`` for a populated instance. When an Agent callback
         raises an error whose ``args`` start with a catalog ``code`` and a
         ``message``, the Agent run keeps that code.
+
+        Args:
+            *args: positional exception arguments, kept in ``args``.
         """
         ...
 
@@ -50,21 +53,33 @@ class AgentError(WyrdError):
     """``WyrdError`` for a ``WYRD_AGENT_*`` code raised by the Agent runtime."""
 
     def __init__(self, *args: object) -> None:
-        """As ``WyrdError()``."""
+        """As ``WyrdError()``.
+
+        Args:
+            *args: positional exception arguments, kept in ``args``.
+        """
         ...
 
 class ToolError(WyrdError):
     """``WyrdError`` for a ``WYRD_TOOL_*`` code raised by tool registration or calls."""
 
     def __init__(self, *args: object) -> None:
-        """As ``WyrdError()``."""
+        """As ``WyrdError()``.
+
+        Args:
+            *args: positional exception arguments, kept in ``args``.
+        """
         ...
 
 class SessionError(WyrdError):
     """``WyrdError`` for a ``WYRD_SESSION_*`` code raised by session memory."""
 
     def __init__(self, *args: object) -> None:
-        """As ``WyrdError()``."""
+        """As ``WyrdError()``.
+
+        Args:
+            *args: positional exception arguments, kept in ``args``.
+        """
         ...
 
 def build_wyrd_error(
@@ -85,6 +100,9 @@ def build_wyrd_error(
         message: human-readable failure text.
         details: JSON-compatible structured context. Omitted, ``details`` is
             empty.
+
+    Returns:
+        The populated ``WyrdError`` subclass for ``code``.
 
     """
     ...

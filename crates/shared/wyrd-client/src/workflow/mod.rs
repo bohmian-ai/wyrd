@@ -10,6 +10,7 @@
 //! dependencies the Workflow's routes select.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use skald_runtime::ProviderRegistry;
 use skald_workflow::{
@@ -21,7 +22,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 
 use crate::WyrdClient;
-use crate::cards::{CardGraphHydrator, CardSelector, Cards, WorkflowBodies};
+use crate::cards::{CardGraphHydrator, CardSelector, Cards, RegistryContext, WorkflowBodies};
 use crate::config::ClientConfig;
 use crate::environment::Environment;
 use crate::global_config::{GlobalConfig, LocalWorkflowConfig};
@@ -40,8 +41,9 @@ pub use remote::Workflows;
 pub struct Workflow {
     /// The hydrated Skald Workflow every run delegates to.
     inner: SkaldWorkflow,
-    /// Client that loaded registered Cards, reused for `wyrd_gateway` calls
-    /// so its connection overrides stay in effect.
+    /// The caller's explicit client, or the client that loaded registered
+    /// Cards, reused for `wyrd_gateway` calls so the same principal and
+    /// connection overrides stay in effect.
     client: Option<WyrdClient>,
     /// Where a run reads the shared configuration directory and the ambient
     /// credential for a client-less `wyrd_gateway` step; the process
@@ -70,6 +72,9 @@ impl Workflow {
     /// is dropped; no partial Workflow is returned and nothing durable is
     /// written.
     ///
+    /// # Arguments
+    /// * `path` - The authored bundle file that defines exactly one Workflow Card.
+    ///
     /// # Errors
     /// Returns `WYRD_WORKFLOW_500_INTERNAL` when the blocking load task panics
     /// or is cancelled by runtime shutdown;
@@ -83,18 +88,83 @@ impl Workflow {
     /// and the hydration and validation errors of
     /// [`SkaldWorkflow::from_card_bodies`].
     pub async fn from_path(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
-        let path = path.as_ref().to_path_buf();
+        Self::load_authored(path.as_ref(), None).await
+    }
+
+    /// Parse a Workflow from one canonical Workflow Card envelope in YAML.
+    ///
+    /// Inline Agents and Prompts resolve eagerly against the process-default
+    /// tool registry and local prompt resolver. No file is read and no client
+    /// is built: a `ref` to a registered Card cannot be resolved here, so a
+    /// Workflow that needs one is loaded with [`Self::from_path`] instead. A
+    /// `wyrd_gateway` step uses the ambient client at run time.
+    ///
+    /// # Arguments
+    /// * `yaml` - The Workflow Card envelope text.
+    ///
+    /// # Errors
+    /// Returns the YAML decode error when `yaml` is not a Workflow Card, and
+    /// the hydration and validation errors of
+    /// [`SkaldWorkflow::from_card_bodies`].
+    pub fn from_yaml(yaml: &str) -> Result<Self, WyrdError> {
+        SkaldWorkflow::from_yaml_str(
+            yaml,
+            skald_tool::default_registry(),
+            skald_agent::default_prompt_resolver(),
+        )
+        .map(Self::from)
+    }
+
+    /// Load the Workflow Card defined in the file at `path`, acting as
+    /// `client`.
+    ///
+    /// Identical to [`Self::from_path`], except that every external `ref` is
+    /// read as `client`'s principal and the loaded Workflow's `wyrd_gateway`
+    /// steps call the gateway as that principal, instead of the ambient
+    /// credential. A program serving several principals passes each one's
+    /// client rather than changing the process environment. A wholly local
+    /// bundle makes no registry request, but keeps `client` for its gateway
+    /// steps.
+    ///
+    /// Cancellation behaves as for [`Self::from_path`].
+    ///
+    /// # Arguments
+    /// * `path` - The authored bundle file that defines exactly one Workflow Card.
+    /// * `client` - The client whose principal reads external refs and calls the
+    ///   gateway.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::from_path`], except that no client
+    /// configuration error arises; a registry read refused for `client`'s
+    /// principal returns that refusal.
+    pub async fn from_path_with_client(
+        path: impl AsRef<Path>,
+        client: WyrdClient,
+    ) -> Result<Self, WyrdError> {
+        Self::load_authored(path.as_ref(), Some(client)).await
+    }
+
+    /// Load the authored bundle at `path`, resolving external refs as
+    /// `client`, or as the ambient client built on first need.
+    ///
+    /// # Errors
+    /// Returns the errors documented on [`Self::from_path`].
+    async fn load_authored(path: &Path, client: Option<WyrdClient>) -> Result<Self, WyrdError> {
+        let path = path.to_path_buf();
         let (tree, entry) = tokio::task::spawn_blocking(move || load_bundle(&path))
             .await
             .map_err(|error| blocking_task_failed("workflow_bundle_load", &error))??;
         let (workflow, mut bodies) = WorkflowBodies::authored(&tree, &entry)?;
         let refs = bodies.external_refs(&workflow);
-        let mut client = None;
+        let mut client = client;
         if !refs.is_empty() {
-            let cards = tokio::task::spawn_blocking(|| Cards::new(None, None))
-                .await
-                .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??;
-            CardGraphHydrator::new(cards.registry_context())
+            let cards = match client {
+                Some(client) => Cards::with_client(client),
+                None => tokio::task::spawn_blocking(Cards::from_env)
+                    .await
+                    .map_err(|error| blocking_task_failed("workflow_cards_client", &error))??,
+            };
+            CardGraphHydrator::new(RegistryContext::new(Arc::clone(&cards.engine)))
                 .resolve_external(&mut bodies, &refs)
                 .await?;
             client = Some(cards.engine.client.clone());
@@ -109,25 +179,35 @@ impl Workflow {
 
     /// Run on the process-default native provider registry.
     ///
-    /// This delegates to [`Self::run_with`], so it prepares the same
-    /// run-start dependencies: the shared configuration, a public gateway
-    /// client, and only the selected bindings' secrets.
+    /// It prepares the run-start dependencies the steps' routes select: the
+    /// shared configuration, a public gateway client, and only the selected
+    /// bindings' secrets, exactly as the `internal` `run_with` does for an
+    /// explicit registry.
     ///
     /// Dropping the future stops the run locally. A model call already sent
     /// to a gateway or provider is not rolled back, and nothing is resent.
     ///
+    /// # Arguments
+    /// * `input` - The Workflow's run input.
+    ///
     /// # Errors
-    /// Returns the errors of [`Self::run_with`].
+    /// Returns the client configuration error when the shared configuration
+    /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when no gateway
+    /// client can be built for a `wyrd_gateway` step or a selected binding is
+    /// absent, invalid, or has an unreadable secret, and the other
+    /// pre-dispatch errors of [`SkaldWorkflow::run_with_options`]; step
+    /// failures are reported in the returned run.
     pub async fn run(&self, input: impl Into<WorkflowInput>) -> WorkflowResult<WorkflowRun> {
-        self.run_with(skald_runtime::default_registry().as_ref(), input)
+        self.run_on(skald_runtime::default_registry().as_ref(), input)
             .await
     }
 
     /// Run on `native` with the shared local dependencies its routes select.
     ///
     /// A step on the `wyrd_gateway` route calls the public gateway through
-    /// the client that loaded the Workflow's registered Cards, or else a
-    /// client built from the shared configuration. The shared client
+    /// the client given to [`Self::from_path_with_client`] or the one that
+    /// loaded the Workflow's registered Cards, or else a client built from the
+    /// shared configuration. The shared client
     /// configuration is read once, at run start, only when a step resolves to
     /// an `ext_gateway` route or a `wyrd_gateway` step has no loading client
     /// to use; a purely Native run reads none. Each selected binding it
@@ -143,6 +223,10 @@ impl Workflow {
     /// result is discarded. A model call already sent to a gateway or
     /// provider is not rolled back, and nothing is resent.
     ///
+    /// # Arguments
+    /// * `native` - The provider registry native-route steps dispatch through.
+    /// * `input` - The Workflow's run input.
+    ///
     /// # Errors
     /// Returns the client configuration error when the shared configuration
     /// cannot be read, `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` when no gateway
@@ -150,7 +234,28 @@ impl Workflow {
     /// absent, invalid, or has an unreadable secret, and the other
     /// pre-dispatch errors of [`SkaldWorkflow::run_with_options`]; step
     /// failures are reported in the returned run.
+    #[cfg(feature = "internal")]
     pub async fn run_with(
+        &self,
+        native: &ProviderRegistry,
+        input: impl Into<WorkflowInput>,
+    ) -> WorkflowResult<WorkflowRun> {
+        self.run_on(native, input).await
+    }
+
+    /// Crate-internal body of `run_with`, which [`Self::run`] calls with the
+    /// process-default registry whether or not `internal` exposes `run_with`.
+    ///
+    /// Selects the routes the spec's steps need, prepares only those local
+    /// dependencies on the blocking pool, then runs with default options.
+    ///
+    /// # Arguments
+    /// * `native` - The provider registry native-route steps dispatch through.
+    /// * `input` - The Workflow's run input.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::run`].
+    pub(crate) async fn run_on(
         &self,
         native: &ProviderRegistry,
         input: impl Into<WorkflowInput>,
@@ -172,9 +277,46 @@ impl Workflow {
             .await
     }
 
+    /// The Workflow's step ids in declaration order.
+    ///
+    /// Reads the loaded spec without IO; the same list Python `steps` and
+    /// TypeScript `steps` return for the same file.
+    #[must_use]
+    pub fn steps(&self) -> Vec<String> {
+        self.inner.step_ids()
+    }
+
+    /// The Workflow's declared card name, or `None` when the file omits it.
+    ///
+    /// Reads the loaded metadata without IO; the same value Python `name` and
+    /// TypeScript `name` return for the same file.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name_str()
+    }
+
+    /// The Workflow's declared card version, or `None` when the file omits it.
+    ///
+    /// Reads the loaded metadata without IO; the same value Python `version`
+    /// and TypeScript `version` return for the same file.
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        self.inner.version_str()
+    }
+
+    /// The Workflow's declared space, or `None` when the file omits it.
+    ///
+    /// Reads the loaded metadata without IO; the same value Python `space` and
+    /// TypeScript `space` return for the same file.
+    #[must_use]
+    pub fn space(&self) -> Option<&str> {
+        self.inner.space_str()
+    }
+
     /// Borrow the hydrated Skald Workflow, for runs with explicit execution
     /// dependencies, limits, or cancellation.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn as_skald(&self) -> &SkaldWorkflow {
         &self.inner
     }
@@ -182,6 +324,7 @@ impl Workflow {
     /// Mutably borrow the hydrated Skald Workflow, for authoring edits that
     /// keep the client that loaded it.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn as_skald_mut(&mut self) -> &mut SkaldWorkflow {
         &mut self.inner
     }
@@ -194,6 +337,7 @@ impl Workflow {
     /// [`SkaldWorkflow::run_with_options`]. Use [`Self::as_skald`] or
     /// [`Self::as_skald_mut`] to keep them.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn into_skald(self) -> SkaldWorkflow {
         self.inner
     }
@@ -201,7 +345,7 @@ impl Workflow {
 
 /// Read the shared configuration and gateway client a run's routes select.
 ///
-/// This is the synchronous filesystem half of [`Workflow::run_with`], which
+/// This is the synchronous filesystem half of [`Workflow::run_on`], which
 /// runs it on the blocking pool. The shared configuration file is read at
 /// most once per run: only when `needs_config`, or when `needs_gateway` and
 /// no `loaded` client exists. Both the selected bindings and any built
@@ -324,6 +468,10 @@ impl WorkflowCards<'_> {
     /// Cancellation may stop after completed registry reads; no partial
     /// Workflow is returned and nothing durable is written.
     ///
+    /// # Arguments
+    /// * `selector` - The registered Workflow to load: a UID selector, an exact
+    ///   reference, or a named selector with an exact version.
+    ///
     /// # Errors
     /// Returns `WYRD_WORKFLOW_400_INVALID_CARD_REF` before any read for a
     /// selector of another kind or a versionless named selector, the Cards
@@ -350,7 +498,7 @@ impl WorkflowCards<'_> {
                 details: serde_json::json!({ "field": "kind" }),
             });
         }
-        let inner = CardGraphHydrator::new(self.cards.registry_context())
+        let inner = CardGraphHydrator::new(RegistryContext::new(Arc::clone(&self.cards.engine)))
             .load_workflow(selector)
             .await?;
         Ok(Workflow {
@@ -483,6 +631,27 @@ mod tests {
     /// # Panics
     /// Panics when the bundle stops loading or running as asserted, or a
     /// refusal is missing or carries the wrong code.
+    /// `steps` lists the checked-in bundle's step ids in the order the
+    /// Workflow file declares them, and `name`, `version`, and `space` read
+    /// its declared metadata.
+    ///
+    /// # Panics
+    /// Panics when the bundle stops loading or its step ids or metadata differ.
+    #[tokio::test]
+    async fn steps_lists_step_ids_in_declaration_order() {
+        let workflow = Workflow::from_path(bundle().join("workflow.yaml"))
+            .await
+            .expect("bundle loads");
+
+        assert_eq!(
+            workflow.steps(),
+            ["security", "correctness", "final_review"]
+        );
+        assert_eq!(workflow.name(), Some("code-review"));
+        assert_eq!(workflow.version(), Some("1.0.0"));
+        assert_eq!(workflow.space(), Some("engineering"));
+    }
+
     #[tokio::test]
     async fn from_path_uses_existing_loader() {
         let workflow = Workflow::from_path(bundle().join("workflow.yaml"))

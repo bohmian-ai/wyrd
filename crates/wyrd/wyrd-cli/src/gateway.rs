@@ -139,7 +139,7 @@ impl GatewayCommand {
     /// not-found, or availability failures.
     pub async fn dispatch(self) -> Result<ExitCode, CliBoundaryError> {
         let client = crate::client::from_global(self.server.as_deref())?;
-        let gateway = Gateway::new(client.clone());
+        let gateway = Gateway::with_client(client.clone());
         match self.resource {
             // Credential mutation runs on the handle no SDK re-exports: a
             // submission can carry a key value, and a name-only revoke or
@@ -199,8 +199,8 @@ impl GatewayCommand {
 ///
 /// The in-process form of `wyrd gateway credential put`; the view is exactly
 /// what the command prints. `write` may carry a provider key; it goes only to
-/// the server, and the answer never echoes it. The client comes from the
-/// ambient credential chain, which `server` re-points.
+/// the server, and the answer never echoes it. The request runs as `client`,
+/// or, when it is omitted, as the ambient credential chain.
 ///
 /// # Errors
 /// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
@@ -208,38 +208,39 @@ impl GatewayCommand {
 /// availability error.
 pub async fn put_provider_credential(
     write: &ProviderCredentialWrite,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<ProviderCredentialView, WyrdError> {
-    put_credential_with(crate::client::from_global(server)?, write).await
+    put_credential_with(crate::client::explicit_or_ambient(client)?, write).await
 }
 
 /// Terminally revoke one provider credential and return its redacted view.
 ///
 /// The in-process form of `wyrd gateway credential revoke`; repeating is
-/// harmless.
+/// harmless. The request runs as `client`, or the ambient credential chain.
 ///
 /// # Errors
 /// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
 /// server's permission, not-found, or availability error.
 pub async fn revoke_provider_credential(
     name: &ProviderCredentialName,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<ProviderCredentialView, WyrdError> {
-    revoke_credential_with(crate::client::from_global(server)?, name).await
+    revoke_credential_with(crate::client::explicit_or_ambient(client)?, name).await
 }
 
 /// Delete one unreferenced provider credential; an absent name succeeds.
 ///
-/// The in-process form of `wyrd gateway credential delete`.
+/// The in-process form of `wyrd gateway credential delete`. The request runs
+/// as `client`, or the ambient credential chain.
 ///
 /// # Errors
 /// Returns a `WYRD_CLIENT_*` error when the client cannot be built, or the
 /// server's permission, conflict, or availability error.
 pub async fn delete_provider_credential(
     name: &ProviderCredentialName,
-    server: Option<&str>,
+    client: Option<WyrdClient>,
 ) -> Result<(), WyrdError> {
-    delete_credential_with(crate::client::from_global(server)?, name).await
+    delete_credential_with(crate::client::explicit_or_ambient(client)?, name).await
 }
 
 /// Create or rotate one provider credential over an assembled `client`.

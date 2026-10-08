@@ -3,13 +3,14 @@
 import pytest
 import wyrd
 from wyrd.cards import AgentCard, Cards, VersionBump
+from wyrd.client import WyrdClient
 from wyrd.prompt import Prompt, PromptCard, PromptReference
 
 
 @pytest.fixture
 def offline_cards() -> Cards:
     """A credential-complete client whose endpoint must never be used."""
-    return Cards(server_url="http://127.0.0.1:1", credential="unit-test-key")
+    return Cards(WyrdClient(server_url="http://127.0.0.1:1", credential="unit-test-key"))
 
 
 def test_agent_cards_are_not_registerable(offline_cards: Cards) -> None:
@@ -42,16 +43,16 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: 
 def test_cards_without_a_credential_raise_the_client_catalog_error() -> None:
     """Cards reports an empty credential chain with Bifrost's client code."""
     with pytest.raises(wyrd.WyrdError) as captured:
-        Cards(server_url="http://127.0.0.1:1")
+        Cards()
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
     assert captured.value.status == 401
     assert captured.value.details == {}
 
 
-def test_cards_with_an_empty_server_url_raise_config_invalid_details() -> None:
-    """Cards keeps the offending field and reason in the client config error."""
+def test_client_with_an_empty_server_url_raises_config_invalid_details() -> None:
+    """The client keeps the offending field and reason in its config error."""
     with pytest.raises(wyrd.WyrdError) as captured:
-        Cards(server_url="", credential="wyrd_sk_t_v_s")
+        WyrdClient(server_url="", credential="wyrd_sk_t_v_s")
     assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
     assert captured.value.status == 400
     assert captured.value.details == {"field": "server_url", "reason": "must not be empty"}

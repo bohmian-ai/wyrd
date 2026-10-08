@@ -10,8 +10,10 @@ import { Bifrost, Cards, TableConfig, WyrdClient } from "@wyrd/sdk";
 const UNREACHABLE = "http://127.0.0.1:1";
 
 // No ambient credential and no saved login: only an explicit argument can
-// authenticate.
+// authenticate, and every ambient surface resolves the unreachable server.
 beforeEach(() => {
+  vi.stubEnv("WYRD_SERVER_URL", UNREACHABLE);
+  vi.stubEnv("WYRD_GRPC_URL", UNREACHABLE);
   for (const name of ["WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT", "WYRD_API_KEY"]) {
     vi.stubEnv(name, undefined);
   }
@@ -20,10 +22,10 @@ beforeEach(() => {
 });
 
 test.for<readonly [string, () => unknown]>([
-  ["WyrdClient.connect", () => WyrdClient.connect({ serverUrl: UNREACHABLE })],
-  ["Cards.connect", () => Cards.connect({ serverUrl: UNREACHABLE })],
-  ["Bifrost.connect", () => Bifrost.connect({ serverUrl: UNREACHABLE, grpcUrl: UNREACHABLE })],
-  ["TableConfig.describe", () => TableConfig.describe("unit.missing", { serverUrl: UNREACHABLE })],
+  ["WyrdClient.connect", () => WyrdClient.connect()],
+  ["Cards.connect", () => Cards.connect()],
+  ["Bifrost.connect", () => Bifrost.connect()],
+  ["TableConfig.describe", () => TableConfig.describe("unit.missing")],
 ])("%s without a credential is refused", async ([, connect]) => {
   await expect(Promise.resolve().then(connect)).rejects.toMatchObject({
     code: "WYRD_CLIENT_401_NO_CREDENTIALS",
@@ -34,6 +36,8 @@ test.for<readonly [string, () => unknown]>([
 
 test("unreachable server is refused with the transport error", async () => {
   await expect(
-    TableConfig.describe("unit.missing", { serverUrl: UNREACHABLE, credential: "wyrd_sk_t_v_s" }),
+    TableConfig.describe("unit.missing", {
+      client: WyrdClient.connect({ serverUrl: UNREACHABLE, credential: "wyrd_sk_t_v_s" }),
+    }),
   ).rejects.toMatchObject({ code: "WYRD_CLIENT_503_TRANSPORT_DOWN", details: { transport: "http" } });
 });

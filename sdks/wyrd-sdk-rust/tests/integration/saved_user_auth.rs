@@ -1,40 +1,117 @@
-//! A person signs in once with the CLI, and their local scripts use the saved
-//! logins through the Rust SDK on the Keycloak identity lane.
+//! A person signs in once with the CLI, and their local scripts use the
+//! saved logins through the Rust SDK, on the Keycloak identity lane.
+//!
+//! A script's configuration is the Wyrd configuration home holding those
+//! logins plus, at most, a tenant selector (what `WYRD_TENANT` sets). Each
+//! test passes that configuration explicitly as a fixed
+//! [`Environment`], so no test reads or changes the process environment.
 
-use std::path::Path;
-
-use secrecy::{ExposeSecret, SecretString};
-use wyrd_sdk::cards::{Cards, ListCardsRequest};
+use secrecy::SecretString;
+use tempfile::TempDir;
+use wyrd_sdk::cards::{CardKind, Cards, ListCardsRequest};
 use wyrd_sdk::config::ClientConfig;
-use wyrd_sdk::saved_login::canonical_origin;
-use wyrd_sdk::{GlobalConfig, WyrdClient};
-use wyrd_testing::Bootstrap;
-use wyrd_testing::human_login::{
-    FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso, expire_saved_access, saved_login,
-};
-use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
+use wyrd_sdk::environment::Environment;
+use wyrd_sdk::{GlobalConfig, WyrdClient, WyrdError};
+use wyrd_testing::human_login::{FIXTURE_TENANT_SLUG, HUMAN_PUBLIC_ORIGIN, HumanSso};
+use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::fixture;
+use crate::support::{Deployment, fixture};
 
-/// Mint a machine API key through the harness's real bootstrap route.
-///
-/// # Panics
-/// Panics when bootstrapping fails or returns a user principal.
-async fn machine_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String {
-    match server
-        .bootstrap_service(name, roles)
-        .await
-        .expect("service bootstraps")
-    {
-        Bootstrap::Machine { api_key, .. } => api_key.expose_secret().to_owned(),
-        Bootstrap::User { .. } => panic!("service bootstrap returned a user principal"),
+/// The second tenant, where alice administers.
+const ADMIN_TENANT: &str = "saved-login-two";
+
+/// The Prompt every write registers.
+const PROMPT: &str = "cards/gateway_inference/ask-prompt.yaml";
+
+/// A deployment accepting human single sign-on in its own tenant, and a
+/// fresh configuration home holding bob's saved reader login there.
+struct SavedLogins {
+    /// The deployment.
+    deployment: Deployment,
+    /// The served human-login steps.
+    sso: HumanSso,
+    /// The configuration home holding the saved logins.
+    config: TempDir,
+}
+
+impl SavedLogins {
+    /// Start the deployment, activate Keycloak sign-on for its tenant, and
+    /// save bob's login.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start() -> Self {
+        let deployment = Deployment::start_with(
+            WyrdTestServer::builder()
+                .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses")),
+        )
+        .await;
+        let sso = HumanSso::new(
+            deployment
+                .server()
+                .base_url()
+                .expect("bound server has a URL"),
+        );
+        sso.activate_keycloak(&deployment.key("sso_admin", &["admin"]).await)
+            .await;
+        let config = wyrd_testing::human_login::private_config_home();
+        sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
+            .await;
+        Self {
+            deployment,
+            sso,
+            config,
+        }
+    }
+
+    /// Activate Keycloak sign-on for [`ADMIN_TENANT`] and save alice's
+    /// administrator login there, making it the newest saved login.
+    ///
+    /// # Panics
+    /// Panics when the tenant cannot be seeded or the login fails.
+    async fn save_alices_admin_login(&self) {
+        self.sso
+            .activate_keycloak(&self.deployment.other_tenant_admin(ADMIN_TENANT).await)
+            .await;
+        self.sso
+            .save_login(self.config.path(), ADMIN_TENANT, "alice", "alice-password")
+            .await;
+    }
+
+    /// The client configuration a script gets from this configuration home,
+    /// selecting `tenant`'s saved login when given.
+    ///
+    /// # Panics
+    /// Panics when the paths are not UTF-8 or the server has no URL.
+    fn config(&self, tenant: Option<&str>) -> ClientConfig {
+        let mut config = ClientConfig::from_environment(
+            Environment::from([(
+                "WYRD_CONFIG_HOME",
+                self.config.path().to_str().expect("UTF-8 config home"),
+            )]),
+            &GlobalConfig::default(),
+            self.deployment.server().base_url(),
+            None,
+        );
+        config.tenant = tenant.map(str::to_owned);
+        config
+    }
+
+    /// `Cards` resolved from the saved logins, selecting `tenant`'s.
+    ///
+    /// # Errors
+    /// Returns the client's refusal when no usable credential resolves.
+    fn cards(&self, tenant: Option<&str>) -> Result<Cards, WyrdError> {
+        Ok(Cards::with_client(WyrdClient::with_config(
+            self.config(tenant),
+        )?))
     }
 }
 
-/// A listing of every Card, the read both saved-login principals may make.
-fn card_listing() -> ListCardsRequest {
+/// A listing of the registered Prompts, a read every saved login may make.
+fn prompts() -> ListCardsRequest {
     ListCardsRequest {
-        kind: None,
+        kind: Some(CardKind::Prompt),
         space: None,
         name: None,
         version_range: None,
@@ -46,223 +123,141 @@ fn card_listing() -> ListCardsRequest {
     }
 }
 
-/// Environment naming the phase a [`saved_user_auth_script`] child runs.
-const SCRIPT_PHASE: &str = "WYRD_SAVED_LOGIN_PHASE";
-
-/// Run one phase of [`saved_user_auth_script`] as a separate local process,
-/// the way a person's script uses the CLI-established login: only the
-/// configuration directory and server URL reach it, plus the machine key the
-/// override phase presents explicitly.
+/// Without a selector the newest saved login, alice's administrator login,
+/// is used, and it registers a Prompt.
 ///
 /// # Panics
-/// Panics when the child cannot run or its phase fails.
-async fn run_script(phase: &str, config: &Path, base_url: &str, second: &str, machine: &str) {
-    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
-    command
-        .args([
-            "--exact",
-            "saved_user_auth::saved_user_auth_script",
-            "--include-ignored",
-            "--nocapture",
-        ])
-        .env(SCRIPT_PHASE, phase)
-        .env("WYRD_CONFIG_HOME", config)
-        .env("WYRD_SAVED_LOGIN_SERVER", base_url)
-        .env("WYRD_SAVED_LOGIN_SECOND_TENANT", second)
-        .env("WYRD_SAVED_LOGIN_MACHINE_KEY", machine)
-        .env_remove("WYRD_ACCESS_TOKEN")
-        .env_remove("WYRD_WORKLOAD_TOKEN")
-        .env_remove("WYRD_API_KEY")
-        .env_remove("WYRD_TENANT");
-    let output = tokio::task::spawn_blocking(move || command.output())
-        .await
-        .expect("script joins")
-        .expect("script runs");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // libtest exits 0 when `--exact` selects nothing; "1 passed" proves the
-    // phase actually ran.
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "script phase {phase} failed:\n{stdout}{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// One phase of a local script using the saved logins, run only as the child
-/// [`run_script`] starts; without [`SCRIPT_PHASE`] it does nothing. A phase
-/// selects a saved login through the configured tenant (`ClientConfig.tenant`,
-/// what `WYRD_TENANT` sets), since constructors take no tenant.
-///
-/// `select`: without a selector the newest login (alice's admin login to the
-/// second tenant) registers a Card, a selector naming no saved login fails, the reader's saved login lists Cards
-/// and is denied a registration, and the second tenant's login resolves by
-/// its tenant route key. `renew`: a stale login renews through Wyrd.
-/// `override`: an explicit machine credential wins over the saved reader, and
-/// a tenant selector beside it is refused because the key names its own
-/// tenant. `revoked`: a revoked login fails renewal and asks for a new login.
-///
-/// # Panics
-/// Panics when the phase's expectation differs.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "a child process of saved_user_auth_journey"]
-async fn saved_user_auth_script() {
-    let Ok(phase) = std::env::var(SCRIPT_PHASE) else {
-        return;
-    };
-    let base_url = std::env::var("WYRD_SAVED_LOGIN_SERVER").expect("server URL");
-    let connect = |credential: Option<String>, tenant: Option<&str>| {
-        let mut config = ClientConfig::from_global_with_overrides(
-            &GlobalConfig::default(),
-            Some(&base_url),
-            None,
-        );
-        config.credential = credential.map(SecretString::from);
-        if let Some(tenant) = tenant {
-            config.tenant = Some(tenant.to_owned());
-        }
-        WyrdClient::with_config(config).map(Cards::with_client)
-    };
-    match phase.as_str() {
-        "select" => {
-            let newest = connect(None, None).expect("the newest login resolves");
-            Box::pin(
-                newest.register_from_path(&fixture("cards/gateway_inference/ask-prompt.yaml")),
-            )
-            .await
-            .expect("the newest login, alice's admin login, registers");
-            let unmatched = connect(None, Some("no-such-tenant"))
-                .err()
-                .expect("a selector naming no saved login fails");
-            assert!(
-                unmatched.to_string().contains("(tenant_mismatch)"),
-                "{unmatched}"
-            );
-            let reader = connect(None, Some(FIXTURE_TENANT_SLUG)).expect("reader resolves");
-            reader
-                .list(card_listing())
-                .await
-                .expect("the reader lists Cards");
-            let denied = Box::pin(
-                reader.register_from_path(&fixture("cards/gateway_inference/ask-prompt.yaml")),
-            )
-            .await
-            .expect_err("the reader cannot register");
-            assert_eq!(denied.status(), 403);
-            let second = std::env::var("WYRD_SAVED_LOGIN_SECOND_TENANT").expect("tenant key");
-            connect(None, Some(&second))
-                .expect("the second tenant's login resolves by its route key")
-                .list(card_listing())
-                .await
-                .expect("alice lists in her tenant");
-        }
-        "renew" => {
-            connect(None, Some(FIXTURE_TENANT_SLUG))
-                .expect("resolves")
-                .list(card_listing())
-                .await
-                .expect("a stale saved login renews through Wyrd");
-        }
-        "override" => {
-            let machine = std::env::var("WYRD_SAVED_LOGIN_MACHINE_KEY").expect("machine key");
-            let selected = connect(Some(machine.clone()), Some(FIXTURE_TENANT_SLUG))
-                .err()
-                .expect("a selector beside a machine key is refused");
-            assert_eq!(selected.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
-            assert!(
-                selected.to_string().contains("already names its tenant"),
-                "{selected}"
-            );
-            let cards = connect(Some(machine), None).expect("resolves");
-            Box::pin(cards.register_from_path(&fixture("cards/gateway_inference/ask-prompt.yaml")))
-                .await
-                .expect("the explicit machine credential overrides the saved reader");
-        }
-        "revoked" => {
-            let revoked = connect(None, Some(FIXTURE_TENANT_SLUG))
-                .expect("resolves")
-                .list(card_listing())
-                .await
-                .expect_err("a revoked login cannot renew");
-            assert_eq!(revoked.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
-            assert!(
-                revoked.to_string().contains("(refresh_refused)"),
-                "{revoked}"
-            );
-        }
-        other => panic!("unknown script phase {other}"),
-    }
-}
-
-/// The Rust SDK uses CLI-established user logins from separate local
-/// processes: it uses the newest of two same-server tenants' logins without a
-/// selector and the named one with it, refuses an unmatched selection, makes
-/// the reader's allowed read and is denied its write, renews without the
-/// provider, lets an
-/// explicit machine credential override, and fails closed once the login's
-/// refresh chain is revoked.
-///
-/// # Panics
-/// Panics when any journey step differs.
+/// Panics when a setup step or the registration fails, or the receipt
+/// differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
-async fn saved_user_auth_journey() {
-    let config = wyrd_testing::human_login::private_config_home();
-    let server = Box::pin(
-        WyrdTestServerBuilder::default()
-            .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
-            .start_bound(),
-    )
-    .await
-    .expect("test server starts");
-    let base_url = server
-        .base_url()
-        .expect("bound server has a URL")
-        .to_owned();
-    let origin = canonical_origin(&base_url).expect("origin");
-    let sso = HumanSso::new(&base_url);
-    let admin_key = machine_key(&server, "saved_login_admin", &["admin"]).await;
-    sso.activate_keycloak(&admin_key).await;
-    let second = server
-        .seed_tenant("saved-login-two")
+async fn newest_saved_login_is_used_without_a_selector() {
+    let logins = SavedLogins::start().await;
+    logins.save_alices_admin_login().await;
+
+    let receipt = logins
+        .cards(None)
+        .expect("the newest login resolves")
+        .register_from_path(&fixture(PROMPT))
         .await
-        .expect("tenant seeds");
-    let second_admin = match server
-        .bootstrap_service_in_tenant(second, "saved_login_two_admin", &["admin"])
+        .expect("alice registers the Prompt");
+
+    assert_eq!(
+        (receipt.root.kind, receipt.root.name.as_str()),
+        (CardKind::Prompt, "ask-prompt")
+    );
+    logins.deployment.shutdown().await;
+}
+
+/// Bob's saved reader login cannot register a Card.
+///
+/// # Panics
+/// Panics when the registration succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn saved_reader_login_is_denied_a_write() {
+    let logins = SavedLogins::start().await;
+
+    let refused = logins
+        .cards(Some(FIXTURE_TENANT_SLUG))
+        .expect("bob's login resolves")
+        .register_from_path(&fixture(PROMPT))
         .await
-        .expect("second admin bootstraps")
-    {
-        Bootstrap::Machine { api_key, .. } => api_key.expose_secret().to_owned(),
-        Bootstrap::User { .. } => panic!("service bootstrap returned a user principal"),
-    };
-    sso.activate_keycloak(&second_admin).await;
-    sso.save_login(config.path(), FIXTURE_TENANT_SLUG, "bob", "wyrd-test")
-        .await;
-    sso.save_login(config.path(), "saved-login-two", "alice", "alice-password")
-        .await;
-    let second = "saved-login-two".to_owned();
-    let script =
-        |phase: &'static str| run_script(phase, config.path(), &base_url, &second, &admin_key);
+        .expect_err("a reader cannot register");
 
-    script("select").await;
+    assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    logins.deployment.shutdown().await;
+}
 
-    let stale = saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
-    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
-    script("renew").await;
-    let renewed = saved_login(config.path(), &origin, FIXTURE_TENANT_SLUG);
+/// A stale saved login renews through Wyrd on use, and the renewal is saved.
+///
+/// # Panics
+/// Panics when the read fails or the saved login stays stale.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn stale_login_refreshes_and_saves_the_renewal() {
+    let logins = SavedLogins::start().await;
+    logins
+        .sso
+        .expire_saved(logins.config.path(), FIXTURE_TENANT_SLUG);
+
+    logins
+        .cards(Some(FIXTURE_TENANT_SLUG))
+        .expect("bob's login resolves")
+        .list(prompts())
+        .await
+        .expect("the stale login renews");
+
     assert!(
-        renewed.refresh_token.expose() != stale.refresh_token.expose(),
-        "the renewal rotated the refresh token"
+        !logins
+            .sso
+            .saved_is_stale(logins.config.path(), FIXTURE_TENANT_SLUG)
     );
-    assert!(
-        renewed.access_expires_at > chrono::Utc::now(),
-        "the renewed token is fresh"
-    );
+    logins.deployment.shutdown().await;
+}
 
-    script("override").await;
+/// A saved login whose refresh chain was revoked cannot renew.
+///
+/// # Panics
+/// Panics when the read succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn revoked_login_is_refused() {
+    let logins = SavedLogins::start().await;
+    logins
+        .sso
+        .revoke_saved(logins.config.path(), FIXTURE_TENANT_SLUG)
+        .await;
+    logins
+        .sso
+        .expire_saved(logins.config.path(), FIXTURE_TENANT_SLUG);
 
-    sso.revoke(&renewed.refresh_token).await;
-    expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
-    script("revoked").await;
+    let refused = logins
+        .cards(Some(FIXTURE_TENANT_SLUG))
+        .expect("bob's login resolves")
+        .list(prompts())
+        .await
+        .expect_err("a revoked login cannot renew");
 
-    server.shutdown().await.expect("test server shuts down");
+    assert_eq!(refused.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
+    logins.deployment.shutdown().await;
+}
+
+/// A tenant selector naming no saved login is refused rather than replaced
+/// by another identity.
+///
+/// # Panics
+/// Panics when the client resolves or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn selector_naming_no_saved_login_is_refused() {
+    let logins = SavedLogins::start().await;
+
+    let refused = logins
+        .cards(Some("no-such-tenant"))
+        .err()
+        .expect("a selector must name a saved login");
+
+    assert_eq!(refused.code(), "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
+    logins.deployment.shutdown().await;
+}
+
+/// An explicit machine key names its own tenant, so a tenant selector beside
+/// it is refused.
+///
+/// # Panics
+/// Panics when the client resolves or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
+async fn explicit_key_beside_a_tenant_selector_is_refused() {
+    let logins = SavedLogins::start().await;
+    let mut config = logins.config(Some(FIXTURE_TENANT_SLUG));
+    config.credential = Some(SecretString::from(
+        logins.deployment.key("script_admin", &["admin"]).await,
+    ));
+
+    let refused = WyrdClient::with_config(config).expect_err("a selector beside a key is refused");
+
+    assert_eq!(refused.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
+    logins.deployment.shutdown().await;
 }

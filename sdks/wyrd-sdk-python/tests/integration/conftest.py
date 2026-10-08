@@ -8,30 +8,36 @@ calls in a test resolve them without arguments.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections.abc import Iterator
-from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from pydantic import BaseModel
-from wyrd import cli
 from wyrd.bifrost import Bifrost, TableConfig
-from wyrd.cards import CardRef, Cards
-from wyrd.model import ModelInterface
+from wyrd.cards import Cards
+from wyrd.client import WyrdClient
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .gateway.support import PROVIDER_KEY, Received, Upstream
+from .gateway.support import PROVIDER_KEY, Upstream
+from .support import (
+    BASELINE_TIMEOUT_SECONDS,
+    ON_CALL_TOKEN,
+    Delivery,
+    QueryRow,
+    Receiver,
+    download,
+    hydrated,
+    register,
+    service_key,
+)
 
 if TYPE_CHECKING:
     from wyrd.operators import OperatorConnectionView
-
-FIXTURES = Path(__file__).resolve().parents[4] / "fixtures"
-"""The repository-root fixture corpus shared by the Rust, Python, and TypeScript journeys."""
 
 JUDGE_VERDICT = {
     "id": "chatcmpl-judge",
@@ -50,44 +56,6 @@ JUDGE_VERDICT = {
 """The local LLM judge's answer: the graded answer passes."""
 
 
-@dataclass
-class Delivery:
-    """One request the local receiver accepted."""
-
-    path: str
-    headers: dict[str, str]
-    body: dict
-
-
-@dataclass
-class Receiver:
-    """A loopback endpoint standing in for the judge provider and Operator hooks.
-
-    ``POST /v1/chat/completions`` answers as a passing LLM judge; any other
-    ``POST`` is accepted as an Operator delivery. Every request is recorded in
-    arrival order.
-    """
-
-    url: str
-    deliveries: list[Delivery] = field(default_factory=list)
-    delivered: threading.Condition = field(default_factory=threading.Condition)
-
-    def to(self, path: str) -> list[Delivery]:
-        """Every delivery received on ``path`` so far."""
-        return [delivery for delivery in self.deliveries if delivery.path == path]
-
-    def wait_for(self, path: str, timeout: float) -> Delivery:
-        """Block until a delivery arrives on ``path`` and return the first one.
-
-        Raises:
-            TimeoutError: when nothing reaches ``path`` within ``timeout`` seconds.
-        """
-        with self.delivered:
-            if not self.delivered.wait_for(lambda: self.to(path), timeout):
-                raise TimeoutError(f"nothing was delivered to {path} in {timeout} s")
-        return self.to(path)[0]
-
-
 @pytest.fixture(scope="session")
 def receiver() -> Iterator[Receiver]:
     """Serve the session's judge provider and Operator hook endpoint."""
@@ -103,9 +71,7 @@ def receiver() -> Iterator[Receiver]:
             self.send_header("content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
-            with received.delivered:
-                received.deliveries.append(Delivery(self.path, headers, body))
-                received.delivered.notify_all()
+            received.record(Delivery(self.path, headers, body))
 
         def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""
@@ -131,57 +97,16 @@ def cards(wyrd_server: WyrdTestServer) -> Cards:
     return Cards()
 
 
-def register(cards: Cards, path: str) -> dict[str, CardRef]:
-    """Register one checked-in fixture file and return every Card it registered, by name."""
-    receipt = cards.register_from_path(str(FIXTURES / path))
-    return {outcome.card_ref.name: outcome.card_ref for outcome in receipt.outcomes}
-
-
-def download(service: str, output_dir: Path) -> Path:
-    """Hydrate the registered ``service`` graph into ``output_dir`` with ``wyrd get``."""
-    cli.get(output_dir=output_dir, kind="Service", space="default", name=service, version="1.0.0")
-    return output_dir
-
-
-def service_key(server: WyrdTestServer, service: str) -> str:
-    """Issue the registered ``service``'s own key, granted the built-in ``agent`` Role.
-
-    A Card-bound principal starts with only the workload Role; ``agent`` adds
-    ``evals:run``. No public surface grants a Role yet, so the harness does.
-    """
-    return server.credential_registered_service(f"default/Service/{service}@1.0.0", ["agent"])
-
-
-BASELINE_TIMEOUT_SECONDS = 90.0
-"""How long a fixture waits for a Drift Verifier's baseline to be fitted."""
-
-
-class StandInModel(ModelInterface):
-    """Stand-in for the fixture Models' ``Custom`` loader.
-
-    The journeys observe and verify the Model Card without running it, and the
-    Card names a loader module that does not exist offline. Supplying this
-    instance for the alias keeps hydration from importing it.
-    """
-
-    def __init__(self) -> None:
-        """Start with the empty holder slot the Model holder expects after load."""
-        super().__init__()
-        self.model: object = None
-
-    def save(self, path: Path, save_kwargs: dict[str, object] | None = None) -> None:
-        """Never called: the journeys register checked-in Cards, they do not save one."""
-        raise NotImplementedError
-
-    def load(self, path: Path, load_kwargs: dict[str, object] | None = None) -> None:
-        """Read nothing and publish an identity function as the loaded model."""
-        self.model = lambda value: value
-
-
 @pytest.fixture(scope="session")
 def bifrost(wyrd_server: WyrdTestServer) -> Bifrost:
     """The session administrator's query-only Bifrost client."""
     return Bifrost()
+
+
+@pytest.fixture(scope="session")
+def other_tenant(wyrd_server: WyrdTestServer) -> str:
+    """A second tenant on the session server, for isolation stories."""
+    return wyrd_server.seed_tenant("other-tenant")
 
 
 @pytest.fixture(scope="session")
@@ -199,39 +124,29 @@ def assistant_bundle(
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     registered = register(cards, "cards/verify_in_real_time/assistant.yaml")
     wyrd_server.wait_for_baseline(str(registered["latency-drift"].uid), BASELINE_TIMEOUT_SECONDS)
-    return download("assistant", tmp_path_factory.mktemp("assistant"))
+    return download(cards, "assistant", tmp_path_factory.mktemp("assistant"))
 
 
 @pytest.fixture(scope="session")
 def assistant_key(wyrd_server: WyrdTestServer, assistant_bundle: Path) -> str:
-    """The ``assistant`` Service's own API key."""
-    return service_key(wyrd_server, "assistant")
+    """The ``assistant`` Service's own key, issued with ``wyrd auth issue-key`` and no added Role."""
+    return service_key("assistant")
 
 
 @pytest.fixture
-def assistant(
-    assistant_bundle: Path, assistant_key: str, monkeypatch: pytest.MonkeyPatch
-) -> WyrdState:
-    """The hydrated ``assistant`` Service, running under its own key."""
-    monkeypatch.setenv("WYRD_API_KEY", assistant_key)
-    return WyrdState.from_path(assistant_bundle, interfaces={"model": StandInModel()})
+def assistant(assistant_bundle: Path, assistant_key: str) -> WyrdState:
+    """The hydrated ``assistant`` Service, acting as its own key."""
+    return hydrated(assistant_bundle, WyrdClient(credential=assistant_key))
 
 
 @pytest.fixture
-def unfitted_assistant(
-    wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> WyrdState:
-    """A Service whose bound ``tier-drift`` baseline can never be fitted."""
+def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path) -> WyrdState:
+    """A Service whose bound ``tier-drift`` baseline can never be fitted, acting as its own key."""
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     register(cards, "cards/verify_in_real_time/unfitted-assistant.yaml")
-    bundle = download("unfitted-assistant", tmp_path)
-    monkeypatch.setenv("WYRD_API_KEY", service_key(wyrd_server, "unfitted-assistant"))
-    return WyrdState.from_path(bundle, interfaces={"model": StandInModel()})
-
-
-ON_CALL_TOKEN = "on-call-bearer-token"
-"""The bearer secret the ``on-call-hooks`` connection presents to the receiver."""
+    bundle = download(cards, "unfitted-assistant", tmp_path)
+    return hydrated(bundle, WyrdClient(credential=service_key("unfitted-assistant")))
 
 
 @pytest.fixture(scope="session")
@@ -253,25 +168,54 @@ def latency_watch(
     cards: Cards,
     on_call_hooks: OperatorConnectionView,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[WyrdState]:
     """The ``latency-watch`` Service, fitted and hydrated, with Bifrost started under its key."""
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     registered = register(cards, "cards/scheduled_drift_alerts_operator/latency-watch.yaml")
     wyrd_server.wait_for_baseline(str(registered["latency-shift"].uid), BASELINE_TIMEOUT_SECONDS)
-    bundle = download("latency-watch", tmp_path)
-    monkeypatch.setenv("WYRD_API_KEY", service_key(wyrd_server, "latency-watch"))
-    state = WyrdState.from_path(bundle)
+    bundle = download(cards, "latency-watch", tmp_path)
+    state = WyrdState.from_path(bundle, WyrdClient(credential=service_key("latency-watch")))
     state.start_bifrost()
     yield state
     state.shutdown()
 
 
-class QueryRow(BaseModel):
-    """The user columns of the query journeys' seeded table."""
+@pytest.fixture(scope="session")
+def observed_bundle(
+    wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """The ``observed-service`` graph, registered and downloaded."""
+    register(cards, "cards/observe_a_run/observed-model.yaml")
+    register(cards, "cards/observe_a_run/observed-service.yaml")
+    return download(cards, "observed-service", tmp_path_factory.mktemp("observed"))
 
-    id: int
-    value: str
+
+@pytest.fixture(scope="session")
+def observed_key(observed_bundle: Path) -> str:
+    """A key bound to the ``observed-service`` Card, issued with ``wyrd auth issue-key``."""
+    return service_key("observed-service")
+
+
+@pytest.fixture
+def observed(observed_bundle: Path, observed_key: str) -> WyrdState:
+    """A fresh state of the ``observed-service`` acting as its own key; Bifrost is not started."""
+    return hydrated(observed_bundle, WyrdClient(credential=observed_key))
+
+
+@pytest.fixture
+def observed_with_bifrost(observed: WyrdState) -> Iterator[WyrdState]:
+    """The ``observed-service`` state with Bifrost started under the Service's own key."""
+    observed.start_bifrost()
+    yield observed
+    observed.shutdown()
+
+
+@pytest.fixture
+def otlp_environment(wyrd_server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point every stock OTLP exporter at the deployment's Wyrd gRPC address and key."""
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", os.environ["WYRD_GRPC_URL"])
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", f"x-wyrd-api-key={wyrd_server.api_key}")
 
 
 @pytest.fixture(scope="session")
@@ -284,27 +228,26 @@ def query_table(wyrd_server: WyrdTestServer) -> str:
         writer.insert({"id": row_id, "value": value})
     writer.flush()
     writer.shutdown()
+    # Publish the flushed rows so every query journey reads them.
     wyrd_server.flush_bifrost()
     return fqn
 
 
 @pytest.fixture
-def gateway_server(wyrd_server: WyrdTestServer) -> Iterator[tuple[WyrdTestServer, Received]]:
+def gateway_server(wyrd_server: WyrdTestServer) -> Iterator[tuple[WyrdTestServer, Receiver]]:
     """Server whose built-in adapters reach a recording mock upstream.
 
-    Starts after the session server and owns its own environment patch, so a
-    test's ``monkeypatch`` unwinds before this server restores the session
-    endpoints.
+    The server leaves the session endpoints in the environment untouched, so
+    every call to it passes an explicit client.
     """
-    received: Received = []
-    handler = type("RecordingUpstream", (Upstream,), {"received": received})
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    recorded = Receiver(url=f"http://127.0.0.1:{upstream.server_address[1]}")
+    upstream.RequestHandlerClass = type("RecordingUpstream", (Upstream,), {"upstream": recorded})
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     try:
-        base = f"http://127.0.0.1:{upstream.server_address[1]}"
         with pytest.MonkeyPatch.context() as env:
             env.setenv("WYRD_TEST_GATEWAY_PROVIDER_KEY", PROVIDER_KEY)
-            with WyrdTestServer(provider_base_url=base) as server:
-                yield server, received
+            with WyrdTestServer(provider_base_url=recorded.url, mutate_env=False) as server:
+                yield server, recorded
     finally:
         upstream.shutdown()

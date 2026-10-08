@@ -29,6 +29,28 @@ impl PyWyrdClient {
     pub(crate) const fn inner(&self) -> &WyrdClient {
         &self.inner
     }
+
+    /// Resolve the client a server-facing surface acts as.
+    ///
+    /// Every public Python surface that calls the server takes one optional
+    /// `client`; this is the single place that turns it into a Rust client.
+    /// A supplied client is reused as is, sharing its transport and token
+    /// cache. Omitted, the ambient chain resolves exactly as Rust
+    /// [`WyrdClient::from_global`] does: the global configuration file, then
+    /// the environment, then the saved user login.
+    ///
+    /// # Arguments
+    /// * `client` - The caller's explicit client, or `None` for the ambient chain.
+    ///
+    /// # Errors
+    /// Returns the configuration, credential, or saved-login error raised while
+    /// resolving the ambient chain; a supplied client never fails.
+    pub(crate) fn resolve(client: Option<&Self>) -> Result<WyrdClient, WyrdError> {
+        match client {
+            Some(client) => Ok(client.inner.clone()),
+            None => WyrdClient::from_global().map_err(WyrdError::from),
+        }
+    }
 }
 
 #[pymethods]
@@ -39,6 +61,13 @@ impl PyWyrdClient {
     /// then the saved user login for this server (the one for `WYRD_TENANT`
     /// when set, otherwise the newest), then
     /// `~/.config/wyrd/credentials.toml`.
+    ///
+    /// # Arguments
+    /// * `server_url` - The HTTP server URL, or `None` to resolve it.
+    /// * `credential` - The client's own credential: a Wyrd API key
+    ///   (`wyrd_sk_…`), exchanged for a short-lived access token and renewed,
+    ///   or an access token, presented as-is. `None` resolves the chain.
+    /// * `grpc_url` - The gRPC endpoint, or `None` to derive it.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no

@@ -96,6 +96,7 @@ impl Run {
     /// The exact Card this view observes, which every observation carries as
     /// its correlation and a foreign runtime attaches to its trace spans.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn subject(&self) -> &CardRef {
         &self.subject
     }
@@ -106,6 +107,9 @@ impl Run {
     /// views may be used concurrently. Resolution is a local index lookup: an
     /// unknown or out-of-graph alias fails without any network IO and never
     /// falls back to the root Service.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of the Card the new view observes.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` when the alias is not registered in
@@ -149,6 +153,10 @@ pub struct Observe<'a> {
 impl Observe<'_> {
     /// Emit one Drift observation from a `Serialize` feature object.
     ///
+    /// # Arguments
+    /// * `features` - One flat object of supported scalar feature values.
+    /// * `session_id` - The session the observation belongs to, or `None`.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown,
@@ -171,10 +179,15 @@ impl Observe<'_> {
     /// An integer literal beyond 64-bit range is refused from the text before
     /// parsing would round it to a float.
     ///
+    /// # Arguments
+    /// * `json` - One flat JSON object of supported scalar feature values.
+    /// * `session_id` - The session the observation belongs to, or `None`.
+    ///
     /// # Errors
     /// As [`Observe::drift`], plus an invalid-observation error when `json` is
     /// not valid JSON or carries an integer literal beyond exact `Float64`
     /// range.
+    #[cfg(feature = "internal")]
     pub fn drift_json(&self, json: &str, session_id: Option<SessionId>) -> Result<(), WyrdError> {
         drift::check_integer_literals(json)?;
         self.drift_value(&parse_json(json, "drift features")?, session_id)
@@ -205,6 +218,10 @@ impl Observe<'_> {
 
     /// Emit one Eval observation from a `Serialize` context value.
     ///
+    /// # Arguments
+    /// * `context` - The context object the Eval observation records.
+    /// * `options` - The optional trace correlation, session, and media.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
     /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, a validation error when
@@ -221,9 +238,14 @@ impl Observe<'_> {
 
     /// Emit one Eval observation from a foreign runtime's JSON text.
     ///
+    /// # Arguments
+    /// * `json` - The context object as JSON text.
+    /// * `options` - The optional trace correlation, session, and media.
+    ///
     /// # Errors
     /// As [`Observe::eval`], plus an invalid-observation error when `json` is
     /// not valid JSON.
+    #[cfg(feature = "internal")]
     pub fn eval_json(&self, json: &str, options: EvalObservationOptions) -> Result<(), WyrdError> {
         self.eval_value(parse_json(json, "eval context")?, options)
     }
@@ -251,6 +273,10 @@ impl Observe<'_> {
     /// queue checks row values against the described schema when it seals a
     /// batch.
     ///
+    /// # Arguments
+    /// * `table` - A registered `vala.datasets.<name>` table.
+    /// * `row` - The row, serialized to the table's columns.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
     /// `vala.datasets`, which is where reserved and system-managed tables are
@@ -264,9 +290,14 @@ impl Observe<'_> {
 
     /// Emit one row into a registered table from a foreign runtime's JSON text.
     ///
+    /// # Arguments
+    /// * `table` - A registered `vala.datasets.<name>` table.
+    /// * `json` - The row as one JSON object.
+    ///
     /// # Errors
     /// As [`Observe::record`], plus an invalid-observation error when `json` is
     /// not valid JSON.
+    #[cfg(feature = "internal")]
     pub async fn record_json(&self, table: &str, json: &str) -> Result<(), WyrdError> {
         self.record_value(table, &parse_json(json, "record row")?)
             .await
@@ -284,7 +315,7 @@ impl Observe<'_> {
             ));
         }
         let started = self.run.state.started_bifrost()?;
-        let destination = started.bifrost.writer_table(table).await?;
+        let destination = started.bifrost.resolve_writer_table(table).await?;
         started.bifrost.insert_observation(
             &destination,
             vec![row_bytes(row)?],
@@ -304,6 +335,10 @@ impl Observe<'_> {
     /// of feature rows, in the forms [`Observe::drift`] accepts. It judges
     /// only: no observation, run, Operator dispatch, or Bifrost write, and
     /// Bifrost need not be started. A `failed` verdict is a normal return.
+    ///
+    /// # Arguments
+    /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
+    /// * `input` - One Eval context object, or a non-empty sequence of Drift feature rows.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` when no Verifier of that name
@@ -326,6 +361,11 @@ impl Observe<'_> {
 
     /// Judge one Eval context carrying media a judge Prompt binds by `id`.
     ///
+    /// # Arguments
+    /// * `verifier` - The `metadata.name` of an Eval Verifier bound to this view's subject.
+    /// * `context` - The Eval context object.
+    /// * `media` - Media references a judge Prompt binds by `id`.
+    ///
     /// # Errors
     /// As [`Observe::verify`], plus `WYRD_SDK_400_INVALID_OBSERVATION` when
     /// `verifier` is a Drift Verifier, which takes no media.
@@ -344,6 +384,11 @@ impl Observe<'_> {
 
     /// Judge input from a foreign runtime's JSON text.
     ///
+    /// # Arguments
+    /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
+    /// * `json` - The input as JSON text, in the shape [`Observe::verify`] takes.
+    /// * `media` - Media references a judge Prompt binds by `id`; empty for none.
+    ///
     /// # Errors
     /// As [`Observe::verify_with_media`], plus an invalid-observation error
     /// when `json` is not valid JSON or a Drift row carries an integer literal
@@ -351,6 +396,7 @@ impl Observe<'_> {
     ///
     /// # Cancellation
     /// As [`Observe::verify`].
+    #[cfg(feature = "internal")]
     pub async fn verify_json(
         &self,
         verifier: &str,
@@ -418,6 +464,7 @@ fn to_value<T: Serialize>(value: &T, field: &str) -> Result<Value, WyrdError> {
 ///
 /// # Errors
 /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` when the text is not valid JSON.
+#[cfg(feature = "internal")]
 fn parse_json(text: &str, field: &str) -> Result<Value, WyrdError> {
     serde_json::from_str(text).map_err(|error| {
         invalid_observation(

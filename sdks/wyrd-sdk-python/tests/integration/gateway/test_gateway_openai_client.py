@@ -7,7 +7,6 @@ reaches the shared recording upstream, and each call is recorded in
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 import openai
@@ -15,16 +14,19 @@ import pytest
 from wyrd.gateway import Gateway
 from wyrd.testing import WyrdTestServer
 
+from ..support import Receiver, client_of
 from .support import (
     IMAGE_BYTES,
+    IMAGE_DIGEST,
     PROVIDER_KEY,
-    Received,
     access_token,
     assert_upstream_credentials,
     calls,
     deploy,
     usage,
 )
+
+pytestmark = pytest.mark.integration
 
 MESSAGES: list[Any] = [{"role": "user", "content": "hi"}]
 VERTEX = "/v1/projects/acme/locations/us-central1/publishers/google/models/gemini-2.5-pro"
@@ -37,10 +39,10 @@ def openai_client(server: WyrdTestServer, token: str) -> openai.OpenAI:
 
 @pytest.fixture
 def backends(
-    gateway_server: tuple[WyrdTestServer, Received],
-) -> tuple[WyrdTestServer, Received]:
+    gateway_server: tuple[WyrdTestServer, Receiver],
+) -> tuple[WyrdTestServer, Receiver]:
     """A server with one chat model on each built-in provider and metadata capture."""
-    server, received = gateway_server
+    server, upstream = gateway_server
     deploy(server, "openai", "gpt-4o", ["chat_completions"])
     deploy(server, "anthropic", "claude-sonnet-5", ["chat_completions"])
     deploy(server, "gemini", "gemini-2.5-flash", ["chat_completions"])
@@ -51,29 +53,28 @@ def backends(
         ["chat_completions"],
         adapter={"vertex": {"project": "acme", "location": "us-central1"}},
     )
-    Gateway().put_capture_policy({"mode": "metadata", "payload_fields": []})
-    return server, received
+    Gateway(client_of(server)).put_capture_policy({"mode": "metadata", "payload_fields": []})
+    return server, upstream
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     ("model", "header", "paths", "expected_usage"),
     [
         (
             "openai/gpt-4o",
-            "authorization",
+            ("authorization", f"Bearer {PROVIDER_KEY}"),
             ["/v1/chat/completions", "/v1/chat/completions"],
             {("input_tokens", "11"), ("output_tokens", "4")},
         ),
         (
             "anthropic/claude-sonnet-5",
-            "x-api-key",
+            ("x-api-key", PROVIDER_KEY),
             ["/v1/messages", "/v1/messages"],
             {("input_tokens", "5"), ("output_tokens", "3")},
         ),
         (
             "gemini/gemini-2.5-flash",
-            "x-goog-api-key",
+            ("x-goog-api-key", PROVIDER_KEY),
             [
                 "/v1beta/models/gemini-2.5-flash:generateContent",
                 "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
@@ -82,20 +83,20 @@ def backends(
         ),
         (
             "vertex/gemini-2.5-pro",
-            "authorization",
+            ("authorization", f"Bearer {PROVIDER_KEY}"),
             [f"{VERTEX}:generateContent", f"{VERTEX}:streamGenerateContent?alt=sse"],
             {("input_tokens", "7"), ("output_tokens", "2")},
         ),
     ],
 )
 def test_openai_client_reaches_the_backend_through_the_server(
-    backends: tuple[WyrdTestServer, Received],
+    backends: tuple[WyrdTestServer, Receiver],
     model: str,
-    header: str,
+    header: tuple[str, str],
     paths: list[str],
     expected_usage: set[tuple[str, str]],
 ) -> None:
-    server, received = backends
+    server, upstream = backends
     token = server.access_token()
     client = openai_client(server, token)
 
@@ -123,22 +124,21 @@ def test_openai_client_reaches_the_backend_through_the_server(
     )
     assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "hi"
     assert chunks[-1].usage is not None
-    assert [path for path, _ in received] == paths
-    assert_upstream_credentials(received, header, token)
+    assert [delivery.path for delivery in upstream.deliveries] == paths
+    assert_upstream_credentials(upstream, *header, token)
     assert len({row["caller_principal_id"] for row in rows} - {None}) == 1
     assert sorted(row["streaming"] for row in rows) == [False, True]
     assert {row["outcome"] for row in rows} == {"succeeded"}
     assert usage(rows) == expected_usage
 
 
-@pytest.mark.integration
 def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(
-    backends: tuple[WyrdTestServer, Received],
+    backends: tuple[WyrdTestServer, Receiver],
 ) -> None:
-    server, received = backends
+    server, upstream = backends
     token = server.access_token()
     client = openai_client(server, token)
-    reader = access_token(server.bootstrap_service(["reader"], name="openai-reader"))
+    reader = access_token(server, server.bootstrap_service(["reader"], name="openai-reader"))
 
     with pytest.raises(openai.PermissionDeniedError) as denied:
         openai_client(server, reader).chat.completions.create(
@@ -166,12 +166,11 @@ def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(
         assert refusal.response.headers.get("wyrd-request-id")
         assert PROVIDER_KEY not in refusal.response.text
         assert token not in refusal.response.text
-    assert received == []
+    assert upstream.deliveries == []
 
 
-@pytest.mark.integration
 def test_server_keeps_serving_after_a_cancelled_stream(
-    backends: tuple[WyrdTestServer, Received],
+    backends: tuple[WyrdTestServer, Receiver],
 ) -> None:
     server, _ = backends
     client = openai_client(server, server.access_token())
@@ -197,12 +196,13 @@ def model_access(provider: str, model: str) -> dict[str, object]:
     }
 
 
-@pytest.mark.integration
-def test_two_users_have_distinct_model_access(backends: tuple[WyrdTestServer, Received]) -> None:
-    server, received = backends
-    ada = access_token(server.scoped_api_key("gateway_ada", [model_access("openai", "gpt-4o")]))
+def test_two_users_have_distinct_model_access(backends: tuple[WyrdTestServer, Receiver]) -> None:
+    server, upstream = backends
+    ada = access_token(
+        server, server.scoped_api_key("gateway_ada", [model_access("openai", "gpt-4o")])
+    )
     bea = access_token(
-        server.scoped_api_key("gateway_bea", [model_access("anthropic", "claude-sonnet-5")])
+        server, server.scoped_api_key("gateway_bea", [model_access("anthropic", "claude-sonnet-5")])
     )
 
     for caller, allowed, denied in (
@@ -218,17 +218,21 @@ def test_two_users_have_distinct_model_access(backends: tuple[WyrdTestServer, Re
                 model=denied, messages=MESSAGES, max_completion_tokens=16
             )
         assert refused.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    assert [path for path, _ in received] == ["/v1/chat/completions", "/v1/messages"]
+    assert [delivery.path for delivery in upstream.deliveries] == [
+        "/v1/chat/completions",
+        "/v1/messages",
+    ]
 
 
-@pytest.mark.integration
 def test_each_users_usage_is_recorded_under_their_principal(
-    backends: tuple[WyrdTestServer, Received],
+    backends: tuple[WyrdTestServer, Receiver],
 ) -> None:
     server, _ = backends
-    ada = access_token(server.scoped_api_key("gateway_ada", [model_access("openai", "gpt-4o")]))
+    ada = access_token(
+        server, server.scoped_api_key("gateway_ada", [model_access("openai", "gpt-4o")])
+    )
     bea = access_token(
-        server.scoped_api_key("gateway_bea", [model_access("anthropic", "claude-sonnet-5")])
+        server, server.scoped_api_key("gateway_bea", [model_access("anthropic", "claude-sonnet-5")])
     )
     openai_client(server, ada).chat.completions.create(
         model="openai/gpt-4o", messages=MESSAGES, max_completion_tokens=16
@@ -250,29 +254,29 @@ def test_each_users_usage_is_recorded_under_their_principal(
     ]
 
 
-@pytest.mark.integration
-def test_revoked_user_never_dispatches(backends: tuple[WyrdTestServer, Received]) -> None:
-    server, received = backends
+def test_revoked_user_never_dispatches(backends: tuple[WyrdTestServer, Receiver]) -> None:
+    server, upstream = backends
     key = server.scoped_api_key("gateway_ada", [model_access("openai", "gpt-4o")])
     server.revoke_scoped_role("gateway_ada")
 
     with pytest.raises(openai.PermissionDeniedError) as revoked:
-        openai_client(server, access_token(key)).chat.completions.create(
+        openai_client(server, access_token(server, key)).chat.completions.create(
             model="openai/gpt-4o", messages=MESSAGES, max_completion_tokens=16
         )
     assert revoked.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    assert received == []
+    assert upstream.deliveries == []
 
 
-@pytest.mark.integration
 def test_embedding_and_image_evidence_reaches_bifrost(
-    gateway_server: tuple[WyrdTestServer, Received],
+    gateway_server: tuple[WyrdTestServer, Receiver],
 ) -> None:
     """Payload capture records the image by digest; fetching the bytes is proven in Rust."""
-    server, received = gateway_server
+    server, upstream = gateway_server
     deploy(server, "openai", "text-embedding-3-small", ["embeddings"])
     deploy(server, "openai", "gpt-image-1", ["images"])
-    Gateway().put_capture_policy({"mode": "payload", "payload_fields": ["response"]})
+    Gateway(client_of(server)).put_capture_policy(
+        {"mode": "payload", "payload_fields": ["response"]}
+    )
     token = server.access_token()
     client = openai_client(server, token)
 
@@ -283,12 +287,12 @@ def test_embedding_and_image_evidence_reaches_bifrost(
     assert embedding.data[0].embedding == [0.25, -0.5, 0.75]
     assert embedding.usage.prompt_tokens == 6
     assert image.data is not None and image.data[0].b64_json is not None
-    assert [path for path, _ in received] == ["/v1/embeddings", "/v1/images/generations"]
-    assert_upstream_credentials(received, "authorization", token)
+    assert [delivery.path for delivery in upstream.deliveries] == [
+        "/v1/embeddings",
+        "/v1/images/generations",
+    ]
+    assert_upstream_credentials(upstream, "authorization", f"Bearer {PROVIDER_KEY}", token)
     by_operation = {row["operation"]: row for row in rows}
     assert usage([by_operation["embeddings"]]) == {("input_tokens", "6")}
     [ref] = by_operation["images"]["payload_object_refs"]
-    assert (ref["digest"], ref["size_bytes"]) == (
-        f"sha256:{hashlib.sha256(IMAGE_BYTES).hexdigest()}",
-        len(IMAGE_BYTES),
-    )
+    assert (ref["digest"], ref["size_bytes"]) == (IMAGE_DIGEST, len(IMAGE_BYTES))

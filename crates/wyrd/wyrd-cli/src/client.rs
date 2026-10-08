@@ -43,6 +43,20 @@ pub fn from_global(server: Option<&str>) -> Result<WyrdClient, WyrdCliError> {
     ))
 }
 
+/// Use the caller's client, or build one from the ambient configuration.
+///
+/// The in-process command functions take an optional [`WyrdClient`] so a
+/// program acting for a principal other than the deployment default passes
+/// that principal's client instead of changing the process environment.
+/// Omitted, the command resolves exactly as the executable does without
+/// `--server`.
+///
+/// # Errors
+/// Returns the construction errors of [`from_global`] when `client` is `None`.
+pub fn explicit_or_ambient(client: Option<WyrdClient>) -> Result<WyrdClient, WyrdCliError> {
+    client.map_or_else(|| from_global(None), Ok)
+}
+
 /// Validate one configuration and stack the client layers over it.
 ///
 /// The single place the CLI walks the shared client's assembly ladder:

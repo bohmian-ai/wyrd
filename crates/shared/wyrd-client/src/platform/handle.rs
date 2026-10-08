@@ -56,22 +56,37 @@ pub struct Platform {
 }
 
 impl Platform {
-    /// Exchange a platform credential for a session and bind a client to it.
+    /// Exchange `client`'s platform credential for a session and bind a
+    /// client to it.
     ///
-    /// This is the only call that reads credential material. The session it
-    /// returns becomes the client's bearer, so every later request presents it
-    /// on `X-Wyrd-Access-Token` like any other Wyrd token — the plane is
-    /// separated by the session's scope marker and by the extractor its routes
-    /// declare, never by which header carried the token.
+    /// `client` names the server and carries the platform credential, which
+    /// its constructor classifies as a presented-as-is token because it is not
+    /// an API key. This is the only call that reads that credential material.
+    /// The session it returns becomes the new client's bearer, so every later
+    /// request presents it on `X-Wyrd-Access-Token` like any other Wyrd token —
+    /// the plane is separated by the session's scope marker and by the
+    /// extractor its routes declare, never by which header carried the token.
+    ///
+    /// # Arguments
+    /// * `client` - A client built with the platform credential and the
+    ///   server URL; only those two are read.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Unauthenticated`] for every credential rejection,
+    /// Returns [`WyrdError::Unauthenticated`] when `client` carries anything
+    /// but a presented-as-is credential, and for every credential rejection,
     /// indistinguishably, and a transport error when the server cannot be
     /// reached.
-    pub async fn connect(base_url: &str, credential: &SecretString) -> Result<Self, WyrdError> {
+    pub async fn with_client(client: &WyrdClient) -> Result<Self, WyrdError> {
+        let auth = &client.auth;
+        let ResolvedCredential::BearerToken(credential) = auth.credential() else {
+            return Err(WyrdError::Unauthenticated {
+                message: "a platform client needs a platform credential".to_owned(),
+                details: serde_json::json!({}),
+            });
+        };
         let config = ClientConfig {
             http: HttpConfig {
-                base_url: base_url.trim_end_matches('/').to_owned(),
+                base_url: client.server_url().trim_end_matches('/').to_owned(),
                 ..HttpConfig::default()
             },
             ..ClientConfig::default()
@@ -97,7 +112,11 @@ impl Platform {
             .map_err(WyrdError::from)?;
         let http = HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(WyrdError::from)?;
         Ok(Self {
-            client: Arc::new(WyrdClient::from_parts(auth, http, config.grpc)),
+            client: Arc::new(WyrdClient {
+                auth,
+                http,
+                grpc_config: config.grpc,
+            }),
         })
     }
 
@@ -105,6 +124,9 @@ impl Platform {
     ///
     /// The credential is the only way into the new tenant and is returned
     /// exactly once. Store it before dropping the response.
+    ///
+    /// # Arguments
+    /// * `request` - The new tenant's slug and display name.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks tenant creation, the slug is
@@ -129,6 +151,9 @@ impl Platform {
 
     /// Read one tenant's directory row.
     ///
+    /// # Arguments
+    /// * `tenant_id` - The tenant whose directory row is read.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks tenant reading or no such
     /// tenant exists.
@@ -142,6 +167,10 @@ impl Platform {
     /// Suspension freezes admission and destroys nothing, so resuming restores
     /// exactly what was there. The transition is refused when the tenant is not
     /// already in the opposite state.
+    ///
+    /// # Arguments
+    /// * `tenant_id` - The tenant to transition.
+    /// * `status` - The target status, `active` or `suspended`.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks tenant suspension, the status
@@ -168,6 +197,10 @@ impl Platform {
     /// Restores the existing administrative principal rather than creating a
     /// second, so the tenant's roles and history are untouched.
     ///
+    /// # Arguments
+    /// * `tenant_id` - The tenant whose administrative principal receives the
+    ///   replacement credential.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized or the tenant has
     /// no administrative principal.
@@ -184,6 +217,9 @@ impl Platform {
     }
 
     /// Install or replace the deployment's platform OIDC connection.
+    ///
+    /// # Arguments
+    /// * `request` - The issuer URL, client id, and client authentication to install.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized, the issuer cannot
@@ -208,6 +244,10 @@ impl Platform {
 
     /// Pre-register a human platform administrator.
     ///
+    /// # Arguments
+    /// * `request` - The administrator's name and the identity-provider claim it
+    ///   matches.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized, no connection is
     /// configured, or the name or claim is already registered.
@@ -229,6 +269,10 @@ impl Platform {
     }
 
     /// Suspend or restore a platform principal.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The platform principal to transition.
+    /// * `status` - The target status, such as `active` or `suspended`.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized, the principal is
@@ -255,6 +299,11 @@ impl Platform {
     /// The plaintext is in the response and nowhere else. Store it before
     /// dropping the response: no later call can recover it.
     ///
+    /// # Arguments
+    /// * `principal_id` - The platform principal the credential is minted for.
+    /// * `expires_in_days` - The credential lifetime in days, or `None` for an
+    ///   unbounded credential.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks platform credential
     /// administration, the principal is unknown, or the write fails.
@@ -276,6 +325,9 @@ impl Platform {
     /// Never returns credential material; the listing exists so an operator can
     /// see what is live, expired, or already retired before rotating.
     ///
+    /// # Arguments
+    /// * `principal_id` - The platform principal whose credentials are listed.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized or the read fails.
     pub async fn list_credentials(
@@ -295,6 +347,10 @@ impl Platform {
     /// Takes effect on the next request: a platform session names the
     /// credential that minted it, so the retired credential's live sessions
     /// stop working immediately.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The platform principal that owns the credential.
+    /// * `credential_id` - The credential to retire.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized, or the credential
@@ -321,7 +377,7 @@ impl Platform {
         S: Serialize,
         D: DeserializeOwned,
     {
-        self.client.request_json(method, path, body).await
+        self.client.http.request_json(method, path, body).await
     }
 
     /// Send one authenticated platform request expecting no body.
@@ -340,6 +396,9 @@ impl Platform {
     where
         S: Serialize,
     {
-        self.client.request_json::<S, ()>(method, path, body).await
+        self.client
+            .http
+            .request_json::<S, ()>(method, path, body)
+            .await
     }
 }

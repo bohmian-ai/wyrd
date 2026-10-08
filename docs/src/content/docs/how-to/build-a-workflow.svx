@@ -1,58 +1,61 @@
 ---
 pillar: wyrd
 title: Build an Agent Workflow
-description: Author a workflow from Python, YAML, or Rust, then run and instrument it.
+description: Author a workflow as YAML, load and run it from an SDK or the CLI, and instrument it.
 group: How-to
 order: 21
 ---
 
 # Build an Agent Workflow
 
-A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.sequential` for linear pipelines, `Workflow.parallel` when steps can run at the same time, or `add` and `add_after` for custom shapes.
+A Workflow is a directed acyclic graph of Agent invocations, authored as a
+`kind: Workflow` YAML file. Each step names an Agent, by a relative path to a
+local Agent file or by the `CardRef` of a registered Agent. A step runs once
+the steps in its `depends_on` have finished; steps with no dependency between
+them run at the same time.
 
 Dependencies only order steps. Data moves through explicit declarations:
 
-- `with_inputs` declares the Workflow inputs and their defaults.
-- `with_step_inputs(step_id, ...)` binds each unresolved Prompt variable of a step to `input.<name>`, a dependency's `steps.<id>.output.text`, or `steps.<id>.output.structured[.<field>...]`.
-- `with_outputs` names the values the run returns.
+- `spec.inputs` declares the Workflow inputs and their defaults.
+- A step's `inputs` binds each unresolved Prompt variable of its Agent to `input.<name>`, a dependency's `steps.<id>.output.text`, or `steps.<id>.output.structured[.<field>...]`.
+- `spec.outputs` names the values the run returns.
 
-Step ids are derived deterministically from Agent names: characters outside `[A-Za-z0-9_]` become `_`, a name that does not start with a letter or `_` gains a leading `_`, an unnamed Agent becomes `step_<n>` for its position, and a repeated id gains a `_2`, `_3`, ... suffix. When an Agent name is not already a unique valid identifier, read the assigned ids from `Workflow.steps` before binding step inputs. A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
+A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
 
 ## Author
 
-<LangTabs>
-<LangTab lang="python">
+This Workflow, from `examples/workflows/code-review`, runs a security review
+and a correctness review in parallel, then hands both to a final reviewer:
 
-<CodeFromFile file="sdks/wyrd-sdk-python/examples/from_builder.py" lang="python" />
+<CodeFromFile file="examples/workflows/code-review/workflow.yaml" lang="yaml" title="workflow.yaml" />
 
-</LangTab>
-<LangTab lang="rust">
-
-<CodeFromFile file="examples/rust/workflow_from_builder.rs" lang="rust" />
-
-</LangTab>
-</LangTabs>
-
-You can also author the same workflow as YAML and load it back:
-
-<CodeFromFile file="examples/rust/workflows/research.yaml" lang="yaml" title="research.yaml" />
+Load it with `Workflow.from_path`, or parse YAML text with `Workflow.from_yaml`:
 
 ```python
 from wyrd import Workflow
-wf = Workflow.from_path("research.yaml")
+
+wf = Workflow.from_path("examples/workflows/code-review/workflow.yaml")
+print(wf.steps)  # ["security", "correctness", "final_review"]
 ```
 
 `Workflow.from_path` loads local Agent and Prompt files next to the Workflow
-without a server. Steps that reference registered Agents, as this file does,
-are read from the Wyrd server using your configured credentials.
+without a server. Steps that reference registered Agents are read from the
+Wyrd server as the `client` you pass, or through your configured credentials
+when you pass none. `Workflow.from_yaml` takes the text of a Workflow whose
+Agents are inline.
+
+The Rust Skald runtime also builds Workflows in code with
+`Workflow::sequential`, `Workflow::parallel`, `add`, and `add_after`:
+
+<CodeFromFile file="examples/rust/workflow_from_builder.rs" lang="rust" />
 
 ## Run
 
 ```python
-run = wf.run({"topic": "the Rust borrow checker"})
+run = wf.run({"code": "diff --git a/src/auth.rs b/src/auth.rs\n..."})
 print(run.status)    # "succeeded", "failed", "cancelled", or "timed_out"
-print(run.outputs)   # named outputs declared with with_outputs
-print(run.steps["planner"]["structured_output"])
+print(run.outputs)   # the named outputs declared under spec.outputs
+print(run.steps["security"]["text"])
 ```
 
 Mapping input supplies declared inputs by name; undeclared keys and values of the wrong declared type are rejected. A string is shorthand for the declared string input named `input`. Validation, input, and route errors raise `WyrdError` before any step runs. Once the run starts, step failures are recorded in `run.steps` and `run.error` instead of being raised.
@@ -118,45 +121,12 @@ The secret is read when a run that selects the binding starts, never while
 loading or registering, and never appears in run output. Server runs use the
 bindings the server operator assigns to your tenant.
 
-## Save And Load
+## Parallel In Rust
 
-```python
-wf.save("research.yaml")
-loaded = Workflow.from_path("research.yaml")
-assert Workflow.from_yaml(wf.to_yaml()).to_yaml() == wf.to_yaml()
-```
-
-## Custom DAG
-
-```python
-wf = Workflow(name="pipeline")
-wf.add(research_agent)
-wf.add_after(analysis_agent, after=research_agent)
-wf.add_after(summary_agent, after=research_agent)
-wf.add_after(final_agent, after=[analysis_agent, summary_agent])
-wf.with_step_inputs("final", {
-    "analysis": "steps.analysis.output.text",
-    "summary": "steps.summary.output.text",
-})
-wf.with_outputs({"report": "steps.final.output.text"})
-```
-
-## Parallel
-
-Use `parallel` when steps do not depend on each other. Use `add_after` to fan back in.
-
-<LangTabs>
-<LangTab lang="python">
-
-<CodeFromFile file="sdks/wyrd-sdk-python/examples/parallel.py" lang="python" />
-
-</LangTab>
-<LangTab lang="rust">
+In the Rust Skald runtime, use `parallel` when steps do not depend on each
+other and `add_after` to fan back in:
 
 <CodeFromFile file="examples/rust/workflow_parallel.rs" lang="rust" />
-
-</LangTab>
-</LangTabs>
 
 ## Observe
 

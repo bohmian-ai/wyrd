@@ -1,26 +1,25 @@
-"""Type fixture pinning the generated `cards.get` envelope types.
+"""The generated typed Cards that `cards.get` returns.
 
-`ty` checks this module in the `py:typecheck` lane with unused suppressions as
-errors, so every valid envelope below must type-check and every
-``ty: ignore`` line must be a real rejection. The types are generated from the
-`wyrd-spec` Card schema, so drift fails `codegen:check` before it reaches here.
-They exist only for type checkers: the native extension owns ``wyrd.cards`` at
-runtime, so callers import them under ``TYPE_CHECKING``.
+`cards.get` passes each registered envelope through the generated
+``from_wire``, so these tests pin its kind-discriminated decoding into frozen
+dataclasses read by attribute. The classes are generated from the `wyrd-spec`
+Card schema, so drift fails `codegen:check` before it reaches here.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import dataclasses
 
-if TYPE_CHECKING:
-    from wyrd.cards import (
-        DriftBaselineState,
-        RegisteredCard,
-        RegisteredVerifierCard,
-        TypedCardKind,
-    )
+import pytest
+from wyrd._card_types import from_wire
+from wyrd.cards import (
+    DriftBaselineState,
+    RegisteredCard,
+    RegisteredVerifierCard,
+    TypedCardKind,
+)
 
-BUILDING_DRIFT_VERIFIER: RegisteredVerifierCard = {
+BUILDING_DRIFT_VERIFIER = {
     "apiVersion": "wyrd/v1",
     "kind": "Verifier",
     "metadata": {"name": "churn-drift", "space": "retention", "version": "1.0.0"},
@@ -56,29 +55,53 @@ BUILDING_DRIFT_VERIFIER: RegisteredVerifierCard = {
 
 
 def baseline_state(card: RegisteredCard) -> DriftBaselineState | None:
-    """Narrow a registered envelope by `kind` and read its typed baseline state."""
-    if card["kind"] != "Verifier":
+    """Narrow a registered Card by its class and read its typed baseline state."""
+    if not isinstance(card, RegisteredVerifierCard) or card.status is None:
         return None
-    verification = (card.get("status") or {}).get("verification") or {}
-    baseline = verification.get("baseline")
-    return None if baseline is None else baseline["state"]
+    verification = card.status.verification
+    if verification is None or verification.baseline is None:
+        return None
+    return verification.baseline.state
 
 
 def test_drift_verifier_envelope_exposes_typed_baseline_state() -> None:
-    assert baseline_state(BUILDING_DRIFT_VERIFIER) == "building"
+    card = from_wire(BUILDING_DRIFT_VERIFIER)
+
+    assert isinstance(card, RegisteredVerifierCard)
+    assert card.metadata.name == "churn-drift"
+    assert baseline_state(card) == "building"
+
+
+def test_tagged_enum_members_decode_to_their_own_variant() -> None:
+    card = from_wire(BUILDING_DRIFT_VERIFIER)
+
+    assert isinstance(card, RegisteredVerifierCard)
+    strategy = card.spec.implementation.spec.profile.binning_strategy  # ty: ignore[unresolved-attribute]
+    assert type(strategy).__name__ == "PsiBinningStrategyQuantile"
+
+
+def test_typed_cards_are_frozen() -> None:
+    card = from_wire(BUILDING_DRIFT_VERIFIER)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        card.kind = "Data"  # ty: ignore[invalid-assignment]
+
+
+def test_deferred_kinds_keep_a_plain_spec() -> None:
+    card = from_wire(
+        {
+            "apiVersion": "wyrd/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "flow", "space": "unit", "version": "1.0.0"},
+            "spec": {"entry": "agent"},
+        }
+    )
+
+    assert type(card).__name__ == "RegisteredWorkflowCard"
+    assert card.spec == {"entry": "agent"}
 
 
 def test_deferred_kinds_are_not_typed_kinds() -> None:
     typed: TypedCardKind = "Verifier"
     deferred: TypedCardKind = "Workflow"  # ty: ignore[invalid-assignment]
     assert [typed, deferred] == ["Verifier", "Workflow"]
-
-
-def test_unknown_spec_field_is_rejected_by_the_type() -> None:
-    card: RegisteredVerifierCard = {
-        "apiVersion": "wyrd/v1",
-        "kind": "Verifier",
-        "metadata": {"name": "n"},
-        "spec": {"implementation_kind": "drift"},  # ty: ignore[invalid-key, missing-typed-dict-key]
-    }
-    assert card["kind"] == "Verifier"

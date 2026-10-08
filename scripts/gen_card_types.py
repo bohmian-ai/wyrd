@@ -3,7 +3,7 @@
 The `wyrd-spec` Card JSON Schema is the single source. This script reads
 `crates/wyrd-spec/schemas/card.json`, keeps the envelope of the Card kinds the
 SDKs type (`SUPPORTED_KINDS`) plus every definition those kinds reach, and
-writes one TypeScript module and one Python `TypedDict` module. Both are
+writes one TypeScript module and one Python module of frozen dataclasses. Both are
 generated outputs: `mise run codegen:check` regenerates them and fails on
 drift.
 
@@ -245,7 +245,14 @@ class TypeScript:
 
 
 class Python:
-    """Render intermediate nodes as a runtime-importable `TypedDict` module."""
+    """Render intermediate nodes as a runtime module of frozen dataclasses.
+
+    Every object becomes a frozen, keyword-only dataclass read by attribute.
+    The module also carries the lowered type expressions as data, and one
+    `from_wire` walks them to build those dataclasses from a decoded JSON
+    envelope: a union member is chosen by its single-literal tags and its
+    declared keys, so `kind` discriminates the envelope.
+    """
 
     PRIMS = {
         "string": "str",
@@ -295,30 +302,144 @@ class Python:
             return []
         return [f"# {line}".rstrip() for line in description.splitlines()]
 
+    def field(self, key: str, expr: tuple, required: bool) -> str:
+        """Render one dataclass field.
+
+        An absent optional array or map reads as empty; any other absent
+        optional field reads as `None`.
+        """
+        rendered = self.expr(expr)
+        if required:
+            return f"    {key}: {rendered}"
+        if expr[0] == "array":
+            return f"    {key}: {rendered} = field(default_factory=list)"
+        if expr[0] == "map":
+            return f"    {key}: {rendered} = field(default_factory=dict)"
+        if "None" not in rendered.split(" | "):
+            rendered += " | None"
+        return f"    {key}: {rendered} = None"
+
     def klass(self, name: str, fields: list, description: str | None) -> list[str]:
-        """Render one object as a `TypedDict`, split by requiredness."""
-        required = [field for field in fields if field[2]]
-        optional = [field for field in fields if not field[2]]
-        body = lambda group: [f"    {key}: {self.expr(expr)}" for key, expr, _, _ in group]  # noqa: E731
-        if required and optional:
-            return [
-                f"class _{name}Required(TypedDict):",
-                f'    """Required keys of `{name}`."""',
-                "",
-                *body(required),
-                "",
-                "",
-                f"class {name}(_{name}Required, total=False):",
-                *self.docstring(description),
-                "",
-                *body(optional),
-            ]
-        total = "" if required else ", total=False"
+        """Render one object as a frozen, keyword-only dataclass."""
         return [
-            f"class {name}(TypedDict{total}):",
+            "@dataclass(frozen=True, kw_only=True)",
+            f"class {name}:",
             *self.docstring(description),
-            *([""] + body(required or optional) if fields else []),
+            *([""] + [self.field(key, expr, required) for key, expr, required, _ in fields] if fields else []),
         ]
+
+    @staticmethod
+    def table(nodes: dict[str, tuple]) -> list[str]:
+        """Render the lowered expressions `from_wire` walks, as module data."""
+        objects = {
+            name: tuple((key, required, expr) for key, expr, required, _ in node[1])
+            for name, node in sorted(nodes.items())
+            if node[0] == "object"
+        }
+        aliases = {name: node[1] for name, node in sorted(nodes.items()) if node[0] == "alias"}
+        return [
+            "_OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = " + repr(objects),
+            '"""Each object\'s fields as `(key, required, expression)`, by class name."""',
+            "",
+            "_ALIASES: dict[str, tuple] = " + repr(aliases),
+            '"""Each type alias\'s expression, by alias name."""',
+        ]
+
+    RUNTIME = '''
+
+_PRIMITIVES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "null": (type(None),),
+}
+"""The Python types one JSON primitive decodes to."""
+
+
+def _is_tag(expr: tuple) -> bool:
+    """Report whether `expr` admits only literal values, as a union tag does."""
+    if expr[0] == "union":
+        return all(member[0] == "lit" for member in expr[1])
+    return expr[0] == "lit"
+
+
+def _matches(expr: tuple, value: Any) -> bool:
+    """Report whether `value` can decode as `expr`, without decoding it."""
+    tag = expr[0]
+    if tag == "ref":
+        if expr[1] in _ALIASES:
+            return _matches(_ALIASES[expr[1]], value)
+        if not isinstance(value, dict):
+            return False
+        fields = _OBJECTS[expr[1]]
+        keys = {key for key, _, _ in fields}
+        return (
+            value.keys() <= keys
+            and all(key in value for key, required, _ in fields if required)
+            and all(
+                _matches(field, value[key])
+                for key, _, field in fields
+                if key in value and _is_tag(field)
+            )
+        )
+    if tag == "prim":
+        kind = expr[1]
+        if kind == "any":
+            return True
+        if isinstance(value, bool) and kind != "boolean":
+            return False
+        return isinstance(value, _PRIMITIVES[kind])
+    if tag == "lit":
+        return value == expr[1]
+    if tag == "array":
+        return isinstance(value, list)
+    if tag == "map":
+        return isinstance(value, dict)
+    return any(_matches(member, value) for member in expr[1])
+
+
+def _decode(expr: tuple, value: Any) -> Any:
+    """Decode one JSON value as `expr`, building dataclasses for objects.
+
+    A union decodes as its first member that matches; a value no member
+    matches is kept as plain JSON.
+    """
+    tag = expr[0]
+    if tag == "ref":
+        if expr[1] in _ALIASES:
+            return _decode(_ALIASES[expr[1]], value)
+        if not isinstance(value, dict):
+            return value
+        fields = {
+            key: _decode(field, value[key]) for key, _, field in _OBJECTS[expr[1]] if key in value
+        }
+        return globals()[expr[1]](**fields)
+    if tag == "array":
+        return [_decode(expr[1], item) for item in value] if isinstance(value, list) else value
+    if tag == "map":
+        if not isinstance(value, dict):
+            return value
+        return {key: _decode(expr[1], item) for key, item in value.items()}
+    if tag == "union":
+        for member in expr[1]:
+            if _matches(member, value):
+                return _decode(member, value)
+    return value
+
+
+def from_wire(wire: Mapping[str, Any]) -> RegisteredCard:
+    """Build the typed Card for one registered envelope, chosen by its `kind`.
+
+    Args:
+        wire: one Card envelope as the registry returns it, decoded from JSON.
+
+    Returns:
+        The frozen dataclass for the envelope's `kind`; a kind whose spec is
+        not typed yet keeps its `spec` as a plain mapping.
+    """
+    return _decode(("ref", "RegisteredCard"), dict(wire))
+'''
 
     def render(self, nodes: dict[str, tuple]) -> str:
         """Render the complete Python module."""
@@ -327,7 +448,9 @@ class Python:
             "",
             "from __future__ import annotations",
             "",
-            "from typing import Literal, TypeAlias, TypedDict",
+            "from collections.abc import Mapping",
+            "from dataclasses import dataclass, field",
+            "from typing import Any, Literal, TypeAlias",
             "",
             "JsonValue: TypeAlias = 'str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]'",
             "",
@@ -342,7 +465,10 @@ class Python:
                 out.append("")
                 out.extend(self.klass(name, node[1], node[2]))
                 out.append("")
-        return "\n".join(out) + "\n"
+        out.append("")
+        out.extend(self.table(nodes))
+        out.append(self.RUNTIME)
+        return "\n".join(out)
 
 
 def envelope(

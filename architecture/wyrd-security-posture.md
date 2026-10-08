@@ -82,11 +82,17 @@ it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
-The first projection grants the built-in `workload` role (`bifrost_table:read`,
-`bifrost_record:write`, `bifrost_query:read`) in the registration transaction,
-so the workload can emit and read back its evidence; its Card scope still
-bounds which Cards it may emit for. Re-applying a Card never grants the role
-again, so an administrator's revocation stands.
+The first projection grants the built-in `wyrd_default` role
+(`bifrost_table:read`, `bifrost_record:write`, `evals:run`) in the registration
+transaction, so the workload can emit and verify its evidence; its Card scope
+still bounds which Cards it may emit for and verify. Tenant-wide Bifrost query
+reads come only from an explicit grant of the built-in `workload` role.
+Re-applying a Card never grants the role again, so an administrator's
+revocation stands. A tenant administrator (`*`, not `service_accounts:write`)
+grants further roles to a Card-bound principal with `POST /v1/auth/grant-role`
+(`wyrd auth grant-role`); the decision is staged on the audit outbox as
+`auth.principal.role.grant`, and the role reaches tokens at the next key
+exchange.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no

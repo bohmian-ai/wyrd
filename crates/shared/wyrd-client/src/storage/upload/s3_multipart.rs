@@ -130,6 +130,7 @@ async fn send_part_with_retry(
         headers.push(("Idempotency-Key", hooks.idempotency_key));
 
         let outcome = client
+            .http
             .request_external_stream(
                 reqwest::Method::PUT,
                 &url,

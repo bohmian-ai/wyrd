@@ -8,12 +8,10 @@ use serde_json::json;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::Bifrost;
 use wyrd_sdk::bifrost::QueryParam;
 use wyrd_sdk::cards::CardRef;
 use wyrd_sdk::state::WyrdState;
-use wyrd_spec::card::operator::VerifierCounts;
-use wyrd_spec::verification::{VerificationVerdict, VerifierKind};
+use wyrd_sdk::{Bifrost, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, hydrate, register, registered};
@@ -45,6 +43,8 @@ struct Assistant {
     judge: MockServer,
     /// The hydrated assistant bundle.
     bundle: TempDir,
+    /// The registered assistant Service.
+    service: CardRef,
     /// The registered `latency-drift` Verifier.
     latency_drift: CardRef,
 }
@@ -90,32 +90,36 @@ impl Assistant {
             deployment,
             judge,
             bundle,
+            service: assistant.root.clone(),
             latency_drift: registered(&assistant, "latency-drift"),
         }
     }
 
-    /// The hydrated assistant, started with Bifrost as the Service's own
-    /// principal holding `roles` beyond `workload`.
+    /// The hydrated assistant, created with the Service's own client and
+    /// started with Bifrost.
+    ///
+    /// The Service's key comes from the `issue_key` CLI function with no Role
+    /// granted beyond its default, so Bifrost startup and every verify run
+    /// with exactly what a newly registered Service holds.
     ///
     /// # Panics
-    /// Panics when the bundle does not load or Bifrost does not start.
-    async fn state(&self, roles: &[&str]) -> WyrdState {
-        let state =
-            WyrdState::from_path(&self.bundle.path().join("bundle")).expect("bundle loads offline");
-        let key = self.deployment.service_key(state.root_ref(), roles).await;
-        self.start_bifrost(&state, &key).await;
+    /// Panics when the key is not issued, the bundle does not load, or
+    /// Bifrost does not start.
+    async fn state(&self) -> WyrdState {
+        let key = self.deployment.service_key(&self.service).await;
+        let state = self.state_as(self.deployment.client(&key));
+        state.start_bifrost().await.expect("Bifrost starts");
         state
     }
 
-    /// Start Bifrost on `state` as the principal `key` names.
+    /// The hydrated assistant, loaded with its server calls fixed to
+    /// `client` and Bifrost not started.
     ///
     /// # Panics
-    /// Panics when Bifrost does not start.
-    async fn start_bifrost(&self, state: &WyrdState, key: &str) {
-        state
-            .start_bifrost_with(&self.deployment.client(key), None)
-            .await
-            .expect("Bifrost starts");
+    /// Panics when the bundle does not load.
+    fn state_as(&self, client: WyrdClient) -> WyrdState {
+        WyrdState::from_path_with_client(self.bundle.path().join("bundle"), client)
+            .expect("bundle loads offline")
     }
 
     /// Wait until the `latency-drift` baseline has fitted.
@@ -145,7 +149,7 @@ impl Assistant {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_answer_passes_its_verifier() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
 
     let judgment = state
         .run_for_card("agent")
@@ -170,7 +174,7 @@ async fn agent_answer_passes_its_verifier() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_answer_fails_its_verifier() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
 
     let judgment = state
         .run_for_card("agent")
@@ -196,7 +200,7 @@ async fn agent_answer_fails_its_verifier() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn judged_answer_passes_the_llm_judge() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
 
     let judgment = state
         .run_for_card("agent")
@@ -221,6 +225,38 @@ async fn judged_answer_passes_the_llm_judge() {
     assistant.deployment.shutdown().await;
 }
 
+/// One hundred latencies spread like the healthy baseline's 0 to 99 ms pass
+/// the drift Verifier on the Model.
+///
+/// # Panics
+/// Panics when the baseline does not fit, the verify fails, or the judgment
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn model_latency_like_the_baseline_passes_its_verifier() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    assistant.wait_for_baseline().await;
+    let healthy = (0..100)
+        .map(|row| Latency {
+            latency: (row * 37) % 100,
+        })
+        .collect::<Vec<_>>();
+
+    let judgment = state
+        .run_for_card("model")
+        .expect("model run opens")
+        .observe()
+        .verify("latency-drift", &healthy)
+        .await
+        .expect("the latencies are judged");
+
+    assert!(judgment.passed());
+    assert_eq!(judgment.kind, VerifierKind::DriftPsi);
+    assert_eq!(&judgment.subject, state.card_ref("model").expect("model"));
+    assistant.deployment.shutdown().await;
+}
+
 /// Latencies all at the slow end of the baseline drift, and the drift
 /// Verifier judges the Model failed on its one feature.
 ///
@@ -231,7 +267,7 @@ async fn judged_answer_passes_the_llm_judge() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn model_latency_drift_is_judged_failed() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
     assistant.wait_for_baseline().await;
     let slow = (0..100)
         .map(|_| Latency { latency: 99 })
@@ -270,12 +306,13 @@ async fn verify_before_baseline_ready_is_refused() {
     let cards = assistant.deployment.cards();
     let unfitted = register(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
     let bundle = hydrate(&cards, &unfitted.root).await;
-    let state = WyrdState::from_path(&bundle.path().join("bundle")).expect("bundle loads");
-    let key = assistant
-        .deployment
-        .service_key(&unfitted.root, &["admin"])
-        .await;
-    assistant.start_bifrost(&state, &key).await;
+    let key = assistant.deployment.service_key(&unfitted.root).await;
+    let state = WyrdState::from_path_with_client(
+        bundle.path().join("bundle"),
+        assistant.deployment.client(&key),
+    )
+    .expect("bundle loads");
+    state.start_bifrost().await.expect("Bifrost starts");
     let tiers = (0..5)
         .map(|_| json!({ "tier": "gold" }))
         .collect::<Vec<_>>();
@@ -300,7 +337,7 @@ async fn verify_before_baseline_ready_is_refused() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn unbound_verifier_fails_locally() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
 
     let refused = state
         .run_for_card("agent")
@@ -314,7 +351,30 @@ async fn unbound_verifier_fails_locally() {
     assistant.deployment.shutdown().await;
 }
 
-/// A principal without `evals:run` cannot verify.
+/// A list where the Verifier judges one answer fails before any call.
+///
+/// # Panics
+/// Panics when the verify succeeds or is refused with another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn input_of_the_wrong_shape_fails_locally() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+
+    let refused = state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("answer-is-yes", &[Answer { answer: "yes" }])
+        .await
+        .expect_err("a list is not one answer");
+
+    assert_eq!(refused.code(), "WYRD_SDK_400_INVALID_OBSERVATION");
+    assistant.deployment.shutdown().await;
+}
+
+/// A state created with a machine principal holding only the `workload`
+/// Role, which grants no `evals:run`, cannot verify.
 ///
 /// # Panics
 /// Panics when the verify succeeds or is refused with another code.
@@ -322,7 +382,11 @@ async fn unbound_verifier_fails_locally() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn caller_without_evals_run_is_refused() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&[]).await;
+    let workload = assistant
+        .deployment
+        .key("workload_only", &["workload"])
+        .await;
+    let state = assistant.state_as(assistant.deployment.client(&workload));
 
     let refused = state
         .run_for_card("agent")
@@ -344,13 +408,12 @@ async fn caller_without_evals_run_is_refused() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn another_tenant_cannot_verify_the_assistant() {
     let assistant = Assistant::start().await;
-    let state =
-        WyrdState::from_path(&assistant.bundle.path().join("bundle")).expect("bundle loads");
     let foreign = assistant
         .deployment
         .other_tenant_admin("other-tenant")
         .await;
-    assistant.start_bifrost(&state, &foreign).await;
+    let state = assistant.state_as(assistant.deployment.client(&foreign));
+    state.start_bifrost().await.expect("Bifrost starts");
 
     let refused = state
         .run_for_card("agent")
@@ -372,7 +435,7 @@ async fn another_tenant_cannot_verify_the_assistant() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn verify_records_no_observation() {
     let assistant = Assistant::start().await;
-    let state = assistant.state(&["admin"]).await;
+    let state = assistant.state().await;
     let run = state.run_for_card("agent").expect("agent run opens");
 
     run.observe()
@@ -387,7 +450,9 @@ async fn verify_records_no_observation() {
         .await
         .expect("rows publish");
 
-    let observed = Bifrost::query_only(&assistant.deployment.admin())
+    let observed = Bifrost::connect(&assistant.deployment.admin())
+        .await
+        .expect("Bifrost connects")
         .sql(
             "SELECT record_id FROM vala.eval.observations WHERE run_id = $1",
             &[QueryParam::String(run.run_id().to_string())],

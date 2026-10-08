@@ -6,17 +6,18 @@ the session ``WyrdTestServer`` exports; each story writes its own fixed
 """
 
 import asyncio
-import json
 from pathlib import Path
 
 import pyarrow
 import pytest
 from pydantic import BaseModel, ValidationError
 from wyrd import WyrdError
-from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
+from wyrd.bifrost import AsyncBifrost, Bifrost, QueryTerminal, TableConfig
 from wyrd.client import WyrdClient
 from wyrd.observe import record
 from wyrd.testing import WyrdTestServer
+
+pytestmark = pytest.mark.integration
 
 
 class Item(BaseModel):
@@ -57,16 +58,17 @@ def items(bifrost: Bifrost, table: str) -> list[Item]:
 @pytest.fixture(scope="module")
 def inferences(wyrd_server: WyrdTestServer) -> str:
     """A published ``vala.datasets.inferences`` table holding ``INFERENCES``."""
-    writer = Bifrost(TableConfig(Inference, "vala.datasets.inferences"))
+    schema = Inference.model_json_schema()
+    writer = Bifrost(TableConfig.from_json_schema("vala.datasets.inferences", schema))
     assert writer.register() == "created"
     for row in INFERENCES:
         writer.insert(row)
     writer.shutdown()
+    # Publish the written rows to the Iceberg table the reads below query.
     wyrd_server.flush_bifrost()
     return "vala.datasets.inferences"
 
 
-@pytest.mark.integration
 def test_omitted_transport_resolves_from_the_environment(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
@@ -78,7 +80,6 @@ def test_omitted_transport_resolves_from_the_environment(
     assert items(bifrost, "vala.datasets.resolved") == [Item(id=1, value="resolved")]
 
 
-@pytest.mark.integration
 def test_no_resolvable_credential_raises(
     wyrd_server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -91,29 +92,28 @@ def test_no_resolvable_credential_raises(
     assert raised.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
 
 
-@pytest.mark.integration
 def test_insert_without_an_active_table_refuses(wyrd_server: WyrdTestServer) -> None:
     with pytest.raises(WyrdError) as raised:
         Bifrost().insert(Item(id=1, value="nowhere"))
     assert raised.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
 
 
-@pytest.mark.integration
 def test_recorded_telemetry_row_reads_back(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
     writer = Bifrost(TableConfig(Item, "vala.datasets.recorded"))
     assert writer.register() == "created"
-    record(
-        writer,
-        "vala.datasets.recorded",
-        json.dumps(Item.model_json_schema()),
-        Item(id=1, value="recorded").model_dump_json(),
-    )
+    record(writer, "vala.datasets.recorded", Item, Item(id=1, value="recorded"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
+    assert writer.dropped == 0
     assert items(bifrost, "vala.datasets.recorded") == [Item(id=1, value="recorded")]
 
 
-@pytest.mark.integration
+def test_recorded_telemetry_with_an_unmappable_schema_is_refused(bifrost: Bifrost) -> None:
+    with pytest.raises(WyrdError) as raised:
+        record(bifrost, "vala.datasets.recorded", {"type": "object"}, {"id": 1})
+    assert raised.value.code == "WYRD_VALA_400_SCHEMA_PARSE"
+
+
 def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
     writer = Bifrost(TableConfig(Item, "vala.datasets.journey"))
     assert writer.register() == "created"
@@ -132,7 +132,6 @@ def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bi
     ]
 
 
-@pytest.mark.integration
 def test_swapped_away_table_still_drains(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
     for table in ("vala.datasets.swap_from", "vala.datasets.swap_to"):
         assert Bifrost(TableConfig(Item, table)).register() == "created"
@@ -146,7 +145,6 @@ def test_swapped_away_table_still_drains(wyrd_server: WyrdTestServer, bifrost: B
     assert items(bifrost, "vala.datasets.swap_to") == [Item(id=2, value="after")]
 
 
-@pytest.mark.integration
 def test_sql_and_stream_return_the_same_rows(bifrost: Bifrost, inferences: str) -> None:
     query = f"SELECT call_id FROM {inferences} ORDER BY call_id"
     collected = bifrost.sql(query).to_arrow().column("call_id").to_pylist()
@@ -154,7 +152,6 @@ def test_sql_and_stream_return_the_same_rows(bifrost: Bifrost, inferences: str) 
     assert collected == streamed == [1, 2, 3]
 
 
-@pytest.mark.integration
 def test_describe_binds_an_existing_table_without_restating_its_schema(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
@@ -168,7 +165,6 @@ def test_describe_binds_an_existing_table_without_restating_its_schema(
     assert items(bifrost, "vala.datasets.described") == [Item(id=6, value="described")]
 
 
-@pytest.mark.integration
 def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
     writer = Bifrost(TableConfig(Item, "vala.datasets.uncorrelated"))
     assert writer.register() == "created"
@@ -178,7 +174,6 @@ def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost:
     assert items(bifrost, "vala.datasets.uncorrelated") == [Item(id=8, value="uncorrelated")]
 
 
-@pytest.mark.integration
 def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
     writer = Bifrost(TableConfig(Item, "vala.datasets.bad_card_ref"))
     with pytest.raises(WyrdError) as raised:
@@ -186,14 +181,15 @@ def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
-@pytest.mark.integration
 def test_negative_empty_permissions_denied_rbac_on_write(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
     assert Bifrost(TableConfig(Item, "vala.datasets.denied")).register() == "created"
     denied = Bifrost(
         TableConfig(Item, "vala.datasets.denied"),
-        credential=wyrd_server.bootstrap_service([], name="bifrost-write-denied"),
+        client=WyrdClient(
+            credential=wyrd_server.bootstrap_service([], name="bifrost-write-denied")
+        ),
     )
     denied.insert(Item(id=999, value="denied"))
     with pytest.raises(WyrdError) as raised:
@@ -204,7 +200,6 @@ def test_negative_empty_permissions_denied_rbac_on_write(
     assert items(bifrost, "vala.datasets.denied") == []
 
 
-@pytest.mark.integration
 def test_registering_a_different_schema_on_one_name_conflicts(wyrd_server: WyrdTestServer) -> None:
     assert Bifrost(TableConfig(Item, "vala.datasets.conflict")).register() == "created"
     conflicting = Bifrost(TableConfig(Inference, "vala.datasets.conflict"))
@@ -216,7 +211,6 @@ def test_registering_a_different_schema_on_one_name_conflicts(wyrd_server: WyrdT
     assert table.resolved is None
 
 
-@pytest.mark.integration
 def test_compaction_target_registers_describes_and_conflicts(wyrd_server: WyrdTestServer) -> None:
     table, target = "vala.datasets.compaction_target", 256 * 1024 * 1024
 
@@ -232,7 +226,6 @@ def test_compaction_target_registers_describes_and_conflicts(wyrd_server: WyrdTe
     assert TableConfig.describe(table).compaction_target_file_size_bytes == target
 
 
-@pytest.mark.integration
 def test_compaction_type_registers_describes_and_conflicts(wyrd_server: WyrdTestServer) -> None:
     table = "vala.datasets.compaction_type"
 
@@ -248,7 +241,6 @@ def test_compaction_type_registers_describes_and_conflicts(wyrd_server: WyrdTest
     assert TableConfig.describe(table).compaction_type == "small-files"
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     "query",
     [
@@ -263,7 +255,6 @@ def test_query_outside_the_read_floor_is_refused(bifrost: Bifrost, query: str) -
     assert raised.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
 
 
-@pytest.mark.integration
 def test_read_back_as_arrow_pandas_and_polars(bifrost: Bifrost, inferences: str) -> None:
     result = bifrost.sql(
         f"SELECT call_id, model, tokens, latency_ms, status FROM {inferences} ORDER BY call_id"
@@ -272,9 +263,11 @@ def test_read_back_as_arrow_pandas_and_polars(bifrost: Bifrost, inferences: str)
     assert result.to_arrow().to_pylist() == expected
     assert result.to_pandas().to_dict(orient="records") == expected
     assert result.to_polars().to_dicts() == expected
+    assert result.num_rows == len(result) == len(INFERENCES)
+    assert result.schema.names == ["call_id", "model", "tokens", "latency_ms", "status"]
+    assert pyarrow.Table.from_batches(result.batches, result.schema).to_pylist() == expected
 
 
-@pytest.mark.integration
 def test_sql_returns_model_instances_when_a_model_is_supplied(
     bifrost: Bifrost, inferences: str
 ) -> None:
@@ -290,7 +283,6 @@ def test_sql_returns_model_instances_when_a_model_is_supplied(
         bifrost.sql(f"SELECT call_id FROM {inferences}", model=MistypedInference)
 
 
-@pytest.mark.integration
 def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
@@ -320,8 +312,22 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     assert items(bifrost, "vala.datasets.delegated") == [Item(id=1, value="as-a")]
 
 
-@pytest.mark.integration
-def test_client_cannot_be_combined_with_transport_options(wyrd_server: WyrdTestServer) -> None:
+def test_async_stream_yields_arrow_batches_and_a_terminal(inferences: str) -> None:
+    async def stream() -> tuple[list[pyarrow.RecordBatch], QueryTerminal | None]:
+        batches = await AsyncBifrost().stream(f"SELECT call_id FROM {inferences} ORDER BY call_id")
+        return [batch async for batch in batches], batches.terminal
+
+    batches, terminal = asyncio.run(stream())
+    assert [id for batch in batches for id in batch.column("call_id").to_pylist()] == [1, 2, 3]
+    assert terminal is not None
+    assert (terminal.outcome, terminal.row_count) == ("success", 3)
+
+
+@pytest.mark.parametrize("deadline_ms", [0, 2**32])
+def test_out_of_range_deadline_is_refused(wyrd_server: WyrdTestServer, deadline_ms: int) -> None:
+    async def stream() -> None:
+        await AsyncBifrost().stream("SELECT 1", deadline_ms=deadline_ms)
+
     with pytest.raises(WyrdError) as raised:
-        Bifrost(client=WyrdClient(), credential=wyrd_server.api_key)
-    assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
+        asyncio.run(stream())
+    assert raised.value.code == "WYRD_VALA_400_QUERY_INVALID_DEADLINE"

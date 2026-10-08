@@ -5,44 +5,24 @@
 //! and a key, the way a user's process is configured. Cards come only from the
 //! repository-root `fixtures/` tree ([`fixture`]).
 //!
-//! Some SDK and CLI calls resolve their server and credential only from the
-//! ambient process environment, which a multithreaded test cannot set without
-//! `unsafe`. [`Deployment::run_child`] runs one test of this binary again as a
-//! child process whose environment is the deployment's; inside it
-//! [`is_child`] is true and [`report`] hands one JSON value back to the parent.
+//! The test process carries no Wyrd configuration of its own: a test acting
+//! as some principal builds that principal's client with
+//! [`Deployment::client`] and passes it to the SDK or CLI call explicitly.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use secrecy::ExposeSecret;
-use serde_json::Value;
+use secrecy::{ExposeSecret, SecretString};
 use wyrd_sdk::WyrdClient;
-use wyrd_sdk::bifrost::client_from_options;
-use wyrd_sdk::cards::{
-    CardGraphHydrator, CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt,
-};
+use wyrd_sdk::cards::{CardRef, CardSelector, Cards, HydrationMode, RegistrationReceipt};
+use wyrd_sdk::cli;
+use wyrd_sdk::config::ClientConfig;
+use wyrd_sdk::transport::{GrpcConfig, HttpConfig};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
-
-/// Environment variable that marks a process as a [`Deployment::run_child`] child.
-const CHILD: &str = "WYRD_JOURNEY_CHILD";
-
-/// Prefix of the one stdout line on which a child [`report`]s its outcome.
-const OUTCOME: &str = "WYRD_JOURNEY_OUTCOME ";
 
 /// Path of a checked-in file under the repository-root `fixtures/` tree.
 pub fn fixture(relative: &str) -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures")).join(relative)
-}
-
-/// Whether this process is a [`Deployment::run_child`] child.
-pub fn is_child() -> bool {
-    std::env::var_os(CHILD).is_some()
-}
-
-/// Hand `outcome` from a child back to the parent's [`Deployment::run_child`].
-pub fn report(outcome: &Value) {
-    println!("{OUTCOME}{outcome}");
 }
 
 /// Return the plaintext API key of a machine principal.
@@ -78,9 +58,7 @@ impl Deployment {
     /// # Panics
     /// Panics when the server cannot start or bootstrap its administrator.
     pub async fn start_with(builder: WyrdTestServerBuilder) -> Self {
-        let server = Box::pin(builder.start_bound())
-            .await
-            .expect("test server starts");
+        let server = builder.start_bound().await.expect("test server starts");
         let admin_key = api_key(
             server
                 .bootstrap_service("journey_admin", &["admin"])
@@ -97,15 +75,29 @@ impl Deployment {
 
     /// A client of this deployment that authenticates with `key`.
     ///
+    /// Built through the public `WyrdClient::with_config` spelling: the
+    /// explicit credential is tier 0 of the chain, so no ambient credential
+    /// can replace it.
+    ///
     /// # Panics
     /// Panics when the client cannot be assembled.
     pub fn client(&self, key: &str) -> WyrdClient {
-        let grpc = self.server.grpc_url().expect("bound server has a gRPC URL");
-        client_from_options(
-            Some(self.server.base_url().expect("bound server has a URL")),
-            Some(key),
-            Some(&grpc),
-        )
+        WyrdClient::with_config(ClientConfig {
+            http: HttpConfig {
+                base_url: self
+                    .server
+                    .base_url()
+                    .expect("bound server has a URL")
+                    .to_owned(),
+                ..HttpConfig::default()
+            },
+            grpc: GrpcConfig {
+                endpoint: self.server.grpc_url().expect("bound server has a gRPC URL"),
+                ..GrpcConfig::default()
+            },
+            credential: Some(SecretString::from(key)),
+            ..ClientConfig::default()
+        })
         .expect("client builds")
     }
 
@@ -151,18 +143,31 @@ impl Deployment {
         self.key(name, &[name]).await
     }
 
-    /// Mint a key for the principal registration projected for the Service
-    /// `card`, granting `roles` beyond the `workload` role it already holds.
+    /// Issue a key for the principal registration projected for the Service
+    /// `card`, as the administrator through the `wyrd auth issue-key` CLI
+    /// function, and return its plaintext.
+    ///
+    /// The key holds exactly the default `wyrd_default` Role every Service
+    /// principal starts with; nothing is granted beyond it.
     ///
     /// # Panics
-    /// Panics when `card` projected no principal.
-    pub async fn service_key(&self, card: &CardRef, roles: &[&str]) -> String {
-        api_key(
-            self.server
-                .credential_registered_service(card, roles)
-                .await
-                .expect("registered Service is credentialed"),
+    /// Panics when the CLI refuses to issue the key.
+    pub async fn service_key(&self, card: &CardRef) -> String {
+        let [kind, name, version, space] = coordinates(card);
+        cli::issue_key(
+            &kind,
+            &name,
+            &version,
+            &space,
+            None,
+            None,
+            Some(self.admin()),
         )
+        .await
+        .expect("the CLI issues the Service key")
+        .key
+        .expose()
+        .to_owned()
     }
 
     /// Bootstrap an administrator in a new tenant `slug` and return its key.
@@ -179,56 +184,6 @@ impl Deployment {
         )
     }
 
-    /// Run `test` (`module::name`) of this binary as a child process whose
-    /// environment is this deployment, authenticated with `key`, plus `env`,
-    /// and return the value the child [`report`]ed, or `Null`.
-    ///
-    /// The child sees only `WYRD_SERVER_URL`, `WYRD_GRPC_URL`, `WYRD_API_KEY`,
-    /// and an empty client configuration home, the way a user's shell runs a
-    /// script against the deployment.
-    ///
-    /// # Panics
-    /// Panics when the child cannot run, fails, or runs no test.
-    pub async fn run_child(&self, test: &str, key: &str, env: &[(&str, &str)]) -> Value {
-        let config_home = wyrd_testing::human_login::private_config_home();
-        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
-        command
-            .args([test, "--exact", "--include-ignored", "--nocapture"])
-            .env(CHILD, "1")
-            .env(
-                "WYRD_SERVER_URL",
-                self.server.base_url().expect("bound server has a URL"),
-            )
-            .env(
-                "WYRD_GRPC_URL",
-                self.server.grpc_url().expect("bound server has a gRPC URL"),
-            )
-            .env("WYRD_API_KEY", key)
-            .env("WYRD_CONFIG_HOME", config_home.path())
-            .env_remove("WYRD_ACCESS_TOKEN")
-            .env_remove("WYRD_WORKLOAD_TOKEN")
-            .env_remove("WYRD_TENANT")
-            .envs(env.iter().copied());
-        let output = tokio::task::spawn_blocking(move || command.output())
-            .await
-            .expect("child joins")
-            .expect("child starts");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // libtest exits 0 when `--exact` selects nothing; "1 passed" proves
-        // the child actually ran.
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "child {test} failed:\n{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(OUTCOME))
-            .map_or(Value::Null, |line| {
-                serde_json::from_str(line).expect("child outcome is JSON")
-            })
-    }
-
     /// Stop the server.
     ///
     /// # Panics
@@ -241,12 +196,26 @@ impl Deployment {
     }
 }
 
+/// The `kind`, `name`, `version`, and `space` arguments the card-selecting
+/// CLI functions take for `card`; an unpinned space is `default`.
+pub fn coordinates(card: &CardRef) -> [String; 4] {
+    [
+        card.kind.wire_name().to_owned(),
+        card.name.as_str().to_owned(),
+        card.version.to_string(),
+        card.space
+            .as_ref()
+            .map_or_else(|| "default".to_owned(), ToString::to_string),
+    ]
+}
+
 /// Register the fixture at `relative` through `cards`.
 ///
 /// # Panics
 /// Panics when registration is refused.
 pub async fn register(cards: &Cards, relative: &str) -> RegistrationReceipt {
-    Box::pin(cards.register_from_path(&fixture(relative)))
+    cards
+        .register_from_path(&fixture(relative))
         .await
         .unwrap_or_else(|error| panic!("{relative} registers: {error}"))
 }
@@ -272,12 +241,13 @@ pub fn registered(receipt: &RegistrationReceipt, name: &str) -> CardRef {
 /// Panics when hydration fails.
 pub async fn hydrate(cards: &Cards, root: &CardRef) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("bundle directory creates");
-    Box::pin(CardGraphHydrator::new(cards.registry_context()).hydrate(
-        &CardSelector::exact(root.clone()),
-        &dir.path().join("bundle"),
-        HydrationMode::Complete,
-    ))
-    .await
-    .expect("graph hydrates");
+    cards
+        .hydrate(
+            CardSelector::exact(root.clone()),
+            dir.path().join("bundle"),
+            HydrationMode::Complete,
+        )
+        .await
+        .expect("graph hydrates");
     dir
 }

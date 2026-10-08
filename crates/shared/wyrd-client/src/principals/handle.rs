@@ -35,6 +35,10 @@ impl Debug for Principals {
 
 impl Principals {
     /// Construct a handle around an already assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every request is sent through, as
+    ///   its principal.
     #[must_use]
     pub fn with_client(client: WyrdClient) -> Self {
         Self {
@@ -42,16 +46,17 @@ impl Principals {
         }
     }
 
-    /// Construct a handle from the ambient client configuration.
+    /// Construct a handle from the ambient client, as
+    /// [`WyrdClient::from_global`] resolves it.
     ///
     /// No network call or token exchange happens here; the first request does
     /// the exchange.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the local configuration or credential cannot
-    /// be resolved.
+    /// Returns a Wyrd error when the global config file cannot be read or
+    /// parsed, or when no credential can be resolved.
     pub fn from_env() -> Result<Self, WyrdError> {
-        let client = WyrdClient::from_env().map_err(WyrdError::from)?;
+        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
         Ok(Self::with_client(client))
     }
 
@@ -65,6 +70,10 @@ impl Principals {
     /// The returned credential is the only time its plaintext exists outside
     /// the server. Store it before dropping the response.
     ///
+    /// # Arguments
+    /// * `request` - The principal's name, the tenant roles it is granted, and an
+    ///   optional description.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks principal administration, a
     /// requested role does not exist in the tenant, or the server rejects the
@@ -74,6 +83,7 @@ impl Principals {
         request: &CreateServicePrincipalRequest,
     ) -> Result<CreateServicePrincipalResponse, WyrdError> {
         self.client
+            .http
             .request_json(Method::POST, "/v1/principals", Some(request))
             .await
     }
@@ -83,6 +93,9 @@ impl Principals {
     /// The first half of a rotation: the principal now holds two live
     /// credentials, so the old one can be retired once the new one is verified.
     ///
+    /// # Arguments
+    /// * `principal_id` - The principal the new credential is issued for.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized or the principal is
     /// unknown in this tenant.
@@ -91,6 +104,7 @@ impl Principals {
         principal_id: &PrincipalId,
     ) -> Result<IssuedCredential, WyrdError> {
         self.client
+            .http
             .request_json::<(), _>(
                 Method::POST,
                 &format!("/v1/principals/{principal_id}/credentials"),
@@ -105,6 +119,9 @@ impl Principals {
     /// mid-rotation needs to see that the superseded one really is gone. No
     /// secret material is ever returned.
     ///
+    /// # Arguments
+    /// * `principal_id` - The principal whose credentials are listed.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized or the read fails.
     pub async fn list_credentials(
@@ -112,6 +129,7 @@ impl Principals {
         principal_id: &PrincipalId,
     ) -> Result<CredentialListResponse, WyrdError> {
         self.client
+            .http
             .request_json::<(), _>(
                 Method::GET,
                 &format!("/v1/principals/{principal_id}/credentials"),
@@ -129,6 +147,10 @@ impl Principals {
     /// when the identity is compromised, not when a credential is merely being
     /// rotated.
     ///
+    /// # Arguments
+    /// * `principal_id` - The principal to suspend.
+    /// * `request` - The principal's kind and the recorded revocation reason.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks principal administration or
     /// the principal is unknown in this tenant.
@@ -138,6 +160,7 @@ impl Principals {
         request: &RevokePrincipalRequest,
     ) -> Result<(), WyrdError> {
         self.client
+            .http
             .request_json(
                 Method::POST,
                 &format!("/v1/principals/{principal_id}/revoke"),
@@ -150,6 +173,10 @@ impl Principals {
     ///
     /// The principal is named as well as the credential so a credential id
     /// alone cannot retire a credential belonging to a different principal.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The principal that owns the credential.
+    /// * `credential_id` - The credential to revoke.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller is unauthorized or the credential
@@ -165,6 +192,7 @@ impl Principals {
         // answers with decodes as the unit type: revocation's only outcome
         // worth reporting is whether it happened.
         self.client
+            .http
             .request_json::<(), ()>(
                 Method::DELETE,
                 &format!("/v1/principals/{principal_id}/credentials/{credential_id}"),

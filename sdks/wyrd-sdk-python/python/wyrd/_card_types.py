@@ -2,51 +2,47 @@
 
 from __future__ import annotations
 
-from typing import Literal, TypeAlias, TypedDict
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypeAlias
 
 JsonValue: TypeAlias = "str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]"
 
 
-class AgentRunConfigSpec(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AgentRunConfigSpec:
     """Pure-serde mirror of the Skald agent run configuration."""
 
-    max_iterations: int | None
-    session_recent_limit: int | None
-    timeout_ms: int | None
-    tool_concurrency_cap: int | None
+    max_iterations: int | None = None
+    session_recent_limit: int | None = None
+    timeout_ms: int | None = None
+    tool_concurrency_cap: int | None = None
 
 
-class _AgentSpecRequired(TypedDict):
-    """Required keys of `AgentSpec`."""
-
-    prompt: InlineableRef_for_Prompt
-
-
-class AgentSpec(_AgentSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AgentSpec:
     """Agent authoring body inside a Wyrd Agent Card envelope."""
 
-    run_config: AgentRunConfigSpec
-    tool_names: list[str]
-    verified_by: list[VerificationBinding]
+    prompt: InlineableRef_for_Prompt
+    run_config: AgentRunConfigSpec | None = None
+    tool_names: list[str] = field(default_factory=list)
+    verified_by: list[VerificationBinding] = field(default_factory=list)
 
 
 # Validated value for free-form Card annotations.
 AnnotationValue: TypeAlias = "str"
 
 
-class _AnthropicCacheControlRequired(TypedDict):
-    """Required keys of `AnthropicCacheControl`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCacheControl:
+    """Generated Card schema type."""
 
+    ttl: str | None = None
     type: str
 
 
-class AnthropicCacheControl(_AnthropicCacheControlRequired, total=False):
-    """Generated Card schema type."""
-
-    ttl: str | None
-
-
-class AnthropicCitationToggle(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationToggle:
     """Generated Card schema type."""
 
     enabled: bool
@@ -56,146 +52,110 @@ class AnthropicCitationToggle(TypedDict):
 AnthropicCitationV1: TypeAlias = "AnthropicCitationV1CharLocation | AnthropicCitationV1PageLocation | AnthropicCitationV1ContentBlockLocation | AnthropicCitationV1WebSearchResultLocation | AnthropicCitationV1SearchResultLocation"
 
 
-class _AnthropicCitationV1CharLocationRequired(TypedDict):
-    """Required keys of `AnthropicCitationV1CharLocation`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationV1CharLocation:
+    """Generated Card schema type."""
 
     cited_text: str
     document_index: int
+    document_title: str | None = None
     end_char_index: int
     start_char_index: int
     type: Literal["char_location"]
 
 
-class AnthropicCitationV1CharLocation(_AnthropicCitationV1CharLocationRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationV1ContentBlockLocation:
     """Generated Card schema type."""
-
-    document_title: str | None
-
-
-class _AnthropicCitationV1ContentBlockLocationRequired(TypedDict):
-    """Required keys of `AnthropicCitationV1ContentBlockLocation`."""
 
     cited_text: str
     document_index: int
+    document_title: str | None = None
     end_block_index: int
     start_block_index: int
     type: Literal["content_block_location"]
 
 
-class AnthropicCitationV1ContentBlockLocation(
-    _AnthropicCitationV1ContentBlockLocationRequired, total=False
-):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationV1PageLocation:
     """Generated Card schema type."""
-
-    document_title: str | None
-
-
-class _AnthropicCitationV1PageLocationRequired(TypedDict):
-    """Required keys of `AnthropicCitationV1PageLocation`."""
 
     cited_text: str
     document_index: int
+    document_title: str | None = None
     end_page_number: int
     start_page_number: int
     type: Literal["page_location"]
 
 
-class AnthropicCitationV1PageLocation(_AnthropicCitationV1PageLocationRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationV1SearchResultLocation:
     """Generated Card schema type."""
-
-    document_title: str | None
-
-
-class _AnthropicCitationV1SearchResultLocationRequired(TypedDict):
-    """Required keys of `AnthropicCitationV1SearchResultLocation`."""
 
     cited_text: str
     end_block_index: int
     search_result_index: int
     source: str
     start_block_index: int
+    title: str | None = None
     type: Literal["search_result_location"]
 
 
-class AnthropicCitationV1SearchResultLocation(
-    _AnthropicCitationV1SearchResultLocationRequired, total=False
-):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicCitationV1WebSearchResultLocation:
     """Generated Card schema type."""
-
-    title: str | None
-
-
-class _AnthropicCitationV1WebSearchResultLocationRequired(TypedDict):
-    """Required keys of `AnthropicCitationV1WebSearchResultLocation`."""
 
     cited_text: str
+    encrypted_index: str | None = None
+    title: str | None = None
     type: Literal["web_search_result_location"]
     url: str
-
-
-class AnthropicCitationV1WebSearchResultLocation(
-    _AnthropicCitationV1WebSearchResultLocationRequired, total=False
-):
-    """Generated Card schema type."""
-
-    encrypted_index: str | None
-    title: str | None
 
 
 AnthropicContentBlock: TypeAlias = "AnthropicContentBlockText | AnthropicContentBlockImage | AnthropicContentBlockDocument | AnthropicContentBlockThinking | AnthropicContentBlockRedactedThinking | AnthropicContentBlockToolUse | AnthropicContentBlockToolResult"
 
 
-class _AnthropicContentBlockDocumentRequired(TypedDict):
-    """Required keys of `AnthropicContentBlockDocument`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockDocument:
+    """Generated Card schema type."""
 
+    cache_control: AnthropicCacheControl | None = None
+    citations: AnthropicCitationToggle | None = None
+    context: str | None = None
     source: AnthropicDocumentSource
+    title: str | None = None
     type: Literal["document"]
 
 
-class AnthropicContentBlockDocument(_AnthropicContentBlockDocumentRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockImage:
     """Generated Card schema type."""
 
-    cache_control: AnthropicCacheControl | None
-    citations: AnthropicCitationToggle | None
-    context: str | None
-    title: str | None
-
-
-class _AnthropicContentBlockImageRequired(TypedDict):
-    """Required keys of `AnthropicContentBlockImage`."""
-
+    cache_control: AnthropicCacheControl | None = None
     source: AnthropicImageSource
     type: Literal["image"]
 
 
-class AnthropicContentBlockImage(_AnthropicContentBlockImageRequired, total=False):
-    """Generated Card schema type."""
-
-    cache_control: AnthropicCacheControl | None
-
-
-class AnthropicContentBlockRedactedThinking(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockRedactedThinking:
     """Generated Card schema type."""
 
     data: str
     type: Literal["redacted_thinking"]
 
 
-class _AnthropicContentBlockTextRequired(TypedDict):
-    """Required keys of `AnthropicContentBlockText`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockText:
+    """Generated Card schema type."""
 
+    cache_control: AnthropicCacheControl | None = None
+    citations: list[AnthropicCitationV1] | None = None
     text: str
     type: Literal["text"]
 
 
-class AnthropicContentBlockText(_AnthropicContentBlockTextRequired, total=False):
-    """Generated Card schema type."""
-
-    cache_control: AnthropicCacheControl | None
-    citations: list[AnthropicCitationV1] | None
-
-
-class AnthropicContentBlockThinking(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockThinking:
     """Generated Card schema type."""
 
     signature: str
@@ -203,22 +163,19 @@ class AnthropicContentBlockThinking(TypedDict):
     type: Literal["thinking"]
 
 
-class _AnthropicContentBlockToolResultRequired(TypedDict):
-    """Required keys of `AnthropicContentBlockToolResult`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockToolResult:
+    """Generated Card schema type."""
 
+    cache_control: AnthropicCacheControl | None = None
     content: AnthropicToolResultContent
+    is_error: bool | None = None
     tool_use_id: str
     type: Literal["tool_result"]
 
 
-class AnthropicContentBlockToolResult(_AnthropicContentBlockToolResultRequired, total=False):
-    """Generated Card schema type."""
-
-    cache_control: AnthropicCacheControl | None
-    is_error: bool | None
-
-
-class AnthropicContentBlockToolUse(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicContentBlockToolUse:
     """Generated Card schema type."""
 
     id: str
@@ -230,7 +187,8 @@ class AnthropicContentBlockToolUse(TypedDict):
 AnthropicDocumentSource: TypeAlias = "AnthropicDocumentSourceBase64 | AnthropicDocumentSourceUrl | AnthropicDocumentSourceFileId | AnthropicDocumentSourceText | AnthropicDocumentSourceContent"
 
 
-class AnthropicDocumentSourceBase64(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicDocumentSourceBase64:
     """Generated Card schema type."""
 
     data: str
@@ -238,21 +196,24 @@ class AnthropicDocumentSourceBase64(TypedDict):
     type: Literal["base64"]
 
 
-class AnthropicDocumentSourceContent(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicDocumentSourceContent:
     """Generated Card schema type."""
 
     content: list[AnthropicContentBlock]
     type: Literal["content"]
 
 
-class AnthropicDocumentSourceFileId(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicDocumentSourceFileId:
     """Generated Card schema type."""
 
     file_id: str
     type: Literal["file_id"]
 
 
-class AnthropicDocumentSourceText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicDocumentSourceText:
     """Generated Card schema type."""
 
     data: str
@@ -260,7 +221,8 @@ class AnthropicDocumentSourceText(TypedDict):
     type: Literal["text"]
 
 
-class AnthropicDocumentSourceUrl(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicDocumentSourceUrl:
     """Generated Card schema type."""
 
     type: Literal["url"]
@@ -272,7 +234,8 @@ AnthropicImageSource: TypeAlias = (
 )
 
 
-class AnthropicImageSourceBase64(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicImageSourceBase64:
     """Generated Card schema type."""
 
     data: str
@@ -280,52 +243,52 @@ class AnthropicImageSourceBase64(TypedDict):
     type: Literal["base64"]
 
 
-class AnthropicImageSourceFileId(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicImageSourceFileId:
     """Generated Card schema type."""
 
     file_id: str
     type: Literal["file_id"]
 
 
-class AnthropicImageSourceUrl(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicImageSourceUrl:
     """Generated Card schema type."""
 
     type: Literal["url"]
     url: str
 
 
-class AnthropicMessage(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicMessage:
     """One Anthropic message."""
 
     content: list[AnthropicContentBlock]
     role: str
 
 
-class _AnthropicMessagesRequestRequired(TypedDict):
-    """Required keys of `AnthropicMessagesRequest`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicMessagesRequest:
+    """`POST /v1/messages`."""
 
     max_tokens: int
     messages: list[AnthropicMessage]
+    metadata: dict[str, JsonValue] | None = None
     model: str
+    output_config: AnthropicOutputConfig | None = None
+    stop_sequences: list[str] | None = None
+    stream: bool | None = None
+    system: AnthropicSystem | None = None
+    temperature: float | None = None
+    thinking: AnthropicThinkingConfig | None = None
+    tool_choice: JsonValue | None = None
+    tools: list[AnthropicTool] | None = None
+    top_k: int | None = None
+    top_p: float | None = None
 
 
-class AnthropicMessagesRequest(_AnthropicMessagesRequestRequired, total=False):
-    """`POST /v1/messages`."""
-
-    metadata: dict[str, JsonValue] | None
-    output_config: AnthropicOutputConfig | None
-    stop_sequences: list[str] | None
-    stream: bool | None
-    system: AnthropicSystem | None
-    temperature: float | None
-    thinking: AnthropicThinkingConfig | None
-    tool_choice: JsonValue
-    tools: list[AnthropicTool] | None
-    top_k: int | None
-    top_p: float | None
-
-
-class AnthropicOutputConfig(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicOutputConfig:
     """Anthropic `output_config` block on a `/v1/messages` request."""
 
     format: AnthropicOutputFormat
@@ -335,7 +298,8 @@ class AnthropicOutputConfig(TypedDict):
 AnthropicOutputFormat: TypeAlias = "AnthropicOutputFormatJsonSchema"
 
 
-class AnthropicOutputFormatJsonSchema(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicOutputFormatJsonSchema:
     """JSON schema enforced by Anthropic at generation time."""
 
     schema: JsonValue
@@ -347,47 +311,35 @@ AnthropicSystem: TypeAlias = "str | list[AnthropicSystemBlock]"
 AnthropicSystemBlock: TypeAlias = "AnthropicSystemBlockText"
 
 
-class _AnthropicSystemBlockTextRequired(TypedDict):
-    """Required keys of `AnthropicSystemBlockText`."""
+@dataclass(frozen=True, kw_only=True)
+class AnthropicSystemBlockText:
+    """Generated Card schema type."""
 
+    cache_control: AnthropicCacheControl | None = None
     text: str
     type: Literal["text"]
 
 
-class AnthropicSystemBlockText(_AnthropicSystemBlockTextRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicThinkingConfig:
     """Generated Card schema type."""
 
-    cache_control: AnthropicCacheControl | None
-
-
-class _AnthropicThinkingConfigRequired(TypedDict):
-    """Required keys of `AnthropicThinkingConfig`."""
-
+    budget_tokens: int | None = None
     type: str
 
 
-class AnthropicThinkingConfig(_AnthropicThinkingConfigRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class AnthropicTool:
     """Generated Card schema type."""
 
-    budget_tokens: int | None
-
-
-class _AnthropicToolRequired(TypedDict):
-    """Required keys of `AnthropicTool`."""
-
+    cache_control: AnthropicCacheControl | None = None
+    description: str | None = None
+    display_height_px: int | None = None
+    display_number: int | None = None
+    display_width_px: int | None = None
     input_schema: JsonValue
     name: str
-
-
-class AnthropicTool(_AnthropicToolRequired, total=False):
-    """Generated Card schema type."""
-
-    cache_control: AnthropicCacheControl | None
-    description: str | None
-    display_height_px: int | None
-    display_number: int | None
-    display_width_px: int | None
-    type: str | None
+    type: str | None = None
 
 
 AnthropicToolResultContent: TypeAlias = "str | list[AnthropicContentBlock]"
@@ -399,7 +351,8 @@ ApiVersion: TypeAlias = "str"
 ArrowFormat: TypeAlias = 'Literal["Ipc", "Parquet"]'
 
 
-class ArrowMeta(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ArrowMeta:
     """Arrow interface metadata."""
 
     format: ArrowFormat
@@ -413,47 +366,35 @@ CardKind: TypeAlias = 'Literal["Data", "Model", "Experiment", "Prompt", "Agent",
 CardName: TypeAlias = "str"
 
 
-class _CardRefRequired(TypedDict):
-    """Required keys of `CardRef`."""
+@dataclass(frozen=True, kw_only=True)
+class CardRef:
+    """Reference to a registered Card by kind, name, version, optional space, and optional UID."""
 
     kind: CardKind
     name: CardName
+    space: SpaceName | None = None
+    uid: CardUid | None = None
     version: VersionBlock
 
 
-class CardRef(_CardRefRequired, total=False):
-    """Reference to a registered Card by kind, name, version, optional space, and optional UID."""
-
-    space: SpaceName | None
-    uid: CardUid | None
-
-
-class _CardRelationshipRequired(TypedDict):
-    """Required keys of `CardRelationship`."""
-
-    ref: CardRef
-
-
-class CardRelationship(_CardRelationshipRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class CardRelationship:
     """One server-derived relationship edge."""
 
-    alias: str | None
+    alias: str | None = None
+    ref: CardRef
 
 
 # Resolved immutable Card UID.
 CardUid: TypeAlias = "str"
 
 
-class _CatboostMetaRequired(TypedDict):
-    """Required keys of `CatboostMeta`."""
-
-    framework_version: str
-
-
-class CatboostMeta(_CatboostMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class CatboostMeta:
     """Config for the Catboost model interface."""
 
-    model_subtype: str | None
+    framework_version: str
+    model_subtype: str | None = None
 
 
 # Literal value used by a column split predicate.
@@ -472,7 +413,8 @@ ComparisonOperator: TypeAlias = (
 )
 
 
-class ComponentSource(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ComponentSource:
     """Development-time local source resolved by `lock` or `install`."""
 
     kind: str
@@ -486,185 +428,186 @@ ConditionCombinator: TypeAlias = 'Literal["and", "or"]'
 ConnectionName: TypeAlias = "str"
 
 
-class CredentialRef(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class CredentialRef:
     """Reference to a credential or secret managed outside public Card specs."""
 
     name: str
     provider: str
 
 
-class _CustomDataMetaRequired(TypedDict):
-    """Required keys of `CustomDataMeta`."""
+@dataclass(frozen=True, kw_only=True)
+class CustomDataMeta:
+    """Custom Python loader metadata."""
 
+    extra: dict[str, str] = field(default_factory=dict)
     loader_class: str
     loader_module: str
 
 
-class CustomDataMeta(_CustomDataMetaRequired, total=False):
-    """Custom Python loader metadata."""
+@dataclass(frozen=True, kw_only=True)
+class CustomMeta:
+    """Config for the Custom model interface."""
 
-    extra: dict[str, str]
-
-
-class _CustomMetaRequired(TypedDict):
-    """Required keys of `CustomMeta`."""
-
+    extra: dict[str, str] = field(default_factory=dict)
     framework_version: str
     loader_class: str
     loader_module: str
-
-
-class CustomMeta(_CustomMetaRequired, total=False):
-    """Config for the Custom model interface."""
-
-    extra: dict[str, str]
-    model_subtype: str | None
+    model_subtype: str | None = None
 
 
 # Data source interface metadata.
 DataInterface: TypeAlias = "DataInterfacePandas | DataInterfacePolars | DataInterfaceArrow | DataInterfaceParquet | DataInterfaceNumpy | DataInterfaceTorch | DataInterfaceSql | DataInterfaceJsonl | DataInterfaceImage | DataInterfaceText | DataInterfaceHuggingface | DataInterfaceCustom"
 
 
-class DataInterfaceArrow(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceArrow:
     """PyArrow table saved as IPC or parquet."""
 
     kind: Literal["Arrow"]
     meta: ArrowMeta
 
 
-class DataInterfaceCustom(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceCustom:
     """Custom Python data loader."""
 
     kind: Literal["Custom"]
     meta: CustomDataMeta
 
 
-class DataInterfaceHuggingface(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceHuggingface:
     """Hugging Face dataset pointer or local dataset."""
 
     kind: Literal["Huggingface"]
     meta: HuggingfaceMeta
 
 
-class DataInterfaceImage(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceImage:
     """Image manifest data."""
 
     kind: Literal["Image"]
     meta: ImageMeta
 
 
-class DataInterfaceJsonl(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceJsonl:
     """JSON Lines data."""
 
     kind: Literal["Jsonl"]
     meta: JsonlMeta
 
 
-class DataInterfaceNumpy(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceNumpy:
     """NumPy array saved as NPY or NPZ."""
 
     kind: Literal["Numpy"]
     meta: NumpyMeta
 
 
-class DataInterfacePandas(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfacePandas:
     """Pandas dataframe saved as parquet by default."""
 
     kind: Literal["Pandas"]
     meta: PandasMeta
 
 
-class DataInterfaceParquet(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceParquet:
     """Existing parquet dataset or file."""
 
     kind: Literal["Parquet"]
     meta: ParquetMeta
 
 
-class DataInterfacePolars(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfacePolars:
     """Polars dataframe saved as parquet by default."""
 
     kind: Literal["Polars"]
     meta: PolarsMeta
 
 
-class DataInterfaceSql(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceSql:
     """SQL query bundle."""
 
     kind: Literal["Sql"]
     meta: SqlMeta
 
 
-class DataInterfaceText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceText:
     """Text manifest data."""
 
     kind: Literal["Text"]
     meta: TextMeta
 
 
-class DataInterfaceTorch(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataInterfaceTorch:
     """Torch tensor saved as safetensors or explicit pickle."""
 
     kind: Literal["Torch"]
     meta: TorchMeta
 
 
-class DataSchema(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class DataSchema:
     """Ordered data schema for DataCard interfaces."""
 
-    columns: list[FieldSpec]
+    columns: list[FieldSpec] = field(default_factory=list)
 
 
-class _DataSpecRequired(TypedDict):
-    """Required keys of `DataSpec`."""
-
-    interface: DataInterface
-    schema: DataSchema
-    stats: DataStats
-
-
-class DataSpec(_DataSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class DataSpec:
     """Pure-data contract for a Data Card."""
 
-    card_refs: list[Ref]
-    splits: dict[str, DataSplit]
-    sql: SqlLogic | None
-    target_columns: list[ColumnName]
+    card_refs: list[Ref] = field(default_factory=list)
+    interface: DataInterface
+    schema: DataSchema
+    splits: dict[str, DataSplit] = field(default_factory=dict)
+    sql: SqlLogic | None = None
+    stats: DataStats
+    target_columns: list[ColumnName] = field(default_factory=list)
 
 
-class DataSplit(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DataSplit:
     """Named DataCard split declaration."""
 
     label: SplitName
     strategy: SplitStrategy
 
 
-class _DataStatsRequired(TypedDict):
-    """Required keys of `DataStats`."""
-
-    byte_count: int
-    sha256: str
-
-
-class DataStats(_DataStatsRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class DataStats:
     """Storage and byte-level statistics for a DataCard source."""
 
-    col_count: int | None
-    row_count: int | None
+    byte_count: int
+    col_count: int | None = None
+    row_count: int | None = None
+    sha256: str
 
 
 # One dimension in a field shape.
 Dim: TypeAlias = "DimFixed | DimDynamic"
 
 
-class DimDynamic(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DimDynamic:
     """A dynamic dimension, optionally named for documentation and signatures."""
 
     kind: Literal["Dynamic"]
     value: str | None
 
 
-class DimFixed(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DimFixed:
     """A fixed, known dimension length."""
 
     kind: Literal["Fixed"]
@@ -680,20 +623,16 @@ DivergenceMetric: TypeAlias = 'Literal["kl", "js", "wasserstein"]'
 DriftBaselineState: TypeAlias = 'Literal["pending", "building", "ready", "failed"]'
 
 
-class _DriftBaselineStatusRequired(TypedDict):
-    """Required keys of `DriftBaselineStatus`."""
-
-    data: CardRef
-    state: DriftBaselineState
-
-
-class DriftBaselineStatus(_DriftBaselineStatusRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class DriftBaselineStatus:
     """Server-derived fitted-baseline status of a PSI or SPC Drift Verifier.
 
     Served on `card.status.verification.baseline`; it never mutates the authored spec.
     """
 
-    error: VerificationError | None
+    data: CardRef
+    error: VerificationError | None = None
+    state: DriftBaselineState
 
 
 # Fire condition for a drift observation.
@@ -702,21 +641,24 @@ DriftCondition: TypeAlias = (
 )
 
 
-class DriftConditionAbove(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftConditionAbove:
     """Fires when sample > limit."""
 
     kind: Literal["Above"]
     limit: float
 
 
-class DriftConditionBelow(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftConditionBelow:
     """Fires when sample < limit."""
 
     kind: Literal["Below"]
     limit: float
 
 
-class DriftConditionOutside(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftConditionOutside:
     """Fires when sample < lower or sample > upper."""
 
     kind: Literal["Outside"]
@@ -724,7 +666,8 @@ class DriftConditionOutside(TypedDict):
     upper: float
 
 
-class DriftConditionStatistical(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftConditionStatistical:
     """The method's profile decides, such as PSI threshold or SPC zone."""
 
     kind: Literal["Statistical"]
@@ -739,7 +682,8 @@ DriftMethod: TypeAlias = 'Literal["Psi", "Spc", "Custom"]'
 DriftProfile: TypeAlias = "DriftProfilePsi | DriftProfileSpc | DriftProfileCustom"
 
 
-class DriftProfileCustom(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftProfileCustom:
     """Custom profile configuration."""
 
     alert_threshold: float
@@ -748,21 +692,18 @@ class DriftProfileCustom(TypedDict):
     metric_name: str
 
 
-class _DriftProfilePsiRequired(TypedDict):
-    """Required keys of `DriftProfilePsi`."""
+@dataclass(frozen=True, kw_only=True)
+class DriftProfilePsi:
+    """PSI profile configuration."""
 
     binning_strategy: PsiBinningStrategy
+    categorical_features: list[FeatureName] = field(default_factory=list)
     kind: Literal["Psi"]
     threshold: PsiThreshold
 
 
-class DriftProfilePsi(_DriftProfilePsiRequired, total=False):
-    """PSI profile configuration."""
-
-    categorical_features: list[FeatureName]
-
-
-class DriftProfileSpc(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftProfileSpc:
     """SPC profile configuration."""
 
     kind: Literal["Spc"]
@@ -773,7 +714,8 @@ class DriftProfileSpc(TypedDict):
 DriftSignal: TypeAlias = "DriftSignalDistribution | DriftSignalMetric"
 
 
-class DriftSignalDistribution(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftSignalDistribution:
     """PSI or SPC over a baseline dataset."""
 
     baseline_ref: Ref
@@ -781,47 +723,40 @@ class DriftSignalDistribution(TypedDict):
     kind: Literal["Distribution"]
 
 
-class DriftSignalMetric(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class DriftSignalMetric:
     """Named scalar emitted by the subject's runtime."""
 
     kind: Literal["Metric"]
     name: str
 
 
-class _DriftSpecRequired(TypedDict):
-    """Required keys of `DriftSpec`."""
-
-    condition: DriftCondition
-    method: DriftMethod
-    signal: DriftSignal
-
-
-class DriftSpec(_DriftSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class DriftSpec:
     """Drift Verifier implementation spec body.
 
     Reached only as `implementation.spec` on a `Verifier` Card; `drift` is an implementation discriminator, never an envelope `kind`.
     """
 
-    description: str | None
-    profile: DriftProfile | None
+    condition: DriftCondition
+    description: str | None = None
+    method: DriftMethod
+    profile: DriftProfile | None = None
+    signal: DriftSignal
 
 
-class _EvalConditionRequired(TypedDict):
-    """Required keys of `EvalCondition`."""
-
-    expected: JsonValue
-    operator: ComparisonOperator
-    path: JsonPath
-
-
-class EvalCondition(_EvalConditionRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class EvalCondition:
     """A typed predicate evaluated against one JSON value extracted from workflow context or scenario payload.
 
     To chain conditions, set both [`EvalCondition::combinator`] and [`EvalCondition::subsequent`]. The whole chain is evaluated left-to-right with `AND` short-circuit on false and `OR` short-circuit on true.
     """
 
-    combinator: ConditionCombinator | None
-    subsequent: EvalCondition | None
+    combinator: ConditionCombinator | None = None
+    expected: JsonValue
+    operator: ComparisonOperator
+    path: JsonPath
+    subsequent: EvalCondition | None = None
 
 
 # Declares how `vala-eval` populates [`AssertionResult::actual`] when writing result rows to `eval_task_results`.
@@ -839,20 +774,23 @@ EvalPassGate: TypeAlias = (
 )
 
 
-class EvalPassGateAllPass(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalPassGateAllPass:
     """Pass iff every task passes."""
 
     kind: Literal["all_pass"]
 
 
-class EvalPassGateOverallPassRate(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalPassGateOverallPassRate:
     """Pass iff `(passed_tasks / total_tasks) >= threshold`."""
 
     kind: Literal["overall_pass_rate"]
     threshold: float
 
 
-class EvalPassGatePerJudgePassRate(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalPassGatePerJudgePassRate:
     """Pass iff the minimum per-task pass rate across **all** tasks meets the threshold.
 
     Computed as `min(pass_rate per task across all subjects)`. A task that never appears scores 0.0. This is task-level, not judge-type-level — `LlmJudge` and other task types all contribute equally.
@@ -870,7 +808,8 @@ EvalSampling: TypeAlias = (
 )
 
 
-class EvalSamplingDeterministicByHash(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalSamplingDeterministicByHash:
     """Deterministic 1-in-N selection by hashing a stable key path."""
 
     bucket: int
@@ -879,27 +818,24 @@ class EvalSamplingDeterministicByHash(TypedDict):
     modulus: int
 
 
-class EvalSamplingEveryNth(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalSamplingEveryNth:
     """Every Nth record."""
 
     kind: Literal["every_nth"]
     n: int
 
 
-class EvalSamplingRatio(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class EvalSamplingRatio:
     """Probabilistic selection."""
 
     kind: Literal["ratio"]
     ratio: float
 
 
-class _EvalSpecRequired(TypedDict):
-    """Required keys of `EvalSpec`."""
-
-    tasks: dict[str, EvalTask]
-
-
-class EvalSpec(_EvalSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class EvalSpec:
     """The typed spec body of an `eval` Verifier implementation.
 
     This struct does not carry a discriminator; the enclosing `VerifierImplementation` union supplies the `implementation.kind: eval` and `implementation.spec: { ... }` wire shape on a `Verifier` Card.
@@ -909,11 +845,12 @@ class EvalSpec(_EvalSpecRequired, total=False):
     This struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.
     """
 
-    context_capture: EvalContextCapture | None
-    dataset: Ref | None
-    pass_gate: EvalPassGate | None
-    sampling: EvalSampling | None
-    workflow: Workflow | None
+    context_capture: EvalContextCapture | None = None
+    dataset: Ref | None = None
+    pass_gate: EvalPassGate | None = None
+    sampling: EvalSampling | None = None
+    tasks: dict[str, EvalTask]
+    workflow: Workflow | None = None
 
 
 # One task in an `EvalSpec` DAG. Adjacently-tagged on the wire by `"kind"`; the inner record fields live alongside.
@@ -922,9 +859,12 @@ EvalTask: TypeAlias = (
 )
 
 
-class _EvalTaskAgentAssertionRequired(TypedDict):
-    """Required keys of `EvalTaskAgentAssertion`."""
+@dataclass(frozen=True, kw_only=True)
+class EvalTaskAgentAssertion:
+    """Assertion over the assembled GenAI workflow envelope."""
 
+    condition: EvalCondition | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
     expected: JsonValue
     id: TaskId
     kind: Literal["agent_assertion"]
@@ -932,53 +872,41 @@ class _EvalTaskAgentAssertionRequired(TypedDict):
     workflow_field_path: JsonPath
 
 
-class EvalTaskAgentAssertion(_EvalTaskAgentAssertionRequired, total=False):
-    """Assertion over the assembled GenAI workflow envelope."""
+@dataclass(frozen=True, kw_only=True)
+class EvalTaskAssertion:
+    """Programmatic assertion against the workflow context."""
 
-    condition: EvalCondition | None
-    depends_on: list[TaskId]
-
-
-class _EvalTaskAssertionRequired(TypedDict):
-    """Required keys of `EvalTaskAssertion`."""
-
+    condition: EvalCondition | None = None
+    context_path: JsonPath | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
     expected: JsonValue
     id: TaskId
+    item_context_path: JsonPath | None = None
     kind: Literal["assertion"]
     operator: ComparisonOperator
 
 
-class EvalTaskAssertion(_EvalTaskAssertionRequired, total=False):
-    """Programmatic assertion against the workflow context."""
+@dataclass(frozen=True, kw_only=True)
+class EvalTaskLlmJudge:
+    """LLM-as-judge evaluation via a `Prompt` card."""
 
-    condition: EvalCondition | None
-    context_path: JsonPath | None
-    depends_on: list[TaskId]
-    item_context_path: JsonPath | None
-
-
-class _EvalTaskLlmJudgeRequired(TypedDict):
-    """Required keys of `EvalTaskLlmJudge`."""
-
+    condition: EvalCondition | None = None
+    context_path: JsonPath | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
     expected: JsonValue
     id: TaskId
     judge_ref: InlineableRef_for_AgentSpec
     kind: Literal["llm_judge"]
+    max_retries: int | None = None
     operator: ComparisonOperator
 
 
-class EvalTaskLlmJudge(_EvalTaskLlmJudgeRequired, total=False):
-    """LLM-as-judge evaluation via a `Prompt` card."""
+@dataclass(frozen=True, kw_only=True)
+class EvalTaskTraceAssertion:
+    """Assertion over the assembled OTel trace document."""
 
-    condition: EvalCondition | None
-    context_path: JsonPath | None
-    depends_on: list[TaskId]
-    max_retries: int
-
-
-class _EvalTaskTraceAssertionRequired(TypedDict):
-    """Required keys of `EvalTaskTraceAssertion`."""
-
+    condition: EvalCondition | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
     expected: JsonValue
     id: TaskId
     kind: Literal["trace_assertion"]
@@ -986,94 +914,87 @@ class _EvalTaskTraceAssertionRequired(TypedDict):
     span_selector: JsonPath
 
 
-class EvalTaskTraceAssertion(_EvalTaskTraceAssertionRequired, total=False):
-    """Assertion over the assembled OTel trace document."""
-
-    condition: EvalCondition | None
-    depends_on: list[TaskId]
-
-
 # Feature column name referenced by a drift Verifier signal.
 FeatureName: TypeAlias = "str"
 
 
-class _FieldSpecRequired(TypedDict):
-    """Required keys of `FieldSpec`."""
-
-    dtype: str
-    name: ColumnName
-
-
-class FieldSpec(_FieldSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class FieldSpec:
     """Ordered field declaration used by Wyrd data schemas and model signatures."""
 
-    extra: dict[str, str]
-    nullable: bool
-    shape: list[Dim]
+    dtype: str
+    extra: dict[str, str] = field(default_factory=dict)
+    name: ColumnName
+    nullable: bool | None = None
+    shape: list[Dim] = field(default_factory=list)
 
 
-class GoogleBatchEmbedRequest(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleBatchEmbedRequest:
     """Generated Card schema type."""
 
     requests: list[GoogleEmbedRequest]
 
 
-class GoogleCodeExecutionResult(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleCodeExecutionResult:
     """Generated Card schema type."""
 
     outcome: str
     output: str
 
 
-class GoogleContent(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleContent:
     """One Google content turn."""
 
     parts: list[GooglePart]
     role: str
 
 
-class GoogleEmbedContent(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleEmbedContent:
     """Generated Card schema type."""
 
     parts: list[GoogleEmbedPart]
 
 
-class GoogleEmbedPart(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleEmbedPart:
     """Generated Card schema type."""
 
     text: str
 
 
-class _GoogleEmbedRequestRequired(TypedDict):
-    """Required keys of `GoogleEmbedRequest`."""
+@dataclass(frozen=True, kw_only=True)
+class GoogleEmbedRequest:
+    """Generated Card schema type."""
 
     content: GoogleEmbedContent
     model: str
+    output_dimensionality: int | None = None
+    task_type: str | None = None
+    title: str | None = None
 
 
-class GoogleEmbedRequest(_GoogleEmbedRequestRequired, total=False):
-    """Generated Card schema type."""
-
-    output_dimensionality: int | None
-    task_type: str | None
-    title: str | None
-
-
-class GoogleExecutableCode(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleExecutableCode:
     """Generated Card schema type."""
 
     code: str
     language: str
 
 
-class GoogleFileData(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleFileData:
     """Generated Card schema type."""
 
     file_uri: str
     mime_type: str
 
 
-class GoogleFunctionCall(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleFunctionCall:
     """Function call the model requested.
 
     Decoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.
@@ -1083,76 +1004,67 @@ class GoogleFunctionCall(TypedDict):
     name: str
 
 
-class _GoogleFunctionCallingConfigRequired(TypedDict):
-    """Required keys of `GoogleFunctionCallingConfig`."""
+@dataclass(frozen=True, kw_only=True)
+class GoogleFunctionCallingConfig:
+    """Generated Card schema type."""
 
+    allowed_function_names: list[str] | None = None
     mode: str
 
 
-class GoogleFunctionCallingConfig(_GoogleFunctionCallingConfigRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class GoogleFunctionDeclaration:
     """Generated Card schema type."""
 
-    allowed_function_names: list[str] | None
-
-
-class _GoogleFunctionDeclarationRequired(TypedDict):
-    """Required keys of `GoogleFunctionDeclaration`."""
-
+    description: str | None = None
     name: str
     parameters: JsonValue
 
 
-class GoogleFunctionDeclaration(_GoogleFunctionDeclarationRequired, total=False):
-    """Generated Card schema type."""
-
-    description: str | None
-
-
-class GoogleFunctionResponse(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleFunctionResponse:
     """Generated Card schema type."""
 
     name: str
     response: JsonValue
 
 
-class _GoogleGenerateContentRequestRequired(TypedDict):
-    """Required keys of `GoogleGenerateContentRequest`."""
-
-    contents: list[GoogleContent]
-
-
-class GoogleGenerateContentRequest(_GoogleGenerateContentRequestRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class GoogleGenerateContentRequest:
     """`POST /v1beta/models/{model}:generateContent`."""
 
-    cached_content: str | None
-    generation_config: GoogleGenerationConfig | None
-    labels: dict[str, JsonValue] | None
-    safety_settings: list[GoogleSafetySetting] | None
-    system_instruction: GoogleContent | None
-    tool_config: GoogleToolConfig | None
-    tools: list[GoogleTool] | None
+    cached_content: str | None = None
+    contents: list[GoogleContent]
+    generation_config: GoogleGenerationConfig | None = None
+    labels: dict[str, JsonValue] | None = None
+    safety_settings: list[GoogleSafetySetting] | None = None
+    system_instruction: GoogleContent | None = None
+    tool_config: GoogleToolConfig | None = None
+    tools: list[GoogleTool] | None = None
 
 
-class GoogleGenerationConfig(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class GoogleGenerationConfig:
     """Generated Card schema type."""
 
-    candidate_count: int | None
-    frequency_penalty: float | None
-    max_output_tokens: int | None
-    presence_penalty: float | None
-    response_mime_type: str | None
-    response_modalities: list[str] | None
-    response_schema: JsonValue
-    seed: int | None
-    speech_config: JsonValue
-    stop_sequences: list[str] | None
-    temperature: float | None
-    thinking_config: GoogleThinkingConfig | None
-    top_k: int | None
-    top_p: float | None
+    candidate_count: int | None = None
+    frequency_penalty: float | None = None
+    max_output_tokens: int | None = None
+    presence_penalty: float | None = None
+    response_mime_type: str | None = None
+    response_modalities: list[str] | None = None
+    response_schema: JsonValue | None = None
+    seed: int | None = None
+    speech_config: JsonValue | None = None
+    stop_sequences: list[str] | None = None
+    temperature: float | None = None
+    thinking_config: GoogleThinkingConfig | None = None
+    top_k: int | None = None
+    top_p: float | None = None
 
 
-class GoogleInlineData(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleInlineData:
     """Generated Card schema type."""
 
     data: str
@@ -1165,80 +1077,92 @@ class GoogleInlineData(TypedDict):
 GooglePart: TypeAlias = "GooglePartVariant1 | GooglePartText | GooglePartInlineData | GooglePartFileData | GooglePartFunctionCall | GooglePartFunctionResponse | GooglePartExecutableCode | GooglePartCodeExecutionResult"
 
 
-class GooglePartCodeExecutionResult(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartCodeExecutionResult:
     """Result of executing generated code."""
 
     code_execution_result: GoogleCodeExecutionResult
 
 
-class GooglePartExecutableCode(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartExecutableCode:
     """Code the model generated for execution."""
 
     executable_code: GoogleExecutableCode
 
 
-class GooglePartFileData(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartFileData:
     """Media referenced by URI."""
 
     file_data: GoogleFileData
 
 
-class GooglePartFunctionCall(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartFunctionCall:
     """Function call the model requested."""
 
     function_call: GoogleFunctionCall
 
 
-class GooglePartFunctionResponse(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartFunctionResponse:
     """Function result returned to the model."""
 
     function_response: GoogleFunctionResponse
 
 
-class GooglePartInlineData(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartInlineData:
     """Inline base64 media."""
 
     inline_data: GoogleInlineData
 
 
-class GooglePartText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartText:
     """Visible text."""
 
     text: str
 
 
-class GooglePartVariant1(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GooglePartVariant1:
     """Model reasoning text."""
 
     text: str
     thought: bool
 
 
-class GoogleSafetySetting(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleSafetySetting:
     """Generated Card schema type."""
 
     category: str
     threshold: str
 
 
-class GoogleThinkingConfig(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class GoogleThinkingConfig:
     """Generated Card schema type."""
 
-    include_thoughts: bool | None
-    thinking_budget: int | None
+    include_thoughts: bool | None = None
+    thinking_budget: int | None = None
 
 
-class GoogleTool(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class GoogleTool:
     """Generated Card schema type."""
 
-    code_execution: JsonValue
-    function_declarations: list[GoogleFunctionDeclaration] | None
-    google_search: JsonValue
-    google_search_retrieval: JsonValue
-    url_context: JsonValue
+    code_execution: JsonValue | None = None
+    function_declarations: list[GoogleFunctionDeclaration] | None = None
+    google_search: JsonValue | None = None
+    google_search_retrieval: JsonValue | None = None
+    url_context: JsonValue | None = None
 
 
-class GoogleToolConfig(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class GoogleToolConfig:
     """Generated Card schema type."""
 
     function_calling_config: GoogleFunctionCallingConfig
@@ -1250,21 +1174,24 @@ class GoogleToolConfig(TypedDict):
 HttpAuth: TypeAlias = "HttpAuthBearer | HttpAuthBasic | HttpAuthHeader"
 
 
-class HttpAuthBasic(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class HttpAuthBasic:
     """`Authorization: Basic` from the connection's username and password."""
 
     connection: ConnectionName
     scheme: Literal["basic"]
 
 
-class HttpAuthBearer(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class HttpAuthBearer:
     """`Authorization: Bearer` from the connection's token."""
 
     connection: ConnectionName
     scheme: Literal["bearer"]
 
 
-class HttpAuthHeader(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class HttpAuthHeader:
     """A custom header carrying the connection's value."""
 
     connection: ConnectionName
@@ -1279,50 +1206,38 @@ HttpMethod: TypeAlias = 'Literal["get", "post", "put", "patch", "delete"]'
 HuggingFaceTask: TypeAlias = 'Literal["TextClassification", "TokenClassification", "QuestionAnswering", "Summarization", "Translation", "TextGeneration", "FillMask", "ZeroShotClassification", "ImageClassification", "ObjectDetection", "ImageSegmentation", "ImageToText", "ImageToImage", "TextToImage", "DepthEstimation", "AudioClassification", "AutomaticSpeechRecognition", "AudioToAudio", "TextToSpeech", "TabularClassification", "TabularRegression", "FeatureExtraction", "SentenceSimilarity", "Conversational", "DocumentQuestionAnswering", "VisualQuestionAnswering", "TableQuestionAnswering", "Embedding", "MultipleChoice", "Other"]'
 
 
-class _HuggingfaceMetaRequired(TypedDict):
-    """Required keys of `HuggingfaceMeta`."""
-
-    dataset_id: str
-
-
-class HuggingfaceMeta(_HuggingfaceMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class HuggingfaceMeta:
     """Hugging Face dataset interface metadata."""
 
-    config: str | None
-    revision: str | None
-    split: str | None
+    config: str | None = None
+    dataset_id: str
+    revision: str | None = None
+    split: str | None = None
 
 
-class _HuggingfaceMeta2Required(TypedDict):
-    """Required keys of `HuggingfaceMeta2`."""
+@dataclass(frozen=True, kw_only=True)
+class HuggingfaceMeta2:
+    """Config for the Huggingface model interface."""
 
     framework_version: str
     hf_task: HuggingFaceTask
-
-
-class HuggingfaceMeta2(_HuggingfaceMeta2Required, total=False):
-    """Config for the Huggingface model interface."""
-
-    model_subtype: str | None
-    repo_id: str | None
-    revision: str | None
+    model_subtype: str | None = None
+    repo_id: str | None = None
+    revision: str | None = None
 
 
 # Image format family accepted by DataCard image manifests.
 ImageFormat: TypeAlias = 'Literal["Png", "Jpeg", "Webp", "Mixed"]'
 
 
-class _ImageMetaRequired(TypedDict):
-    """Required keys of `ImageMeta`."""
+@dataclass(frozen=True, kw_only=True)
+class ImageMeta:
+    """Image manifest interface metadata."""
 
     color_mode: ColorMode
     format: ImageFormat
-
-
-class ImageMeta(_ImageMetaRequired, total=False):
-    """Image manifest interface metadata."""
-
-    manifest_ref: Ref | None
+    manifest_ref: Ref | None = None
 
 
 # Predicate operator for a column split.
@@ -1336,7 +1251,8 @@ InlineableRef_for_AgentSpec: TypeAlias = (
 )
 
 
-class InlineableRef_for_AgentSpecSibling(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class InlineableRef_for_AgentSpecSibling:
     """A loader-projected reference to another submission in the same request."""
 
     sibling: CardRef
@@ -1350,7 +1266,8 @@ InlineableRef_for_OperatorSpec: TypeAlias = (
 )
 
 
-class InlineableRef_for_OperatorSpecSibling(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class InlineableRef_for_OperatorSpecSibling:
     """A loader-projected reference to another submission in the same request."""
 
     sibling: CardRef
@@ -1362,7 +1279,8 @@ class InlineableRef_for_OperatorSpecSibling(TypedDict):
 InlineableRef_for_Prompt: TypeAlias = "CardRef | InlineableRef_for_PromptSibling | Prompt | str"
 
 
-class InlineableRef_for_PromptSibling(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class InlineableRef_for_PromptSibling:
     """A loader-projected reference to another submission in the same request."""
 
     sibling: CardRef
@@ -1376,7 +1294,8 @@ InlineableRef_for_TriggerSpec: TypeAlias = (
 )
 
 
-class InlineableRef_for_TriggerSpecSibling(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class InlineableRef_for_TriggerSpecSibling:
     """A loader-projected reference to another submission in the same request."""
 
     sibling: CardRef
@@ -1391,53 +1310,36 @@ JsonValueType: TypeAlias = 'Literal["null", "bool", "number", "string", "array",
 JsonlCompression: TypeAlias = 'Literal["None", "Gzip", "Zstd"]'
 
 
-class _JsonlMetaRequired(TypedDict):
-    """Required keys of `JsonlMeta`."""
-
-    compression: JsonlCompression
-
-
-class JsonlMeta(_JsonlMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class JsonlMeta:
     """JSON Lines interface metadata."""
 
-    lines_per_file: int | None
+    compression: JsonlCompression
+    lines_per_file: int | None = None
 
 
 # Validated value for queryable Card and Run labels.
 LabelValue: TypeAlias = "str"
 
 
-class _LightgbmMetaRequired(TypedDict):
-    """Required keys of `LightgbmMeta`."""
-
-    framework_version: str
-
-
-class LightgbmMeta(_LightgbmMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class LightgbmMeta:
     """Config for the Lightgbm model interface."""
 
-    model_subtype: str | None
-
-
-class _LightningMetaRequired(TypedDict):
-    """Required keys of `LightningMeta`."""
-
     framework_version: str
+    model_subtype: str | None = None
 
 
-class LightningMeta(_LightningMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class LightningMeta:
     """Config for the Lightning model interface."""
 
-    model_subtype: str | None
+    framework_version: str
+    model_subtype: str | None = None
 
 
-class _MetadataRequired(TypedDict):
-    """Required keys of `Metadata`."""
-
-    name: CardName
-
-
-class Metadata(_MetadataRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class Metadata:
     """Card metadata common to every kind.
 
     `version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:
@@ -1445,142 +1347,154 @@ class Metadata(_MetadataRequired, total=False):
     - Pre-register: `version` may be `None` (server bumps absolute latest or seeds `0.1.0`), `Some(VersionSpec::Scope("1.0"))` (server bumps within the prefix line), or `Some(VersionSpec::Pin("1.4.2"))` (exact pin). `bump` selects the bump level applied on the auto-bump paths (defaults to `Patch` if unset). - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`; readers may use [`Metadata::resolved_pin`] to extract the [`VersionBlock`].
     """
 
-    annotations: dict[str, AnnotationValue]
-    artifact_hash: str | None
-    bump: VersionBump | None
-    labels: dict[str, LabelValue]
-    origin: Origin | None
-    space: SpaceName | None
-    spec_hash: str | None
-    uid: CardUid | None
-    version: VersionSpec | None
+    annotations: dict[str, AnnotationValue] = field(default_factory=dict)
+    artifact_hash: str | None = None
+    bump: VersionBump | None = None
+    labels: dict[str, LabelValue] = field(default_factory=dict)
+    name: CardName
+    origin: Origin | None = None
+    space: SpaceName | None = None
+    spec_hash: str | None = None
+    uid: CardUid | None = None
+    version: VersionSpec | None = None
 
 
 # Framework interface tag for a Model spec.
 ModelInterface: TypeAlias = "ModelInterfaceSklearn | ModelInterfaceXgboost | ModelInterfaceLightgbm | ModelInterfaceCatboost | ModelInterfaceTorch | ModelInterfaceLightning | ModelInterfaceTensorflow | ModelInterfaceHuggingface | ModelInterfaceCustom"
 
 
-class ModelInterfaceCatboost(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceCatboost:
     """CatBoost model persisted through the catboost loader."""
 
     kind: Literal["Catboost"]
     meta: CatboostMeta
 
 
-class ModelInterfaceCustom(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceCustom:
     """User-supplied loader metadata."""
 
     kind: Literal["Custom"]
     meta: CustomMeta
 
 
-class ModelInterfaceHuggingface(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceHuggingface:
     """Hugging Face model persisted through a local snapshot or pinned repo."""
 
     kind: Literal["Huggingface"]
     meta: HuggingfaceMeta2
 
 
-class ModelInterfaceLightgbm(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceLightgbm:
     """LightGBM model persisted through the lightgbm loader."""
 
     kind: Literal["Lightgbm"]
     meta: LightgbmMeta
 
 
-class ModelInterfaceLightning(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceLightning:
     """PyTorch Lightning module persisted as a trainer checkpoint."""
 
     kind: Literal["Lightning"]
     meta: LightningMeta
 
 
-class ModelInterfaceSklearn(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceSklearn:
     """scikit-learn estimator persisted through the sklearn loader."""
 
     kind: Literal["Sklearn"]
     meta: SklearnMeta
 
 
-class ModelInterfaceTensorflow(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceTensorflow:
     """TensorFlow or Keras model persisted through the tensorflow loader."""
 
     kind: Literal["Tensorflow"]
     meta: TensorflowMeta
 
 
-class ModelInterfaceTorch(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceTorch:
     """PyTorch module persisted through the torch loader."""
 
     kind: Literal["Torch"]
     meta: TorchMeta2
 
 
-class ModelInterfaceXgboost(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelInterfaceXgboost:
     """XGBoost model persisted through the xgboost loader."""
 
     kind: Literal["Xgboost"]
     meta: XgboostMeta
 
 
-class ModelSignature(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ModelSignature:
     """Typed input and output schema for a Model spec."""
 
     inputs: list[FieldSpec]
     outputs: list[FieldSpec]
 
 
-class _ModelSpecRequired(TypedDict):
-    """Required keys of `ModelSpec`."""
-
-    interface: ModelInterface
-    signature: ModelSignature
-    task_type: TaskType
-
-
-class ModelSpec(_ModelSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ModelSpec:
     """Body of a Model card.
 
     This pure contract describes which framework loads the model, which task it performs, which fields it consumes and produces, and which Artifact cards hold model-related bytes.
     """
 
-    card_refs: list[Ref]
-    sample_input: SampleInput | None
+    card_refs: list[Ref] = field(default_factory=list)
+    interface: ModelInterface
+    sample_input: SampleInput | None = None
+    signature: ModelSignature
+    task_type: TaskType
 
 
 # Non-secret JSON-like configuration value.
 NonSecretValue: TypeAlias = "NonSecretValueStr | NonSecretValueNumber | NonSecretValueBool | NonSecretValueList | NonSecretValueObject"
 
 
-class NonSecretValueBool(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NonSecretValueBool:
     """Boolean value."""
 
     type: Literal["bool"]
     value: bool
 
 
-class NonSecretValueList(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NonSecretValueList:
     """List of non-secret values."""
 
     type: Literal["list"]
     value: list[NonSecretValue]
 
 
-class NonSecretValueNumber(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NonSecretValueNumber:
     """Numeric value."""
 
     type: Literal["number"]
     value: float
 
 
-class NonSecretValueObject(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NonSecretValueObject:
     """Object of non-secret values."""
 
     type: Literal["object"]
     value: dict[str, NonSecretValue]
 
 
-class NonSecretValueStr(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NonSecretValueStr:
     """String value."""
 
     type: Literal["str"]
@@ -1591,23 +1505,20 @@ class NonSecretValueStr(TypedDict):
 NotifyChannel: TypeAlias = "NotifyChannelPagerDuty | NotifyChannelSlack"
 
 
-class _NotifyChannelPagerDutyRequired(TypedDict):
-    """Required keys of `NotifyChannelPagerDuty`."""
+@dataclass(frozen=True, kw_only=True)
+class NotifyChannelPagerDuty:
+    """PagerDuty Events API v2 trigger through a tenant Global Integration key."""
 
     connection: ConnectionName
+    dedup_key: str | None = None
     kind: Literal["pager_duty"]
     route: str
     severity: PagerDutySeverity
     summary: str
 
 
-class NotifyChannelPagerDuty(_NotifyChannelPagerDutyRequired, total=False):
-    """PagerDuty Events API v2 trigger through a tenant Global Integration key."""
-
-    dedup_key: str | None
-
-
-class NotifyChannelSlack(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class NotifyChannelSlack:
     """Slack `chat.postMessage` through a tenant workspace bot token."""
 
     channel_id: str
@@ -1620,27 +1531,25 @@ class NotifyChannelSlack(TypedDict):
 NumpyFormat: TypeAlias = 'Literal["Npy", "Npz"]'
 
 
-class _NumpyMetaRequired(TypedDict):
-    """Required keys of `NumpyMeta`."""
+@dataclass(frozen=True, kw_only=True)
+class NumpyMeta:
+    """NumPy interface metadata."""
 
     dtype: str
     format: NumpyFormat
+    shape: list[int] = field(default_factory=list)
 
 
-class NumpyMeta(_NumpyMetaRequired, total=False):
-    """NumPy interface metadata."""
-
-    shape: list[int]
-
-
-class OpenAiAllowedTools(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiAllowedTools:
     """Generated Card schema type."""
 
     mode: OpenAiAllowedToolsMode
     tools: list[dict[str, JsonValue]]
 
 
-class OpenAiAllowedToolsChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiAllowedToolsChoice:
     """Generated Card schema type."""
 
     allowed_tools: OpenAiAllowedTools
@@ -1656,69 +1565,62 @@ OpenAiAudioFormat: TypeAlias = 'Literal["wav", "aac", "mp3", "flac", "opus", "pc
 OpenAiBuiltInVoice: TypeAlias = 'Literal["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "marin", "cedar"]'
 
 
-class OpenAiChatAudio(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiChatAudio:
     """Generated Card schema type."""
 
     format: OpenAiAudioFormat
     voice: OpenAiVoice
 
 
-class _OpenAiChatMessageRequired(TypedDict):
-    """Required keys of `OpenAiChatMessage`."""
-
-    role: str
-
-
-class OpenAiChatMessage(_OpenAiChatMessageRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiChatMessage:
     """One chat message on the wire."""
 
-    annotations: list[OpenAiMessageAnnotation]
-    audio: OpenAiMessageAudio | None
-    content: OpenAiMessageContent | None
-    name: str | None
-    refusal: str | None
-    tool_call_id: str | None
-    tool_calls: list[OpenAiToolCall] | None
+    annotations: list[OpenAiMessageAnnotation] = field(default_factory=list)
+    audio: OpenAiMessageAudio | None = None
+    content: OpenAiMessageContent | None = None
+    name: str | None = None
+    refusal: str | None = None
+    role: str
+    tool_call_id: str | None = None
+    tool_calls: list[OpenAiToolCall] | None = None
 
 
-class _OpenAiChatRequestRequired(TypedDict):
-    """Required keys of `OpenAiChatRequest`."""
-
-    messages: list[OpenAiChatMessage]
-    model: str
-
-
-class OpenAiChatRequest(_OpenAiChatRequestRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiChatRequest:
     """`POST /v1/chat/completions`."""
 
-    audio: OpenAiChatAudio | None
-    frequency_penalty: float | None
-    logit_bias: dict[str, JsonValue] | None
-    logprobs: bool | None
-    max_completion_tokens: int | None
-    max_tokens: int | None
-    metadata: dict[str, JsonValue] | None
-    modalities: list[OpenAiResponseModality] | None
-    n: int | None
-    parallel_tool_calls: bool | None
-    prediction: OpenAiPredictionContent | None
-    presence_penalty: float | None
-    prompt_cache_key: str | None
-    reasoning_effort: OpenAiReasoningEffort | None
-    response_format: OpenAiResponseFormat | None
-    safety_identifier: str | None
-    seed: int | None
-    service_tier: str | None
-    stop: OpenAiStop | None
-    store: bool | None
-    stream: bool | None
-    stream_options: OpenAiStreamOptions | None
-    temperature: float | None
-    tool_choice: OpenAiChatToolChoice | None
-    tools: list[OpenAiTool] | None
-    top_logprobs: int | None
-    top_p: float | None
-    user: str | None
+    audio: OpenAiChatAudio | None = None
+    frequency_penalty: float | None = None
+    logit_bias: dict[str, JsonValue] | None = None
+    logprobs: bool | None = None
+    max_completion_tokens: int | None = None
+    max_tokens: int | None = None
+    messages: list[OpenAiChatMessage]
+    metadata: dict[str, JsonValue] | None = None
+    modalities: list[OpenAiResponseModality] | None = None
+    model: str
+    n: int | None = None
+    parallel_tool_calls: bool | None = None
+    prediction: OpenAiPredictionContent | None = None
+    presence_penalty: float | None = None
+    prompt_cache_key: str | None = None
+    reasoning_effort: OpenAiReasoningEffort | None = None
+    response_format: OpenAiResponseFormat | None = None
+    safety_identifier: str | None = None
+    seed: int | None = None
+    service_tier: str | None = None
+    stop: OpenAiStop | None = None
+    store: bool | None = None
+    stream: bool | None = None
+    stream_options: OpenAiStreamOptions | None = None
+    temperature: float | None = None
+    tool_choice: OpenAiChatToolChoice | None = None
+    tools: list[OpenAiTool] | None = None
+    top_logprobs: int | None = None
+    top_p: float | None = None
+    user: str | None = None
 
 
 OpenAiChatToolChoice: TypeAlias = "OpenAiToolChoiceMode | OpenAiAllowedToolsChoice | OpenAiNamedFunctionToolChoice | OpenAiNamedCustomToolChoice"
@@ -1726,70 +1628,74 @@ OpenAiChatToolChoice: TypeAlias = "OpenAiToolChoiceMode | OpenAiAllowedToolsChoi
 OpenAiContentPart: TypeAlias = "OpenAiContentPartText | OpenAiContentPartImageUrl | OpenAiContentPartInputAudio | OpenAiContentPartFile"
 
 
-class OpenAiContentPartFile(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiContentPartFile:
     """Generated Card schema type."""
 
     file: OpenAiFilePart
     type: Literal["file"]
 
 
-class OpenAiContentPartImageUrl(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiContentPartImageUrl:
     """Generated Card schema type."""
 
     image_url: OpenAiImageUrl
     type: Literal["image_url"]
 
 
-class OpenAiContentPartInputAudio(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiContentPartInputAudio:
     """Generated Card schema type."""
 
     input_audio: OpenAiInputAudio
     type: Literal["input_audio"]
 
 
-class OpenAiContentPartText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiContentPartText:
     """Generated Card schema type."""
 
     text: str
     type: Literal["text"]
 
 
-class OpenAiCustomChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiCustomChoice:
     """Generated Card schema type."""
 
     name: str
 
 
-class _OpenAiCustomToolRequired(TypedDict):
-    """Required keys of `OpenAiCustomTool`."""
-
-    name: str
-
-
-class OpenAiCustomTool(_OpenAiCustomToolRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiCustomTool:
     """Generated Card schema type."""
 
-    description: str | None
-    format: OpenAiCustomToolFormat | None
+    description: str | None = None
+    format: OpenAiCustomToolFormat | None = None
+    name: str
 
 
 OpenAiCustomToolFormat: TypeAlias = "OpenAiCustomToolFormatText | OpenAiCustomToolFormatGrammar"
 
 
-class OpenAiCustomToolFormatGrammar(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiCustomToolFormatGrammar:
     """Generated Card schema type."""
 
     grammar: OpenAiGrammar
     type: Literal["grammar"]
 
 
-class OpenAiCustomToolFormatText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiCustomToolFormatText:
     """Generated Card schema type."""
 
     type: Literal["text"]
 
 
-class OpenAiCustomVoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiCustomVoice:
     """Generated Card schema type."""
 
     id: str
@@ -1798,50 +1704,45 @@ class OpenAiCustomVoice(TypedDict):
 OpenAiEmbeddingsInput: TypeAlias = "str | list[str] | list[int] | list[list[int]]"
 
 
-class _OpenAiEmbeddingsRequestRequired(TypedDict):
-    """Required keys of `OpenAiEmbeddingsRequest`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiEmbeddingsRequest:
+    """Generated Card schema type."""
 
+    dimensions: int | None = None
+    encoding_format: str | None = None
     input: OpenAiEmbeddingsInput
     model: str
+    user: str | None = None
 
 
-class OpenAiEmbeddingsRequest(_OpenAiEmbeddingsRequestRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiFilePart:
     """Generated Card schema type."""
 
-    dimensions: int | None
-    encoding_format: str | None
-    user: str | None
+    file_data: str | None = None
+    file_id: str | None = None
+    filename: str | None = None
 
 
-class OpenAiFilePart(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiFunction:
     """Generated Card schema type."""
 
-    file_data: str | None
-    file_id: str | None
-    filename: str | None
-
-
-class _OpenAiFunctionRequired(TypedDict):
-    """Required keys of `OpenAiFunction`."""
-
+    description: str | None = None
     name: str
+    parameters: dict[str, JsonValue] | None = None
+    strict: bool | None = None
 
 
-class OpenAiFunction(_OpenAiFunctionRequired, total=False):
-    """Generated Card schema type."""
-
-    description: str | None
-    parameters: dict[str, JsonValue] | None
-    strict: bool | None
-
-
-class OpenAiFunctionChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiFunctionChoice:
     """Generated Card schema type."""
 
     name: str
 
 
-class OpenAiGrammar(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiGrammar:
     """Generated Card schema type."""
 
     definition: str
@@ -1851,47 +1752,42 @@ class OpenAiGrammar(TypedDict):
 OpenAiGrammarSyntax: TypeAlias = 'Literal["lark", "regex"]'
 
 
-class _OpenAiImageUrlRequired(TypedDict):
-    """Required keys of `OpenAiImageUrl`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiImageUrl:
+    """Generated Card schema type."""
 
+    detail: str | None = None
     url: str
 
 
-class OpenAiImageUrl(_OpenAiImageUrlRequired, total=False):
-    """Generated Card schema type."""
-
-    detail: str | None
-
-
-class OpenAiInputAudio(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiInputAudio:
     """Generated Card schema type."""
 
     data: str
     format: str
 
 
-class _OpenAiJsonSchemaRequired(TypedDict):
-    """Required keys of `OpenAiJsonSchema`."""
-
-    name: str
-
-
-class OpenAiJsonSchema(_OpenAiJsonSchemaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiJsonSchema:
     """Generated Card schema type."""
 
-    description: str | None
-    schema: dict[str, JsonValue] | None
-    strict: bool | None
+    description: str | None = None
+    name: str
+    schema: dict[str, JsonValue] | None = None
+    strict: bool | None = None
 
 
-class OpenAiMessageAnnotation(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiMessageAnnotation:
     """A URL citation annotation returned by web search."""
 
     type: str
     url_citation: OpenAiUrlCitation
 
 
-class OpenAiMessageAudio(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiMessageAudio:
     """Audio output returned by the model."""
 
     data: str
@@ -1903,7 +1799,8 @@ class OpenAiMessageAudio(TypedDict):
 OpenAiMessageContent: TypeAlias = "str | list[OpenAiContentPart]"
 
 
-class OpenAiNamedCustomToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiNamedCustomToolChoice:
     """Generated Card schema type."""
 
     custom: OpenAiCustomChoice
@@ -1913,7 +1810,8 @@ class OpenAiNamedCustomToolChoice(TypedDict):
 OpenAiNamedCustomToolChoiceKind: TypeAlias = 'Literal["custom"]'
 
 
-class OpenAiNamedFunctionToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiNamedFunctionToolChoice:
     """Generated Card schema type."""
 
     function: OpenAiFunctionChoice
@@ -1923,7 +1821,8 @@ class OpenAiNamedFunctionToolChoice(TypedDict):
 OpenAiNamedFunctionToolChoiceKind: TypeAlias = 'Literal["function"]'
 
 
-class OpenAiPredictionContent(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiPredictionContent:
     """Generated Card schema type."""
 
     content: OpenAiPredictionPayload
@@ -1933,7 +1832,8 @@ class OpenAiPredictionContent(TypedDict):
 OpenAiPredictionContentPart: TypeAlias = "OpenAiPredictionContentPartText"
 
 
-class OpenAiPredictionContentPartText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiPredictionContentPartText:
     """Generated Card schema type."""
 
     text: str
@@ -1945,12 +1845,13 @@ OpenAiPredictionKind: TypeAlias = 'Literal["content"]'
 OpenAiPredictionPayload: TypeAlias = "str | list[OpenAiPredictionContentPart]"
 
 
-class OpenAiReasoning(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiReasoning:
     """Generated Card schema type."""
 
-    effort: OpenAiReasoningEffort2 | None
-    generate_summary: OpenAiReasoningSummary | None
-    summary: OpenAiReasoningSummary | None
+    effort: OpenAiReasoningEffort2 | None = None
+    generate_summary: OpenAiReasoningSummary | None = None
+    summary: OpenAiReasoningSummary | None = None
 
 
 OpenAiReasoningEffort: TypeAlias = 'Literal["none", "minimal", "low", "medium", "high", "xhigh"]'
@@ -1963,7 +1864,8 @@ OpenAiReasoningSummary: TypeAlias = 'Literal["auto", "concise", "detailed"]'
 OpenAiReasoningSummaryPart: TypeAlias = "OpenAiReasoningSummaryPartSummaryText"
 
 
-class OpenAiReasoningSummaryPartSummaryText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiReasoningSummaryPartSummaryText:
     """Summary text."""
 
     text: str
@@ -1973,36 +1875,33 @@ class OpenAiReasoningSummaryPartSummaryText(TypedDict):
 OpenAiResponseContentPart: TypeAlias = "OpenAiResponseContentPartInputText | OpenAiResponseContentPartOutputText | OpenAiResponseContentPartInputImage | OpenAiResponseContentPartInputFile"
 
 
-class OpenAiResponseContentPartInputFile(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseContentPartInputFile:
     """Generated Card schema type."""
 
     file_id: str
     type: Literal["input_file"]
 
 
-class _OpenAiResponseContentPartInputImageRequired(TypedDict):
-    """Required keys of `OpenAiResponseContentPartInputImage`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseContentPartInputImage:
+    """Generated Card schema type."""
 
+    detail: str | None = None
     image_url: str
     type: Literal["input_image"]
 
 
-class OpenAiResponseContentPartInputImage(
-    _OpenAiResponseContentPartInputImageRequired, total=False
-):
-    """Generated Card schema type."""
-
-    detail: str | None
-
-
-class OpenAiResponseContentPartInputText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseContentPartInputText:
     """Generated Card schema type."""
 
     text: str
     type: Literal["input_text"]
 
 
-class OpenAiResponseContentPartOutputText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseContentPartOutputText:
     """Generated Card schema type."""
 
     text: str
@@ -2014,20 +1913,23 @@ OpenAiResponseFormat: TypeAlias = (
 )
 
 
-class OpenAiResponseFormatJsonObject(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseFormatJsonObject:
     """Generated Card schema type."""
 
     type: Literal["json_object"]
 
 
-class OpenAiResponseFormatJsonSchema(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseFormatJsonSchema:
     """Generated Card schema type."""
 
     json_schema: OpenAiJsonSchema
     type: Literal["json_schema"]
 
 
-class OpenAiResponseFormatText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseFormatText:
     """Generated Card schema type."""
 
     type: Literal["text"]
@@ -2036,7 +1938,8 @@ class OpenAiResponseFormatText(TypedDict):
 OpenAiResponseItem: TypeAlias = "OpenAiResponseItemMessage | OpenAiResponseItemFunctionCall | OpenAiResponseItemFunctionCallOutput | OpenAiResponseItemReasoning | OpenAiResponseItemInputFile | OpenAiResponseItemInputImage"
 
 
-class OpenAiResponseItemFunctionCall(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemFunctionCall:
     """Generated Card schema type."""
 
     arguments: str
@@ -2045,7 +1948,8 @@ class OpenAiResponseItemFunctionCall(TypedDict):
     type: Literal["function_call"]
 
 
-class OpenAiResponseItemFunctionCallOutput(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemFunctionCallOutput:
     """Generated Card schema type."""
 
     call_id: str
@@ -2053,27 +1957,25 @@ class OpenAiResponseItemFunctionCallOutput(TypedDict):
     type: Literal["function_call_output"]
 
 
-class OpenAiResponseItemInputFile(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemInputFile:
     """Generated Card schema type."""
 
     file_id: str
     type: Literal["input_file"]
 
 
-class _OpenAiResponseItemInputImageRequired(TypedDict):
-    """Required keys of `OpenAiResponseItemInputImage`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemInputImage:
+    """Generated Card schema type."""
 
+    detail: str | None = None
     image_url: str
     type: Literal["input_image"]
 
 
-class OpenAiResponseItemInputImage(_OpenAiResponseItemInputImageRequired, total=False):
-    """Generated Card schema type."""
-
-    detail: str | None
-
-
-class OpenAiResponseItemMessage(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemMessage:
     """Generated Card schema type."""
 
     content: list[OpenAiResponseContentPart]
@@ -2081,24 +1983,21 @@ class OpenAiResponseItemMessage(TypedDict):
     type: Literal["message"]
 
 
-class _OpenAiResponseItemReasoningRequired(TypedDict):
-    """Required keys of `OpenAiResponseItemReasoning`."""
-
-    type: Literal["reasoning"]
-
-
-class OpenAiResponseItemReasoning(_OpenAiResponseItemReasoningRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponseItemReasoning:
     """Generated Card schema type."""
 
-    encrypted_content: str | None
-    id: str | None
-    summary: list[OpenAiReasoningSummaryPart]
+    encrypted_content: str | None = None
+    id: str | None = None
+    summary: list[OpenAiReasoningSummaryPart] = field(default_factory=list)
+    type: Literal["reasoning"]
 
 
 OpenAiResponseModality: TypeAlias = 'Literal["text", "audio"]'
 
 
-class OpenAiResponsesAllowedToolsChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesAllowedToolsChoice:
     """Generated Card schema type."""
 
     mode: OpenAiResponsesAllowedToolsMode
@@ -2111,7 +2010,8 @@ OpenAiResponsesAllowedToolsKind: TypeAlias = 'Literal["allowed_tools"]'
 OpenAiResponsesAllowedToolsMode: TypeAlias = 'Literal["auto", "required"]'
 
 
-class OpenAiResponsesApplyPatchToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesApplyPatchToolChoice:
     """Generated Card schema type."""
 
     type: OpenAiResponsesApplyPatchToolKind
@@ -2120,7 +2020,8 @@ class OpenAiResponsesApplyPatchToolChoice(TypedDict):
 OpenAiResponsesApplyPatchToolKind: TypeAlias = 'Literal["apply_patch"]'
 
 
-class OpenAiResponsesCustomToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesCustomToolChoice:
     """Generated Card schema type."""
 
     name: str
@@ -2132,14 +2033,16 @@ OpenAiResponsesCustomToolFormat: TypeAlias = (
 )
 
 
-class OpenAiResponsesCustomToolFormatGrammar(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesCustomToolFormatGrammar:
     """Generated Card schema type."""
 
     grammar: OpenAiResponsesGrammar
     type: Literal["grammar"]
 
 
-class OpenAiResponsesCustomToolFormatText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesCustomToolFormatText:
     """Generated Card schema type."""
 
     type: Literal["text"]
@@ -2148,7 +2051,8 @@ class OpenAiResponsesCustomToolFormatText(TypedDict):
 OpenAiResponsesCustomToolKind: TypeAlias = 'Literal["custom"]'
 
 
-class OpenAiResponsesFunctionToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesFunctionToolChoice:
     """Generated Card schema type."""
 
     name: str
@@ -2158,7 +2062,8 @@ class OpenAiResponsesFunctionToolChoice(TypedDict):
 OpenAiResponsesFunctionToolKind: TypeAlias = 'Literal["function"]'
 
 
-class OpenAiResponsesGrammar(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesGrammar:
     """Generated Card schema type."""
 
     definition: str
@@ -2168,7 +2073,8 @@ class OpenAiResponsesGrammar(TypedDict):
 OpenAiResponsesGrammarSyntax: TypeAlias = 'Literal["lark", "regex"]'
 
 
-class OpenAiResponsesHostedToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesHostedToolChoice:
     """Generated Card schema type."""
 
     type: OpenAiResponsesHostedToolKind
@@ -2182,52 +2088,45 @@ OpenAiResponsesHostedToolKind: TypeAlias = 'Literal["file_search", "web_search_p
 OpenAiResponsesInput: TypeAlias = "str | list[OpenAiResponseItem]"
 
 
-class _OpenAiResponsesMcpToolChoiceRequired(TypedDict):
-    """Required keys of `OpenAiResponsesMcpToolChoice`."""
-
-    server_label: str
-    type: OpenAiResponsesMcpToolKind
-
-
-class OpenAiResponsesMcpToolChoice(_OpenAiResponsesMcpToolChoiceRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesMcpToolChoice:
     """Generated Card schema type."""
 
-    name: str | None
+    name: str | None = None
+    server_label: str
+    type: OpenAiResponsesMcpToolKind
 
 
 OpenAiResponsesMcpToolKind: TypeAlias = 'Literal["mcp"]'
 
 
-class _OpenAiResponsesRequestRequired(TypedDict):
-    """Required keys of `OpenAiResponsesRequest`."""
-
-    input: OpenAiResponsesInput
-    model: str
-
-
-class OpenAiResponsesRequest(_OpenAiResponsesRequestRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesRequest:
     """`OpenAI` Responses API request body carried by a prompt or gateway call.
 
     `input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.
     """
 
-    include: list[str] | None
-    instructions: str | None
-    max_output_tokens: int | None
-    metadata: dict[str, JsonValue] | None
-    parallel_tool_calls: bool | None
-    previous_response_id: str | None
-    reasoning: OpenAiReasoning | None
-    store: bool | None
-    stream: bool | None
-    temperature: float | None
-    text: OpenAiResponsesText | None
-    tool_choice: OpenAiResponsesToolChoice | None
-    tools: list[OpenAiResponsesTool] | None
-    top_p: float | None
+    include: list[str] | None = None
+    input: OpenAiResponsesInput
+    instructions: str | None = None
+    max_output_tokens: int | None = None
+    metadata: dict[str, JsonValue] | None = None
+    model: str
+    parallel_tool_calls: bool | None = None
+    previous_response_id: str | None = None
+    reasoning: OpenAiReasoning | None = None
+    store: bool | None = None
+    stream: bool | None = None
+    temperature: float | None = None
+    text: OpenAiResponsesText | None = None
+    tool_choice: OpenAiResponsesToolChoice | None = None
+    tools: list[OpenAiResponsesTool] | None = None
+    top_p: float | None = None
 
 
-class OpenAiResponsesShellToolChoice(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesShellToolChoice:
     """Generated Card schema type."""
 
     type: OpenAiResponsesShellToolKind
@@ -2236,10 +2135,11 @@ class OpenAiResponsesShellToolChoice(TypedDict):
 OpenAiResponsesShellToolKind: TypeAlias = 'Literal["shell"]'
 
 
-class OpenAiResponsesText(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesText:
     """Generated Card schema type."""
 
-    format: OpenAiTextResponseFormat | None
+    format: OpenAiTextResponseFormat | None = None
 
 
 OpenAiResponsesTool: TypeAlias = "OpenAiResponsesToolFunction | OpenAiResponsesToolWebSearchPreview | OpenAiResponsesToolFileSearch | OpenAiResponsesToolCodeInterpreter | OpenAiResponsesToolImageGeneration | OpenAiResponsesToolMcp | OpenAiResponsesToolCustom"
@@ -2249,69 +2149,61 @@ OpenAiResponsesToolChoice: TypeAlias = "OpenAiResponsesToolChoiceMode | OpenAiRe
 OpenAiResponsesToolChoiceMode: TypeAlias = 'Literal["none", "auto", "required"]'
 
 
-class OpenAiResponsesToolCodeInterpreter(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolCodeInterpreter:
     """Generated Card schema type."""
 
     type: Literal["code_interpreter"]
 
 
-class _OpenAiResponsesToolCustomRequired(TypedDict):
-    """Required keys of `OpenAiResponsesToolCustom`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolCustom:
+    """Generated Card schema type."""
 
+    description: str | None = None
+    format: OpenAiResponsesCustomToolFormat | None = None
     name: str
     type: Literal["custom"]
 
 
-class OpenAiResponsesToolCustom(_OpenAiResponsesToolCustomRequired, total=False):
-    """Generated Card schema type."""
-
-    description: str | None
-    format: OpenAiResponsesCustomToolFormat | None
-
-
-class OpenAiResponsesToolFileSearch(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolFileSearch:
     """Generated Card schema type."""
 
     type: Literal["file_search"]
     vector_store_ids: list[str]
 
 
-class _OpenAiResponsesToolFunctionRequired(TypedDict):
-    """Required keys of `OpenAiResponsesToolFunction`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolFunction:
+    """Generated Card schema type."""
 
+    description: str | None = None
     name: str
+    parameters: dict[str, JsonValue] | None = None
+    strict: bool | None = None
     type: Literal["function"]
 
 
-class OpenAiResponsesToolFunction(_OpenAiResponsesToolFunctionRequired, total=False):
-    """Generated Card schema type."""
-
-    description: str | None
-    parameters: dict[str, JsonValue] | None
-    strict: bool | None
-
-
-class OpenAiResponsesToolImageGeneration(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolImageGeneration:
     """Generated Card schema type."""
 
     type: Literal["image_generation"]
 
 
-class _OpenAiResponsesToolMcpRequired(TypedDict):
-    """Required keys of `OpenAiResponsesToolMcp`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolMcp:
+    """Generated Card schema type."""
 
+    allowed_tools: list[str] | None = None
     server_label: str
     server_url: str
     type: Literal["mcp"]
 
 
-class OpenAiResponsesToolMcp(_OpenAiResponsesToolMcpRequired, total=False):
-    """Generated Card schema type."""
-
-    allowed_tools: list[str] | None
-
-
-class OpenAiResponsesToolWebSearchPreview(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiResponsesToolWebSearchPreview:
     """Generated Card schema type."""
 
     type: Literal["web_search_preview"]
@@ -2320,38 +2212,37 @@ class OpenAiResponsesToolWebSearchPreview(TypedDict):
 OpenAiStop: TypeAlias = "str | list[str]"
 
 
-class OpenAiStreamOptions(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiStreamOptions:
     """Generated Card schema type."""
 
-    include_obfuscation: bool | None
-    include_usage: bool | None
+    include_obfuscation: bool | None = None
+    include_usage: bool | None = None
 
 
 OpenAiTextResponseFormat: TypeAlias = "OpenAiTextResponseFormatText | OpenAiTextResponseFormatJsonObject | OpenAiTextResponseFormatJsonSchema"
 
 
-class OpenAiTextResponseFormatJsonObject(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiTextResponseFormatJsonObject:
     """Generated Card schema type."""
 
     type: Literal["json_object"]
 
 
-class _OpenAiTextResponseFormatJsonSchemaRequired(TypedDict):
-    """Required keys of `OpenAiTextResponseFormatJsonSchema`."""
+@dataclass(frozen=True, kw_only=True)
+class OpenAiTextResponseFormatJsonSchema:
+    """Generated Card schema type."""
 
+    description: str | None = None
     name: str
+    schema: dict[str, JsonValue] | None = None
+    strict: bool | None = None
     type: Literal["json_schema"]
 
 
-class OpenAiTextResponseFormatJsonSchema(_OpenAiTextResponseFormatJsonSchemaRequired, total=False):
-    """Generated Card schema type."""
-
-    description: str | None
-    schema: dict[str, JsonValue] | None
-    strict: bool | None
-
-
-class OpenAiTextResponseFormatText(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiTextResponseFormatText:
     """Generated Card schema type."""
 
     type: Literal["text"]
@@ -2360,7 +2251,8 @@ class OpenAiTextResponseFormatText(TypedDict):
 OpenAiTool: TypeAlias = "OpenAiToolFunction | OpenAiToolCustom"
 
 
-class OpenAiToolCall(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiToolCall:
     """Generated Card schema type."""
 
     function: OpenAiToolFunctionCall
@@ -2371,28 +2263,32 @@ class OpenAiToolCall(TypedDict):
 OpenAiToolChoiceMode: TypeAlias = 'Literal["none", "auto", "required"]'
 
 
-class OpenAiToolCustom(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiToolCustom:
     """Generated Card schema type."""
 
     custom: OpenAiCustomTool
     type: Literal["custom"]
 
 
-class OpenAiToolFunction(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiToolFunction:
     """Generated Card schema type."""
 
     function: OpenAiFunction
     type: Literal["function"]
 
 
-class OpenAiToolFunctionCall(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiToolFunctionCall:
     """Generated Card schema type."""
 
     arguments: str
     name: str
 
 
-class OpenAiUrlCitation(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class OpenAiUrlCitation:
     """Citation metadata for a web search result."""
 
     end_index: int
@@ -2404,106 +2300,89 @@ class OpenAiUrlCitation(TypedDict):
 OpenAiVoice: TypeAlias = "OpenAiBuiltInVoice | OpenAiCustomVoice"
 
 
-class OperatorBudget(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class OperatorBudget:
     """Operator execution limits."""
 
-    max_tool_calls: int | None
-    max_wall_seconds: int | None
+    max_tool_calls: int | None = None
+    max_wall_seconds: int | None = None
 
 
 # A server-owned side-effect template.
 OperatorSpec: TypeAlias = "OperatorSpecWorkflow | OperatorSpecNotify | OperatorSpecHttp"
 
 
-class _OperatorSpecHttpRequired(TypedDict):
-    """Required keys of `OperatorSpecHttp`."""
+@dataclass(frozen=True, kw_only=True)
+class OperatorSpecHttp:
+    """Perform an HTTP request."""
 
+    auth: HttpAuth | None = None
+    body: JsonValue | None = None
+    budget: OperatorBudget | None = None
+    description: str | None = None
+    expect_status: int | None = None
+    headers: dict[str, str] = field(default_factory=dict)
     kind: Literal["http"]
     method: HttpMethod
+    timeout_seconds: int | None = None
     url: str
 
 
-class OperatorSpecHttp(_OperatorSpecHttpRequired, total=False):
-    """Perform an HTTP request."""
+@dataclass(frozen=True, kw_only=True)
+class OperatorSpecNotify:
+    """Send a typed notification."""
 
-    auth: HttpAuth | None
-    body: JsonValue
-    budget: OperatorBudget | None
-    description: str | None
-    expect_status: int | None
-    headers: dict[str, str]
-    timeout_seconds: int | None
-
-
-class _OperatorSpecNotifyRequired(TypedDict):
-    """Required keys of `OperatorSpecNotify`."""
-
+    budget: OperatorBudget | None = None
     channel: NotifyChannel
+    description: str | None = None
     kind: Literal["notify"]
 
 
-class OperatorSpecNotify(_OperatorSpecNotifyRequired, total=False):
-    """Send a typed notification."""
+@dataclass(frozen=True, kw_only=True)
+class OperatorSpecWorkflow:
+    """Dispatch a registered Workflow."""
 
-    budget: OperatorBudget | None
-    description: str | None
-
-
-class _OperatorSpecWorkflowRequired(TypedDict):
-    """Required keys of `OperatorSpecWorkflow`."""
-
+    budget: OperatorBudget | None = None
+    description: str | None = None
     kind: Literal["workflow"]
     workflow_ref: Ref
 
 
-class OperatorSpecWorkflow(_OperatorSpecWorkflowRequired, total=False):
-    """Dispatch a registered Workflow."""
-
-    budget: OperatorBudget | None
-    description: str | None
-
-
-class _OriginRequired(TypedDict):
-    """Required keys of `Origin`."""
-
-    commit: CommitSha
-    repo: str
-
-
-class Origin(_OriginRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class Origin:
     """Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation."""
 
-    dirty: bool
-    path: str | None
+    commit: CommitSha
+    dirty: bool | None = None
+    path: str | None = None
+    repo: str
 
 
 # PagerDuty Events API v2 severities.
 PagerDutySeverity: TypeAlias = 'Literal["critical", "error", "warning", "info"]'
 
 
-class _PandasMetaRequired(TypedDict):
-    """Required keys of `PandasMeta`."""
-
-    framework_version: str
-
-
-class PandasMeta(_PandasMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class PandasMeta:
     """Pandas interface metadata."""
 
-    compression: ParquetCompression
+    compression: ParquetCompression | None = None
+    framework_version: str
 
 
 ParameterizedComparisonOperator: TypeAlias = "ParameterizedComparisonOperatorInRange | ParameterizedComparisonOperatorNotInRange | ParameterizedComparisonOperatorApproximatelyEquals | ParameterizedComparisonOperatorMatchesRegex | ParameterizedComparisonOperatorNotMatchesRegex | ParameterizedComparisonOperatorHasMinLength | ParameterizedComparisonOperatorHasMaxLength | ParameterizedComparisonOperatorLength | ParameterizedComparisonOperatorLengthGreaterThan | ParameterizedComparisonOperatorLengthLessThan | ParameterizedComparisonOperatorIsType | ParameterizedComparisonOperatorWithinAbsTolerance | ParameterizedComparisonOperatorWithinPctTolerance | ParameterizedComparisonOperatorWithinStdDev | ParameterizedComparisonOperatorBetweenPercentiles | ParameterizedComparisonOperatorDivergenceLessThan | ParameterizedComparisonOperatorCosineSimilarityAtLeast"
 
 
-class ParameterizedComparisonOperatorApproximatelyEquals(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorApproximatelyEquals:
     """Generated Card schema type."""
 
     kind: Literal["approximately_equals"]
     tolerance: float
 
 
-class ParameterizedComparisonOperatorBetweenPercentiles(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorBetweenPercentiles:
     """Generated Card schema type."""
 
     kind: Literal["between_percentiles"]
@@ -2511,14 +2390,16 @@ class ParameterizedComparisonOperatorBetweenPercentiles(TypedDict):
     upper_pct: float
 
 
-class ParameterizedComparisonOperatorCosineSimilarityAtLeast(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorCosineSimilarityAtLeast:
     """Generated Card schema type."""
 
     kind: Literal["cosine_similarity_at_least"]
     threshold: float
 
 
-class ParameterizedComparisonOperatorDivergenceLessThan(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorDivergenceLessThan:
     """Generated Card schema type."""
 
     kind: Literal["divergence_less_than"]
@@ -2526,21 +2407,24 @@ class ParameterizedComparisonOperatorDivergenceLessThan(TypedDict):
     threshold: float
 
 
-class ParameterizedComparisonOperatorHasMaxLength(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorHasMaxLength:
     """Generated Card schema type."""
 
     kind: Literal["has_max_length"]
     max: int
 
 
-class ParameterizedComparisonOperatorHasMinLength(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorHasMinLength:
     """Generated Card schema type."""
 
     kind: Literal["has_min_length"]
     min: int
 
 
-class ParameterizedComparisonOperatorInRange(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorInRange:
     """Generated Card schema type."""
 
     inclusive: bool
@@ -2549,42 +2433,48 @@ class ParameterizedComparisonOperatorInRange(TypedDict):
     min: float
 
 
-class ParameterizedComparisonOperatorIsType(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorIsType:
     """Generated Card schema type."""
 
     expected: JsonValueType
     kind: Literal["is_type"]
 
 
-class ParameterizedComparisonOperatorLength(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorLength:
     """Generated Card schema type."""
 
     expected: int
     kind: Literal["length"]
 
 
-class ParameterizedComparisonOperatorLengthGreaterThan(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorLengthGreaterThan:
     """Generated Card schema type."""
 
     kind: Literal["length_greater_than"]
     min: int
 
 
-class ParameterizedComparisonOperatorLengthLessThan(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorLengthLessThan:
     """Generated Card schema type."""
 
     kind: Literal["length_less_than"]
     max: int
 
 
-class ParameterizedComparisonOperatorMatchesRegex(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorMatchesRegex:
     """Generated Card schema type."""
 
     kind: Literal["matches_regex"]
     pattern: str
 
 
-class ParameterizedComparisonOperatorNotInRange(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorNotInRange:
     """Generated Card schema type."""
 
     inclusive: bool
@@ -2593,28 +2483,32 @@ class ParameterizedComparisonOperatorNotInRange(TypedDict):
     min: float
 
 
-class ParameterizedComparisonOperatorNotMatchesRegex(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorNotMatchesRegex:
     """Generated Card schema type."""
 
     kind: Literal["not_matches_regex"]
     pattern: str
 
 
-class ParameterizedComparisonOperatorWithinAbsTolerance(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorWithinAbsTolerance:
     """Generated Card schema type."""
 
     kind: Literal["within_abs_tolerance"]
     tolerance: float
 
 
-class ParameterizedComparisonOperatorWithinPctTolerance(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorWithinPctTolerance:
     """Generated Card schema type."""
 
     kind: Literal["within_pct_tolerance"]
     pct: float
 
 
-class ParameterizedComparisonOperatorWithinStdDev(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ParameterizedComparisonOperatorWithinStdDev:
     """Generated Card schema type."""
 
     kind: Literal["within_std_dev"]
@@ -2629,50 +2523,37 @@ ParameterlessComparisonOperatorSchema: TypeAlias = 'Literal["equals", "not_equal
 ParquetCompression: TypeAlias = 'Literal["None", "Snappy", "Gzip", "Zstd", "Lz4"]'
 
 
-class ParquetMeta(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ParquetMeta:
     """Parquet interface metadata."""
 
-    compression: ParquetCompression
-    row_group_size: int | None
+    compression: ParquetCompression | None = None
+    row_group_size: int | None = None
 
 
-class _PolarsMetaRequired(TypedDict):
-    """Required keys of `PolarsMeta`."""
+@dataclass(frozen=True, kw_only=True)
+class PolarsMeta:
+    """Polars interface metadata."""
 
+    compression: ParquetCompression | None = None
     framework_version: str
 
 
-class PolarsMeta(_PolarsMetaRequired, total=False):
-    """Polars interface metadata."""
-
-    compression: ParquetCompression
-
-
-class _PromptRequired(TypedDict):
-    """Required keys of `Prompt`."""
-
-    model: str
-    request: ProviderRequest
-
-
-class Prompt(_PromptRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class Prompt:
     """Authored native prompt request plus render metadata."""
 
-    media_variables: list[str]
-    provider: ProviderName | None
-    response_type: ResponseType
-    variables: list[str]
-    version: str | None
-
-
-class _PromptSpecRequired(TypedDict):
-    """Required keys of `PromptSpec`."""
-
+    media_variables: list[str] = field(default_factory=list)
     model: str
+    provider: ProviderName | None = None
     request: ProviderRequest
+    response_type: ResponseType | None = None
+    variables: list[str] = field(default_factory=list)
+    version: str | None = None
 
 
-class PromptSpec(_PromptSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class PromptSpec:
     """PromptCard spec body wrapping the native Skald prompt.
 
     Serializes with the `prompt` fields flattened directly into the spec body (no `prompt:` nesting key on the wire). Accepts two input forms:
@@ -2680,18 +2561,21 @@ class PromptSpec(_PromptSpecRequired, total=False):
     - **Declarative** (`provider` present, `request` absent): a `PromptDraft` that is compiled into the native provider request. - **Native** (`request` present): the stored native `Prompt` shape, as produced by `save()`.
     """
 
-    media_variables: list[str]
-    provider: ProviderName | None
-    response_type: ResponseType
-    variables: list[str]
-    version: str | None
+    media_variables: list[str] = field(default_factory=list)
+    model: str
+    provider: ProviderName | None = None
+    request: ProviderRequest
+    response_type: ResponseType | None = None
+    variables: list[str] = field(default_factory=list)
+    version: str | None = None
 
 
 # Which provider a request targets.
 ProviderName: TypeAlias = 'Literal["open_ai", "anthropic", "google", "vertex"] | ProviderNameCustom'
 
 
-class ProviderNameCustom(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderNameCustom:
     """Provider not modeled by skald-spec."""
 
     custom: str
@@ -2703,63 +2587,72 @@ class ProviderNameCustom(TypedDict):
 ProviderRequest: TypeAlias = "ProviderRequestOpenAiChatCompletion | ProviderRequestOpenAiResponses | ProviderRequestOpenAiEmbeddings | ProviderRequestAnthropicMessage | ProviderRequestGeminiGenerateContent | ProviderRequestGoogleBatchEmbed | ProviderRequestVertexPredict | ProviderRequestRawV1"
 
 
-class ProviderRequestAnthropicMessage(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestAnthropicMessage:
     """Anthropic Messages request."""
 
     body: AnthropicMessagesRequest
     provider: Literal["anthropic_message"]
 
 
-class ProviderRequestGeminiGenerateContent(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestGeminiGenerateContent:
     """Google GenerateContent request, sent to Gemini or, when [`Prompt::provider`](crate::Prompt::provider) is Vertex, to Vertex."""
 
     body: GoogleGenerateContentRequest
     provider: Literal["gemini_generate_content"]
 
 
-class ProviderRequestGoogleBatchEmbed(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestGoogleBatchEmbed:
     """Google Gemini BatchEmbedContents request."""
 
     body: GoogleBatchEmbedRequest
     provider: Literal["google_batch_embed"]
 
 
-class ProviderRequestOpenAiChatCompletion(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestOpenAiChatCompletion:
     """OpenAI Chat Completions request, whether it is sent to OpenAI, a gateway, or a custom OpenAI-compatible endpoint named by [`Prompt::provider`](crate::Prompt::provider)."""
 
     body: OpenAiChatRequest
     provider: Literal["open_ai_chat_completion"]
 
 
-class ProviderRequestOpenAiEmbeddings(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestOpenAiEmbeddings:
     """OpenAI Embeddings request."""
 
     body: OpenAiEmbeddingsRequest
     provider: Literal["open_ai_embeddings"]
 
 
-class ProviderRequestOpenAiResponses(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestOpenAiResponses:
     """OpenAI Responses API request."""
 
     body: OpenAiResponsesRequest
     provider: Literal["open_ai_responses"]
 
 
-class ProviderRequestRawV1(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestRawV1:
     """Raw provider request body that no typed variant models."""
 
     body: ProviderRequestRawV1Body
     provider: Literal["raw_v1"]
 
 
-class ProviderRequestRawV1Body(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestRawV1Body:
     """Generated Card schema type."""
 
     body: JsonValue
     provider: ProviderName
 
 
-class ProviderRequestVertexPredict(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ProviderRequestVertexPredict:
     """Vertex Predict request."""
 
     body: VertexPredictRequest
@@ -2770,14 +2663,16 @@ class ProviderRequestVertexPredict(TypedDict):
 PsiBinningStrategy: TypeAlias = "PsiBinningStrategyEqualWidth | PsiBinningStrategyQuantile"
 
 
-class PsiBinningStrategyEqualWidth(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class PsiBinningStrategyEqualWidth:
     """Equal-width bins across the baseline column range."""
 
     kind: Literal["EqualWidth"]
     n_bins: int
 
 
-class PsiBinningStrategyQuantile(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class PsiBinningStrategyQuantile:
     """Quantile bins from sorted baseline values."""
 
     kind: Literal["Quantile"]
@@ -2788,21 +2683,24 @@ class PsiBinningStrategyQuantile(TypedDict):
 PsiThreshold: TypeAlias = "PsiThresholdChiSquare | PsiThresholdNormal | PsiThresholdFixed"
 
 
-class PsiThresholdChiSquare(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class PsiThresholdChiSquare:
     """Chi-square approximation threshold."""
 
     alpha: float
     kind: Literal["ChiSquare"]
 
 
-class PsiThresholdFixed(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class PsiThresholdFixed:
     """Static threshold value."""
 
     kind: Literal["Fixed"]
     value: float
 
 
-class PsiThresholdNormal(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class PsiThresholdNormal:
     """Normal approximation threshold."""
 
     alpha: float
@@ -2818,287 +2716,232 @@ QueryName: TypeAlias = "str"
 Ref: TypeAlias = "CardRef | RefSibling | str"
 
 
-class RefSibling(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class RefSibling:
     """A loader-projected reference to another submission in the same request."""
 
     sibling: CardRef
 
 
-class _RegisteredAgentCardRequired(TypedDict):
-    """Required keys of `RegisteredAgentCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredAgentCard:
+    """Registered `Agent` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Agent"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: AgentSpec
+    status: Status | None = None
 
 
-class RegisteredAgentCard(_RegisteredAgentCardRequired, total=False):
-    """Registered `Agent` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredArtifactCardRequired(TypedDict):
-    """Required keys of `RegisteredArtifactCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredArtifactCard:
+    """Registered `Artifact` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Artifact"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredArtifactCard(_RegisteredArtifactCardRequired, total=False):
-    """Registered `Artifact` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredAuditCardRequired(TypedDict):
-    """Required keys of `RegisteredAuditCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredAuditCard:
+    """Registered `Audit` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Audit"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
-
-
-class RegisteredAuditCard(_RegisteredAuditCardRequired, total=False):
-    """Registered `Audit` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
+    status: Status | None = None
 
 
 # One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
 RegisteredCard: TypeAlias = "RegisteredDataCard | RegisteredModelCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard"
 
 
-class _RegisteredDataCardRequired(TypedDict):
-    """Required keys of `RegisteredDataCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredDataCard:
+    """Registered `Data` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Data"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: DataSpec
+    status: Status | None = None
 
 
-class RegisteredDataCard(_RegisteredDataCardRequired, total=False):
-    """Registered `Data` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredExperimentCardRequired(TypedDict):
-    """Required keys of `RegisteredExperimentCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredExperimentCard:
+    """Registered `Experiment` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Experiment"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredExperimentCard(_RegisteredExperimentCardRequired, total=False):
-    """Registered `Experiment` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredMcpCardRequired(TypedDict):
-    """Required keys of `RegisteredMcpCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredMcpCard:
+    """Registered `Mcp` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Mcp"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredMcpCard(_RegisteredMcpCardRequired, total=False):
-    """Registered `Mcp` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredModelCardRequired(TypedDict):
-    """Required keys of `RegisteredModelCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredModelCard:
+    """Registered `Model` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Model"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: ModelSpec
+    status: Status | None = None
 
 
-class RegisteredModelCard(_RegisteredModelCardRequired, total=False):
-    """Registered `Model` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredOperatorCardRequired(TypedDict):
-    """Required keys of `RegisteredOperatorCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredOperatorCard:
+    """Registered `Operator` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Operator"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: OperatorSpec
+    status: Status | None = None
 
 
-class RegisteredOperatorCard(_RegisteredOperatorCardRequired, total=False):
-    """Registered `Operator` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredPolicyCardRequired(TypedDict):
-    """Required keys of `RegisteredPolicyCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredPolicyCard:
+    """Registered `Policy` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Policy"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredPolicyCard(_RegisteredPolicyCardRequired, total=False):
-    """Registered `Policy` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredPromptCardRequired(TypedDict):
-    """Required keys of `RegisteredPromptCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredPromptCard:
+    """Registered `Prompt` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Prompt"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: PromptSpec
+    status: Status | None = None
 
 
-class RegisteredPromptCard(_RegisteredPromptCardRequired, total=False):
-    """Registered `Prompt` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredServiceCardRequired(TypedDict):
-    """Required keys of `RegisteredServiceCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredServiceCard:
+    """Registered `Service` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Service"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: ServiceSpec
+    status: Status | None = None
 
 
-class RegisteredServiceCard(_RegisteredServiceCardRequired, total=False):
-    """Registered `Service` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredSourceCardRequired(TypedDict):
-    """Required keys of `RegisteredSourceCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredSourceCard:
+    """Registered `Source` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Source"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredSourceCard(_RegisteredSourceCardRequired, total=False):
-    """Registered `Source` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredTriggerCardRequired(TypedDict):
-    """Required keys of `RegisteredTriggerCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredTriggerCard:
+    """Registered `Trigger` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Trigger"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: TriggerSpec
-
-
-class RegisteredTriggerCard(_RegisteredTriggerCardRequired, total=False):
-    """Registered `Trigger` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
+    status: Status | None = None
 
 
 # Registered Card envelope of a kind whose spec is not typed yet.
 RegisteredUntypedCard: TypeAlias = "RegisteredExperimentCard | RegisteredWorkflowCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard"
 
 
-class _RegisteredVerifierCardRequired(TypedDict):
-    """Required keys of `RegisteredVerifierCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredVerifierCard:
+    """Registered `Verifier` Card envelope."""
 
     apiVersion: ApiVersion
     kind: Literal["Verifier"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: VerifierSpec
+    status: Status | None = None
 
 
-class RegisteredVerifierCard(_RegisteredVerifierCardRequired, total=False):
-    """Registered `Verifier` Card envelope."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class _RegisteredWorkflowCardRequired(TypedDict):
-    """Required keys of `RegisteredWorkflowCard`."""
+@dataclass(frozen=True, kw_only=True)
+class RegisteredWorkflowCard:
+    """Registered `Workflow` Card envelope; its spec is not typed yet."""
 
     apiVersion: ApiVersion
     kind: Literal["Workflow"]
     metadata: Metadata
+    relationships: Relationships | None = None
     spec: dict[str, JsonValue]
+    status: Status | None = None
 
 
-class RegisteredWorkflowCard(_RegisteredWorkflowCardRequired, total=False):
-    """Registered `Workflow` Card envelope; its spec is not typed yet."""
-
-    relationships: Relationships
-    status: Status | None
-
-
-class Relationships(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class Relationships:
     """Server-derived relationship summary for graph, UI, policy, imports, and diff."""
 
-    inbound: list[str]
-    inbound_refs: list[CardRelationship]
-    outbound: list[str]
-    outbound_refs: list[CardRelationship]
+    inbound: list[str] = field(default_factory=list)
+    inbound_refs: list[CardRelationship] = field(default_factory=list)
+    outbound: list[str] = field(default_factory=list)
+    outbound_refs: list[CardRelationship] = field(default_factory=list)
 
 
 # Expected response shape for a rendered prompt.
 ResponseType: TypeAlias = 'Literal["text"] | ResponseTypeJsonSchema'
 
 
-class ResponseTypeJsonSchema(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ResponseTypeJsonSchema:
     """JSON response validated against a named schema by the runtime."""
 
     json_schema: ResponseTypeJsonSchemaJsonSchema
 
 
-class ResponseTypeJsonSchemaJsonSchema(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class ResponseTypeJsonSchemaJsonSchema:
     """Generated Card schema type."""
 
     name: str
     schema: JsonValue
 
 
-class SampleInput(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SampleInput:
     """Sample input description for loader-side rehydration."""
 
     kind: SampleInputKind
@@ -3108,36 +2951,28 @@ class SampleInput(TypedDict):
 SampleInputKind: TypeAlias = 'Literal["Pandas", "Polars", "Arrow", "Numpy", "Torch", "Tf", "Dict", "List", "Tuple", "Str", "None"]'
 
 
-class _ServiceComponentRequired(TypedDict):
-    """Required keys of `ServiceComponent`."""
-
-    alias: str
-    ref: Ref
-
-
-class ServiceComponent(_ServiceComponentRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ServiceComponent:
     """Alias-bound service component."""
 
-    config: dict[str, NonSecretValue]
-    credential_refs: list[CredentialRef]
-    source: ComponentSource | None
-    verified_by: list[VerificationBinding]
+    alias: str
+    config: dict[str, NonSecretValue] = field(default_factory=dict)
+    credential_refs: list[CredentialRef] = field(default_factory=list)
+    ref: Ref
+    source: ComponentSource | None = None
+    verified_by: list[VerificationBinding] = field(default_factory=list)
 
 
-class _ServiceRuntimeRequired(TypedDict):
-    """Required keys of `ServiceRuntime`."""
-
-    kind: ServiceRuntimeKind
-
-
-class ServiceRuntime(_ServiceRuntimeRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ServiceRuntime:
     """Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`."""
 
-    config: dict[str, NonSecretValue]
-    framework: str | None
-    mode: ServiceRuntimeMode | None
-    policy: ServiceRuntimePolicy | None
-    strict: bool | None
+    config: dict[str, NonSecretValue] = field(default_factory=dict)
+    framework: str | None = None
+    kind: ServiceRuntimeKind
+    mode: ServiceRuntimeMode | None = None
+    policy: ServiceRuntimePolicy | None = None
+    strict: bool | None = None
 
 
 # Service runtime kind.
@@ -3147,39 +2982,37 @@ ServiceRuntimeKind: TypeAlias = 'Literal["api", "mcp", "agent", "workflow"]'
 ServiceRuntimeMode: TypeAlias = 'Literal["in_process"]'
 
 
-class ServiceRuntimePolicy(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ServiceRuntimePolicy:
     """Service runtime policy settings."""
 
-    runtime_hooks: bool
+    runtime_hooks: bool | None = None
 
 
-class ServiceSpec(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class ServiceSpec:
     """Composition of cards used by an application or deployment."""
 
-    components: list[ServiceComponent]
-    content_hash: str | None
-    credential_refs: list[CredentialRef]
-    deployment: dict[str, NonSecretValue]
-    description: str | None
-    entry_point: str | None
-    lock_hash: str | None
-    metadata: dict[str, NonSecretValue]
-    runtime: ServiceRuntime | None
-    service_config: dict[str, NonSecretValue]
-    service_type: str | None
-    verified_by: list[VerificationBinding]
+    components: list[ServiceComponent] = field(default_factory=list)
+    content_hash: str | None = None
+    credential_refs: list[CredentialRef] = field(default_factory=list)
+    deployment: dict[str, NonSecretValue] = field(default_factory=dict)
+    description: str | None = None
+    entry_point: str | None = None
+    lock_hash: str | None = None
+    metadata: dict[str, NonSecretValue] = field(default_factory=dict)
+    runtime: ServiceRuntime | None = None
+    service_config: dict[str, NonSecretValue] = field(default_factory=dict)
+    service_type: str | None = None
+    verified_by: list[VerificationBinding] = field(default_factory=list)
 
 
-class _SklearnMetaRequired(TypedDict):
-    """Required keys of `SklearnMeta`."""
-
-    framework_version: str
-
-
-class SklearnMeta(_SklearnMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class SklearnMeta:
     """Config for the Sklearn model interface."""
 
-    model_subtype: str | None
+    framework_version: str
+    model_subtype: str | None = None
 
 
 # Human-visible namespace for Cards and Runs.
@@ -3192,14 +3025,16 @@ SplitName: TypeAlias = "str"
 SplitStrategy: TypeAlias = "SplitStrategyMaterialized | SplitStrategyColumn | SplitStrategyIndexRange | SplitStrategyIndices"
 
 
-class SplitStrategyColumn(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyColumn:
     """Predicate over a schema column."""
 
     kind: Literal["Column"]
     value: SplitStrategyColumnValue
 
 
-class SplitStrategyColumnValue(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyColumnValue:
     """Generated Card schema type."""
 
     name: ColumnName
@@ -3207,70 +3042,62 @@ class SplitStrategyColumnValue(TypedDict):
     value: ColValue
 
 
-class SplitStrategyIndexRange(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyIndexRange:
     """Positional range using inclusive start and exclusive stop."""
 
     kind: Literal["IndexRange"]
     value: SplitStrategyIndexRangeValue
 
 
-class SplitStrategyIndexRangeValue(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyIndexRangeValue:
     """Generated Card schema type."""
 
     start: int
     stop: int
 
 
-class SplitStrategyIndices(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyIndices:
     """Explicit positional indices."""
 
     kind: Literal["Indices"]
     value: list[int]
 
 
-class SplitStrategyMaterialized(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class SplitStrategyMaterialized:
     """Reference to an already materialized split artifact."""
 
     kind: Literal["Materialized"]
     value: Ref
 
 
-class _SqlLogicRequired(TypedDict):
-    """Required keys of `SqlLogic`."""
+@dataclass(frozen=True, kw_only=True)
+class SqlLogic:
+    """SQL query bundle associated with SQL-backed DataCards."""
 
+    default_query: QueryName | None = None
     queries: dict[str, str]
 
 
-class SqlLogic(_SqlLogicRequired, total=False):
-    """SQL query bundle associated with SQL-backed DataCards."""
+@dataclass(frozen=True, kw_only=True)
+class SqlMeta:
+    """SQL interface metadata."""
 
-    default_query: QueryName | None
-
-
-class _SqlMetaRequired(TypedDict):
-    """Required keys of `SqlMeta`."""
-
+    connection_hint: str | None = None
     dialect: str
 
 
-class SqlMeta(_SqlMetaRequired, total=False):
-    """SQL interface metadata."""
-
-    connection_hint: str | None
-
-
-class _StatusRequired(TypedDict):
-    """Required keys of `Status`."""
-
-    phase: str
-
-
-class Status(_StatusRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class Status:
     """Server-derived Card status."""
 
-    message: str | None
-    updated_at: str | None
-    verification: VerificationStatus | None
+    message: str | None = None
+    phase: str
+    updated_at: str | None = None
+    verification: VerificationStatus | None = None
 
 
 TaskId: TypeAlias = "str"
@@ -3279,48 +3106,42 @@ TaskId: TypeAlias = "str"
 TaskType: TypeAlias = 'Literal["BinaryClassification", "MultiClassClassification", "Regression", "Clustering", "AnomalyDetection", "Forecasting", "Generation", "Other"]'
 
 
-class _TensorflowMetaRequired(TypedDict):
-    """Required keys of `TensorflowMeta`."""
+@dataclass(frozen=True, kw_only=True)
+class TensorflowMeta:
+    """Config for the Tensorflow model interface."""
 
     framework_version: str
+    model_subtype: str | None = None
     save_format: TfSaveFormat
 
 
-class TensorflowMeta(_TensorflowMetaRequired, total=False):
-    """Config for the Tensorflow model interface."""
-
-    model_subtype: str | None
-
-
-class TextMeta(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class TextMeta:
     """Text manifest interface metadata."""
 
-    encoding: str
-    manifest_ref: Ref | None
+    encoding: str | None = None
+    manifest_ref: Ref | None = None
 
 
 # Save format for the Tensorflow model interface.
 TfSaveFormat: TypeAlias = 'Literal["Keras", "SavedModel"]'
 
 
-class TorchMeta(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class TorchMeta:
     """Torch interface metadata."""
 
     framework_version: str
     save_format: TorchSaveFormat
 
 
-class _TorchMeta2Required(TypedDict):
-    """Required keys of `TorchMeta2`."""
-
-    framework_version: str
-    save_format: TorchSaveFormat2
-
-
-class TorchMeta2(_TorchMeta2Required, total=False):
+@dataclass(frozen=True, kw_only=True)
+class TorchMeta2:
     """Config for the Torch model interface."""
 
-    model_subtype: str | None
+    framework_version: str
+    model_subtype: str | None = None
+    save_format: TorchSaveFormat2
 
 
 # Torch serialization formats accepted by DataCard.
@@ -3333,33 +3154,25 @@ TorchSaveFormat2: TypeAlias = 'Literal["Safetensors", "Pickle"]'
 TriggerSpec: TypeAlias = "TriggerSpecSchedule | TriggerSpecObservationsReady"
 
 
-class _TriggerSpecObservationsReadyRequired(TypedDict):
-    """Required keys of `TriggerSpecObservationsReady`."""
-
-    kind: Literal["observations_ready"]
-
-
-class TriggerSpecObservationsReady(_TriggerSpecObservationsReadyRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class TriggerSpecObservationsReady:
     """Activate on each successfully committed observation for the subject.
 
     Declared as a fieldless struct variant so the enum-level `deny_unknown_fields` applies: a unit variant's internally tagged visitor would silently drain every sibling key, admitting typos and pasted secrets. The authored wire shape stays `{kind: observations_ready}`.
     """
 
-    description: str | None
+    description: str | None = None
+    kind: Literal["observations_ready"]
 
 
-class _TriggerSpecScheduleRequired(TypedDict):
-    """Required keys of `TriggerSpecSchedule`."""
-
-    cron: str
-    kind: Literal["schedule"]
-
-
-class TriggerSpecSchedule(_TriggerSpecScheduleRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class TriggerSpecSchedule:
     """Activate on each due occurrence of a cron schedule."""
 
-    description: str | None
-    tz: str | None
+    cron: str
+    description: str | None = None
+    kind: Literal["schedule"]
+    tz: str | None = None
 
 
 # Card kinds whose `spec` and `status` `cards.get` types.
@@ -3368,37 +3181,35 @@ TypedCardKind: TypeAlias = (
 )
 
 
-class _VerificationBindingRequired(TypedDict):
-    """Required keys of `VerificationBinding`."""
-
-    runs_on: InlineableRef_for_TriggerSpec
-    verifier: Ref
-
-
-class VerificationBinding(_VerificationBindingRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class VerificationBinding:
     """One inline declaration attaching a Verifier to its containing subject.
 
     Authored on a Service, a Service component occurrence, or a standalone Agent. Registration resolves and UID-pins the Verifier, the effective Trigger, and every effective Operator before the owning Card persists.
     """
 
-    on_failure: list[InlineableRef_for_OperatorSpec]
+    on_failure: list[InlineableRef_for_OperatorSpec] = field(default_factory=list)
+    runs_on: InlineableRef_for_TriggerSpec
+    verifier: Ref
 
 
-class VerificationError(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VerificationError:
     """Structured, secret-free execution or delivery error."""
 
     code: str
     message: str
 
 
-class VerificationStatus(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class VerificationStatus:
     """Server-derived verification state projected onto `card.status`.
 
     A Service or standalone Agent owning `verified_by` bindings exposes the stable identity of each projected binding here, so a caller can address a binding without a separate listing resource. The field is read-only: it is derived from the tenant's binding projection on every Card read and is never persisted as Card status.
     """
 
-    baseline: DriftBaselineStatus | None
-    binding_ids: list[str]
+    baseline: DriftBaselineStatus | None = None
+    binding_ids: list[str] = field(default_factory=list)
 
 
 # The closed set of Verifier implementations.
@@ -3407,33 +3218,31 @@ class VerificationStatus(TypedDict, total=False):
 VerifierImplementation: TypeAlias = "VerifierImplementationDrift | VerifierImplementationEval"
 
 
-class VerifierImplementationDrift(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VerifierImplementationDrift:
     """Continuous distribution or metric drift over observed records."""
 
     kind: Literal["drift"]
     spec: DriftSpec
 
 
-class VerifierImplementationEval(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VerifierImplementationEval:
     """Task-based evaluation over committed observations."""
 
     kind: Literal["eval"]
     spec: EvalSpec
 
 
-class _VerifierSpecRequired(TypedDict):
-    """Required keys of `VerifierSpec`."""
-
-    implementation: VerifierImplementation
-
-
-class VerifierSpec(_VerifierSpecRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class VerifierSpec:
     """Verifier Card spec body.
 
     One Verifier declares one implementation. Independent judgments are composed by attaching multiple Verifier Cards, never by nesting implementations or introducing a Verifier DAG.
     """
 
-    description: str | None
+    description: str | None = None
+    implementation: VerifierImplementation
 
 
 # Semver-compatible version string.
@@ -3447,38 +3256,44 @@ VersionBump: TypeAlias = (
 )
 
 
-class VersionBumpBuild(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpBuild:
     """Set the build metadata on the current triple (e.g. "001", "sha-abc123")."""
 
     build: VersionBumpBuildBuild
 
 
-class VersionBumpBuildBuild(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpBuildBuild:
     """Generated Card schema type."""
 
     metadata: str
 
 
-class VersionBumpPre(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpPre:
     """Set the pre-release identifier on the current triple (e.g. "rc.1")."""
 
     pre: VersionBumpPrePre
 
 
-class VersionBumpPreBuild(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpPreBuild:
     """Set both pre-release and build metadata on the current triple."""
 
     pre_build: VersionBumpPreBuildPreBuild
 
 
-class VersionBumpPreBuildPreBuild(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpPreBuildPreBuild:
     """Generated Card schema type."""
 
     build: str
     pre: str
 
 
-class VersionBumpPrePre(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class VersionBumpPrePre:
     """Generated Card schema type."""
 
     identifier: str
@@ -3488,39 +3303,33 @@ class VersionBumpPrePre(TypedDict):
 VersionSpec: TypeAlias = "str"
 
 
-class _VertexEmbedInstanceRequired(TypedDict):
-    """Required keys of `VertexEmbedInstance`."""
+@dataclass(frozen=True, kw_only=True)
+class VertexEmbedInstance:
+    """Generated Card schema type."""
 
     content: str
+    task_type: str | None = None
+    title: str | None = None
 
 
-class VertexEmbedInstance(_VertexEmbedInstanceRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class VertexEmbedParameters:
     """Generated Card schema type."""
 
-    task_type: str | None
-    title: str | None
+    auto_truncate: bool | None = None
+    output_dimensionality: int | None = None
 
 
-class VertexEmbedParameters(TypedDict, total=False):
+@dataclass(frozen=True, kw_only=True)
+class VertexPredictRequest:
     """Generated Card schema type."""
-
-    auto_truncate: bool | None
-    output_dimensionality: int | None
-
-
-class _VertexPredictRequestRequired(TypedDict):
-    """Required keys of `VertexPredictRequest`."""
 
     instances: list[VertexEmbedInstance]
+    parameters: VertexEmbedParameters | None = None
 
 
-class VertexPredictRequest(_VertexPredictRequestRequired, total=False):
-    """Generated Card schema type."""
-
-    parameters: VertexEmbedParameters | None
-
-
-class Workflow(TypedDict):
+@dataclass(frozen=True, kw_only=True)
+class Workflow:
     """Author-declared workflow field map for eval task inputs and outputs."""
 
     fields: dict[str, WorkflowFieldType]
@@ -3532,13 +3341,2443 @@ WorkflowFieldType: TypeAlias = (
 )
 
 
-class _XgboostMetaRequired(TypedDict):
-    """Required keys of `XgboostMeta`."""
-
-    framework_version: str
-
-
-class XgboostMeta(_XgboostMetaRequired, total=False):
+@dataclass(frozen=True, kw_only=True)
+class XgboostMeta:
     """Config for the Xgboost model interface."""
 
-    model_subtype: str | None
+    framework_version: str
+    model_subtype: str | None = None
+
+
+_OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
+    "AgentRunConfigSpec": (
+        ("max_iterations", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("session_recent_limit", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("timeout_ms", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("tool_concurrency_cap", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "AgentSpec": (
+        ("prompt", True, ("ref", "InlineableRef_for_Prompt")),
+        ("run_config", False, ("ref", "AgentRunConfigSpec")),
+        ("tool_names", False, ("array", ("prim", "string"))),
+        ("verified_by", False, ("array", ("ref", "VerificationBinding"))),
+    ),
+    "AnthropicCacheControl": (
+        ("ttl", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("type", True, ("prim", "string")),
+    ),
+    "AnthropicCitationToggle": (("enabled", True, ("prim", "boolean")),),
+    "AnthropicCitationV1CharLocation": (
+        ("cited_text", True, ("prim", "string")),
+        ("document_index", True, ("prim", "integer")),
+        ("document_title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("end_char_index", True, ("prim", "integer")),
+        ("start_char_index", True, ("prim", "integer")),
+        ("type", True, ("union", [("lit", "char_location")])),
+    ),
+    "AnthropicCitationV1ContentBlockLocation": (
+        ("cited_text", True, ("prim", "string")),
+        ("document_index", True, ("prim", "integer")),
+        ("document_title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("end_block_index", True, ("prim", "integer")),
+        ("start_block_index", True, ("prim", "integer")),
+        ("type", True, ("union", [("lit", "content_block_location")])),
+    ),
+    "AnthropicCitationV1PageLocation": (
+        ("cited_text", True, ("prim", "string")),
+        ("document_index", True, ("prim", "integer")),
+        ("document_title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("end_page_number", True, ("prim", "integer")),
+        ("start_page_number", True, ("prim", "integer")),
+        ("type", True, ("union", [("lit", "page_location")])),
+    ),
+    "AnthropicCitationV1SearchResultLocation": (
+        ("cited_text", True, ("prim", "string")),
+        ("end_block_index", True, ("prim", "integer")),
+        ("search_result_index", True, ("prim", "integer")),
+        ("source", True, ("prim", "string")),
+        ("start_block_index", True, ("prim", "integer")),
+        ("title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("type", True, ("union", [("lit", "search_result_location")])),
+    ),
+    "AnthropicCitationV1WebSearchResultLocation": (
+        ("cited_text", True, ("prim", "string")),
+        ("encrypted_index", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("type", True, ("union", [("lit", "web_search_result_location")])),
+        ("url", True, ("prim", "string")),
+    ),
+    "AnthropicContentBlockDocument": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        ("citations", False, ("union", [("ref", "AnthropicCitationToggle"), ("prim", "null")])),
+        ("context", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("source", True, ("ref", "AnthropicDocumentSource")),
+        ("title", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("type", True, ("union", [("lit", "document")])),
+    ),
+    "AnthropicContentBlockImage": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        ("source", True, ("ref", "AnthropicImageSource")),
+        ("type", True, ("union", [("lit", "image")])),
+    ),
+    "AnthropicContentBlockRedactedThinking": (
+        ("data", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "redacted_thinking")])),
+    ),
+    "AnthropicContentBlockText": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        (
+            "citations",
+            False,
+            ("union", [("array", ("ref", "AnthropicCitationV1")), ("prim", "null")]),
+        ),
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "text")])),
+    ),
+    "AnthropicContentBlockThinking": (
+        ("signature", True, ("prim", "string")),
+        ("thinking", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "thinking")])),
+    ),
+    "AnthropicContentBlockToolResult": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        ("content", True, ("ref", "AnthropicToolResultContent")),
+        ("is_error", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("tool_use_id", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "tool_result")])),
+    ),
+    "AnthropicContentBlockToolUse": (
+        ("id", True, ("prim", "string")),
+        ("input", True, ("prim", "any")),
+        ("name", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "tool_use")])),
+    ),
+    "AnthropicDocumentSourceBase64": (
+        ("data", True, ("prim", "string")),
+        ("media_type", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "base64")])),
+    ),
+    "AnthropicDocumentSourceContent": (
+        ("content", True, ("array", ("ref", "AnthropicContentBlock"))),
+        ("type", True, ("union", [("lit", "content")])),
+    ),
+    "AnthropicDocumentSourceFileId": (
+        ("file_id", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "file_id")])),
+    ),
+    "AnthropicDocumentSourceText": (
+        ("data", True, ("prim", "string")),
+        ("media_type", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "text")])),
+    ),
+    "AnthropicDocumentSourceUrl": (
+        ("type", True, ("union", [("lit", "url")])),
+        ("url", True, ("prim", "string")),
+    ),
+    "AnthropicImageSourceBase64": (
+        ("data", True, ("prim", "string")),
+        ("media_type", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "base64")])),
+    ),
+    "AnthropicImageSourceFileId": (
+        ("file_id", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "file_id")])),
+    ),
+    "AnthropicImageSourceUrl": (
+        ("type", True, ("union", [("lit", "url")])),
+        ("url", True, ("prim", "string")),
+    ),
+    "AnthropicMessage": (
+        ("content", True, ("array", ("ref", "AnthropicContentBlock"))),
+        ("role", True, ("prim", "string")),
+    ),
+    "AnthropicMessagesRequest": (
+        ("max_tokens", True, ("prim", "integer")),
+        ("messages", True, ("array", ("ref", "AnthropicMessage"))),
+        ("metadata", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("model", True, ("prim", "string")),
+        ("output_config", False, ("union", [("ref", "AnthropicOutputConfig"), ("prim", "null")])),
+        ("stop_sequences", False, ("union", [("array", ("prim", "string")), ("prim", "null")])),
+        ("stream", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("system", False, ("union", [("ref", "AnthropicSystem"), ("prim", "null")])),
+        ("temperature", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("thinking", False, ("union", [("ref", "AnthropicThinkingConfig"), ("prim", "null")])),
+        ("tool_choice", False, ("prim", "any")),
+        ("tools", False, ("union", [("array", ("ref", "AnthropicTool")), ("prim", "null")])),
+        ("top_k", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("top_p", False, ("union", [("prim", "number"), ("prim", "null")])),
+    ),
+    "AnthropicOutputConfig": (("format", True, ("ref", "AnthropicOutputFormat")),),
+    "AnthropicOutputFormatJsonSchema": (
+        ("schema", True, ("prim", "any")),
+        ("type", True, ("union", [("lit", "json_schema")])),
+    ),
+    "AnthropicSystemBlockText": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "text")])),
+    ),
+    "AnthropicThinkingConfig": (
+        ("budget_tokens", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("type", True, ("prim", "string")),
+    ),
+    "AnthropicTool": (
+        ("cache_control", False, ("union", [("ref", "AnthropicCacheControl"), ("prim", "null")])),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("display_height_px", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("display_number", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("display_width_px", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("input_schema", True, ("prim", "any")),
+        ("name", True, ("prim", "string")),
+        ("type", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "ArrowMeta": (
+        ("format", True, ("ref", "ArrowFormat")),
+        ("framework_version", True, ("prim", "string")),
+    ),
+    "CardRef": (
+        ("kind", True, ("ref", "CardKind")),
+        ("name", True, ("ref", "CardName")),
+        ("space", False, ("union", [("ref", "SpaceName"), ("prim", "null")])),
+        ("uid", False, ("union", [("ref", "CardUid"), ("prim", "null")])),
+        ("version", True, ("ref", "VersionBlock")),
+    ),
+    "CardRelationship": (
+        ("alias", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("ref", True, ("ref", "CardRef")),
+    ),
+    "CatboostMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "ComponentSource": (("kind", True, ("prim", "string")), ("path", True, ("prim", "string"))),
+    "CredentialRef": (("name", True, ("prim", "string")), ("provider", True, ("prim", "string"))),
+    "CustomDataMeta": (
+        ("extra", False, ("map", ("prim", "string"))),
+        ("loader_class", True, ("prim", "string")),
+        ("loader_module", True, ("prim", "string")),
+    ),
+    "CustomMeta": (
+        ("extra", False, ("map", ("prim", "string"))),
+        ("framework_version", True, ("prim", "string")),
+        ("loader_class", True, ("prim", "string")),
+        ("loader_module", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "DataInterfaceArrow": (
+        ("kind", True, ("union", [("lit", "Arrow")])),
+        ("meta", True, ("ref", "ArrowMeta")),
+    ),
+    "DataInterfaceCustom": (
+        ("kind", True, ("union", [("lit", "Custom")])),
+        ("meta", True, ("ref", "CustomDataMeta")),
+    ),
+    "DataInterfaceHuggingface": (
+        ("kind", True, ("union", [("lit", "Huggingface")])),
+        ("meta", True, ("ref", "HuggingfaceMeta")),
+    ),
+    "DataInterfaceImage": (
+        ("kind", True, ("union", [("lit", "Image")])),
+        ("meta", True, ("ref", "ImageMeta")),
+    ),
+    "DataInterfaceJsonl": (
+        ("kind", True, ("union", [("lit", "Jsonl")])),
+        ("meta", True, ("ref", "JsonlMeta")),
+    ),
+    "DataInterfaceNumpy": (
+        ("kind", True, ("union", [("lit", "Numpy")])),
+        ("meta", True, ("ref", "NumpyMeta")),
+    ),
+    "DataInterfacePandas": (
+        ("kind", True, ("union", [("lit", "Pandas")])),
+        ("meta", True, ("ref", "PandasMeta")),
+    ),
+    "DataInterfaceParquet": (
+        ("kind", True, ("union", [("lit", "Parquet")])),
+        ("meta", True, ("ref", "ParquetMeta")),
+    ),
+    "DataInterfacePolars": (
+        ("kind", True, ("union", [("lit", "Polars")])),
+        ("meta", True, ("ref", "PolarsMeta")),
+    ),
+    "DataInterfaceSql": (
+        ("kind", True, ("union", [("lit", "Sql")])),
+        ("meta", True, ("ref", "SqlMeta")),
+    ),
+    "DataInterfaceText": (
+        ("kind", True, ("union", [("lit", "Text")])),
+        ("meta", True, ("ref", "TextMeta")),
+    ),
+    "DataInterfaceTorch": (
+        ("kind", True, ("union", [("lit", "Torch")])),
+        ("meta", True, ("ref", "TorchMeta")),
+    ),
+    "DataSchema": (("columns", False, ("array", ("ref", "FieldSpec"))),),
+    "DataSpec": (
+        ("card_refs", False, ("array", ("ref", "Ref"))),
+        ("interface", True, ("ref", "DataInterface")),
+        ("schema", True, ("ref", "DataSchema")),
+        ("splits", False, ("map", ("ref", "DataSplit"))),
+        ("sql", False, ("union", [("ref", "SqlLogic"), ("prim", "null")])),
+        ("stats", True, ("ref", "DataStats")),
+        ("target_columns", False, ("array", ("ref", "ColumnName"))),
+    ),
+    "DataSplit": (
+        ("label", True, ("ref", "SplitName")),
+        ("strategy", True, ("ref", "SplitStrategy")),
+    ),
+    "DataStats": (
+        ("byte_count", True, ("prim", "integer")),
+        ("col_count", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("row_count", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("sha256", True, ("prim", "string")),
+    ),
+    "DimDynamic": (
+        ("kind", True, ("union", [("lit", "Dynamic")])),
+        ("value", True, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "DimFixed": (
+        ("kind", True, ("union", [("lit", "Fixed")])),
+        ("value", True, ("prim", "integer")),
+    ),
+    "DriftBaselineStatus": (
+        ("data", True, ("ref", "CardRef")),
+        ("error", False, ("union", [("ref", "VerificationError"), ("prim", "null")])),
+        ("state", True, ("ref", "DriftBaselineState")),
+    ),
+    "DriftConditionAbove": (
+        ("kind", True, ("union", [("lit", "Above")])),
+        ("limit", True, ("prim", "number")),
+    ),
+    "DriftConditionBelow": (
+        ("kind", True, ("union", [("lit", "Below")])),
+        ("limit", True, ("prim", "number")),
+    ),
+    "DriftConditionOutside": (
+        ("kind", True, ("union", [("lit", "Outside")])),
+        ("lower", True, ("prim", "number")),
+        ("upper", True, ("prim", "number")),
+    ),
+    "DriftConditionStatistical": (("kind", True, ("union", [("lit", "Statistical")])),),
+    "DriftProfileCustom": (
+        ("alert_threshold", True, ("prim", "number")),
+        ("baseline_value", True, ("prim", "number")),
+        ("kind", True, ("union", [("lit", "Custom")])),
+        ("metric_name", True, ("prim", "string")),
+    ),
+    "DriftProfilePsi": (
+        ("binning_strategy", True, ("ref", "PsiBinningStrategy")),
+        ("categorical_features", False, ("array", ("ref", "FeatureName"))),
+        ("kind", True, ("union", [("lit", "Psi")])),
+        ("threshold", True, ("ref", "PsiThreshold")),
+    ),
+    "DriftProfileSpc": (
+        ("kind", True, ("union", [("lit", "Spc")])),
+        ("sample_size", True, ("prim", "integer")),
+    ),
+    "DriftSignalDistribution": (
+        ("baseline_ref", True, ("ref", "Ref")),
+        ("features", True, ("array", ("ref", "FeatureName"))),
+        ("kind", True, ("union", [("lit", "Distribution")])),
+    ),
+    "DriftSignalMetric": (
+        ("kind", True, ("union", [("lit", "Metric")])),
+        ("name", True, ("prim", "string")),
+    ),
+    "DriftSpec": (
+        ("condition", True, ("ref", "DriftCondition")),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("method", True, ("ref", "DriftMethod")),
+        ("profile", False, ("union", [("ref", "DriftProfile"), ("prim", "null")])),
+        ("signal", True, ("ref", "DriftSignal")),
+    ),
+    "EvalCondition": (
+        ("combinator", False, ("union", [("ref", "ConditionCombinator"), ("prim", "null")])),
+        ("expected", True, ("prim", "any")),
+        ("operator", True, ("ref", "ComparisonOperator")),
+        ("path", True, ("ref", "JsonPath")),
+        ("subsequent", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+    ),
+    "EvalPassGateAllPass": (("kind", True, ("union", [("lit", "all_pass")])),),
+    "EvalPassGateOverallPassRate": (
+        ("kind", True, ("union", [("lit", "overall_pass_rate")])),
+        ("threshold", True, ("prim", "number")),
+    ),
+    "EvalPassGatePerJudgePassRate": (
+        ("kind", True, ("union", [("lit", "per_judge_pass_rate")])),
+        ("threshold", True, ("prim", "number")),
+    ),
+    "EvalSamplingDeterministicByHash": (
+        ("bucket", True, ("prim", "integer")),
+        ("key_path", True, ("ref", "JsonPath")),
+        ("kind", True, ("union", [("lit", "deterministic_by_hash")])),
+        ("modulus", True, ("prim", "integer")),
+    ),
+    "EvalSamplingEveryNth": (
+        ("kind", True, ("union", [("lit", "every_nth")])),
+        ("n", True, ("prim", "integer")),
+    ),
+    "EvalSamplingRatio": (
+        ("kind", True, ("union", [("lit", "ratio")])),
+        ("ratio", True, ("prim", "number")),
+    ),
+    "EvalSpec": (
+        ("context_capture", False, ("union", [("ref", "EvalContextCapture"), ("prim", "null")])),
+        ("dataset", False, ("union", [("ref", "Ref"), ("prim", "null")])),
+        ("pass_gate", False, ("union", [("ref", "EvalPassGate"), ("prim", "null")])),
+        ("sampling", False, ("union", [("ref", "EvalSampling"), ("prim", "null")])),
+        ("tasks", True, ("map", ("ref", "EvalTask"))),
+        ("workflow", False, ("union", [("ref", "Workflow"), ("prim", "null")])),
+    ),
+    "EvalTaskAgentAssertion": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("kind", True, ("union", [("lit", "agent_assertion")])),
+        ("operator", True, ("ref", "ComparisonOperator")),
+        ("workflow_field_path", True, ("ref", "JsonPath")),
+    ),
+    "EvalTaskAssertion": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("item_context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "assertion")])),
+        ("operator", True, ("ref", "ComparisonOperator")),
+    ),
+    "EvalTaskLlmJudge": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("judge_ref", True, ("ref", "InlineableRef_for_AgentSpec")),
+        ("kind", True, ("union", [("lit", "llm_judge")])),
+        ("max_retries", False, ("prim", "integer")),
+        ("operator", True, ("ref", "ComparisonOperator")),
+    ),
+    "EvalTaskTraceAssertion": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("kind", True, ("union", [("lit", "trace_assertion")])),
+        ("operator", True, ("ref", "ComparisonOperator")),
+        ("span_selector", True, ("ref", "JsonPath")),
+    ),
+    "FieldSpec": (
+        ("dtype", True, ("prim", "string")),
+        ("extra", False, ("map", ("prim", "string"))),
+        ("name", True, ("ref", "ColumnName")),
+        ("nullable", False, ("prim", "boolean")),
+        ("shape", False, ("array", ("ref", "Dim"))),
+    ),
+    "GoogleBatchEmbedRequest": (("requests", True, ("array", ("ref", "GoogleEmbedRequest"))),),
+    "GoogleCodeExecutionResult": (
+        ("outcome", True, ("prim", "string")),
+        ("output", True, ("prim", "string")),
+    ),
+    "GoogleContent": (
+        ("parts", True, ("array", ("ref", "GooglePart"))),
+        ("role", True, ("prim", "string")),
+    ),
+    "GoogleEmbedContent": (("parts", True, ("array", ("ref", "GoogleEmbedPart"))),),
+    "GoogleEmbedPart": (("text", True, ("prim", "string")),),
+    "GoogleEmbedRequest": (
+        ("content", True, ("ref", "GoogleEmbedContent")),
+        ("model", True, ("prim", "string")),
+        ("output_dimensionality", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("task_type", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("title", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "GoogleExecutableCode": (
+        ("code", True, ("prim", "string")),
+        ("language", True, ("prim", "string")),
+    ),
+    "GoogleFileData": (
+        ("file_uri", True, ("prim", "string")),
+        ("mime_type", True, ("prim", "string")),
+    ),
+    "GoogleFunctionCall": (("args", True, ("prim", "any")), ("name", True, ("prim", "string"))),
+    "GoogleFunctionCallingConfig": (
+        (
+            "allowed_function_names",
+            False,
+            ("union", [("array", ("prim", "string")), ("prim", "null")]),
+        ),
+        ("mode", True, ("prim", "string")),
+    ),
+    "GoogleFunctionDeclaration": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+        ("parameters", True, ("prim", "any")),
+    ),
+    "GoogleFunctionResponse": (
+        ("name", True, ("prim", "string")),
+        ("response", True, ("prim", "any")),
+    ),
+    "GoogleGenerateContentRequest": (
+        ("cached_content", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("contents", True, ("array", ("ref", "GoogleContent"))),
+        (
+            "generation_config",
+            False,
+            ("union", [("ref", "GoogleGenerationConfig"), ("prim", "null")]),
+        ),
+        ("labels", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        (
+            "safety_settings",
+            False,
+            ("union", [("array", ("ref", "GoogleSafetySetting")), ("prim", "null")]),
+        ),
+        ("system_instruction", False, ("union", [("ref", "GoogleContent"), ("prim", "null")])),
+        ("tool_config", False, ("union", [("ref", "GoogleToolConfig"), ("prim", "null")])),
+        ("tools", False, ("union", [("array", ("ref", "GoogleTool")), ("prim", "null")])),
+    ),
+    "GoogleGenerationConfig": (
+        ("candidate_count", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("frequency_penalty", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("max_output_tokens", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("presence_penalty", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("response_mime_type", False, ("union", [("prim", "string"), ("prim", "null")])),
+        (
+            "response_modalities",
+            False,
+            ("union", [("array", ("prim", "string")), ("prim", "null")]),
+        ),
+        ("response_schema", False, ("prim", "any")),
+        ("seed", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("speech_config", False, ("prim", "any")),
+        ("stop_sequences", False, ("union", [("array", ("prim", "string")), ("prim", "null")])),
+        ("temperature", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("thinking_config", False, ("union", [("ref", "GoogleThinkingConfig"), ("prim", "null")])),
+        ("top_k", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("top_p", False, ("union", [("prim", "number"), ("prim", "null")])),
+    ),
+    "GoogleInlineData": (
+        ("data", True, ("prim", "string")),
+        ("mime_type", True, ("prim", "string")),
+    ),
+    "GooglePartCodeExecutionResult": (
+        ("code_execution_result", True, ("ref", "GoogleCodeExecutionResult")),
+    ),
+    "GooglePartExecutableCode": (("executable_code", True, ("ref", "GoogleExecutableCode")),),
+    "GooglePartFileData": (("file_data", True, ("ref", "GoogleFileData")),),
+    "GooglePartFunctionCall": (("function_call", True, ("ref", "GoogleFunctionCall")),),
+    "GooglePartFunctionResponse": (("function_response", True, ("ref", "GoogleFunctionResponse")),),
+    "GooglePartInlineData": (("inline_data", True, ("ref", "GoogleInlineData")),),
+    "GooglePartText": (("text", True, ("prim", "string")),),
+    "GooglePartVariant1": (
+        ("text", True, ("prim", "string")),
+        ("thought", True, ("prim", "boolean")),
+    ),
+    "GoogleSafetySetting": (
+        ("category", True, ("prim", "string")),
+        ("threshold", True, ("prim", "string")),
+    ),
+    "GoogleThinkingConfig": (
+        ("include_thoughts", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("thinking_budget", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "GoogleTool": (
+        ("code_execution", False, ("prim", "any")),
+        (
+            "function_declarations",
+            False,
+            ("union", [("array", ("ref", "GoogleFunctionDeclaration")), ("prim", "null")]),
+        ),
+        ("google_search", False, ("prim", "any")),
+        ("google_search_retrieval", False, ("prim", "any")),
+        ("url_context", False, ("prim", "any")),
+    ),
+    "GoogleToolConfig": (
+        ("function_calling_config", True, ("ref", "GoogleFunctionCallingConfig")),
+    ),
+    "HttpAuthBasic": (
+        ("connection", True, ("ref", "ConnectionName")),
+        ("scheme", True, ("union", [("lit", "basic")])),
+    ),
+    "HttpAuthBearer": (
+        ("connection", True, ("ref", "ConnectionName")),
+        ("scheme", True, ("union", [("lit", "bearer")])),
+    ),
+    "HttpAuthHeader": (
+        ("connection", True, ("ref", "ConnectionName")),
+        ("name", True, ("prim", "string")),
+        ("scheme", True, ("union", [("lit", "header")])),
+    ),
+    "HuggingfaceMeta": (
+        ("config", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("dataset_id", True, ("prim", "string")),
+        ("revision", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("split", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "HuggingfaceMeta2": (
+        ("framework_version", True, ("prim", "string")),
+        ("hf_task", True, ("ref", "HuggingFaceTask")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("repo_id", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("revision", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "ImageMeta": (
+        ("color_mode", True, ("ref", "ColorMode")),
+        ("format", True, ("ref", "ImageFormat")),
+        ("manifest_ref", False, ("union", [("ref", "Ref"), ("prim", "null")])),
+    ),
+    "InlineableRef_for_AgentSpecSibling": (("sibling", True, ("ref", "CardRef")),),
+    "InlineableRef_for_OperatorSpecSibling": (("sibling", True, ("ref", "CardRef")),),
+    "InlineableRef_for_PromptSibling": (("sibling", True, ("ref", "CardRef")),),
+    "InlineableRef_for_TriggerSpecSibling": (("sibling", True, ("ref", "CardRef")),),
+    "JsonlMeta": (
+        ("compression", True, ("ref", "JsonlCompression")),
+        ("lines_per_file", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "LightgbmMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "LightningMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "Metadata": (
+        ("annotations", False, ("map", ("ref", "AnnotationValue"))),
+        ("artifact_hash", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("bump", False, ("union", [("ref", "VersionBump"), ("prim", "null")])),
+        ("labels", False, ("map", ("ref", "LabelValue"))),
+        ("name", True, ("ref", "CardName")),
+        ("origin", False, ("union", [("ref", "Origin"), ("prim", "null")])),
+        ("space", False, ("union", [("ref", "SpaceName"), ("prim", "null")])),
+        ("spec_hash", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("uid", False, ("union", [("ref", "CardUid"), ("prim", "null")])),
+        ("version", False, ("union", [("ref", "VersionSpec"), ("prim", "null")])),
+    ),
+    "ModelInterfaceCatboost": (
+        ("kind", True, ("union", [("lit", "Catboost")])),
+        ("meta", True, ("ref", "CatboostMeta")),
+    ),
+    "ModelInterfaceCustom": (
+        ("kind", True, ("union", [("lit", "Custom")])),
+        ("meta", True, ("ref", "CustomMeta")),
+    ),
+    "ModelInterfaceHuggingface": (
+        ("kind", True, ("union", [("lit", "Huggingface")])),
+        ("meta", True, ("ref", "HuggingfaceMeta2")),
+    ),
+    "ModelInterfaceLightgbm": (
+        ("kind", True, ("union", [("lit", "Lightgbm")])),
+        ("meta", True, ("ref", "LightgbmMeta")),
+    ),
+    "ModelInterfaceLightning": (
+        ("kind", True, ("union", [("lit", "Lightning")])),
+        ("meta", True, ("ref", "LightningMeta")),
+    ),
+    "ModelInterfaceSklearn": (
+        ("kind", True, ("union", [("lit", "Sklearn")])),
+        ("meta", True, ("ref", "SklearnMeta")),
+    ),
+    "ModelInterfaceTensorflow": (
+        ("kind", True, ("union", [("lit", "Tensorflow")])),
+        ("meta", True, ("ref", "TensorflowMeta")),
+    ),
+    "ModelInterfaceTorch": (
+        ("kind", True, ("union", [("lit", "Torch")])),
+        ("meta", True, ("ref", "TorchMeta2")),
+    ),
+    "ModelInterfaceXgboost": (
+        ("kind", True, ("union", [("lit", "Xgboost")])),
+        ("meta", True, ("ref", "XgboostMeta")),
+    ),
+    "ModelSignature": (
+        ("inputs", True, ("array", ("ref", "FieldSpec"))),
+        ("outputs", True, ("array", ("ref", "FieldSpec"))),
+    ),
+    "ModelSpec": (
+        ("card_refs", False, ("array", ("ref", "Ref"))),
+        ("interface", True, ("ref", "ModelInterface")),
+        ("sample_input", False, ("union", [("ref", "SampleInput"), ("prim", "null")])),
+        ("signature", True, ("ref", "ModelSignature")),
+        ("task_type", True, ("ref", "TaskType")),
+    ),
+    "NonSecretValueBool": (
+        ("type", True, ("union", [("lit", "bool")])),
+        ("value", True, ("prim", "boolean")),
+    ),
+    "NonSecretValueList": (
+        ("type", True, ("union", [("lit", "list")])),
+        ("value", True, ("array", ("ref", "NonSecretValue"))),
+    ),
+    "NonSecretValueNumber": (
+        ("type", True, ("union", [("lit", "number")])),
+        ("value", True, ("prim", "number")),
+    ),
+    "NonSecretValueObject": (
+        ("type", True, ("union", [("lit", "object")])),
+        ("value", True, ("map", ("ref", "NonSecretValue"))),
+    ),
+    "NonSecretValueStr": (
+        ("type", True, ("union", [("lit", "str")])),
+        ("value", True, ("prim", "string")),
+    ),
+    "NotifyChannelPagerDuty": (
+        ("connection", True, ("ref", "ConnectionName")),
+        ("dedup_key", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "pager_duty")])),
+        ("route", True, ("prim", "string")),
+        ("severity", True, ("ref", "PagerDutySeverity")),
+        ("summary", True, ("prim", "string")),
+    ),
+    "NotifyChannelSlack": (
+        ("channel_id", True, ("prim", "string")),
+        ("connection", True, ("ref", "ConnectionName")),
+        ("kind", True, ("union", [("lit", "slack")])),
+        ("text", True, ("prim", "string")),
+    ),
+    "NumpyMeta": (
+        ("dtype", True, ("prim", "string")),
+        ("format", True, ("ref", "NumpyFormat")),
+        ("shape", False, ("array", ("prim", "integer"))),
+    ),
+    "OpenAiAllowedTools": (
+        ("mode", True, ("ref", "OpenAiAllowedToolsMode")),
+        ("tools", True, ("array", ("map", ("prim", "any")))),
+    ),
+    "OpenAiAllowedToolsChoice": (
+        ("allowed_tools", True, ("ref", "OpenAiAllowedTools")),
+        ("type", True, ("ref", "OpenAiAllowedToolsKind")),
+    ),
+    "OpenAiChatAudio": (
+        ("format", True, ("ref", "OpenAiAudioFormat")),
+        ("voice", True, ("ref", "OpenAiVoice")),
+    ),
+    "OpenAiChatMessage": (
+        ("annotations", False, ("array", ("ref", "OpenAiMessageAnnotation"))),
+        ("audio", False, ("union", [("ref", "OpenAiMessageAudio"), ("prim", "null")])),
+        ("content", False, ("union", [("ref", "OpenAiMessageContent"), ("prim", "null")])),
+        ("name", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("refusal", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("role", True, ("prim", "string")),
+        ("tool_call_id", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("tool_calls", False, ("union", [("array", ("ref", "OpenAiToolCall")), ("prim", "null")])),
+    ),
+    "OpenAiChatRequest": (
+        ("audio", False, ("union", [("ref", "OpenAiChatAudio"), ("prim", "null")])),
+        ("frequency_penalty", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("logit_bias", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("logprobs", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("max_completion_tokens", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("max_tokens", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("messages", True, ("array", ("ref", "OpenAiChatMessage"))),
+        ("metadata", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        (
+            "modalities",
+            False,
+            ("union", [("array", ("ref", "OpenAiResponseModality")), ("prim", "null")]),
+        ),
+        ("model", True, ("prim", "string")),
+        ("n", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("parallel_tool_calls", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("prediction", False, ("union", [("ref", "OpenAiPredictionContent"), ("prim", "null")])),
+        ("presence_penalty", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("prompt_cache_key", False, ("union", [("prim", "string"), ("prim", "null")])),
+        (
+            "reasoning_effort",
+            False,
+            ("union", [("ref", "OpenAiReasoningEffort"), ("prim", "null")]),
+        ),
+        ("response_format", False, ("union", [("ref", "OpenAiResponseFormat"), ("prim", "null")])),
+        ("safety_identifier", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("seed", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("service_tier", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("stop", False, ("union", [("ref", "OpenAiStop"), ("prim", "null")])),
+        ("store", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("stream", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("stream_options", False, ("union", [("ref", "OpenAiStreamOptions"), ("prim", "null")])),
+        ("temperature", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("tool_choice", False, ("union", [("ref", "OpenAiChatToolChoice"), ("prim", "null")])),
+        ("tools", False, ("union", [("array", ("ref", "OpenAiTool")), ("prim", "null")])),
+        ("top_logprobs", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("top_p", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("user", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "OpenAiContentPartFile": (
+        ("file", True, ("ref", "OpenAiFilePart")),
+        ("type", True, ("union", [("lit", "file")])),
+    ),
+    "OpenAiContentPartImageUrl": (
+        ("image_url", True, ("ref", "OpenAiImageUrl")),
+        ("type", True, ("union", [("lit", "image_url")])),
+    ),
+    "OpenAiContentPartInputAudio": (
+        ("input_audio", True, ("ref", "OpenAiInputAudio")),
+        ("type", True, ("union", [("lit", "input_audio")])),
+    ),
+    "OpenAiContentPartText": (
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "text")])),
+    ),
+    "OpenAiCustomChoice": (("name", True, ("prim", "string")),),
+    "OpenAiCustomTool": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("format", False, ("union", [("ref", "OpenAiCustomToolFormat"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+    ),
+    "OpenAiCustomToolFormatGrammar": (
+        ("grammar", True, ("ref", "OpenAiGrammar")),
+        ("type", True, ("union", [("lit", "grammar")])),
+    ),
+    "OpenAiCustomToolFormatText": (("type", True, ("union", [("lit", "text")])),),
+    "OpenAiCustomVoice": (("id", True, ("prim", "string")),),
+    "OpenAiEmbeddingsRequest": (
+        ("dimensions", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("encoding_format", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("input", True, ("ref", "OpenAiEmbeddingsInput")),
+        ("model", True, ("prim", "string")),
+        ("user", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "OpenAiFilePart": (
+        ("file_data", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("file_id", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("filename", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "OpenAiFunction": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+        ("parameters", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("strict", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+    ),
+    "OpenAiFunctionChoice": (("name", True, ("prim", "string")),),
+    "OpenAiGrammar": (
+        ("definition", True, ("prim", "string")),
+        ("syntax", True, ("ref", "OpenAiGrammarSyntax")),
+    ),
+    "OpenAiImageUrl": (
+        ("detail", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("url", True, ("prim", "string")),
+    ),
+    "OpenAiInputAudio": (("data", True, ("prim", "string")), ("format", True, ("prim", "string"))),
+    "OpenAiJsonSchema": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+        ("schema", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("strict", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+    ),
+    "OpenAiMessageAnnotation": (
+        ("type", True, ("prim", "string")),
+        ("url_citation", True, ("ref", "OpenAiUrlCitation")),
+    ),
+    "OpenAiMessageAudio": (
+        ("data", True, ("prim", "string")),
+        ("expires_at", True, ("prim", "integer")),
+        ("id", True, ("prim", "string")),
+        ("transcript", True, ("prim", "string")),
+    ),
+    "OpenAiNamedCustomToolChoice": (
+        ("custom", True, ("ref", "OpenAiCustomChoice")),
+        ("type", True, ("ref", "OpenAiNamedCustomToolChoiceKind")),
+    ),
+    "OpenAiNamedFunctionToolChoice": (
+        ("function", True, ("ref", "OpenAiFunctionChoice")),
+        ("type", True, ("ref", "OpenAiNamedFunctionToolChoiceKind")),
+    ),
+    "OpenAiPredictionContent": (
+        ("content", True, ("ref", "OpenAiPredictionPayload")),
+        ("type", True, ("ref", "OpenAiPredictionKind")),
+    ),
+    "OpenAiPredictionContentPartText": (
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "text")])),
+    ),
+    "OpenAiReasoning": (
+        ("effort", False, ("union", [("ref", "OpenAiReasoningEffort2"), ("prim", "null")])),
+        (
+            "generate_summary",
+            False,
+            ("union", [("ref", "OpenAiReasoningSummary"), ("prim", "null")]),
+        ),
+        ("summary", False, ("union", [("ref", "OpenAiReasoningSummary"), ("prim", "null")])),
+    ),
+    "OpenAiReasoningSummaryPartSummaryText": (
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "summary_text")])),
+    ),
+    "OpenAiResponseContentPartInputFile": (
+        ("file_id", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "input_file")])),
+    ),
+    "OpenAiResponseContentPartInputImage": (
+        ("detail", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("image_url", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "input_image")])),
+    ),
+    "OpenAiResponseContentPartInputText": (
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "input_text")])),
+    ),
+    "OpenAiResponseContentPartOutputText": (
+        ("text", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "output_text")])),
+    ),
+    "OpenAiResponseFormatJsonObject": (("type", True, ("union", [("lit", "json_object")])),),
+    "OpenAiResponseFormatJsonSchema": (
+        ("json_schema", True, ("ref", "OpenAiJsonSchema")),
+        ("type", True, ("union", [("lit", "json_schema")])),
+    ),
+    "OpenAiResponseFormatText": (("type", True, ("union", [("lit", "text")])),),
+    "OpenAiResponseItemFunctionCall": (
+        ("arguments", True, ("prim", "string")),
+        ("call_id", True, ("prim", "string")),
+        ("name", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "function_call")])),
+    ),
+    "OpenAiResponseItemFunctionCallOutput": (
+        ("call_id", True, ("prim", "string")),
+        ("output", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "function_call_output")])),
+    ),
+    "OpenAiResponseItemInputFile": (
+        ("file_id", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "input_file")])),
+    ),
+    "OpenAiResponseItemInputImage": (
+        ("detail", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("image_url", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "input_image")])),
+    ),
+    "OpenAiResponseItemMessage": (
+        ("content", True, ("array", ("ref", "OpenAiResponseContentPart"))),
+        ("role", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "message")])),
+    ),
+    "OpenAiResponseItemReasoning": (
+        ("encrypted_content", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("id", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("summary", False, ("array", ("ref", "OpenAiReasoningSummaryPart"))),
+        ("type", True, ("union", [("lit", "reasoning")])),
+    ),
+    "OpenAiResponsesAllowedToolsChoice": (
+        ("mode", True, ("ref", "OpenAiResponsesAllowedToolsMode")),
+        ("tools", True, ("array", ("map", ("prim", "any")))),
+        ("type", True, ("ref", "OpenAiResponsesAllowedToolsKind")),
+    ),
+    "OpenAiResponsesApplyPatchToolChoice": (
+        ("type", True, ("ref", "OpenAiResponsesApplyPatchToolKind")),
+    ),
+    "OpenAiResponsesCustomToolChoice": (
+        ("name", True, ("prim", "string")),
+        ("type", True, ("ref", "OpenAiResponsesCustomToolKind")),
+    ),
+    "OpenAiResponsesCustomToolFormatGrammar": (
+        ("grammar", True, ("ref", "OpenAiResponsesGrammar")),
+        ("type", True, ("union", [("lit", "grammar")])),
+    ),
+    "OpenAiResponsesCustomToolFormatText": (("type", True, ("union", [("lit", "text")])),),
+    "OpenAiResponsesFunctionToolChoice": (
+        ("name", True, ("prim", "string")),
+        ("type", True, ("ref", "OpenAiResponsesFunctionToolKind")),
+    ),
+    "OpenAiResponsesGrammar": (
+        ("definition", True, ("prim", "string")),
+        ("syntax", True, ("ref", "OpenAiResponsesGrammarSyntax")),
+    ),
+    "OpenAiResponsesHostedToolChoice": (("type", True, ("ref", "OpenAiResponsesHostedToolKind")),),
+    "OpenAiResponsesMcpToolChoice": (
+        ("name", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("server_label", True, ("prim", "string")),
+        ("type", True, ("ref", "OpenAiResponsesMcpToolKind")),
+    ),
+    "OpenAiResponsesRequest": (
+        ("include", False, ("union", [("array", ("prim", "string")), ("prim", "null")])),
+        ("input", True, ("ref", "OpenAiResponsesInput")),
+        ("instructions", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("max_output_tokens", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("metadata", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("model", True, ("prim", "string")),
+        ("parallel_tool_calls", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("previous_response_id", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("reasoning", False, ("union", [("ref", "OpenAiReasoning"), ("prim", "null")])),
+        ("store", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("stream", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("temperature", False, ("union", [("prim", "number"), ("prim", "null")])),
+        ("text", False, ("union", [("ref", "OpenAiResponsesText"), ("prim", "null")])),
+        ("tool_choice", False, ("union", [("ref", "OpenAiResponsesToolChoice"), ("prim", "null")])),
+        ("tools", False, ("union", [("array", ("ref", "OpenAiResponsesTool")), ("prim", "null")])),
+        ("top_p", False, ("union", [("prim", "number"), ("prim", "null")])),
+    ),
+    "OpenAiResponsesShellToolChoice": (("type", True, ("ref", "OpenAiResponsesShellToolKind")),),
+    "OpenAiResponsesText": (
+        ("format", False, ("union", [("ref", "OpenAiTextResponseFormat"), ("prim", "null")])),
+    ),
+    "OpenAiResponsesToolCodeInterpreter": (
+        ("type", True, ("union", [("lit", "code_interpreter")])),
+    ),
+    "OpenAiResponsesToolCustom": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        (
+            "format",
+            False,
+            ("union", [("ref", "OpenAiResponsesCustomToolFormat"), ("prim", "null")]),
+        ),
+        ("name", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "custom")])),
+    ),
+    "OpenAiResponsesToolFileSearch": (
+        ("type", True, ("union", [("lit", "file_search")])),
+        ("vector_store_ids", True, ("array", ("prim", "string"))),
+    ),
+    "OpenAiResponsesToolFunction": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+        ("parameters", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("strict", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("type", True, ("union", [("lit", "function")])),
+    ),
+    "OpenAiResponsesToolImageGeneration": (
+        ("type", True, ("union", [("lit", "image_generation")])),
+    ),
+    "OpenAiResponsesToolMcp": (
+        ("allowed_tools", False, ("union", [("array", ("prim", "string")), ("prim", "null")])),
+        ("server_label", True, ("prim", "string")),
+        ("server_url", True, ("prim", "string")),
+        ("type", True, ("union", [("lit", "mcp")])),
+    ),
+    "OpenAiResponsesToolWebSearchPreview": (
+        ("type", True, ("union", [("lit", "web_search_preview")])),
+    ),
+    "OpenAiStreamOptions": (
+        ("include_obfuscation", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("include_usage", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+    ),
+    "OpenAiTextResponseFormatJsonObject": (("type", True, ("union", [("lit", "json_object")])),),
+    "OpenAiTextResponseFormatJsonSchema": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("name", True, ("prim", "string")),
+        ("schema", False, ("union", [("map", ("prim", "any")), ("prim", "null")])),
+        ("strict", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("type", True, ("union", [("lit", "json_schema")])),
+    ),
+    "OpenAiTextResponseFormatText": (("type", True, ("union", [("lit", "text")])),),
+    "OpenAiToolCall": (
+        ("function", True, ("ref", "OpenAiToolFunctionCall")),
+        ("id", True, ("prim", "string")),
+        ("type", True, ("prim", "string")),
+    ),
+    "OpenAiToolCustom": (
+        ("custom", True, ("ref", "OpenAiCustomTool")),
+        ("type", True, ("union", [("lit", "custom")])),
+    ),
+    "OpenAiToolFunction": (
+        ("function", True, ("ref", "OpenAiFunction")),
+        ("type", True, ("union", [("lit", "function")])),
+    ),
+    "OpenAiToolFunctionCall": (
+        ("arguments", True, ("prim", "string")),
+        ("name", True, ("prim", "string")),
+    ),
+    "OpenAiUrlCitation": (
+        ("end_index", True, ("prim", "integer")),
+        ("start_index", True, ("prim", "integer")),
+        ("title", True, ("prim", "string")),
+        ("url", True, ("prim", "string")),
+    ),
+    "OperatorBudget": (
+        ("max_tool_calls", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("max_wall_seconds", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "OperatorSpecHttp": (
+        ("auth", False, ("union", [("ref", "HttpAuth"), ("prim", "null")])),
+        ("body", False, ("prim", "any")),
+        ("budget", False, ("union", [("ref", "OperatorBudget"), ("prim", "null")])),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("expect_status", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("headers", False, ("map", ("prim", "string"))),
+        ("kind", True, ("union", [("lit", "http")])),
+        ("method", True, ("ref", "HttpMethod")),
+        ("timeout_seconds", False, ("union", [("prim", "integer"), ("prim", "null")])),
+        ("url", True, ("prim", "string")),
+    ),
+    "OperatorSpecNotify": (
+        ("budget", False, ("union", [("ref", "OperatorBudget"), ("prim", "null")])),
+        ("channel", True, ("ref", "NotifyChannel")),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "notify")])),
+    ),
+    "OperatorSpecWorkflow": (
+        ("budget", False, ("union", [("ref", "OperatorBudget"), ("prim", "null")])),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "workflow")])),
+        ("workflow_ref", True, ("ref", "Ref")),
+    ),
+    "Origin": (
+        ("commit", True, ("ref", "CommitSha")),
+        ("dirty", False, ("prim", "boolean")),
+        ("path", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("repo", True, ("prim", "string")),
+    ),
+    "PandasMeta": (
+        ("compression", False, ("ref", "ParquetCompression")),
+        ("framework_version", True, ("prim", "string")),
+    ),
+    "ParameterizedComparisonOperatorApproximatelyEquals": (
+        ("kind", True, ("union", [("lit", "approximately_equals")])),
+        ("tolerance", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorBetweenPercentiles": (
+        ("kind", True, ("union", [("lit", "between_percentiles")])),
+        ("lower_pct", True, ("prim", "number")),
+        ("upper_pct", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorCosineSimilarityAtLeast": (
+        ("kind", True, ("union", [("lit", "cosine_similarity_at_least")])),
+        ("threshold", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorDivergenceLessThan": (
+        ("kind", True, ("union", [("lit", "divergence_less_than")])),
+        ("metric", True, ("ref", "DivergenceMetric")),
+        ("threshold", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorHasMaxLength": (
+        ("kind", True, ("union", [("lit", "has_max_length")])),
+        ("max", True, ("prim", "integer")),
+    ),
+    "ParameterizedComparisonOperatorHasMinLength": (
+        ("kind", True, ("union", [("lit", "has_min_length")])),
+        ("min", True, ("prim", "integer")),
+    ),
+    "ParameterizedComparisonOperatorInRange": (
+        ("inclusive", True, ("prim", "boolean")),
+        ("kind", True, ("union", [("lit", "in_range")])),
+        ("max", True, ("prim", "number")),
+        ("min", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorIsType": (
+        ("expected", True, ("ref", "JsonValueType")),
+        ("kind", True, ("union", [("lit", "is_type")])),
+    ),
+    "ParameterizedComparisonOperatorLength": (
+        ("expected", True, ("prim", "integer")),
+        ("kind", True, ("union", [("lit", "length")])),
+    ),
+    "ParameterizedComparisonOperatorLengthGreaterThan": (
+        ("kind", True, ("union", [("lit", "length_greater_than")])),
+        ("min", True, ("prim", "integer")),
+    ),
+    "ParameterizedComparisonOperatorLengthLessThan": (
+        ("kind", True, ("union", [("lit", "length_less_than")])),
+        ("max", True, ("prim", "integer")),
+    ),
+    "ParameterizedComparisonOperatorMatchesRegex": (
+        ("kind", True, ("union", [("lit", "matches_regex")])),
+        ("pattern", True, ("prim", "string")),
+    ),
+    "ParameterizedComparisonOperatorNotInRange": (
+        ("inclusive", True, ("prim", "boolean")),
+        ("kind", True, ("union", [("lit", "not_in_range")])),
+        ("max", True, ("prim", "number")),
+        ("min", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorNotMatchesRegex": (
+        ("kind", True, ("union", [("lit", "not_matches_regex")])),
+        ("pattern", True, ("prim", "string")),
+    ),
+    "ParameterizedComparisonOperatorWithinAbsTolerance": (
+        ("kind", True, ("union", [("lit", "within_abs_tolerance")])),
+        ("tolerance", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorWithinPctTolerance": (
+        ("kind", True, ("union", [("lit", "within_pct_tolerance")])),
+        ("pct", True, ("prim", "number")),
+    ),
+    "ParameterizedComparisonOperatorWithinStdDev": (
+        ("kind", True, ("union", [("lit", "within_std_dev")])),
+        ("mean", True, ("prim", "number")),
+        ("sigma", True, ("prim", "number")),
+        ("std_dev", True, ("prim", "number")),
+    ),
+    "ParquetMeta": (
+        ("compression", False, ("ref", "ParquetCompression")),
+        ("row_group_size", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "PolarsMeta": (
+        ("compression", False, ("ref", "ParquetCompression")),
+        ("framework_version", True, ("prim", "string")),
+    ),
+    "Prompt": (
+        ("media_variables", False, ("array", ("prim", "string"))),
+        ("model", True, ("prim", "string")),
+        ("provider", False, ("union", [("ref", "ProviderName"), ("prim", "null")])),
+        ("request", True, ("ref", "ProviderRequest")),
+        ("response_type", False, ("ref", "ResponseType")),
+        ("variables", False, ("array", ("prim", "string"))),
+        ("version", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "PromptSpec": (
+        ("media_variables", False, ("array", ("prim", "string"))),
+        ("model", True, ("prim", "string")),
+        ("provider", False, ("union", [("ref", "ProviderName"), ("prim", "null")])),
+        ("request", True, ("ref", "ProviderRequest")),
+        ("response_type", False, ("ref", "ResponseType")),
+        ("variables", False, ("array", ("prim", "string"))),
+        ("version", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "ProviderNameCustom": (("custom", True, ("prim", "string")),),
+    "ProviderRequestAnthropicMessage": (
+        ("body", True, ("ref", "AnthropicMessagesRequest")),
+        ("provider", True, ("union", [("lit", "anthropic_message")])),
+    ),
+    "ProviderRequestGeminiGenerateContent": (
+        ("body", True, ("ref", "GoogleGenerateContentRequest")),
+        ("provider", True, ("union", [("lit", "gemini_generate_content")])),
+    ),
+    "ProviderRequestGoogleBatchEmbed": (
+        ("body", True, ("ref", "GoogleBatchEmbedRequest")),
+        ("provider", True, ("union", [("lit", "google_batch_embed")])),
+    ),
+    "ProviderRequestOpenAiChatCompletion": (
+        ("body", True, ("ref", "OpenAiChatRequest")),
+        ("provider", True, ("union", [("lit", "open_ai_chat_completion")])),
+    ),
+    "ProviderRequestOpenAiEmbeddings": (
+        ("body", True, ("ref", "OpenAiEmbeddingsRequest")),
+        ("provider", True, ("union", [("lit", "open_ai_embeddings")])),
+    ),
+    "ProviderRequestOpenAiResponses": (
+        ("body", True, ("ref", "OpenAiResponsesRequest")),
+        ("provider", True, ("union", [("lit", "open_ai_responses")])),
+    ),
+    "ProviderRequestRawV1": (
+        ("body", True, ("ref", "ProviderRequestRawV1Body")),
+        ("provider", True, ("union", [("lit", "raw_v1")])),
+    ),
+    "ProviderRequestRawV1Body": (
+        ("body", True, ("prim", "any")),
+        ("provider", True, ("ref", "ProviderName")),
+    ),
+    "ProviderRequestVertexPredict": (
+        ("body", True, ("ref", "VertexPredictRequest")),
+        ("provider", True, ("union", [("lit", "vertex_predict")])),
+    ),
+    "PsiBinningStrategyEqualWidth": (
+        ("kind", True, ("union", [("lit", "EqualWidth")])),
+        ("n_bins", True, ("prim", "integer")),
+    ),
+    "PsiBinningStrategyQuantile": (
+        ("kind", True, ("union", [("lit", "Quantile")])),
+        ("n_bins", True, ("prim", "integer")),
+    ),
+    "PsiThresholdChiSquare": (
+        ("alpha", True, ("prim", "number")),
+        ("kind", True, ("union", [("lit", "ChiSquare")])),
+    ),
+    "PsiThresholdFixed": (
+        ("kind", True, ("union", [("lit", "Fixed")])),
+        ("value", True, ("prim", "number")),
+    ),
+    "PsiThresholdNormal": (
+        ("alpha", True, ("prim", "number")),
+        ("kind", True, ("union", [("lit", "Normal")])),
+    ),
+    "RefSibling": (("sibling", True, ("ref", "CardRef")),),
+    "RegisteredAgentCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Agent")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "AgentSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredArtifactCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Artifact")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredAuditCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Audit")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredDataCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Data")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "DataSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredExperimentCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Experiment")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredMcpCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Mcp")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredModelCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Model")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "ModelSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredOperatorCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Operator")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "OperatorSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredPolicyCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Policy")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredPromptCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Prompt")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "PromptSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredServiceCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Service")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "ServiceSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredSourceCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Source")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredTriggerCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Trigger")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "TriggerSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredVerifierCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Verifier")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("ref", "VerifierSpec")),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "RegisteredWorkflowCard": (
+        ("apiVersion", True, ("ref", "ApiVersion")),
+        ("kind", True, ("lit", "Workflow")),
+        ("metadata", True, ("ref", "Metadata")),
+        ("relationships", False, ("ref", "Relationships")),
+        ("spec", True, ("map", ("prim", "any"))),
+        ("status", False, ("union", [("ref", "Status"), ("prim", "null")])),
+    ),
+    "Relationships": (
+        ("inbound", False, ("array", ("prim", "string"))),
+        ("inbound_refs", False, ("array", ("ref", "CardRelationship"))),
+        ("outbound", False, ("array", ("prim", "string"))),
+        ("outbound_refs", False, ("array", ("ref", "CardRelationship"))),
+    ),
+    "ResponseTypeJsonSchema": (("json_schema", True, ("ref", "ResponseTypeJsonSchemaJsonSchema")),),
+    "ResponseTypeJsonSchemaJsonSchema": (
+        ("name", True, ("prim", "string")),
+        ("schema", True, ("prim", "any")),
+    ),
+    "SampleInput": (("kind", True, ("ref", "SampleInputKind")),),
+    "ServiceComponent": (
+        ("alias", True, ("prim", "string")),
+        ("config", False, ("map", ("ref", "NonSecretValue"))),
+        ("credential_refs", False, ("array", ("ref", "CredentialRef"))),
+        ("ref", True, ("ref", "Ref")),
+        ("source", False, ("union", [("ref", "ComponentSource"), ("prim", "null")])),
+        ("verified_by", False, ("array", ("ref", "VerificationBinding"))),
+    ),
+    "ServiceRuntime": (
+        ("config", False, ("map", ("ref", "NonSecretValue"))),
+        ("framework", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("ref", "ServiceRuntimeKind")),
+        ("mode", False, ("union", [("ref", "ServiceRuntimeMode"), ("prim", "null")])),
+        ("policy", False, ("union", [("ref", "ServiceRuntimePolicy"), ("prim", "null")])),
+        ("strict", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+    ),
+    "ServiceRuntimePolicy": (("runtime_hooks", False, ("prim", "boolean")),),
+    "ServiceSpec": (
+        ("components", False, ("array", ("ref", "ServiceComponent"))),
+        ("content_hash", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("credential_refs", False, ("array", ("ref", "CredentialRef"))),
+        ("deployment", False, ("map", ("ref", "NonSecretValue"))),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("entry_point", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("lock_hash", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("metadata", False, ("map", ("ref", "NonSecretValue"))),
+        ("runtime", False, ("union", [("ref", "ServiceRuntime"), ("prim", "null")])),
+        ("service_config", False, ("map", ("ref", "NonSecretValue"))),
+        ("service_type", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("verified_by", False, ("array", ("ref", "VerificationBinding"))),
+    ),
+    "SklearnMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "SplitStrategyColumn": (
+        ("kind", True, ("union", [("lit", "Column")])),
+        ("value", True, ("ref", "SplitStrategyColumnValue")),
+    ),
+    "SplitStrategyColumnValue": (
+        ("name", True, ("ref", "ColumnName")),
+        ("op", True, ("ref", "Inequality")),
+        ("value", True, ("ref", "ColValue")),
+    ),
+    "SplitStrategyIndexRange": (
+        ("kind", True, ("union", [("lit", "IndexRange")])),
+        ("value", True, ("ref", "SplitStrategyIndexRangeValue")),
+    ),
+    "SplitStrategyIndexRangeValue": (
+        ("start", True, ("prim", "integer")),
+        ("stop", True, ("prim", "integer")),
+    ),
+    "SplitStrategyIndices": (
+        ("kind", True, ("union", [("lit", "Indices")])),
+        ("value", True, ("array", ("prim", "integer"))),
+    ),
+    "SplitStrategyMaterialized": (
+        ("kind", True, ("union", [("lit", "Materialized")])),
+        ("value", True, ("ref", "Ref")),
+    ),
+    "SqlLogic": (
+        ("default_query", False, ("union", [("ref", "QueryName"), ("prim", "null")])),
+        ("queries", True, ("map", ("prim", "string"))),
+    ),
+    "SqlMeta": (
+        ("connection_hint", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("dialect", True, ("prim", "string")),
+    ),
+    "Status": (
+        ("message", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("phase", True, ("prim", "string")),
+        ("updated_at", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("verification", False, ("union", [("ref", "VerificationStatus"), ("prim", "null")])),
+    ),
+    "TensorflowMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("save_format", True, ("ref", "TfSaveFormat")),
+    ),
+    "TextMeta": (
+        ("encoding", False, ("prim", "string")),
+        ("manifest_ref", False, ("union", [("ref", "Ref"), ("prim", "null")])),
+    ),
+    "TorchMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("save_format", True, ("ref", "TorchSaveFormat")),
+    ),
+    "TorchMeta2": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("save_format", True, ("ref", "TorchSaveFormat2")),
+    ),
+    "TriggerSpecObservationsReady": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "observations_ready")])),
+    ),
+    "TriggerSpecSchedule": (
+        ("cron", True, ("prim", "string")),
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "schedule")])),
+        ("tz", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "VerificationBinding": (
+        ("on_failure", False, ("array", ("ref", "InlineableRef_for_OperatorSpec"))),
+        ("runs_on", True, ("ref", "InlineableRef_for_TriggerSpec")),
+        ("verifier", True, ("ref", "Ref")),
+    ),
+    "VerificationError": (
+        ("code", True, ("prim", "string")),
+        ("message", True, ("prim", "string")),
+    ),
+    "VerificationStatus": (
+        ("baseline", False, ("union", [("ref", "DriftBaselineStatus"), ("prim", "null")])),
+        ("binding_ids", False, ("array", ("prim", "string"))),
+    ),
+    "VerifierImplementationDrift": (
+        ("kind", True, ("union", [("lit", "drift")])),
+        ("spec", True, ("ref", "DriftSpec")),
+    ),
+    "VerifierImplementationEval": (
+        ("kind", True, ("union", [("lit", "eval")])),
+        ("spec", True, ("ref", "EvalSpec")),
+    ),
+    "VerifierSpec": (
+        ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("implementation", True, ("ref", "VerifierImplementation")),
+    ),
+    "VersionBumpBuild": (("build", True, ("ref", "VersionBumpBuildBuild")),),
+    "VersionBumpBuildBuild": (("metadata", True, ("prim", "string")),),
+    "VersionBumpPre": (("pre", True, ("ref", "VersionBumpPrePre")),),
+    "VersionBumpPreBuild": (("pre_build", True, ("ref", "VersionBumpPreBuildPreBuild")),),
+    "VersionBumpPreBuildPreBuild": (
+        ("build", True, ("prim", "string")),
+        ("pre", True, ("prim", "string")),
+    ),
+    "VersionBumpPrePre": (("identifier", True, ("prim", "string")),),
+    "VertexEmbedInstance": (
+        ("content", True, ("prim", "string")),
+        ("task_type", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("title", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+    "VertexEmbedParameters": (
+        ("auto_truncate", False, ("union", [("prim", "boolean"), ("prim", "null")])),
+        ("output_dimensionality", False, ("union", [("prim", "integer"), ("prim", "null")])),
+    ),
+    "VertexPredictRequest": (
+        ("instances", True, ("array", ("ref", "VertexEmbedInstance"))),
+        ("parameters", False, ("union", [("ref", "VertexEmbedParameters"), ("prim", "null")])),
+    ),
+    "Workflow": (("fields", True, ("map", ("ref", "WorkflowFieldType"))),),
+    "XgboostMeta": (
+        ("framework_version", True, ("prim", "string")),
+        ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
+    ),
+}
+"""Each object's fields as `(key, required, expression)`, by class name."""
+
+_ALIASES: dict[str, tuple] = {
+    "AnnotationValue": ("prim", "string"),
+    "AnthropicCitationV1": (
+        "union",
+        [
+            ("ref", "AnthropicCitationV1CharLocation"),
+            ("ref", "AnthropicCitationV1PageLocation"),
+            ("ref", "AnthropicCitationV1ContentBlockLocation"),
+            ("ref", "AnthropicCitationV1WebSearchResultLocation"),
+            ("ref", "AnthropicCitationV1SearchResultLocation"),
+        ],
+    ),
+    "AnthropicContentBlock": (
+        "union",
+        [
+            ("ref", "AnthropicContentBlockText"),
+            ("ref", "AnthropicContentBlockImage"),
+            ("ref", "AnthropicContentBlockDocument"),
+            ("ref", "AnthropicContentBlockThinking"),
+            ("ref", "AnthropicContentBlockRedactedThinking"),
+            ("ref", "AnthropicContentBlockToolUse"),
+            ("ref", "AnthropicContentBlockToolResult"),
+        ],
+    ),
+    "AnthropicDocumentSource": (
+        "union",
+        [
+            ("ref", "AnthropicDocumentSourceBase64"),
+            ("ref", "AnthropicDocumentSourceUrl"),
+            ("ref", "AnthropicDocumentSourceFileId"),
+            ("ref", "AnthropicDocumentSourceText"),
+            ("ref", "AnthropicDocumentSourceContent"),
+        ],
+    ),
+    "AnthropicImageSource": (
+        "union",
+        [
+            ("ref", "AnthropicImageSourceBase64"),
+            ("ref", "AnthropicImageSourceUrl"),
+            ("ref", "AnthropicImageSourceFileId"),
+        ],
+    ),
+    "AnthropicOutputFormat": ("union", [("ref", "AnthropicOutputFormatJsonSchema")]),
+    "AnthropicSystem": ("union", [("prim", "string"), ("array", ("ref", "AnthropicSystemBlock"))]),
+    "AnthropicSystemBlock": ("union", [("ref", "AnthropicSystemBlockText")]),
+    "AnthropicToolResultContent": (
+        "union",
+        [("prim", "string"), ("array", ("ref", "AnthropicContentBlock"))],
+    ),
+    "ApiVersion": ("prim", "string"),
+    "ArrowFormat": ("union", [("union", [("lit", "Ipc")]), ("union", [("lit", "Parquet")])]),
+    "CardKind": (
+        "union",
+        [
+            ("lit", "Data"),
+            ("lit", "Model"),
+            ("lit", "Experiment"),
+            ("lit", "Prompt"),
+            ("lit", "Agent"),
+            ("lit", "Workflow"),
+            ("lit", "Verifier"),
+            ("lit", "Service"),
+            ("lit", "Policy"),
+            ("lit", "Mcp"),
+            ("lit", "Audit"),
+            ("lit", "Artifact"),
+            ("lit", "Trigger"),
+            ("lit", "Operator"),
+            ("lit", "Source"),
+        ],
+    ),
+    "CardName": ("prim", "string"),
+    "CardUid": ("prim", "string"),
+    "ColValue": (
+        "union",
+        [
+            ("prim", "integer"),
+            ("prim", "number"),
+            ("prim", "string"),
+            ("prim", "boolean"),
+            ("prim", "string"),
+            ("array", ("ref", "ColValue")),
+        ],
+    ),
+    "ColorMode": (
+        "union",
+        [
+            ("union", [("lit", "Rgb")]),
+            ("union", [("lit", "Rgba")]),
+            ("union", [("lit", "Grayscale")]),
+        ],
+    ),
+    "ColumnName": ("prim", "string"),
+    "CommitSha": ("prim", "string"),
+    "ComparisonOperator": (
+        "union",
+        [
+            ("ref", "ParameterlessComparisonOperatorSchema"),
+            ("ref", "ParameterizedComparisonOperator"),
+        ],
+    ),
+    "ConditionCombinator": ("union", [("union", [("lit", "and")]), ("union", [("lit", "or")])]),
+    "ConnectionName": ("prim", "string"),
+    "DataInterface": (
+        "union",
+        [
+            ("ref", "DataInterfacePandas"),
+            ("ref", "DataInterfacePolars"),
+            ("ref", "DataInterfaceArrow"),
+            ("ref", "DataInterfaceParquet"),
+            ("ref", "DataInterfaceNumpy"),
+            ("ref", "DataInterfaceTorch"),
+            ("ref", "DataInterfaceSql"),
+            ("ref", "DataInterfaceJsonl"),
+            ("ref", "DataInterfaceImage"),
+            ("ref", "DataInterfaceText"),
+            ("ref", "DataInterfaceHuggingface"),
+            ("ref", "DataInterfaceCustom"),
+        ],
+    ),
+    "Dim": ("union", [("ref", "DimFixed"), ("ref", "DimDynamic")]),
+    "DivergenceMetric": (
+        "union",
+        [
+            ("union", [("lit", "kl")]),
+            ("union", [("lit", "js")]),
+            ("union", [("lit", "wasserstein")]),
+        ],
+    ),
+    "DriftBaselineState": (
+        "union",
+        [
+            ("union", [("lit", "pending")]),
+            ("union", [("lit", "building")]),
+            ("union", [("lit", "ready")]),
+            ("union", [("lit", "failed")]),
+        ],
+    ),
+    "DriftCondition": (
+        "union",
+        [
+            ("ref", "DriftConditionStatistical"),
+            ("ref", "DriftConditionAbove"),
+            ("ref", "DriftConditionBelow"),
+            ("ref", "DriftConditionOutside"),
+        ],
+    ),
+    "DriftMethod": (
+        "union",
+        [("union", [("lit", "Psi")]), ("union", [("lit", "Spc")]), ("union", [("lit", "Custom")])],
+    ),
+    "DriftProfile": (
+        "union",
+        [("ref", "DriftProfilePsi"), ("ref", "DriftProfileSpc"), ("ref", "DriftProfileCustom")],
+    ),
+    "DriftSignal": ("union", [("ref", "DriftSignalDistribution"), ("ref", "DriftSignalMetric")]),
+    "EvalContextCapture": (
+        "union",
+        [
+            ("union", [("lit", "full")]),
+            ("union", [("lit", "hash")]),
+            ("union", [("lit", "redact")]),
+        ],
+    ),
+    "EvalPassGate": (
+        "union",
+        [
+            ("ref", "EvalPassGateOverallPassRate"),
+            ("ref", "EvalPassGatePerJudgePassRate"),
+            ("ref", "EvalPassGateAllPass"),
+        ],
+    ),
+    "EvalSampling": (
+        "union",
+        [
+            ("ref", "EvalSamplingRatio"),
+            ("ref", "EvalSamplingDeterministicByHash"),
+            ("ref", "EvalSamplingEveryNth"),
+        ],
+    ),
+    "EvalTask": (
+        "union",
+        [
+            ("ref", "EvalTaskAssertion"),
+            ("ref", "EvalTaskLlmJudge"),
+            ("ref", "EvalTaskTraceAssertion"),
+            ("ref", "EvalTaskAgentAssertion"),
+        ],
+    ),
+    "FeatureName": ("prim", "string"),
+    "GooglePart": (
+        "union",
+        [
+            ("ref", "GooglePartVariant1"),
+            ("ref", "GooglePartText"),
+            ("ref", "GooglePartInlineData"),
+            ("ref", "GooglePartFileData"),
+            ("ref", "GooglePartFunctionCall"),
+            ("ref", "GooglePartFunctionResponse"),
+            ("ref", "GooglePartExecutableCode"),
+            ("ref", "GooglePartCodeExecutionResult"),
+        ],
+    ),
+    "HttpAuth": (
+        "union",
+        [("ref", "HttpAuthBearer"), ("ref", "HttpAuthBasic"), ("ref", "HttpAuthHeader")],
+    ),
+    "HttpMethod": (
+        "union",
+        [
+            ("union", [("lit", "get")]),
+            ("union", [("lit", "post")]),
+            ("union", [("lit", "put")]),
+            ("union", [("lit", "patch")]),
+            ("union", [("lit", "delete")]),
+        ],
+    ),
+    "HuggingFaceTask": (
+        "union",
+        [
+            ("union", [("lit", "TextClassification")]),
+            ("union", [("lit", "TokenClassification")]),
+            ("union", [("lit", "QuestionAnswering")]),
+            ("union", [("lit", "Summarization")]),
+            ("union", [("lit", "Translation")]),
+            ("union", [("lit", "TextGeneration")]),
+            ("union", [("lit", "FillMask")]),
+            ("union", [("lit", "ZeroShotClassification")]),
+            ("union", [("lit", "ImageClassification")]),
+            ("union", [("lit", "ObjectDetection")]),
+            ("union", [("lit", "ImageSegmentation")]),
+            ("union", [("lit", "ImageToText")]),
+            ("union", [("lit", "ImageToImage")]),
+            ("union", [("lit", "TextToImage")]),
+            ("union", [("lit", "DepthEstimation")]),
+            ("union", [("lit", "AudioClassification")]),
+            ("union", [("lit", "AutomaticSpeechRecognition")]),
+            ("union", [("lit", "AudioToAudio")]),
+            ("union", [("lit", "TextToSpeech")]),
+            ("union", [("lit", "TabularClassification")]),
+            ("union", [("lit", "TabularRegression")]),
+            ("union", [("lit", "FeatureExtraction")]),
+            ("union", [("lit", "SentenceSimilarity")]),
+            ("union", [("lit", "Conversational")]),
+            ("union", [("lit", "DocumentQuestionAnswering")]),
+            ("union", [("lit", "VisualQuestionAnswering")]),
+            ("union", [("lit", "TableQuestionAnswering")]),
+            ("union", [("lit", "Embedding")]),
+            ("union", [("lit", "MultipleChoice")]),
+            ("union", [("lit", "Other")]),
+        ],
+    ),
+    "ImageFormat": (
+        "union",
+        [
+            ("union", [("lit", "Png")]),
+            ("union", [("lit", "Jpeg")]),
+            ("union", [("lit", "Webp")]),
+            ("union", [("lit", "Mixed")]),
+        ],
+    ),
+    "Inequality": (
+        "union",
+        [
+            ("union", [("lit", "Eq")]),
+            ("union", [("lit", "Ne")]),
+            ("union", [("lit", "Gt")]),
+            ("union", [("lit", "Ge")]),
+            ("union", [("lit", "Lt")]),
+            ("union", [("lit", "Le")]),
+            ("union", [("lit", "In")]),
+        ],
+    ),
+    "InlineableRef_for_AgentSpec": (
+        "union",
+        [
+            ("ref", "CardRef"),
+            ("ref", "InlineableRef_for_AgentSpecSibling"),
+            ("ref", "AgentSpec"),
+            ("prim", "string"),
+        ],
+    ),
+    "InlineableRef_for_OperatorSpec": (
+        "union",
+        [
+            ("ref", "CardRef"),
+            ("ref", "InlineableRef_for_OperatorSpecSibling"),
+            ("ref", "OperatorSpec"),
+            ("prim", "string"),
+        ],
+    ),
+    "InlineableRef_for_Prompt": (
+        "union",
+        [
+            ("ref", "CardRef"),
+            ("ref", "InlineableRef_for_PromptSibling"),
+            ("ref", "Prompt"),
+            ("prim", "string"),
+        ],
+    ),
+    "InlineableRef_for_TriggerSpec": (
+        "union",
+        [
+            ("ref", "CardRef"),
+            ("ref", "InlineableRef_for_TriggerSpecSibling"),
+            ("ref", "TriggerSpec"),
+            ("prim", "string"),
+        ],
+    ),
+    "JsonPath": ("prim", "string"),
+    "JsonValueType": (
+        "union",
+        [
+            ("union", [("lit", "null")]),
+            ("union", [("lit", "bool")]),
+            ("union", [("lit", "number")]),
+            ("union", [("lit", "string")]),
+            ("union", [("lit", "array")]),
+            ("union", [("lit", "object")]),
+        ],
+    ),
+    "JsonlCompression": (
+        "union",
+        [("union", [("lit", "None")]), ("union", [("lit", "Gzip")]), ("union", [("lit", "Zstd")])],
+    ),
+    "LabelValue": ("prim", "string"),
+    "ModelInterface": (
+        "union",
+        [
+            ("ref", "ModelInterfaceSklearn"),
+            ("ref", "ModelInterfaceXgboost"),
+            ("ref", "ModelInterfaceLightgbm"),
+            ("ref", "ModelInterfaceCatboost"),
+            ("ref", "ModelInterfaceTorch"),
+            ("ref", "ModelInterfaceLightning"),
+            ("ref", "ModelInterfaceTensorflow"),
+            ("ref", "ModelInterfaceHuggingface"),
+            ("ref", "ModelInterfaceCustom"),
+        ],
+    ),
+    "NonSecretValue": (
+        "union",
+        [
+            ("ref", "NonSecretValueStr"),
+            ("ref", "NonSecretValueNumber"),
+            ("ref", "NonSecretValueBool"),
+            ("ref", "NonSecretValueList"),
+            ("ref", "NonSecretValueObject"),
+        ],
+    ),
+    "NotifyChannel": ("union", [("ref", "NotifyChannelPagerDuty"), ("ref", "NotifyChannelSlack")]),
+    "NumpyFormat": ("union", [("union", [("lit", "Npy")]), ("union", [("lit", "Npz")])]),
+    "OpenAiAllowedToolsKind": ("union", [("lit", "allowed_tools")]),
+    "OpenAiAllowedToolsMode": ("union", [("lit", "auto"), ("lit", "required")]),
+    "OpenAiAudioFormat": (
+        "union",
+        [
+            ("lit", "wav"),
+            ("lit", "aac"),
+            ("lit", "mp3"),
+            ("lit", "flac"),
+            ("lit", "opus"),
+            ("lit", "pcm16"),
+        ],
+    ),
+    "OpenAiBuiltInVoice": (
+        "union",
+        [
+            ("lit", "alloy"),
+            ("lit", "ash"),
+            ("lit", "ballad"),
+            ("lit", "coral"),
+            ("lit", "echo"),
+            ("lit", "fable"),
+            ("lit", "nova"),
+            ("lit", "onyx"),
+            ("lit", "sage"),
+            ("lit", "shimmer"),
+            ("lit", "marin"),
+            ("lit", "cedar"),
+        ],
+    ),
+    "OpenAiChatToolChoice": (
+        "union",
+        [
+            ("ref", "OpenAiToolChoiceMode"),
+            ("ref", "OpenAiAllowedToolsChoice"),
+            ("ref", "OpenAiNamedFunctionToolChoice"),
+            ("ref", "OpenAiNamedCustomToolChoice"),
+        ],
+    ),
+    "OpenAiContentPart": (
+        "union",
+        [
+            ("ref", "OpenAiContentPartText"),
+            ("ref", "OpenAiContentPartImageUrl"),
+            ("ref", "OpenAiContentPartInputAudio"),
+            ("ref", "OpenAiContentPartFile"),
+        ],
+    ),
+    "OpenAiCustomToolFormat": (
+        "union",
+        [("ref", "OpenAiCustomToolFormatText"), ("ref", "OpenAiCustomToolFormatGrammar")],
+    ),
+    "OpenAiEmbeddingsInput": (
+        "union",
+        [
+            ("prim", "string"),
+            ("array", ("prim", "string")),
+            ("array", ("prim", "integer")),
+            ("array", ("array", ("prim", "integer"))),
+        ],
+    ),
+    "OpenAiGrammarSyntax": ("union", [("lit", "lark"), ("lit", "regex")]),
+    "OpenAiMessageContent": (
+        "union",
+        [("prim", "string"), ("array", ("ref", "OpenAiContentPart"))],
+    ),
+    "OpenAiNamedCustomToolChoiceKind": ("union", [("lit", "custom")]),
+    "OpenAiNamedFunctionToolChoiceKind": ("union", [("lit", "function")]),
+    "OpenAiPredictionContentPart": ("union", [("ref", "OpenAiPredictionContentPartText")]),
+    "OpenAiPredictionKind": ("union", [("lit", "content")]),
+    "OpenAiPredictionPayload": (
+        "union",
+        [("prim", "string"), ("array", ("ref", "OpenAiPredictionContentPart"))],
+    ),
+    "OpenAiReasoningEffort": (
+        "union",
+        [
+            ("lit", "none"),
+            ("lit", "minimal"),
+            ("lit", "low"),
+            ("lit", "medium"),
+            ("lit", "high"),
+            ("lit", "xhigh"),
+        ],
+    ),
+    "OpenAiReasoningEffort2": (
+        "union",
+        [
+            ("lit", "none"),
+            ("lit", "minimal"),
+            ("lit", "low"),
+            ("lit", "medium"),
+            ("lit", "high"),
+            ("lit", "xhigh"),
+        ],
+    ),
+    "OpenAiReasoningSummary": ("union", [("lit", "auto"), ("lit", "concise"), ("lit", "detailed")]),
+    "OpenAiReasoningSummaryPart": ("union", [("ref", "OpenAiReasoningSummaryPartSummaryText")]),
+    "OpenAiResponseContentPart": (
+        "union",
+        [
+            ("ref", "OpenAiResponseContentPartInputText"),
+            ("ref", "OpenAiResponseContentPartOutputText"),
+            ("ref", "OpenAiResponseContentPartInputImage"),
+            ("ref", "OpenAiResponseContentPartInputFile"),
+        ],
+    ),
+    "OpenAiResponseFormat": (
+        "union",
+        [
+            ("ref", "OpenAiResponseFormatText"),
+            ("ref", "OpenAiResponseFormatJsonObject"),
+            ("ref", "OpenAiResponseFormatJsonSchema"),
+        ],
+    ),
+    "OpenAiResponseItem": (
+        "union",
+        [
+            ("ref", "OpenAiResponseItemMessage"),
+            ("ref", "OpenAiResponseItemFunctionCall"),
+            ("ref", "OpenAiResponseItemFunctionCallOutput"),
+            ("ref", "OpenAiResponseItemReasoning"),
+            ("ref", "OpenAiResponseItemInputFile"),
+            ("ref", "OpenAiResponseItemInputImage"),
+        ],
+    ),
+    "OpenAiResponseModality": ("union", [("lit", "text"), ("lit", "audio")]),
+    "OpenAiResponsesAllowedToolsKind": ("union", [("lit", "allowed_tools")]),
+    "OpenAiResponsesAllowedToolsMode": ("union", [("lit", "auto"), ("lit", "required")]),
+    "OpenAiResponsesApplyPatchToolKind": ("union", [("lit", "apply_patch")]),
+    "OpenAiResponsesCustomToolFormat": (
+        "union",
+        [
+            ("ref", "OpenAiResponsesCustomToolFormatText"),
+            ("ref", "OpenAiResponsesCustomToolFormatGrammar"),
+        ],
+    ),
+    "OpenAiResponsesCustomToolKind": ("union", [("lit", "custom")]),
+    "OpenAiResponsesFunctionToolKind": ("union", [("lit", "function")]),
+    "OpenAiResponsesGrammarSyntax": ("union", [("lit", "lark"), ("lit", "regex")]),
+    "OpenAiResponsesHostedToolKind": (
+        "union",
+        [
+            ("lit", "file_search"),
+            ("lit", "web_search_preview"),
+            ("lit", "computer"),
+            ("lit", "computer_use_preview"),
+            ("lit", "computer_use"),
+            ("lit", "web_search_preview_2025_03_11"),
+            ("lit", "image_generation"),
+            ("lit", "code_interpreter"),
+        ],
+    ),
+    "OpenAiResponsesInput": (
+        "union",
+        [("prim", "string"), ("array", ("ref", "OpenAiResponseItem"))],
+    ),
+    "OpenAiResponsesMcpToolKind": ("union", [("lit", "mcp")]),
+    "OpenAiResponsesShellToolKind": ("union", [("lit", "shell")]),
+    "OpenAiResponsesTool": (
+        "union",
+        [
+            ("ref", "OpenAiResponsesToolFunction"),
+            ("ref", "OpenAiResponsesToolWebSearchPreview"),
+            ("ref", "OpenAiResponsesToolFileSearch"),
+            ("ref", "OpenAiResponsesToolCodeInterpreter"),
+            ("ref", "OpenAiResponsesToolImageGeneration"),
+            ("ref", "OpenAiResponsesToolMcp"),
+            ("ref", "OpenAiResponsesToolCustom"),
+        ],
+    ),
+    "OpenAiResponsesToolChoice": (
+        "union",
+        [
+            ("ref", "OpenAiResponsesToolChoiceMode"),
+            ("ref", "OpenAiResponsesAllowedToolsChoice"),
+            ("ref", "OpenAiResponsesHostedToolChoice"),
+            ("ref", "OpenAiResponsesFunctionToolChoice"),
+            ("ref", "OpenAiResponsesMcpToolChoice"),
+            ("ref", "OpenAiResponsesCustomToolChoice"),
+            ("ref", "OpenAiResponsesApplyPatchToolChoice"),
+            ("ref", "OpenAiResponsesShellToolChoice"),
+        ],
+    ),
+    "OpenAiResponsesToolChoiceMode": (
+        "union",
+        [("lit", "none"), ("lit", "auto"), ("lit", "required")],
+    ),
+    "OpenAiStop": ("union", [("prim", "string"), ("array", ("prim", "string"))]),
+    "OpenAiTextResponseFormat": (
+        "union",
+        [
+            ("ref", "OpenAiTextResponseFormatText"),
+            ("ref", "OpenAiTextResponseFormatJsonObject"),
+            ("ref", "OpenAiTextResponseFormatJsonSchema"),
+        ],
+    ),
+    "OpenAiTool": ("union", [("ref", "OpenAiToolFunction"), ("ref", "OpenAiToolCustom")]),
+    "OpenAiToolChoiceMode": ("union", [("lit", "none"), ("lit", "auto"), ("lit", "required")]),
+    "OpenAiVoice": ("union", [("ref", "OpenAiBuiltInVoice"), ("ref", "OpenAiCustomVoice")]),
+    "OperatorSpec": (
+        "union",
+        [
+            ("ref", "OperatorSpecWorkflow"),
+            ("ref", "OperatorSpecNotify"),
+            ("ref", "OperatorSpecHttp"),
+        ],
+    ),
+    "PagerDutySeverity": (
+        "union",
+        [
+            ("union", [("lit", "critical")]),
+            ("union", [("lit", "error")]),
+            ("union", [("lit", "warning")]),
+            ("union", [("lit", "info")]),
+        ],
+    ),
+    "ParameterizedComparisonOperator": (
+        "union",
+        [
+            ("ref", "ParameterizedComparisonOperatorInRange"),
+            ("ref", "ParameterizedComparisonOperatorNotInRange"),
+            ("ref", "ParameterizedComparisonOperatorApproximatelyEquals"),
+            ("ref", "ParameterizedComparisonOperatorMatchesRegex"),
+            ("ref", "ParameterizedComparisonOperatorNotMatchesRegex"),
+            ("ref", "ParameterizedComparisonOperatorHasMinLength"),
+            ("ref", "ParameterizedComparisonOperatorHasMaxLength"),
+            ("ref", "ParameterizedComparisonOperatorLength"),
+            ("ref", "ParameterizedComparisonOperatorLengthGreaterThan"),
+            ("ref", "ParameterizedComparisonOperatorLengthLessThan"),
+            ("ref", "ParameterizedComparisonOperatorIsType"),
+            ("ref", "ParameterizedComparisonOperatorWithinAbsTolerance"),
+            ("ref", "ParameterizedComparisonOperatorWithinPctTolerance"),
+            ("ref", "ParameterizedComparisonOperatorWithinStdDev"),
+            ("ref", "ParameterizedComparisonOperatorBetweenPercentiles"),
+            ("ref", "ParameterizedComparisonOperatorDivergenceLessThan"),
+            ("ref", "ParameterizedComparisonOperatorCosineSimilarityAtLeast"),
+        ],
+    ),
+    "ParameterlessComparisonOperatorSchema": (
+        "union",
+        [
+            ("lit", "equals"),
+            ("lit", "not_equals"),
+            ("lit", "greater_than"),
+            ("lit", "greater_than_or_equals"),
+            ("lit", "less_than"),
+            ("lit", "less_than_or_equals"),
+            ("lit", "is_positive"),
+            ("lit", "is_negative"),
+            ("lit", "is_zero"),
+            ("lit", "contains"),
+            ("lit", "not_contains"),
+            ("lit", "contains_ignore_case"),
+            ("lit", "starts_with"),
+            ("lit", "ends_with"),
+            ("lit", "is_email"),
+            ("lit", "is_url"),
+            ("lit", "is_uuid"),
+            ("lit", "is_ipv4"),
+            ("lit", "is_ipv6"),
+            ("lit", "is_json"),
+            ("lit", "in"),
+            ("lit", "not_in"),
+            ("lit", "is_subset"),
+            ("lit", "is_superset"),
+            ("lit", "is_disjoint"),
+            ("lit", "all_of"),
+            ("lit", "any_of"),
+            ("lit", "none_of"),
+            ("lit", "is_empty"),
+            ("lit", "is_non_empty"),
+            ("lit", "unique_values"),
+            ("lit", "is_truthy"),
+            ("lit", "is_falsy"),
+            ("lit", "is_null"),
+            ("lit", "is_not_null"),
+            ("lit", "is_string"),
+            ("lit", "is_number"),
+            ("lit", "is_boolean"),
+            ("lit", "is_object"),
+        ],
+    ),
+    "ParquetCompression": (
+        "union",
+        [
+            ("union", [("lit", "None")]),
+            ("union", [("lit", "Snappy")]),
+            ("union", [("lit", "Gzip")]),
+            ("union", [("lit", "Zstd")]),
+            ("union", [("lit", "Lz4")]),
+        ],
+    ),
+    "ProviderName": (
+        "union",
+        [
+            ("union", [("lit", "open_ai")]),
+            ("union", [("lit", "anthropic")]),
+            ("union", [("lit", "google")]),
+            ("union", [("lit", "vertex")]),
+            ("ref", "ProviderNameCustom"),
+        ],
+    ),
+    "ProviderRequest": (
+        "union",
+        [
+            ("ref", "ProviderRequestOpenAiChatCompletion"),
+            ("ref", "ProviderRequestOpenAiResponses"),
+            ("ref", "ProviderRequestOpenAiEmbeddings"),
+            ("ref", "ProviderRequestAnthropicMessage"),
+            ("ref", "ProviderRequestGeminiGenerateContent"),
+            ("ref", "ProviderRequestGoogleBatchEmbed"),
+            ("ref", "ProviderRequestVertexPredict"),
+            ("ref", "ProviderRequestRawV1"),
+        ],
+    ),
+    "PsiBinningStrategy": (
+        "union",
+        [("ref", "PsiBinningStrategyEqualWidth"), ("ref", "PsiBinningStrategyQuantile")],
+    ),
+    "PsiThreshold": (
+        "union",
+        [
+            ("ref", "PsiThresholdChiSquare"),
+            ("ref", "PsiThresholdNormal"),
+            ("ref", "PsiThresholdFixed"),
+        ],
+    ),
+    "QueryName": ("prim", "string"),
+    "Ref": ("union", [("ref", "CardRef"), ("ref", "RefSibling"), ("prim", "string")]),
+    "RegisteredCard": (
+        "union",
+        [
+            ("ref", "RegisteredDataCard"),
+            ("ref", "RegisteredModelCard"),
+            ("ref", "RegisteredPromptCard"),
+            ("ref", "RegisteredAgentCard"),
+            ("ref", "RegisteredVerifierCard"),
+            ("ref", "RegisteredServiceCard"),
+            ("ref", "RegisteredTriggerCard"),
+            ("ref", "RegisteredOperatorCard"),
+            ("ref", "RegisteredUntypedCard"),
+        ],
+    ),
+    "RegisteredUntypedCard": (
+        "union",
+        [
+            ("ref", "RegisteredExperimentCard"),
+            ("ref", "RegisteredWorkflowCard"),
+            ("ref", "RegisteredPolicyCard"),
+            ("ref", "RegisteredMcpCard"),
+            ("ref", "RegisteredAuditCard"),
+            ("ref", "RegisteredArtifactCard"),
+            ("ref", "RegisteredSourceCard"),
+        ],
+    ),
+    "ResponseType": ("union", [("union", [("lit", "text")]), ("ref", "ResponseTypeJsonSchema")]),
+    "SampleInputKind": (
+        "union",
+        [
+            ("union", [("lit", "Pandas")]),
+            ("union", [("lit", "Polars")]),
+            ("union", [("lit", "Arrow")]),
+            ("union", [("lit", "Numpy")]),
+            ("union", [("lit", "Torch")]),
+            ("union", [("lit", "Tf")]),
+            ("union", [("lit", "Dict")]),
+            ("union", [("lit", "List")]),
+            ("union", [("lit", "Tuple")]),
+            ("union", [("lit", "Str")]),
+            ("union", [("lit", "None")]),
+        ],
+    ),
+    "ServiceRuntimeKind": (
+        "union",
+        [
+            ("union", [("lit", "api")]),
+            ("union", [("lit", "mcp")]),
+            ("union", [("lit", "agent")]),
+            ("union", [("lit", "workflow")]),
+        ],
+    ),
+    "ServiceRuntimeMode": ("union", [("union", [("lit", "in_process")])]),
+    "SpaceName": ("prim", "string"),
+    "SplitName": ("prim", "string"),
+    "SplitStrategy": (
+        "union",
+        [
+            ("ref", "SplitStrategyMaterialized"),
+            ("ref", "SplitStrategyColumn"),
+            ("ref", "SplitStrategyIndexRange"),
+            ("ref", "SplitStrategyIndices"),
+        ],
+    ),
+    "TaskId": ("prim", "string"),
+    "TaskType": (
+        "union",
+        [
+            ("union", [("lit", "BinaryClassification")]),
+            ("union", [("lit", "MultiClassClassification")]),
+            ("union", [("lit", "Regression")]),
+            ("union", [("lit", "Clustering")]),
+            ("union", [("lit", "AnomalyDetection")]),
+            ("union", [("lit", "Forecasting")]),
+            ("union", [("lit", "Generation")]),
+            ("union", [("lit", "Other")]),
+        ],
+    ),
+    "TfSaveFormat": ("union", [("union", [("lit", "Keras")]), ("union", [("lit", "SavedModel")])]),
+    "TorchSaveFormat": (
+        "union",
+        [("union", [("lit", "Safetensors")]), ("union", [("lit", "Pickle")])],
+    ),
+    "TorchSaveFormat2": (
+        "union",
+        [("union", [("lit", "Safetensors")]), ("union", [("lit", "Pickle")])],
+    ),
+    "TriggerSpec": (
+        "union",
+        [("ref", "TriggerSpecSchedule"), ("ref", "TriggerSpecObservationsReady")],
+    ),
+    "TypedCardKind": (
+        "union",
+        [
+            ("lit", "Data"),
+            ("lit", "Model"),
+            ("lit", "Prompt"),
+            ("lit", "Agent"),
+            ("lit", "Verifier"),
+            ("lit", "Service"),
+            ("lit", "Trigger"),
+            ("lit", "Operator"),
+        ],
+    ),
+    "VerifierImplementation": (
+        "union",
+        [("ref", "VerifierImplementationDrift"), ("ref", "VerifierImplementationEval")],
+    ),
+    "VersionBlock": ("prim", "string"),
+    "VersionBump": (
+        "union",
+        [
+            ("union", [("lit", "major")]),
+            ("union", [("lit", "minor")]),
+            ("union", [("lit", "patch")]),
+            ("ref", "VersionBumpPre"),
+            ("ref", "VersionBumpBuild"),
+            ("ref", "VersionBumpPreBuild"),
+        ],
+    ),
+    "VersionSpec": ("prim", "string"),
+    "WorkflowFieldType": (
+        "union",
+        [
+            ("union", [("lit", "string")]),
+            ("union", [("lit", "integer")]),
+            ("union", [("lit", "float")]),
+            ("union", [("lit", "boolean")]),
+            ("union", [("lit", "object")]),
+            ("union", [("lit", "array")]),
+            ("union", [("lit", "any")]),
+        ],
+    ),
+}
+"""Each type alias's expression, by alias name."""
+
+
+_PRIMITIVES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "null": (type(None),),
+}
+"""The Python types one JSON primitive decodes to."""
+
+
+def _is_tag(expr: tuple) -> bool:
+    """Report whether `expr` admits only literal values, as a union tag does."""
+    if expr[0] == "union":
+        return all(member[0] == "lit" for member in expr[1])
+    return expr[0] == "lit"
+
+
+def _matches(expr: tuple, value: Any) -> bool:
+    """Report whether `value` can decode as `expr`, without decoding it."""
+    tag = expr[0]
+    if tag == "ref":
+        if expr[1] in _ALIASES:
+            return _matches(_ALIASES[expr[1]], value)
+        if not isinstance(value, dict):
+            return False
+        fields = _OBJECTS[expr[1]]
+        keys = {key for key, _, _ in fields}
+        return (
+            value.keys() <= keys
+            and all(key in value for key, required, _ in fields if required)
+            and all(
+                _matches(field, value[key])
+                for key, _, field in fields
+                if key in value and _is_tag(field)
+            )
+        )
+    if tag == "prim":
+        kind = expr[1]
+        if kind == "any":
+            return True
+        if isinstance(value, bool) and kind != "boolean":
+            return False
+        return isinstance(value, _PRIMITIVES[kind])
+    if tag == "lit":
+        return value == expr[1]
+    if tag == "array":
+        return isinstance(value, list)
+    if tag == "map":
+        return isinstance(value, dict)
+    return any(_matches(member, value) for member in expr[1])
+
+
+def _decode(expr: tuple, value: Any) -> Any:
+    """Decode one JSON value as `expr`, building dataclasses for objects.
+
+    A union decodes as its first member that matches; a value no member
+    matches is kept as plain JSON.
+    """
+    tag = expr[0]
+    if tag == "ref":
+        if expr[1] in _ALIASES:
+            return _decode(_ALIASES[expr[1]], value)
+        if not isinstance(value, dict):
+            return value
+        fields = {
+            key: _decode(field, value[key]) for key, _, field in _OBJECTS[expr[1]] if key in value
+        }
+        return globals()[expr[1]](**fields)
+    if tag == "array":
+        return [_decode(expr[1], item) for item in value] if isinstance(value, list) else value
+    if tag == "map":
+        if not isinstance(value, dict):
+            return value
+        return {key: _decode(expr[1], item) for key, item in value.items()}
+    if tag == "union":
+        for member in expr[1]:
+            if _matches(member, value):
+                return _decode(member, value)
+    return value
+
+
+def from_wire(wire: Mapping[str, Any]) -> RegisteredCard:
+    """Build the typed Card for one registered envelope, chosen by its `kind`.
+
+    Args:
+        wire: one Card envelope as the registry returns it, decoded from JSON.
+
+    Returns:
+        The frozen dataclass for the envelope's `kind`; a kind whose spec is
+        not typed yet keeps its `spec` as a plain mapping.
+    """
+    return _decode(("ref", "RegisteredCard"), dict(wire))

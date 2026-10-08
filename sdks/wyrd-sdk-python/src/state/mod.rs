@@ -6,13 +6,11 @@ use std::path::PathBuf;
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyMapping, PyModule, PyTuple};
-use secrecy::SecretString;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
-use wyrd_client::bifrost::client_from_options;
-use wyrd_client::cards::{CardSelector, Cards};
+use wyrd_client::cards::{CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
 use wyrd_loader::{LoadError, RegistrationInput};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
@@ -30,6 +28,7 @@ use wyrd_spec::registry::{
 use wyrd_client::state::WyrdState;
 
 use crate::bifrost::PyTableConfig;
+use crate::client::PyWyrdClient;
 use crate::observe::PyRun;
 use crate::workflow::PyWorkflow;
 
@@ -91,38 +90,56 @@ pub struct PyWyrdState {
 
 #[pymethods]
 impl PyWyrdState {
-    /// Load and eagerly hydrate a complete local Service bundle offline.
+    /// Load and eagerly hydrate a complete local Service bundle, fixing the
+    /// client its server calls run as.
     ///
     /// The native graph is loaded first while detached from the GIL. Python
     /// mappings are then normalized and each exact `CardRef` is hydrated once;
     /// construction publishes in order: envelopes, Prompts, Agents, Models,
-    /// then Data. No registry or network access occurs. A failed local read or
-    /// interface load leaves no published Python state; local reads may be
-    /// partial before failure and callers may retry from the original path.
+    /// then Data. Loading reads no registry and opens no connection. A failed
+    /// local read or interface load leaves no published Python state; local
+    /// reads may be partial before failure and callers may retry from the
+    /// original path.
+    ///
+    /// With `client`, Bifrost startup and every `observe.verify` of this state
+    /// run as that client. Without it, the state resolves the ambient chain
+    /// once, at its first server call, and keeps that client.
     ///
     /// ```python
     /// from wyrd.state import WyrdState
     ///
-    /// state = WyrdState.from_path("./bundle")
+    /// state = WyrdState.from_path("./bundle", client)
     /// model = state.model("fraud-model")
     /// ```
+    ///
+    /// # Arguments
+    /// * `path` - The hydrated bundle directory, as `cards.hydrate` publishes it.
+    /// * `client` - The `WyrdClient` this state's server calls run as, or
+    ///   `None` for the ambient chain.
+    /// * `interfaces` - Model and Data interfaces keyed by alias.
+    /// * `load_kwargs` - Loader options keyed by alias.
+    /// * `trusted_artifact_hashes` - Trusted artifact manifest hashes keyed by alias.
     ///
     /// # Errors
     ///
     /// Returns a stable SDK error for malformed bundles, mapping conversion,
     /// Card-kind conflicts, runtime loader failures, or Python allocation.
-    ///
     #[staticmethod]
-    #[pyo3(signature = (path, *, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
+    #[pyo3(signature = (path, client=None, *, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
     fn from_path(
         py: Python<'_>,
         path: PathBuf,
+        client: Option<PyRef<'_, PyWyrdClient>>,
         interfaces: Option<&Bound<'_, PyMapping>>,
         load_kwargs: Option<&Bound<'_, PyMapping>>,
         trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
+        let client = client.map(|client| client.inner().clone());
         let inner = py
-            .detach(|| WyrdState::from_path(&path))
+            .detach(|| match client {
+                Some(client) => WyrdState::from_path_with_client(&path, client),
+                None => WyrdState::from_path(&path),
+            })
             .map_err(WyrdPyError::from)?;
         let config = PythonStateHydrator::normalize_config(
             py,
@@ -142,13 +159,17 @@ impl PyWyrdState {
         })
     }
 
-    /// Connect this state's one Bifrost writer and describe both fixed tables.
+    /// Connect this state's one Bifrost writer, as the state's client, and
+    /// describe both fixed tables.
     ///
-    /// The transport arguments are `Bifrost(...)`'s and pass straight through to
-    /// it, including its environment and default resolution.
-    /// `client_byte_limit_bytes` overrides the handle-wide ingestion byte
-    /// budget (256 MiB by default). Synchronous because a caller starts
-    /// Bifrost once at application start, not on a hot path.
+    /// The client is the one the state was created with, else the ambient one
+    /// it resolved. Synchronous because a caller starts Bifrost once at
+    /// application start, not on a hot path.
+    ///
+    /// # Arguments
+    /// * `table` - The handle's active write table, or `None`.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget, or
+    ///   `None` for 256 MiB.
     ///
     /// # Errors
     ///
@@ -158,22 +179,16 @@ impl PyWyrdState {
     /// to seal one message, and the catalog error for a missing credential, an
     /// undialable ingest channel, or a missing, unauthorized, or incompatible
     /// fixed observation table.
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client_byte_limit_bytes=None))]
+    #[pyo3(signature = (table=None, client_byte_limit_bytes=None))]
     fn start_bifrost(
         &self,
         py: Python<'_>,
         table: Option<PyTableConfig>,
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        grpc_url: Option<&str>,
         client_byte_limit_bytes: Option<usize>,
     ) -> CardPyResult<()> {
-        let client = client_from_options(server_url, credential, grpc_url)
-            .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
         let table = table.map(PyTableConfig::into_native);
         py.detach(|| {
             wyrd_runtime::runtime().block_on(self.inner.start_bifrost_with_config(
-                &client,
                 table,
                 wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
             ))
@@ -226,6 +241,15 @@ impl PyWyrdState {
     fn shutdown(&self, py: Python<'_>) -> CardPyResult<()> {
         py.detach(|| wyrd_runtime::runtime().block_on(self.inner.shutdown()))
             .map_err(WyrdPyError::from)
+    }
+
+    /// Return the exact root `CardRef` of this bundle, independent of aliases.
+    ///
+    /// Reads the root reference fixed at load; no envelope, payload, or IO is
+    /// touched.
+    #[getter]
+    fn root_ref(&self) -> CardRefPy {
+        CardRefPy(self.inner.root_ref().clone())
     }
 
     /// Return the persistent root Service envelope without reading payloads.
@@ -1592,24 +1616,27 @@ pub struct PyCards {
 
 #[pymethods]
 impl PyCards {
-    /// Construct a tenant-scoped Card client.
+    /// Construct a tenant-scoped Card client acting as `client`.
     ///
-    /// When `server_url` or `credential` is omitted, the shared Wyrd client
-    /// configuration supplies the value. The handle is cheap to clone and the
-    /// kind-specific properties retain this same connection context.
+    /// Omitted, the client resolves from the ambient chain exactly as Rust
+    /// `Cards::from_env` does. The handle is cheap to clone and the
+    /// kind-specific properties retain this same connection context. No
+    /// network call or token exchange happens here.
     ///
     /// # Arguments
-    /// * `server_url` - Optional Wyrd server URL override.
-    /// * `credential` - Optional explicit credential override.
+    /// * `client` - The `WyrdClient` every registry call is sent as, or `None`
+    ///   for the ambient chain.
     ///
     /// # Errors
-    /// Returns a Wyrd error when local configuration, the credential override,
-    /// or the saved-login selection cannot be loaded.
+    /// Returns a Wyrd error when the ambient configuration, credential, or
+    /// saved-login selection cannot be resolved.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None))]
-    fn __new__(server_url: Option<String>, credential: Option<String>) -> CardPyResult<Self> {
-        Cards::new(server_url.as_deref(), credential.map(SecretString::from))
-            .map(|inner| Self { inner })
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, PyWyrdClient>>) -> CardPyResult<Self> {
+        PyWyrdClient::resolve(client.as_deref())
+            .map(|client| Self {
+                inner: Cards::with_client(client),
+            })
             .map_err(WyrdPyError::from)
     }
 
@@ -1695,14 +1722,14 @@ impl PyCards {
         PythonCardRegistry::new(&self.inner).register(py, card, version_bump, save_args)
     }
 
-    /// Register a declarative Card bundle from a local path.
+    /// Register a declarative Card from a local Card file or bundle directory.
     ///
     /// Use `register` for Python-authored `DataCard`, `ModelCard`, and
-    /// `PromptCard` objects. This method is for file-based bundles that the
+    /// `PromptCard` objects. This method is for file-based Cards that the
     /// shared loader can validate and materialize.
     ///
     /// # Arguments
-    /// * `path` - Directory containing the declarative Card bundle.
+    /// * `path` - A Card file or a bundle directory, as `str` or `PathLike`.
     ///
     /// # Returns
     /// A receipt for the completed registration.
@@ -1721,12 +1748,12 @@ impl PyCards {
             .map_err(WyrdPyError::from)
     }
 
-    /// Fetch one registered Card envelope by exact reference.
+    /// Fetch one registered Card by exact reference, typed by its kind.
     ///
     /// The shared Rust `Cards::get` reads and validates the typed envelope
-    /// while the GIL is released; the result crosses the boundary as the
-    /// JSON mapping the generated `wyrd.cards.RegisteredCard` types describe,
-    /// with `spec` and `status` discriminated by `kind`. No artifact bytes are
+    /// while the GIL is released. The envelope then crosses the boundary once,
+    /// through the generated `wyrd._card_types.from_wire`, into the frozen
+    /// dataclass for its `kind`, read by attribute. No artifact bytes are
     /// downloaded.
     ///
     /// # Arguments
@@ -1742,7 +1769,169 @@ impl PyCards {
         let card = py
             .detach(|| wyrd_runtime::runtime().block_on(self.inner.get(selector)))
             .map_err(WyrdPyError::from)?;
-        json_to_py(py, &serde_json::to_value(&card)?)
+        let wire = json_to_py(py, &serde_json::to_value(&card)?)?;
+        Ok(py
+            .import("wyrd._card_types")?
+            .getattr("from_wire")?
+            .call1((wire,))?
+            .unbind())
+    }
+
+    /// List metadata-only summaries of registered Cards of any kind.
+    ///
+    /// # Arguments
+    /// * `kind` - Only Cards of this kind, as a `CardKind` or its wire name,
+    ///   or `None` for every kind.
+    /// * `kwargs` - The typed views' `list` filters: `space`, `name`,
+    ///   `version_range`, `status`, `filter`, `include_prerelease`, `limit`,
+    ///   and `cursor`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error for an unknown kind, an invalid filter, or a
+    /// failed server request.
+    #[pyo3(signature = (*, kind=None, **kwargs))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        kind: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> CardPyResult<PyCardList> {
+        let kind = kind.map(parse_kind).transpose()?;
+        list_registry(
+            py,
+            &self.inner,
+            kind,
+            RegistryListQuery::from_kwargs(kwargs)?,
+        )
+    }
+
+    /// Resolve the latest Active version of one named Card to an exact reference.
+    ///
+    /// # Arguments
+    /// * `kind` - The Card kind, as a `CardKind` or its wire name.
+    /// * `space` - The Card space.
+    /// * `name` - The Card name.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error for an invalid kind, space, or name, or when no
+    /// Active Card matches.
+    #[pyo3(signature = (kind, space, name))]
+    fn resolve_latest(
+        &self,
+        py: Python<'_>,
+        kind: &Bound<'_, PyAny>,
+        space: &str,
+        name: &str,
+    ) -> CardPyResult<CardRefPy> {
+        resolve_latest_registry(py, &self.inner, parse_kind(kind)?, space, name)
+    }
+
+    /// Delete one registered Card, of any kind, by exact reference.
+    ///
+    /// The Card is marked deleted and its stored artifacts are removed.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef` carrying its space and version.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the Card is absent, still referenced, or the
+    /// deletion is refused.
+    #[pyo3(signature = (card_ref))]
+    fn delete(&self, py: Python<'_>, card_ref: PyRef<'_, CardRefPy>) -> CardPyResult<()> {
+        let selector = CardSelector::exact(card_ref.0.clone());
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.delete(selector)))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Download a registered Card's reachable graph as a local bundle.
+    ///
+    /// Thin projection of the shared Rust `Cards::hydrate`, run with the GIL
+    /// released. The bundle is published atomically under `destination`,
+    /// ready for `WyrdState.from_path`.
+    ///
+    /// # Arguments
+    /// * `card_ref` - The root Card's exact reference.
+    /// * `destination` - The bundle directory to publish.
+    /// * `metadata_only` - `True` writes Card metadata only; `False` also
+    ///   downloads and verifies every artifact.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the graph cannot be resolved, the destination
+    /// is invalid, an artifact cannot be downloaded or verified, or the bundle
+    /// cannot be published.
+    #[pyo3(signature = (card_ref, destination, metadata_only=false))]
+    fn hydrate(
+        &self,
+        py: Python<'_>,
+        card_ref: PyRef<'_, CardRefPy>,
+        destination: PathBuf,
+        metadata_only: bool,
+    ) -> CardPyResult<PyHydrationSummary> {
+        let selector = CardSelector::exact(card_ref.0.clone());
+        let mode = if metadata_only {
+            HydrationMode::MetadataOnly
+        } else {
+            HydrationMode::Complete
+        };
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(self.inner.hydrate(selector, &destination, mode))
+        })
+        .map(PyHydrationSummary::from)
+        .map_err(WyrdPyError::from)
+    }
+}
+
+/// Result of one published hydration: `Cards.hydrate` and the test CLI `get`.
+#[pyclass(module = "wyrd.cards", name = "HydrationSummary", frozen)]
+pub struct PyHydrationSummary {
+    /// The shared Rust summary every getter reads.
+    inner: HydrationSummary,
+}
+
+/// Wraps a shared Rust summary for Python.
+impl From<HydrationSummary> for PyHydrationSummary {
+    /// Takes ownership of `inner`; no field is copied.
+    fn from(inner: HydrationSummary) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyHydrationSummary {
+    /// The exact resolved root reference.
+    #[getter]
+    fn root(&self) -> CardRefPy {
+        CardRefPy(self.inner.root.clone())
+    }
+
+    /// The published bundle directory.
+    #[getter]
+    fn destination(&self) -> PathBuf {
+        self.inner.destination.clone()
+    }
+
+    /// `"complete"` or `"metadata"`.
+    #[getter]
+    fn mode(&self) -> String {
+        self.inner.mode.to_string()
+    }
+
+    /// Number of unique Cards in the bundle.
+    #[getter]
+    fn card_count(&self) -> usize {
+        self.inner.card_count
+    }
+
+    /// Number of server-owned artifact inventory entries.
+    #[getter]
+    fn artifact_count(&self) -> usize {
+        self.inner.artifact_count
+    }
+
+    /// Number of artifact payloads downloaded and verified.
+    #[getter]
+    fn downloaded_artifact_count(&self) -> usize {
+        self.inner.downloaded_artifact_count
     }
 }
 
@@ -1992,7 +2181,8 @@ impl RegistryGetQuery {
     }
 }
 
-/// Execute one normalized typed-registry list request without holding the GIL.
+/// Execute one normalized registry list request, optionally for one kind,
+/// without holding the GIL.
 ///
 /// # Errors
 ///
@@ -2001,11 +2191,11 @@ impl RegistryGetQuery {
 fn list_registry(
     py: Python<'_>,
     registry: &Cards,
-    kind: CardKind,
+    kind: Option<CardKind>,
     query: RegistryListQuery,
 ) -> CardPyResult<PyCardList> {
     let request = ListCardsRequest {
-        kind: Some(kind),
+        kind,
         space: query.space.as_deref().map(parse_space).transpose()?,
         name: query.name.as_deref().map(parse_name).transpose()?,
         version_range: query.version_range,
@@ -2052,24 +2242,14 @@ fn resolve_latest_registry(
         .map_err(WyrdPyError::from)
 }
 
-/// Soft-deletes one Card of `kind` selected by UID or by space and name.
+/// Soft-deletes the one Card a typed view's selector names.
 ///
-/// The selector is validated before IO; deletion runs detached from the GIL.
+/// Deletion runs detached from the GIL.
 ///
 /// # Errors
 ///
-/// Returns a validation error for an incomplete or invalid selector, and the
-/// registry's not-found, authorization, or transport error otherwise.
-fn delete_registry(
-    py: Python<'_>,
-    registry: &Cards,
-    kind: CardKind,
-    uid: Option<&str>,
-    space: Option<&str>,
-    name: Option<&str>,
-    version: Option<&str>,
-) -> CardPyResult<()> {
-    let selector = selector_for_kind(kind, uid, space, name, version)?;
+/// Returns the registry's not-found, authorization, or transport error.
+fn delete_registry(py: Python<'_>, registry: &Cards, selector: CardSelector) -> CardPyResult<()> {
     py.detach(|| wyrd_runtime::runtime().block_on(registry.delete(selector)))
         .map_err(WyrdPyError::from)
 }
@@ -2154,7 +2334,7 @@ impl PyDataCardRegistry {
         list_registry(
             py,
             &self.inner,
-            CardKind::Data,
+            Some(CardKind::Data),
             RegistryListQuery::from_kwargs(kwargs)?,
         )
     }
@@ -2184,19 +2364,31 @@ impl PyDataCardRegistry {
     /// Provide `uid` for an exact deletion. Otherwise provide `space`, `name`,
     /// and the exact `version`.
     ///
+    /// Pass `card_ref` alone for an exact deletion instead.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of the fields below.
+    /// * `uid` - Exact server-assigned UID.
+    /// * `space` - Card space, required when `uid` is omitted.
+    /// * `name` - Card name, required when `uid` is omitted.
+    /// * `version` - Exact version.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, or deletion is rejected.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
     fn delete(
         &self,
         py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
         uid: Option<&str>,
         space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
     ) -> CardPyResult<()> {
-        delete_registry(py, &self.inner, CardKind::Data, uid, space, name, version)
+        let card_ref = card_ref.as_ref().map(|card_ref| &card_ref.0);
+        let selector = selector_for_kind(CardKind::Data, card_ref, uid, space, name, version)?;
+        delete_registry(py, &self.inner, selector)
     }
 
     /// Retrieve and validate one complete `DataCard` envelope.
@@ -2209,6 +2401,8 @@ impl PyDataCardRegistry {
     /// it returns the hydrated holder without loading artifacts.
     ///
     /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of `uid`, `space`,
+    ///   `name`, and `version`.
     /// * `uid` - Exact server-assigned UID. It takes precedence over the named
     ///   selector; supplied identity fields are checked against the result.
     /// * `space` - Card space, required when `uid` is omitted.
@@ -2228,11 +2422,17 @@ impl PyDataCardRegistry {
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, the envelope fails validation, or a required custom interface is
     /// missing.
-    #[pyo3(signature = (**kwargs))]
-    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<DataCard> {
+    #[pyo3(signature = (card_ref=None, **kwargs))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<DataCard> {
         let query = RegistryGetQuery::from_kwargs(kwargs)?;
         let selector = selector_for_kind(
             CardKind::Data,
+            card_ref.as_ref().map(|card_ref| &card_ref.0),
             query.uid.as_deref(),
             query.space.as_deref(),
             query.name.as_deref(),
@@ -2336,7 +2536,7 @@ impl PyModelCardRegistry {
         list_registry(
             py,
             &self.inner,
-            CardKind::Model,
+            Some(CardKind::Model),
             RegistryListQuery::from_kwargs(kwargs)?,
         )
     }
@@ -2366,19 +2566,31 @@ impl PyModelCardRegistry {
     /// Provide `uid` for an exact deletion. Otherwise provide `space`, `name`,
     /// and the exact `version`.
     ///
+    /// Pass `card_ref` alone for an exact deletion instead.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of the fields below.
+    /// * `uid` - Exact server-assigned UID.
+    /// * `space` - Card space, required when `uid` is omitted.
+    /// * `name` - Card name, required when `uid` is omitted.
+    /// * `version` - Exact version.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, or deletion is rejected.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
     fn delete(
         &self,
         py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
         uid: Option<&str>,
         space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
     ) -> CardPyResult<()> {
-        delete_registry(py, &self.inner, CardKind::Model, uid, space, name, version)
+        let card_ref = card_ref.as_ref().map(|card_ref| &card_ref.0);
+        let selector = selector_for_kind(CardKind::Model, card_ref, uid, space, name, version)?;
+        delete_registry(py, &self.inner, selector)
     }
 
     /// Retrieve and validate one complete `ModelCard` envelope.
@@ -2392,6 +2604,8 @@ impl PyModelCardRegistry {
     /// operation.
     ///
     /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of `uid`, `space`,
+    ///   `name`, and `version`.
     /// * `uid` - Exact server-assigned UID. It takes precedence over the named
     ///   selector.
     /// * `space` - Card space, required when `uid` is omitted.
@@ -2412,11 +2626,17 @@ impl PyModelCardRegistry {
     /// found, the envelope fails validation, or a required custom interface is
     /// missing. With `eager_load=True`, `get` retains verified artifacts on
     /// the holder after the interface loads successfully.
-    #[pyo3(signature = (**kwargs))]
-    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<ModelCard> {
+    #[pyo3(signature = (card_ref=None, **kwargs))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<ModelCard> {
         let query = RegistryGetQuery::from_kwargs(kwargs)?;
         let selector = selector_for_kind(
             CardKind::Model,
+            card_ref.as_ref().map(|card_ref| &card_ref.0),
             query.uid.as_deref(),
             query.space.as_deref(),
             query.name.as_deref(),
@@ -2508,7 +2728,7 @@ impl PyPromptCardRegistry {
         list_registry(
             py,
             &self.inner,
-            CardKind::Prompt,
+            Some(CardKind::Prompt),
             RegistryListQuery::from_kwargs(kwargs)?,
         )
     }
@@ -2538,19 +2758,31 @@ impl PyPromptCardRegistry {
     /// Provide `uid` for an exact deletion. Otherwise provide `space`, `name`,
     /// and the exact `version`.
     ///
+    /// Pass `card_ref` alone for an exact deletion instead.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of the fields below.
+    /// * `uid` - Exact server-assigned UID.
+    /// * `space` - Card space, required when `uid` is omitted.
+    /// * `name` - Card name, required when `uid` is omitted.
+    /// * `version` - Exact version.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, or deletion is rejected.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
     fn delete(
         &self,
         py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
         uid: Option<&str>,
         space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
     ) -> CardPyResult<()> {
-        delete_registry(py, &self.inner, CardKind::Prompt, uid, space, name, version)
+        let card_ref = card_ref.as_ref().map(|card_ref| &card_ref.0);
+        let selector = selector_for_kind(CardKind::Prompt, card_ref, uid, space, name, version)?;
+        delete_registry(py, &self.inner, selector)
     }
 
     /// Retrieve and validate one complete `PromptCard` envelope.
@@ -2560,6 +2792,8 @@ impl PyPromptCardRegistry {
     /// Prompt cards do not have a separate artifact hydration step.
     ///
     /// # Arguments
+    /// * `card_ref` - Exact `CardRef`, used alone in place of `uid`, `space`,
+    ///   `name`, and `version`.
     /// * `uid` - Exact server-assigned UID. It takes precedence over the named
     ///   selector.
     /// * `space` - Card space, required when `uid` is omitted.
@@ -2572,16 +2806,18 @@ impl PyPromptCardRegistry {
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, or the envelope fails validation.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
     fn get(
         &self,
         py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
         uid: Option<&str>,
         space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
     ) -> CardPyResult<PromptCard> {
-        let selector = selector_for_kind(CardKind::Prompt, uid, space, name, version)?;
+        let card_ref = card_ref.as_ref().map(|card_ref| &card_ref.0);
+        let selector = selector_for_kind(CardKind::Prompt, card_ref, uid, space, name, version)?;
         let envelope = download_card(py, &self.inner, selector)?;
         let mut card = PromptCard::from_card(envelope)?;
         card.hydrate_prompt(py)?;
@@ -2604,8 +2840,9 @@ pub struct PyWorkflowCards {
 impl PyWorkflowCards {
     /// Load one registered Workflow by exact identity or by UID.
     ///
-    /// Pass either `uid` alone or all of `space`, `name`, and `version`; a
-    /// mixed or versionless selector is refused before any read. Every Agent
+    /// Pass either a Workflow `CardRef` alone, `uid` alone, or all of `space`,
+    /// `name`, and `version`; a mixed or versionless selector is refused
+    /// before any read. Every Agent
     /// and Prompt is read along the Workflow's locked relationships, so later
     /// versions never float in. The GIL is released while loading.
     ///
@@ -2614,6 +2851,7 @@ impl PyWorkflowCards {
     /// partial Workflow and writes nothing durable.
     ///
     /// # Arguments
+    /// * `card_ref` - Exact Workflow `CardRef`.
     /// * `uid` - Exact server-assigned Workflow UID.
     /// * `space` - Workflow space.
     /// * `name` - Workflow name.
@@ -2631,10 +2869,11 @@ impl PyWorkflowCards {
     /// Cards, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow matches, and
     /// the inactive-dependency and Workflow validation errors. Python raises
     /// each as a `WyrdError` with that code.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
+    #[pyo3(signature = (card_ref=None, *, uid=None, space=None, name=None, version=None))]
     fn load(
         &self,
         py: Python<'_>,
+        card_ref: Option<PyRef<'_, CardRefPy>>,
         uid: Option<&str>,
         space: Option<&str>,
         name: Option<&str>,
@@ -2646,12 +2885,15 @@ impl PyWorkflowCards {
                 details: serde_json::json!({ "field": field }),
             })
         };
-        let selector = match (uid, space, name, version) {
-            (Some(uid), None, None, None) => CardSelector::uid(
+        let selector = match (card_ref, uid, space, name, version) {
+            (Some(card_ref), None, None, None, None) if card_ref.0.kind == CardKind::Workflow => {
+                CardSelector::exact(card_ref.0.clone())
+            }
+            (None, Some(uid), None, None, None) => CardSelector::uid(
                 CardKind::Workflow,
                 CardUid::new(uid).map_err(|error| invalid("uid", error.to_string()))?,
             ),
-            (None, Some(space), Some(name), Some(version)) => CardSelector::named(
+            (None, None, Some(space), Some(name), Some(version)) => CardSelector::named(
                 CardKind::Workflow,
                 SpaceName::new(space).map_err(|error| invalid("space", error.to_string()))?,
                 CardName::new(name).map_err(|error| invalid("name", error.to_string()))?,
@@ -2663,7 +2905,8 @@ impl PyWorkflowCards {
             _ => {
                 return Err(invalid(
                     "selector",
-                    "pass either uid alone or space, name, and version".to_owned(),
+                    "pass either a Workflow card_ref alone, uid alone, or space, name, and version"
+                        .to_owned(),
                 ));
             }
         };
@@ -3061,23 +3304,45 @@ fn parse_version_bump(value: &Bound<'_, PyAny>) -> CardPyResult<VersionBump> {
         .map_err(|_| WyrdPyError::validation("version_bump must be a VersionBump"))
 }
 
-/// Builds a registry selector from a UID or from space and name.
+/// Builds a registry selector from a `CardRef`, a UID, or space and name.
 ///
-/// A UID takes precedence; any supplied space and name then become identity
-/// assertions the server checks. Without a UID both space and name are
-/// required. An optional version narrows either selector.
+/// A `CardRef` stands alone as an exact selector and must name `kind`. A UID
+/// takes precedence over a name; any supplied space and name then become
+/// identity assertions the server checks. Without a UID both space and name
+/// are required. An optional version narrows either selector.
 ///
 /// # Errors
 ///
-/// Returns a validation error for a missing space or name, or any invalid
+/// Returns a validation error for a `CardRef` of another kind or combined
+/// with any other selector field, a missing space or name, or any invalid
 /// UID, space, name, or version.
 fn selector_for_kind(
     kind: CardKind,
+    card_ref: Option<&CardRef>,
     uid: Option<&str>,
     space: Option<&str>,
     name: Option<&str>,
     version: Option<&str>,
 ) -> CardPyResult<CardSelector> {
+    if let Some(card_ref) = card_ref {
+        if uid.is_some() || space.is_some() || name.is_some() || version.is_some() {
+            return Err(invalid_selector(
+                "card_ref",
+                "pass card_ref alone, without uid, space, name, or version",
+            ));
+        }
+        if card_ref.kind != kind {
+            return Err(invalid_selector(
+                "card_ref",
+                format!(
+                    "expected a {} CardRef, got {}",
+                    kind.wire_name(),
+                    card_ref.kind.wire_name()
+                ),
+            ));
+        }
+        return Ok(CardSelector::exact(card_ref.clone()));
+    }
     if let Some(uid) = uid {
         let uid = CardUid::new(uid).map_err(|error| invalid_selector("uid", error.to_string()))?;
         let selector = CardSelector::uid(kind, uid).with_identity_assertions(
@@ -3105,6 +3370,28 @@ fn selector_for_kind(
         .map_or(Ok(selector.clone()), |version| {
             Ok(selector.with_version(version))
         })
+}
+
+/// Parses a `Kind` member or a native kind wire name into a `CardKind`.
+///
+/// A `Kind` member is read through its `name` wire-name getter, so both input
+/// forms resolve through the same native-kind table.
+///
+/// # Errors
+///
+/// Returns a validation error for any other object or an unknown kind name.
+fn parse_kind(value: &Bound<'_, PyAny>) -> CardPyResult<CardKind> {
+    let name = match value.extract::<String>() {
+        Ok(name) => name,
+        Err(_) => value
+            .getattr("name")
+            .and_then(|name| name.extract::<String>())
+            .map_err(|_| invalid_selector("kind", "kind must be a CardKind or kind name"))?,
+    };
+    CardKind::native()
+        .into_iter()
+        .find(|kind| kind.wire_name() == name)
+        .ok_or_else(|| invalid_selector("kind", format!("unknown card kind: {name}")))
 }
 
 /// Builds the request validation error for one malformed registry selector
@@ -3287,5 +3574,6 @@ pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyCardList>()?;
     module.add_class::<PyRegistrationOutcome>()?;
     module.add_class::<PyRegistrationReceipt>()?;
+    module.add_class::<PyHydrationSummary>()?;
     Ok(())
 }

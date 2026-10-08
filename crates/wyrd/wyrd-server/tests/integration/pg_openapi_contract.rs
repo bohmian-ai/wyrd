@@ -150,6 +150,7 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards/{card_uid}/complete",
         "/v1/cards/download/init",
         "/v1/principals/{principal_id}/credentials/{credential_id}",
+        "/v1/auth/grant-role",
         "/v1/verification/bindings/{binding_id}",
         "/v1/verification/runs",
         "/v1/verification/runs/{run_id}",

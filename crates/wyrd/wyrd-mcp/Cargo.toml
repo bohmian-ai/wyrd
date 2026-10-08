@@ -21,7 +21,7 @@ name = "mcp"
 path = "tests/bifrost/mcp/main.rs"
 
 [dependencies]
-wyrd-client = { workspace = true }
+wyrd-client = { workspace = true, features = ["internal"] }
 # Streamable HTTP MCP client only: `wyrd-mcp` connects to Wyrd's `/mcp`
 # endpoint, it never serves the protocol.
 rmcp = { workspace = true, features = [

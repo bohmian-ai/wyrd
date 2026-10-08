@@ -21,6 +21,9 @@ pub enum Environment {
 
 impl Environment {
     /// The non-empty value of `name`, or `None` when it is unset or empty.
+    ///
+    /// # Arguments
+    /// * `name` - Variable name to read.
     #[must_use]
     pub fn var(&self, name: &str) -> Option<String> {
         match self {

@@ -122,6 +122,10 @@ impl SelectedRoutes {
 /// read already started on the blocking pool finishes on its own after a
 /// drop, and its value is discarded.
 ///
+/// # Arguments
+/// * `name` - The binding's name, reported in any refusal.
+/// * `config` - The binding's configuration, including its secret header refs.
+///
 /// # Errors
 /// Returns `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` for an invalid header name
 /// or an unreadable secret.

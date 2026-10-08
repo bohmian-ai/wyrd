@@ -1,5 +1,5 @@
 import { tableFromArrays, tableToIPC } from "apache-arrow";
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import { BifrostQueryStream, IncompleteQueryStreamError, TableConfig, type CompactionType } from "@wyrd/sdk";
 
@@ -36,77 +36,81 @@ function fakeStream(steps: Partial<NativeStep>[], terminalJson: string | null = 
 
 const DONE = { done: true, value: undefined };
 
-test("arrow batches are yielded and the validated terminal is retained", async () => {
-  const terminal = { outcome: "success", row_count: 2, warnings: [], source_completion: [], error: null };
-  const { stream } = fakeStream([
-    { ipc: Buffer.from(tableToIPC(tableFromArrays({ value: [1, 2] }), "stream")) },
-    { terminalJson: JSON.stringify(terminal) },
-  ]);
+// Internal: these drive the TypeScript wrapper over a fake native stream,
+// which no user constructs; the `query-bifrost` journey proves the public path.
+describe("internal native query stream wrapper", () => {
+  test("arrow batches are yielded and the validated terminal is retained", async () => {
+    const terminal = { outcome: "success", row_count: 2, warnings: [], source_completion: [], error: null };
+    const { stream } = fakeStream([
+      { ipc: Buffer.from(tableToIPC(tableFromArrays({ value: [1, 2] }), "stream")) },
+      { terminalJson: JSON.stringify(terminal) },
+    ]);
 
-  const rows = [];
-  for await (const batch of stream) {
-    rows.push(batch.numRows);
-  }
+    const rows = [];
+    for await (const batch of stream) {
+      rows.push(batch.numRows);
+    }
 
-  expect([stream.requestId, rows, stream.terminal]).toEqual([REQUEST_ID, [2], terminal]);
-});
-
-test("stopping iteration early closes the native response", async () => {
-  const { stream, state } = fakeStream([{}]);
-
-  await stream.return();
-
-  expect(state.closed).toBe(true);
-});
-
-test("stream that ends before its terminal raises the incomplete stream error once", async () => {
-  const { stream } = fakeStream([
-    {
-      errorCode: "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
-      errorStatus: 502,
-      errorTitle: "Query stream incomplete",
-      errorDetail: "response ended before terminal",
-    },
-  ]);
-
-  await expect(stream.next()).rejects.toBeInstanceOf(IncompleteQueryStreamError);
-  await expect(stream.next()).resolves.toEqual(DONE);
-});
-
-test("failed terminal keeps its step details and status", async () => {
-  const terminal = { outcome: "failed", error: { code: "query_execution_failed", detail: "source unavailable" } };
-  const { stream } = fakeStream(
-    [
-      {
-        errorCode: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
-        errorStatus: 500,
-        errorTitle: "Query execution failed",
-        errorDetail: "source unavailable",
-        errorRemediation: "Inspect the retained terminal error.",
-        errorDetailsJson: JSON.stringify(terminal),
-      },
-    ],
-    JSON.stringify(terminal),
-  );
-
-  await expect(stream.next()).rejects.toMatchObject({
-    code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
-    status: 500,
-    detail: "source unavailable",
-    details: terminal,
+    expect([stream.requestId, rows, stream.terminal]).toEqual([REQUEST_ID, [2], terminal]);
   });
-});
 
-test("arrow decode failure closes the native response before it propagates", async () => {
-  const { stream, state } = fakeStream([{ ipc: Buffer.from("not-arrow") }]);
-  state.closeError = new Error("cleanup failed");
+  test("stopping iteration early closes the native response", async () => {
+    const { stream, state } = fakeStream([{}]);
 
-  const failure = await stream.next().catch((reason: unknown) => reason);
+    await stream.return();
 
-  expect(failure).toBeInstanceOf(Error);
-  expect(failure).not.toBe(state.closeError);
-  expect(state.closed).toBe(true);
-  await expect(stream.next()).resolves.toEqual(DONE);
+    expect(state.closed).toBe(true);
+  });
+
+  test("stream that ends before its terminal raises the incomplete stream error once", async () => {
+    const { stream } = fakeStream([
+      {
+        errorCode: "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+        errorStatus: 502,
+        errorTitle: "Query stream incomplete",
+        errorDetail: "response ended before terminal",
+      },
+    ]);
+
+    await expect(stream.next()).rejects.toBeInstanceOf(IncompleteQueryStreamError);
+    await expect(stream.next()).resolves.toEqual(DONE);
+  });
+
+  test("failed terminal keeps its step details and status", async () => {
+    const terminal = { outcome: "failed", error: { code: "query_execution_failed", detail: "source unavailable" } };
+    const { stream } = fakeStream(
+      [
+        {
+          errorCode: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+          errorStatus: 500,
+          errorTitle: "Query execution failed",
+          errorDetail: "source unavailable",
+          errorRemediation: "Inspect the retained terminal error.",
+          errorDetailsJson: JSON.stringify(terminal),
+        },
+      ],
+      JSON.stringify(terminal),
+    );
+
+    await expect(stream.next()).rejects.toMatchObject({
+      code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+      status: 500,
+      detail: "source unavailable",
+      details: terminal,
+    });
+  });
+
+  test("arrow decode failure closes the native response before it propagates", async () => {
+    const { stream, state } = fakeStream([{ ipc: Buffer.from("not-arrow") }]);
+    state.closeError = new Error("cleanup failed");
+
+    const failure = await stream.next().catch((reason: unknown) => reason);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBe(state.closeError);
+    expect(state.closed).toBe(true);
+    await expect(stream.next()).resolves.toEqual(DONE);
+  });
 });
 
 const SCHEMA = { type: "object", properties: { id: { type: "integer" } }, required: ["id"] };

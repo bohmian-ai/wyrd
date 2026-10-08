@@ -41,6 +41,10 @@ impl Default for BifrostTransportConfig {
 
 impl BifrostTransportConfig {
     /// Build configuration with a bounded retry budget.
+    ///
+    /// # Arguments
+    /// * `max_frame_retries` - Reconnect attempts after the initial batch
+    ///   attempt; clamped to the transport's ceiling.
     #[must_use]
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_max_frame_retries(max_frame_retries: u32) -> Self {
@@ -68,20 +72,45 @@ impl std::fmt::Debug for BifrostGrpcTransport {
 
 impl BifrostGrpcTransport {
     /// Connect through the shared Wyrd client authentication path.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose gRPC channel and token cache
+    ///   the transport shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WyrdClientError::TransportDown` when the gRPC endpoint URI is
+    /// invalid or the dial fails on all attempts.
     pub async fn connect(client: &WyrdClient) -> Result<Self, WyrdClientError> {
         Self::connect_with_config(client, BifrostTransportConfig::default()).await
     }
 
     /// Connect with an explicit bounded retry budget.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose gRPC channel and token cache
+    ///   the transport shares.
+    /// * `config` - The bounded retry budget for each batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WyrdClientError::TransportDown` when the gRPC endpoint URI is
+    /// invalid or the dial fails on all attempts.
     pub async fn connect_with_config(
         client: &WyrdClient,
         config: BifrostTransportConfig,
     ) -> Result<Self, WyrdClientError> {
-        let connection = client.connect_grpc().await?;
+        let connection =
+            GrpcConnection::connect(&client.grpc_config, std::sync::Arc::clone(&client.auth))
+                .await?;
         Ok(Self::new(connection, config))
     }
 
     /// Build a transport over an already connected, authenticated channel.
+    ///
+    /// # Arguments
+    /// * `connection` - An already connected, authenticated gRPC channel.
+    /// * `config` - The bounded retry budget for each batch.
     #[must_use]
     pub fn new(connection: GrpcConnection, config: BifrostTransportConfig) -> Self {
         Self { connection, config }

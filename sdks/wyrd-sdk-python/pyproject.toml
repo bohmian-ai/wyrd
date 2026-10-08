@@ -73,8 +73,16 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "D417"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Every documented stub parameter gets an ``Args:`` entry; the stubs are the
+# public help text. Other modules keep their existing docstring style.
+"!python/wyrd/stubs/**" = ["D417"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ty.src]
 # Public modules are typed by their ``__init__.pyi``; the ``stubs/`` sources are

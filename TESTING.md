@@ -200,11 +200,20 @@ against this checklist:
 - [ ] **Deployment-shaped server.** The session `WyrdTestServer` exports its
   address and key the way a deployment's environment does; SDK and CLI calls
   resolve them without arguments. Only a credentials test passes them.
+- [ ] **A second principal is an explicit client.** A test acting as anyone
+  but the session administrator builds a `WyrdClient` from that principal's
+  key and passes it as the surface's one `client` argument; a state acting as
+  a Service is created with that client (`WyrdState.from_path(path,
+  client=...)`) and starts Bifrost with no identity argument. Server URLs,
+  credentials, and gRPC URLs go only to the `WyrdClient` constructor, and no
+  test switches principals by editing the environment.
 - [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
   functions, the three test controls (`flush_bifrost`,
   `wait_for_baseline`, `make_binding_due`), and the server's credential
-  fixtures for keys that need Roles; a Card key without added Roles comes
-  from the CLI `issue_key`. No private or extension import,
+  fixtures for principals that are not Card keys. A Service or Agent key
+  comes from the CLI `issue_key` and holds `wyrd_default`; a Role beyond it is
+  added with the CLI `grant_role`, and takes effect for a client built from
+  the key after the grant. No private or extension import,
   subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
   JSON parsing of results, sleep, or polling loop.
 - [ ] **Setup is fixtures that return domain objects** (a `WyrdState`, a

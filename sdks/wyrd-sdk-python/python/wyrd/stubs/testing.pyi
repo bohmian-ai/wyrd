@@ -9,7 +9,7 @@ class WyrdTestServer:
     fixtures, which stand in for the operator who grants Roles in a
     deployment: ``bootstrap_service``, ``bootstrap_service_in_tenant``, and
     ``credential_registered_service``. A Card key without added Roles comes
-    from ``wyrd.cli.issue_key``. The remaining members start or address the
+    from ``wyrd.testing.cli.issue_key``. The remaining members start or address the
     server.
 
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
@@ -96,6 +96,13 @@ class WyrdTestServer:
 
         Lets a test hand an unmodified OTLP exporter or provider SDK the token
         it needs.
+
+        Returns:
+            A bearer access token for the harness's ``admin`` service.
+
+        Raises:
+            WyrdError: The harness error outside the context manager, or the
+                exchange route's refusal of the key.
         """
         ...
 
@@ -104,6 +111,11 @@ class WyrdTestServer:
 
         Bounded: a Scribe that cannot settle its staged rows raises instead of
         blocking the interpreter thread forever.
+
+        Raises:
+            WyrdError: Outside the context manager, when the Scribe cannot
+                commit its buffered rows, or when the flush does not settle
+                within the harness bound.
         """
         ...
     def __enter__(self) -> WyrdTestServer: ...
@@ -111,6 +123,11 @@ class WyrdTestServer:
     @property
     def base_url(self) -> str:
         """Base HTTP URL of the bound server (``http://127.0.0.1:<port>``)."""
+        ...
+
+    @property
+    def grpc_url(self) -> str:
+        """gRPC endpoint of the bound server, for a client of a ``mutate_env=False`` server."""
         ...
 
     @property
@@ -132,6 +149,13 @@ class WyrdTestServer:
                 RBAC journeys.
             name: the service principal's name.
 
+        Returns:
+            The new principal's API key.
+
+        Raises:
+            WyrdError: Outside the context manager, or when bootstrap fails or
+                yields a user.
+
         """
         ...
 
@@ -147,6 +171,9 @@ class WyrdTestServer:
                 Service already registered in the fixture tenant.
             roles: built-in role names granted to that principal in addition
                 to any it already holds.
+
+        Returns:
+            An API key for the Service's principal.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
@@ -174,11 +201,16 @@ class WyrdTestServer:
     def wait_for_baseline(self, verifier: str, timeout: float) -> None:
         """Return once Drift Verifier ``verifier``'s fitted baseline is ready.
 
-        ``verifier`` is the Verifier Card UID and ``timeout`` is in seconds.
-        Raises ``WyrdError`` with ``WYRD_VERIFICATION_409_BASELINE_NOT_READY``
-        when ``timeout`` elapses first; its ``details["baseline"]`` is the last
-        observed baseline status, the same value ``card.status.verification``
-        serves.
+        Args:
+            verifier: the Verifier Card UID.
+            timeout: the longest wait, in seconds.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_409_BASELINE_NOT_READY`` when
+                ``timeout`` elapses first; its ``details["baseline"]`` is the
+                last observed baseline status, the same value
+                ``card.status.verification`` serves. A harness error for an
+                invalid UID or a negative or non-finite ``timeout``.
         """
         ...
 
@@ -196,6 +228,9 @@ class WyrdTestServer:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
                 permission.
 
+        Returns:
+            An API key for the service holding exactly ``role``.
+
         """
         ...
 
@@ -203,6 +238,9 @@ class WyrdTestServer:
         """Revoke ``role`` from the service ``scoped_api_key`` minted for it.
 
         Access tokens exchanged afterwards resolve the revoked grant set.
+
+        Args:
+            role: a role ``scoped_api_key`` seeded.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
@@ -222,6 +260,10 @@ class WyrdTestServer:
         Returns:
             The new tenant's UUID string, for ``bootstrap_service_in_tenant()``.
 
+        Raises:
+            WyrdError: Outside the context manager, or when the tenant cannot
+                be seeded.
+
         """
         ...
 
@@ -236,6 +278,9 @@ class WyrdTestServer:
             roles: built-in role names, as for ``bootstrap_service()``.
             name: the service principal's name.
 
+        Returns:
+            The new principal's API key.
+
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when ``tenant_id``
                 does not parse.
@@ -244,25 +289,78 @@ class WyrdTestServer:
         ...
 
     def activate_human_sso(self, admin_key: str) -> None:
-        """Activate the identity lane's Keycloak sign-in for ``admin_key``'s tenant."""
+        """Activate the identity lane's Keycloak sign-in for ``admin_key``'s tenant.
+
+        Maps ``wyrd-admins`` to ``admin`` and ``wyrd-viewers`` to ``reader``.
+        Needs ``human_sso=True`` and the identity lane's Keycloak.
+
+        Args:
+            admin_key: an API key of the tenant's administrator.
+
+        Raises:
+            WyrdError: The harness error outside the context manager; a
+                ``PanicException`` when any served step fails.
+        """
         ...
 
     def save_human_login(
         self, config_home: str | os.PathLike[str], tenant: str, username: str, password: str
     ) -> None:
-        """Save ``username``'s login to ``tenant`` under ``config_home`` as ``wyrd auth login`` does."""
+        """Save ``username``'s login to ``tenant`` under ``config_home`` as ``wyrd auth login`` does.
+
+        Args:
+            config_home: the Wyrd configuration directory to save under.
+            tenant: the tenant to log in to.
+            username: the identity lane user.
+            password: that user's password.
+
+        Raises:
+            WyrdError: The harness error outside the context manager; a
+                ``PanicException`` when the login or the save fails.
+        """
         ...
 
     def expire_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:
-        """Make the saved login stale, so the next client renews it."""
+        """Make the saved login stale, so the next client renews it.
+
+        Args:
+            config_home: the Wyrd configuration directory holding the login.
+            tenant: the saved login's tenant.
+
+        Raises:
+            WyrdError: The harness error outside the context manager; a
+                ``PanicException`` when the login is missing or cannot be saved.
+        """
         ...
 
     def saved_login_is_stale(self, config_home: str | os.PathLike[str], tenant: str) -> bool:
-        """Return whether the saved login's access token has expired."""
+        """Return whether the saved login's access token has expired.
+
+        Args:
+            config_home: the Wyrd configuration directory holding the login.
+            tenant: the saved login's tenant.
+
+        Returns:
+            ``True`` when the saved access token has expired.
+
+        Raises:
+            WyrdError: The harness error outside the context manager; a
+                ``PanicException`` when the login is missing.
+        """
         ...
 
     def revoke_saved_login(self, config_home: str | os.PathLike[str], tenant: str) -> None:
-        """Revoke the saved login's refresh chain on the server, keeping the record."""
+        """Revoke the saved login's refresh chain on the server, keeping the record.
+
+        Args:
+            config_home: the Wyrd configuration directory holding the login.
+            tenant: the saved login's tenant.
+
+        Raises:
+            WyrdError: The harness error outside the context manager; a
+                ``PanicException`` when the login is not ready or the server
+                refuses the revocation.
+        """
         ...
 
 __all__ = ["WyrdTestServer"]

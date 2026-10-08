@@ -249,9 +249,10 @@ fn media_as(uri: &str, media_type: &str) -> String {
 /// # Panics
 /// Panics when the bundle does not load or Bifrost does not start.
 async fn start_state(bundle: &Path, client: &WyrdClient) -> WyrdState {
-    let state = WyrdState::from_path(bundle).expect("complete bundle loads offline");
+    let state = WyrdState::from_path_with_client(bundle, client.clone())
+        .expect("complete bundle loads offline");
     state
-        .start_bifrost_with_config(client, None, QueueConfig::default())
+        .start_bifrost_with_config(None, QueueConfig::default())
         .await
         .expect("Bifrost starts");
     state

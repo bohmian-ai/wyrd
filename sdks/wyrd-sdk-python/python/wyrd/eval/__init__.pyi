@@ -37,7 +37,14 @@ class MediaRef:
         uri: str,
         media_type: str | None = None,
     ) -> None:
-        """Create a media descriptor; the arguments are the attributes above."""
+        """Create a media descriptor; the arguments are the attributes above.
+
+        Args:
+            id: the ``${media:id}`` slot name in the judge Prompt.
+            kind: ``"image"`` or ``"document"``.
+            uri: the durable object-storage URI of the media.
+            media_type: the IANA media type, or ``None`` to leave it unstated.
+        """
         ...
 
 __all__ = ["MediaKind", "MediaRef"]

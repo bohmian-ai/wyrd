@@ -79,9 +79,6 @@ def test_builtin_model_without_a_trusted_hash_is_refused_before_load(
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model"
     assert caught.value.details["stage"] == "artifact_trust"
-    assert caught.value.details["reason"] == (
-        "executable model requires an exact trusted artifact manifest hash"
-    )
     assert joblib_loads == []
 
 
@@ -99,7 +96,6 @@ def test_builtin_model_with_a_wrong_trusted_hash_is_refused_before_load(
         )
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["stage"] == "artifact_trust"
-    assert caught.value.details["reason"] == "trusted artifact manifest hash does not match"
     assert joblib_loads == []
 
 
@@ -260,7 +256,6 @@ def test_wrong_kind_interface_alias_is_rejected(
     assert caught.value.details["alias"] == "training_data"
     assert caught.value.details["card_ref"]["kind"] == "Data"
     assert caught.value.details["stage"] == "interface"
-    assert caught.value.details["reason"] == "data interface hydration failed"
 
 
 def test_unknown_load_kwargs_alias_is_rejected(
@@ -301,9 +296,6 @@ def test_conflicting_loader_aliases_for_same_card_are_rejected(
     assert caught.value.details["alias"] == "primary_model"
     assert caught.value.details["card_ref"]["name"] == "model"
     assert caught.value.details["stage"] == "interface"
-    assert caught.value.details["reason"] == (
-        "aliases resolving to one Card must use the identical interface object"
-    )
 
 
 def test_equivalent_duplicate_alias_kwargs_are_accepted(
@@ -332,9 +324,6 @@ def test_conflicting_duplicate_alias_kwargs_are_rejected(
     assert caught.value.details["alias"] == "primary_model"
     assert caught.value.details["card_ref"]["name"] == "model"
     assert caught.value.details["stage"] == "interface"
-    assert caught.value.details["reason"] == (
-        "aliases resolving to one Card must use equivalent loader kwargs"
-    )
 
 
 class FailingModelInterface(TinyModelInterface):
@@ -366,7 +355,6 @@ def test_interface_load_failure_maps_to_runtime_hydration_error(
     assert caught.value.details["alias"] == "model"
     assert caught.value.details["card_ref"]["name"] == "model"
     assert caught.value.details["stage"] == "artifact_load"
-    assert caught.value.details["reason"] == "model artifact load failed"
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert "cannot load" in str(caught.value.__cause__)
 

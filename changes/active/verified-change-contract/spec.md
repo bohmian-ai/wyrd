@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 66
+revision: 70
 status: approved
 ---
 
@@ -812,11 +812,11 @@ multi-table transaction design survives as an alternative.
   operations MUST be owned by `wyrd-sql`. Registration uses those operations
   through the caller-owned `TenantConn` so the Card, card-bound principal,
   binding projection, baseline work row, and connection validation share one
-  transaction. A Service or Agent principal's first projection also grants it
-  the built-in `workload` role (`bifrost_table:read`, `bifrost_record:write`,
-  `bifrost_query:read`) in that transaction, so a key issued for it through
-  `POST /auth/issue-key` can emit and read back its evidence without a manual
-  grant. Its Card scope still bounds which Cards it may emit for. Re-applying
+  transaction. (revised in revision 67) A Service or Agent principal's first
+  projection also grants it the built-in `wyrd_default` role
+  (`bifrost_table:read`, `bifrost_record:write`, `evals:run`; REQ-213) in that
+  transaction, so a key issued for it through `POST /auth/issue-key` can
+  emit and verify its evidence without a manual grant. Its Card scope still bounds which Cards it may emit for. Re-applying
   the Card never grants the role again, so an administrator's revocation
   stands; existing tenants receive the role row by migration. Vala consumers use the `vala-sql` re-export rather than import
   `wyrd-sql` directly. All five tables MUST carry `data_tenant_id`, enable and
@@ -1566,6 +1566,9 @@ table on `(data_tenant_id, result_id)`.
     principal passes a `WyrdClient` built for that principal's key through
     the call's optional `client` argument, the way a multi-tenant program
     would, and never changes the process environment to switch principal.
+    (revised in revision 67) A `WyrdState` acting as a Service is created
+    with that Service's client (REQ-209). A second test server a story
+    starts does not export its address; its calls pass an explicit client.
     Ambient resolution itself is proved once per SDK by one test about
     configuration; in Rust, where changing the environment of a running test
     process is unsound, only that test may run in a child process.
@@ -1606,7 +1609,11 @@ table on `(data_tenant_id, result_id)`.
   discriminated by `kind`. The Python and TypeScript types are generated
   from the `wyrd-spec` JSON schemas, so that `codegen:check` fails when a
   language drifts. The kind-specific `cards.data`, `cards.model`, and
-  `cards.prompt` loaders are unchanged.
+  `cards.prompt` loaders are unchanged. (revised in revision 67) The Python
+  type is read by attribute, not by key: `cards.get(ref)` returns generated
+  frozen dataclasses (`card.spec.…`, `card.status.verification.binding_ids`)
+  discriminated by `kind`, built from the same schemas by the existing Card
+  type generator. No runtime dependency is added.
 - **REQ-194**: A Run view identifies itself by the alias it was opened with.
   The view property is `alias` (Rust `alias()`, Python and TypeScript
   `alias`), replacing the string `card_ref` / `cardRef`, whose value and
@@ -1626,7 +1633,14 @@ table on `(data_tenant_id, result_id)`.
   named other tenant, and the principal projected by a registered Service
   Card. They stand in for the operator who grants Roles in a deployment;
   no public surface grants a Role. A Card-scoped key without added Roles is
-  still issued through the CLI (REQ-199).
+  still issued through the CLI (REQ-199). (revised in revision 67) Roles are
+  now granted with the public `grant-role` command (REQ-212), and a Service's
+  own key holds `wyrd_default` (REQ-213), so story journeys obtain a
+  Service's key with the `issue_key` CLI function and grant any further
+  Role with `grant_role`. The credential fixtures remain only for machine
+  principals that a story needs but no public command creates: a principal
+  holding named Roles in the session tenant, and another tenant's
+  administrator.
 
   (revised in revision 66) The saved-user-login story additionally uses the
   test server's saved-login fixtures: enable human single sign-on on the
@@ -1660,7 +1674,8 @@ table on `(data_tenant_id, result_id)`.
   an OpenAI SDK pointed at the Gateway. No principal-id accessor is added.
 - **REQ-199**: Card-scoped key issuance and Gateway provider credential
   writes are performed through the CLI functions (REQ-196). No separate SDK
-  method is added.
+  method is added. (revised in revision 67) Role grants (REQ-212) follow the
+  same rule.
 - **REQ-200**: The Bifrost query API in all three SDKs accepts bind
   parameters (`sql(query, params)`), and Oracle binds them server-side.
   Examples and tests read their own rows through the Bifrost client with
@@ -1717,6 +1732,136 @@ table on `(data_tenant_id, result_id)`.
   loaded Workflow's Gateway calls are made, as that client's principal;
   omitted, the ambient chain is used as today. A wholly local Workflow still
   needs neither a client nor a server.
+- **REQ-208**: (added in revision 67) **One identity parameter.** Every
+  public SDK entry point that calls the server takes exactly one optional
+  identity parameter, a `WyrdClient`: Python `client=None`, TypeScript an
+  options object `{ client }`, and Rust a `with_client(client)` constructor
+  or a `&WyrdClient` argument beside a `from_env()` form. Omitted, the call
+  resolves the client from the ambient chain (environment, then the active
+  profile, then the newest saved login). The server URL, credential, and gRPC
+  URL are arguments of the `WyrdClient` constructor only; no other public
+  surface accepts them. This covers `Cards`, `Bifrost` (connect and table
+  describe), `Gateway`, `OperatorConnections`, `Workflow` loading, and
+  `WyrdState` (REQ-209), and Rust `Platform`. Rust `Cards::new(server_url,
+  credential)` is removed and `Gateway` gains `with_client` and `from_env`
+  like the other handles. The removed arguments get no compatibility alias.
+  The `WyrdClient` constructor documents `credential` once, in every SDK: an
+  API key (`wyrd_sk_…`), which is exchanged for an access token, or an
+  access token, which is presented as-is.
+- **REQ-209**: (added in revision 67) **A state's identity is fixed when it
+  is created.** `WyrdState` takes its client at creation: Python
+  `WyrdState.from_path(path, client=None, …)`, TypeScript
+  `WyrdState.fromPath(path, { client })`, and Rust
+  `WyrdState::from_path_with_client(path, client)` beside `from_path(path)`.
+  `start_bifrost` / `startBifrost` takes no identity argument, and every
+  server call the state makes, including Bifrost startup and
+  `observe.verify`, runs as that client. A state created without a client
+  resolves the ambient chain once, at its first server call, and keeps that
+  client; later environment changes do not change its principal.
+- **REQ-210**: (added in revision 67) **One public surface across SDKs.**
+  The Rust, Python, and TypeScript SDKs expose the same public operations,
+  with the same argument names (in each language's casing), argument kinds,
+  defaults, and typed results. In particular:
+  - `cards.hydrate(ref, destination, metadata_only=False)` downloads a
+    registered Card's reachable graph as a bundle in all three SDKs (Rust
+    `Cards::hydrate(selector, destination, mode)`); Python gains it, and a
+    bundle no longer requires the CLI.
+  - `Cards` exposes root `get`, `list`, `delete`, and `resolve_latest` in
+    all three SDKs.
+  - Bifrost `stream(query, params, deadline)` has one shape in all three
+    SDKs; Rust keeps one table-describe name (`describe_table(namespace,
+    name)`); TypeScript exposes `dropped`.
+  - `state.run(alias)` names its argument `alias` everywhere, and the typed
+    state accessors exist for every kind the state hydrates.
+  - `Workflow.run` accepts the same input kinds, and `Workflow.from_yaml`
+    exists wherever `Workflow.from_path` does.
+  - (revised in revision 68) The same concept has the same name everywhere:
+    a state exposes `root_ref` (the root `CardRef`) and `service` (the typed
+    root Card), and a Workflow exposes its step ids as `steps`.
+  - (revised in revision 68) Workflows are authored as YAML and loaded with
+    `from_path` or `from_yaml`; no SDK exposes programmatic Workflow
+    builders.
+
+  Allowed differences are named idiom exceptions only:
+  - Python's Data and Model holders and per-kind registries;
+  - programmatic `register` in Rust and Python (revised in revision 68);
+  - a synchronous twin where the language has blocking IO: Rust's blocking
+    Bifrost and Python's `Bifrost` beside `AsyncBifrost` (added in revision
+    68);
+  - row-model typing (`model=` / `sql_as::<T>` / a row type);
+  - row serialization on `insert`;
+  - Rust's `run()` / `run_for_card(alias)` and `verify` / `verify_with_media`
+    pairs, where Rust has no optional arguments;
+  - Python's synchronous `record`;
+  - TypeScript string paths;
+  - Python's agent runtime (`Agent.run`);
+  - the operator-only Rust `Principals`, `Platform`, and storage handles;
+  - (added in revision 69) language-native ecosystem adapters that wrap a
+    shared surface without adding server behavior: Python's
+    `QueryResult.to_pandas` / `to_polars` and
+    `wyrd.otel.install_run_correlation`, and (added in revision 70)
+    Python's and TypeScript's `QueryResult.to_arrow` / `toArrow`, which
+    wrap the shared `batches` in the language's Arrow table type that Rust's
+    arrow-rs does not have;
+  - (added in revision 69) Rust's `ClientConfig`, `Environment`, and
+    `GlobalConfig` as the Rust spelling of the `WyrdClient` constructor
+    options that Python and TypeScript take as keyword or object arguments;
+  - (added in revision 69) test-harness CLI helpers that only load fixtures,
+    such as Rust's `cli::load` taking `Option<&Path>`.
+
+  An SDK that exposes a surface no other SDK has, outside this list, either
+  gains the surface everywhere or loses it.
+
+  (added in revision 68) Parity is measured on the SDK packages
+  (`wyrd_sdk`, Python `wyrd`, `@wyrd/sdk`), not on `wyrd-client`, which is
+  also the shared implementation behind the CLI, MCP, the test harness, and
+  the language bindings. `wyrd_sdk` re-exports only parity types; remote
+  `Workflows` and `PublicWyrdGatewayCaller` are not re-exported. Low-level
+  methods on re-exported types (raw requests, `from_parts`, Bifrost query
+  and writer internals, bundle introspection, `Run::subject`, and the
+  `Cards` response and download plumbing) are compiled only under a
+  `wyrd-client` `internal` feature. `wyrd-cli`, `wyrd-mcp`, `wyrd-testing`,
+  and the Python and TypeScript binding crates enable it; `wyrd-sdk-rust`
+  never does, and `check:deps` fails if it does.
+- **REQ-211**: (added in revision 67) **References and paths.** Every
+  selector, loader, and delete accepts a `CardRef` as well as its
+  identity or uid pieces, and every path parameter accepts the language's
+  path type: Python `str | os.PathLike[str]`, Rust `impl AsRef<Path>`, and
+  TypeScript `string`. Docstrings describe what the path names (a Card
+  file or a bundle directory) accurately.
+- **REQ-212**: (added in revision 67) **Role grants.** A tenant
+  administrator grants a built-in or tenant Role to a Card-bound Service or
+  Agent principal with `wyrd auth grant-role --kind --name --version --space
+  --role`, backed by `POST /v1/auth/grant-role` taking `{ card_ref, role }`
+  and returning the principal's roles. The route requires the tenant
+  administrator permission (`*`), not `service_accounts:write`. It is
+  idempotent, tenant-isolated, answers an unknown or foreign Card with the
+  existing non-enumerating not-found code and an unknown role with
+  `WYRD_SPEC_400_VALIDATION`, and stages the `auth.principal.role.grant`
+  authorization decision on the audit outbox. A grant takes effect at the
+  principal's next key exchange. Human users are not grant targets, because
+  federated login replaces their roles. The command is also a test-only CLI
+  function (REQ-196) in every SDK. No revoke command is added.
+- **REQ-213**: (added in revision 67) **A usable default Role.** A Service
+  or Agent principal's first projection grants the built-in `wyrd_default`
+  Role (`bifrost_table:read`, `bifrost_record:write`, `evals:run`) instead of
+  `workload`, so the key `wyrd auth issue-key` issues for a Service can
+  start Bifrost, emit its evidence, and verify without any grant. Its Card
+  scope still bounds which Cards it may emit for and verify. Tenant-wide
+  Bifrost query reads are not in the default; they come from an explicit
+  grant of the built-in `workload` Role, which keeps its permissions.
+  Bifrost reads scoped to a principal's own Card are not added; they need an
+  Oracle row filter that does not exist.
+- **REQ-214**: (added in revision 67) **Every public parameter is
+  documented.** Each public callable documents every parameter's name, type,
+  and meaning, its return value, and its errors, in the SDK's native form:
+  - Python: Google-style `Args:`, `Returns:`, and `Raises:` in the stub
+    sources. The stub assembler's existing docstring gate requires an
+    `Args:` entry for every non-`self` parameter, and Ruff's `D417` runs on
+    the stubs.
+  - TypeScript: `@param`, `@returns`, and `@throws` in `index.ts`.
+  - Rust: an `# Arguments` section on public SDK functions that take
+    parameters.
 
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
@@ -2742,8 +2887,76 @@ published image pinned by an immutable registry digest before release.
   whose Agent and Prompt refs are registry Cards with an explicit `client`
   holding read access while the ambient credential has none, and the
   Workflow loads and runs as that client (REQ-207).
+- **AC-060**: (added in revision 67) No public SDK surface outside the
+  `WyrdClient` constructor accepts a server URL, credential, or gRPC URL, in
+  any of the three SDKs; each REQ-208 surface takes an optional client, and a
+  journey in each SDK uses every one of them with an explicit client
+  (REQ-208).
+- **AC-061**: (added in revision 67) In each SDK a journey creates a
+  `WyrdState` with a Service's client, starts Bifrost without identity
+  arguments, and verifies as that Service; a state created with a client
+  lacking `evals:run` is refused with `WYRD_PERMISSION_403_DENIED_RBAC`
+  (REQ-209).
+- **AC-062**: (added in revision 67) A parity table under the change packet
+  lists every public operation of the three SDKs with its arguments and
+  result type; every row matches or names its REQ-210 idiom exception, and
+  each SDK has a journey that hydrates a bundle with `cards.hydrate`
+  (REQ-210).
+- **AC-063**: (added in revision 67) Selectors, loaders, and deletes accept
+  a `CardRef`, Python path parameters accept `pathlib.Path`, and Python
+  `cards.get` results are read by attribute with `ty` type checking passing
+  over the journeys (REQ-193, REQ-211).
+- **AC-064**: (added in revision 67) A journey in each SDK grants a Role
+  with the `grant_role` CLI function and acts with it after a fresh key
+  exchange, and is refused with `WYRD_PERMISSION_403_DENIED_RBAC` when the
+  caller is not a tenant administrator. A Rust route test proves tenant
+  isolation, the non-enumerating not-found answer, an unknown role refused,
+  idempotency, and the staged audit decision (REQ-212).
+- **AC-065**: (added in revision 67) A Service key issued by `issue_key`,
+  with no grant, starts Bifrost, emits, and verifies in each SDK; the same
+  key is refused a tenant-wide Bifrost query until `workload` is granted
+  (REQ-213).
+- **AC-066**: (added in revision 67) The Python stub gate fails on a public
+  callable with an undocumented parameter, and every public Python,
+  TypeScript, and Rust SDK callable documents its parameters, result, and
+  errors (REQ-214).
+- **AC-067**: (added in revision 68) `wyrd_sdk` built without the
+  `internal` feature exposes no raw-request, writer-internal, or
+  introspection method; `check:deps` fails when `wyrd-sdk-rust` enables
+  `internal`; every SDK names the root accessors `root_ref` and `service`
+  and the Workflow step ids `steps`; no SDK exposes Workflow builders; and
+  the parity table has no unexplained row (REQ-210).
 
 ## Open material decisions
+
+Revision 70:
+
+- None. The user approved on 2026-10-07 naming Python and TypeScript
+  `QueryResult.to_arrow` as an ecosystem adapter instead of adding a Rust
+  `to_arrow`.
+
+Revision 69:
+
+- None. The user approved on 2026-10-07 three named REQ-210 exceptions:
+  language-native ecosystem adapters, Rust config types as the spelling of
+  constructor options, and fixture-only test-harness CLI helpers.
+
+Revision 68:
+
+- None. The user approved every decision on 2026-10-07: unified names,
+  the synchronous-twin and Rust programmatic-`register` exceptions, Rust-only
+  types left out of `wyrd_sdk`, the `internal` feature for low-level
+  methods, and removing the Python Workflow builders in favour of YAML.
+
+Revision 67:
+
+- None. The user approved every decision on 2026-10-07, including the
+  `wyrd_default` Role name (role names allow only `[a-z0-9_]`), its narrow
+  permission set, and documenting parameters in every SDK.
+- Noted outside this change: `POST /v1/principals` gates on
+  `service_accounts:write`, which `runtime_admin` holds, so that role can
+  create a principal holding `admin`. REQ-212 does not reuse that gate. The
+  existing route needs its own follow-up.
 
 Revision 66:
 
@@ -2789,6 +3002,59 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 70 Arrow table adapter (2026-10-07, approved by the user):**
+  - **Trigger.** The final TASK-017-R2 parity pass left one row: Python and
+    TypeScript `QueryResult.to_arrow` return an Arrow table, and Rust has
+    only `batches()`.
+  - **Decision (REQ-210, AC-067).** arrow-rs has no table type, and a batch
+    slice is its equivalent, so `to_arrow` is an ecosystem adapter under
+    exception (a). Rust gains no copying `to_arrow`.
+- **Revision 69 Named idiom exceptions for adapters, config, and test
+  helpers (2026-10-07, approved by the user):**
+  - **Trigger.** The TASK-017-R2 parity table left three surfaces matching
+    no REQ-210 exception: Python pandas/polars and OpenTelemetry adapters,
+    Rust's config types, and Rust's test-only `cli::load` signature.
+  - **Decision (REQ-210, AC-067).** Each is an idiom, not a divergent
+    contract: adapters wrap a shared result or runtime hook in the
+    language's ecosystem, Rust config types carry the same constructor
+    options, and fixture-loading test helpers are not user surface. All
+    three are named exceptions; no SDK is changed to add or remove them.
+- **Revision 68 Parity measured on the SDK packages (2026-10-07, approved
+  by the user):**
+  - **Trigger.** The TASK-017-R2 parity table found surfaces in one or two
+    SDKs that matched no REQ-210 exception: Rust low-level client, writer,
+    and bundle-inspection methods; Rust remote `Workflows` and the gateway
+    caller; blocking Bifrost in Rust and Python only; Python Workflow
+    builders; and different names for the root accessor and step ids.
+  - **Decision (REQ-210, AC-067).** Nothing has shipped, so parity is
+    enforced on the SDK packages for the long term: names are unified;
+    synchronous twins and Rust/Python programmatic `register` are named
+    exceptions; Rust-only types are not re-exported by `wyrd_sdk`;
+    low-level methods sit behind a `wyrd-client` `internal` feature that
+    `wyrd-sdk-rust` never enables; Workflows are authored as YAML only.
+- **Revision 67 One client, one surface, usable roles (2026-10-07,
+  approved by the user):**
+  - **Trigger.** A user-persona review of the TASK-017-R1 journeys, written
+    from the view of a Python data scientist, found that the story tests
+    cannot be copied into a notebook. A bundle needed the test-only CLI. A
+    verify key needed a harness-only Role grant. Identity arrived through
+    `credential=`, `client=`, or the environment, and `verify` silently ran
+    as whichever client Bifrost had started with. A cross-SDK inventory
+    found three SDKs with different shapes for the same operations, and
+    most public parameters undocumented.
+  - **Identity (REQ-208, REQ-209).** Every server-facing surface now takes
+    one optional `WyrdClient`, and a state's identity is fixed when it is
+    created.
+  - **Parity (REQ-210, REQ-211).** The three SDKs expose one surface, with
+    named idiom exceptions only. Python gains `cards.hydrate`, typed
+    attribute-access Cards (REQ-193), `CardRef` selectors, and path
+    arguments.
+  - **Roles (REQ-212, REQ-213).** A tenant administrator grants Roles with
+    `wyrd auth grant-role`. Service principals default to `wyrd_default`,
+    which can emit and verify but not read the tenant's Bifrost.
+  - **Documentation (REQ-214).** Every public parameter is documented in
+    every SDK.
+  - **Breaking.** The removed identity arguments get no alias.
 - **Revision 66 Test-only CLI functions and explicit clients (2026-10-07,
   approved):** An independent readability review of the TASK-017 rewrites found
   that every Rust journey needing a credential re-ran its own test binary as

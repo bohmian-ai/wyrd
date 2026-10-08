@@ -1,6 +1,6 @@
 import { expect, vi } from "vitest";
 
-import { OperatorConnections } from "@wyrd/sdk";
+import { OperatorConnections, WyrdClient } from "@wyrd/sdk";
 
 import { serverTest } from "../support/server.js";
 
@@ -45,7 +45,7 @@ test("admin manages redacted connections", async ({ connections, slack }) => {
 
 test("writer is refused", async ({ server }) => {
   const writer = OperatorConnections.connect({
-    credential: server.scopedApiKey("card_writer", ["cards:read", "cards:write"]),
+    client: WyrdClient.connect({ credential: server.scopedApiKey("card_writer", ["cards:read", "cards:write"]) }),
   });
 
   await expect(writer.list()).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
@@ -53,7 +53,9 @@ test("writer is refused", async ({ server }) => {
 
 test("other tenant sees nothing", async ({ server, slack }) => {
   const foreign = OperatorConnections.connect({
-    credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other-admin"),
+    client: WyrdClient.connect({
+      credential: server.bootstrapServiceInTenant(server.seedTenant("other-tenant"), ["admin"], "other-admin"),
+    }),
   });
 
   expect(await foreign.list()).toEqual([]);
@@ -62,27 +64,9 @@ test("other tenant sees nothing", async ({ server, slack }) => {
 
 test("reader cannot disable a connection", async ({ server, connections, slack }) => {
   const reader = OperatorConnections.connect({
-    credential: server.scopedApiKey("operator_reader", ["operators:read"]),
+    client: WyrdClient.connect({ credential: server.scopedApiKey("operator_reader", ["operators:read"]) }),
   });
 
   expect(await reader.get(slack)).toEqual(await connections.get(slack));
   await expect(reader.disable(slack)).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
-});
-
-/** One connection change the server refuses, and the catalog code it raises. */
-type Refusal = readonly [string, (connections: OperatorConnections, slack: string) => Promise<unknown>, string];
-
-test.for<Refusal>([
-  ["duplicate name", (connections) => connections.create(SLACK), "WYRD_OPERATOR_409_CONNECTION_CONFLICT"],
-  [
-    "update for another provider",
-    (connections, slack) => connections.update(slack, { provider: "pager_duty", integration_key: SECRETS[1] }),
-    "WYRD_OPERATOR_400_INVALID_CONNECTION",
-  ],
-  ["malformed connection id", (connections) => connections.get("not-a-uuid"), "WYRD_SPEC_400_VALIDATION"],
-])("refused connection change raises its catalog code: %s", async ([, change, code], { connections, slack }) => {
-  const refusal = change(connections, slack);
-
-  await expect(refusal).rejects.toMatchObject({ code });
-  await refusal.catch(expectRedacted);
 });

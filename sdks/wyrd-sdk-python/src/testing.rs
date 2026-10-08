@@ -120,6 +120,8 @@ pub struct WyrdTestServer {
     human_sso: bool,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
+    /// Bound gRPC endpoint while entered.
+    grpc_url: Option<String>,
     /// Writer service API key bootstrapped on entry.
     api_key: Option<String>,
     /// Fixture data tenant id while entered.
@@ -186,6 +188,7 @@ impl WyrdTestServer {
             live_providers,
             human_sso,
             base_url: None,
+            grpc_url: None,
             api_key: None,
             tenant_id: None,
             server: None,
@@ -255,6 +258,7 @@ impl WyrdTestServer {
 
         slf.tenant_id = Some(server.data_tenant_id().to_string());
         slf.base_url = Some(base_url);
+        slf.grpc_url = Some(grpc_url);
         slf.api_key = Some(api_key);
         slf.server = Some(server);
         Ok(slf)
@@ -300,6 +304,16 @@ impl WyrdTestServer {
     #[getter]
     fn base_url(&self) -> WyrdPyResult<String> {
         self.base_url.clone().ok_or_else(not_started)
+    }
+
+    /// Bound gRPC endpoint, for a client built against a server entered with
+    /// `mutate_env=False`.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    #[getter]
+    fn grpc_url(&self) -> WyrdPyResult<String> {
+        self.grpc_url.clone().ok_or_else(not_started)
     }
 
     /// Writer service API key bootstrapped on entry.
@@ -364,7 +378,7 @@ impl WyrdTestServer {
     ///
     /// A credential fixture: `roles` are granted to the Service's existing
     /// principal, standing in for the operator who grants Roles in a
-    /// deployment. A key without added Roles comes from `wyrd.cli.issue_key`.
+    /// deployment. A key without added Roles comes from `wyrd.testing.cli.issue_key`.
     ///
     /// # Errors
     /// Raises a harness error for an invalid Card identity or a missing principal.

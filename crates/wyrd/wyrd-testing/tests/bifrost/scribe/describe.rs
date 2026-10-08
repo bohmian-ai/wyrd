@@ -65,7 +65,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let query = Bifrost::query_only(&client);
 
     let canonical = query
-        .describe("vala.traces.spans")
+        .describe_table("vala.traces", "spans")
         .await
         .expect("describe the canonical span table");
     let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
@@ -136,8 +136,9 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
         );
     }
 
+    let (namespace, name) = fqn.rsplit_once('.').expect("the fqn names a namespace");
     let dynamic = query
-        .describe(&fqn)
+        .describe_table(namespace, name)
         .await
         .expect("describe the dynamic table");
     assert!(

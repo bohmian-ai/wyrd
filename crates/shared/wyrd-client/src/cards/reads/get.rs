@@ -44,6 +44,7 @@ pub(crate) async fn get_response(
         CardSelector::Uid { kind, uid, .. } => {
             let path = format!("/v1/cards/by-uid/{}/{}", kind.wire_name(), uid);
             client
+                .http
                 .request_json(reqwest::Method::GET, &path, None::<&()>)
                 .await?
         }
@@ -61,6 +62,7 @@ pub(crate) async fn get_response(
                 urlencoding::encode(version.as_str()),
             );
             client
+                .http
                 .request_json(reqwest::Method::GET, &path, None::<&()>)
                 .await?
         }
@@ -81,6 +83,7 @@ pub(crate) async fn get_response(
                 urlencoding::encode(card_ref.version.as_str()),
             );
             client
+                .http
                 .request_json(reqwest::Method::GET, &path, None::<&()>)
                 .await?
         }
@@ -97,6 +100,7 @@ pub(crate) async fn get_response(
                 urlencoding::encode(name.as_str()),
             );
             client
+                .http
                 .request_json(reqwest::Method::GET, &path, None::<&()>)
                 .await?
         }

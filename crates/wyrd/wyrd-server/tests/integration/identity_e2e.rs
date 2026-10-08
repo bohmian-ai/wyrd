@@ -189,7 +189,7 @@ async fn delegate_through_writer(
     label: &str,
 ) -> (String, Bootstrap) {
     let actor = srv
-        .bootstrap_service(&format!("{label}-actor"), &["writer"])
+        .bootstrap_service(&format!("{label}-actor"), &["editor"])
         .await
         .expect("actor bootstraps");
     let actor_jwt = srv
@@ -451,7 +451,7 @@ async fn workload_jwt_bearer_journey_keycloak() {
 
     // Seed the bound principal under the exact server-owned card_ref. It holds
     // writer so the minted workload token can be the terminal's subject.
-    srv.seed_card_principal(&card_ref, &["writer"])
+    srv.seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
 
@@ -636,7 +636,7 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
         .await
         .expect("server boots config-driven");
     let Bootstrap::User { jwt, .. } = srv
-        .bootstrap_user("workload-live-writer", &["writer"])
+        .bootstrap_user("workload-live-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -695,7 +695,7 @@ async fn ttl_expiry_journey() {
         .expect("test server starts");
 
     let principal = srv
-        .bootstrap_service("ttl-svc", &["writer"])
+        .bootstrap_service("ttl-svc", &["editor"])
         .await
         .expect("service bootstraps");
     let api_key = principal
@@ -751,7 +751,7 @@ async fn revocation_journey() {
         .expect("admin api key exchange succeeds");
 
     let target = srv
-        .bootstrap_service("revoke-target", &["writer"])
+        .bootstrap_service("revoke-target", &["editor"])
         .await
         .expect("target bootstraps");
     let target_key = target.api_key().expect("target has api key").clone();
@@ -852,7 +852,7 @@ async fn revocation_requires_admin_permission() {
 // ─── Service-account issuer full chain ────────────────────────────────────────
 
 /// Full-chain API-key journey with a **service-account** issuer:
-///   1. Admin SA (`runtime_admin`) bootstrapped via harness SQL.
+///   1. Admin SA (`admin`) bootstrapped via harness SQL.
 ///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
 ///   3. Admin key → `POST /auth/token` → access token.
 ///   4. `POST /auth/issue-key` authenticated as the admin SA; `created_by` is the
@@ -873,9 +873,9 @@ async fn service_account_issuer_full_chain() {
         .await
         .expect("test server starts");
 
-    // Admin service account: holds runtime_admin so it has key-issuance permission.
+    // Admin service account: holds admin so it has key-issuance permission.
     let admin = srv
-        .bootstrap_service("sa-chain-admin", &["runtime_admin"])
+        .bootstrap_service("sa-chain-admin", &["admin"])
         .await
         .expect("admin service account bootstraps");
     let admin_key = admin.api_key().expect("admin has api key").clone();
@@ -889,7 +889,7 @@ async fn service_account_issuer_full_chain() {
     // Target service card: the card a key will be issued for.
     // Holds writer so the issued token can later be the terminal's subject.
     let target = srv
-        .bootstrap_service("sa-chain-target", &["writer"])
+        .bootstrap_service("sa-chain-target", &["editor"])
         .await
         .expect("target service account bootstraps");
     let target_card_ref = target
@@ -971,7 +971,7 @@ fn human_server_builder() -> WyrdTestServerBuilder {
 /// The group map every human journey grants through: the realm's
 /// `wyrd-admins` group confers `writer`, so alice can be a delegation subject.
 fn admins_write() -> HashMap<String, Vec<String>> {
-    HashMap::from([("wyrd-admins".to_owned(), vec!["writer".to_owned()])])
+    HashMap::from([("wyrd-admins".to_owned(), vec!["editor".to_owned()])])
 }
 
 /// A tenant administrator's access token and its recovery API key.
@@ -2388,8 +2388,8 @@ fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: 
 /// Tenant A and tenant B each configure the same Keycloak issuer through the
 /// served `/v1/identity/oidc/*` API — A with the public client, B with the
 /// confidential client and a `SecretPost` secret — and the journey proves:
-///   1. an unauthorized tenant principal (`runtime_admin`, which holds
-///      `service_accounts:write` but not `identity_connections:write`) is
+///   1. an unauthorized tenant principal (`editor`, which does not hold
+///      `identity_connections:write`) is
 ///      refused on read and write, and each refusal is audited;
 ///   2. each tenant reads only its own redacted connection with the
 ///      deployment callback URL, and no response carries B's secret;
@@ -2425,13 +2425,13 @@ async fn tenant_connection_admin_journey() {
     let admin_a = tenant_admin(&srv, tenant_a, "connection-admin-a").await;
     let admin_b = tenant_admin(&srv, tenant_b, "connection-admin-b").await;
     let operator = srv
-        .bootstrap_service_in_tenant(tenant_a, "connection-runtime-admin", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_a, "connection-editor", &["editor"])
         .await
-        .expect("runtime admin bootstraps");
+        .expect("non-admin bootstraps");
     let operator_token = srv
-        .exchange_api_key(operator.api_key().expect("runtime admin has a key"))
+        .exchange_api_key(operator.api_key().expect("non-admin has a key"))
         .await
-        .expect("runtime admin key exchanges");
+        .expect("non-admin key exchanges");
 
     // 1. service_accounts:write alone does not administer human SSO.
     let (status, body) = call_json(&srv, &operator_token, Method::GET, CONNECTIONS, None).await;
@@ -2883,10 +2883,10 @@ async fn tenant_connection_rotation_journey() {
             && window <= ChronoDuration::minutes(15) + ChronoDuration::seconds(5),
         "the stamp lasts fifteen minutes: {window}"
     );
-    let runtime_admin = replica_a
-        .bootstrap_service_in_tenant(tenant, "rotation-runtime-admin", &["runtime_admin"])
+    let non_admin = replica_a
+        .bootstrap_service_in_tenant(tenant, "rotation-editor", &["editor"])
         .await
-        .expect("runtime admin bootstraps");
+        .expect("non-admin bootstraps");
     let recovery_admin = replica_a
         .bootstrap_service_in_tenant(tenant, "rotation-recovery-admin", &["admin"])
         .await
@@ -2916,7 +2916,7 @@ async fn tenant_connection_rotation_journey() {
         CANDIDATE_ACTIVATE,
         Some(activation(
             3,
-            runtime_admin.api_key().expect("runtime admin has a key"),
+            non_admin.api_key().expect("non-admin has a key"),
         )),
     )
     .await;
@@ -2928,9 +2928,9 @@ async fn tenant_connection_rotation_journey() {
     );
     assert!(
         !body.to_string().contains(
-            runtime_admin
+            non_admin
                 .api_key()
-                .expect("runtime admin has a key")
+                .expect("non-admin has a key")
                 .expose_secret()
         ),
         "the refusal never echoes the recovery key"
@@ -3171,7 +3171,7 @@ async fn tenant_connection_rotation_journey() {
     .await
     .expect("staged activation decisions read");
     let admin_id = principal_id_of(token);
-    let runtime_id = runtime_admin.id().as_uuid().to_string();
+    let runtime_id = non_admin.id().as_uuid().to_string();
     let recovery_id = recovery_admin.id().as_uuid().to_string();
     let decisions_of = |principal: &str| -> Vec<(Option<String>, String, String)> {
         recovery_decisions
@@ -3186,7 +3186,7 @@ async fn tenant_connection_rotation_journey() {
     assert_eq!(
         decisions_of(&runtime_id),
         vec![(
-            Some(api_key_id(&superuser, &runtime_admin).await),
+            Some(api_key_id(&superuser, &non_admin).await),
             write.clone(),
             "denied".to_owned()
         )],
@@ -5033,7 +5033,7 @@ async fn tenant_machine_independence_journey() {
     // principal resolution, so only the accepted workload needs a principal.
     srv.seed_card_principal(
         &binding_card_ref(CardKind::Service, "machine-sa", "prod"),
-        &["writer"],
+        &["editor"],
     )
     .await
     .expect("workload principal seeds");
@@ -5053,7 +5053,7 @@ async fn tenant_machine_independence_journey() {
 
     // 2. An API key is unaffected.
     let keyed = srv
-        .bootstrap_service("machine-key", &["writer"])
+        .bootstrap_service("machine-key", &["editor"])
         .await
         .expect("keyed service bootstraps");
     let keyed_token = srv
@@ -5106,7 +5106,7 @@ async fn tenant_machine_independence_journey() {
 /// operator path — `wyrd auth trusted-issuer add` and `wyrd auth
 /// workload-binding add` over HTTP into `/admin` → Postgres — then exchange a
 /// live Keycloak assertion and reach `/v1`:
-///   1. an admin SA (`runtime_admin`) mints the access token the CLI presents,
+///   1. an admin SA (`admin`) mints the access token the CLI presents,
 ///   2. the trusted issuer is authored via the CLI with a `SecretPost` client
 ///      secret, which must be sealed to ciphertext at rest (never plaintext),
 ///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to a
@@ -5151,9 +5151,9 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         .expect("workload token carries a subject")
         .to_owned();
 
-    // Admin SA holding runtime_admin → access token used as the CLI bearer.
+    // Admin SA holding admin → access token used as the CLI bearer.
     let admin = srv
-        .bootstrap_service("cloud-journey-admin", &["runtime_admin"])
+        .bootstrap_service("cloud-journey-admin", &["admin"])
         .await
         .expect("admin service account bootstraps");
     let admin_token = srv
@@ -5163,7 +5163,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
 
     // The server-owned card the binding resolves to; seed its principal.
     let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa", "prod");
-    srv.seed_card_principal(&card_ref, &["writer"])
+    srv.seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
 
@@ -5305,7 +5305,7 @@ async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str)
 /// tenants, with a subject bound only in tenant A, resolves in A and fails
 /// closed in B.
 ///   1. tenant A is the fixture tenant; tenant B is provisioned fresh,
-///   2. per-tenant `runtime_admin` admins each author the same issuer via the
+///   2. per-tenant `admin` principals each author the same issuer via the
 ///      real CLI (so the issuer is trusted in BOTH tenants),
 ///   3. the `(issuer, subject)` binding is authored via the CLI only in A, and
 ///      its principal is seeded only in A,
@@ -5352,10 +5352,10 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .expect("workload token carries a subject")
         .to_owned();
 
-    // Per-tenant runtime_admin admins, each minted under its own tenant so its
+    // Per-tenant admins, each minted under its own tenant so its
     // access token authors into that tenant.
     let admin_a = srv
-        .bootstrap_service_in_tenant(tenant_a, "iso-admin-a", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_a, "iso-admin-a", &["admin"])
         .await
         .expect("tenant A admin bootstraps");
     let admin_token_a = srv
@@ -5363,7 +5363,7 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .await
         .expect("admin A api key exchange succeeds");
     let admin_b = srv
-        .bootstrap_service_in_tenant(tenant_b, "iso-admin-b", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_b, "iso-admin-b", &["admin"])
         .await
         .expect("tenant B admin bootstraps");
     let admin_token_b = srv
@@ -5393,7 +5393,7 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .await,
         "CLI workload-binding add (tenant A) succeeds",
     );
-    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["runtime_admin"])
+    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["workload"])
         .await
         .expect("tenant A workload principal seeds");
 

@@ -54,7 +54,7 @@ async fn auth_issue_key_cli_journey() {
         .expect("admin bootstraps");
     let admin_token = machine_token(&server, &admin).await;
     let subject = server
-        .bootstrap_service("cli-issue-key-subject", &["reader"])
+        .bootstrap_service("cli-issue-key-subject", &["viewer"])
         .await
         .expect("subject bootstraps");
     let card = subject

@@ -84,7 +84,7 @@ fn client_for(srv: &WyrdTestServer, token: &str) -> WyrdClient {
 /// Panics when bootstrap or key exchange fails.
 async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
     let service = srv
-        .bootstrap_service(name, &["writer", "reader"])
+        .bootstrap_service(name, &["editor"])
         .await
         .expect("bootstrap service");
     srv.exchange_api_key(service.api_key().expect("service API key"))

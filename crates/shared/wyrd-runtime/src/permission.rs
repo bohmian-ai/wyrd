@@ -717,6 +717,19 @@ impl Permission {
         }
     }
 
+    /// Invoke the gateway for every configured provider and model.
+    ///
+    /// The unscoped grant the built-in `workload` Role carries; a narrower
+    /// custom Role uses [`Self::gateway_invoke`] with one provider or model.
+    #[must_use]
+    pub const fn gateway_invoke_any() -> Self {
+        Self {
+            resource: Resource::Gateway,
+            action: Action::Invoke,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// Read captured gateway payload fields.
     #[must_use]
     pub const fn gateway_payload_read() -> Self {

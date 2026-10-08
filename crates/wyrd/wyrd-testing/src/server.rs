@@ -1458,13 +1458,13 @@ impl WyrdTestServer {
     ///
     /// # Errors
     ///
-    /// Returns an authentication error when the viewer service cannot be
+    /// Returns an authentication error when the role-less service cannot be
     /// bootstrapped or its API key cannot be exchanged.
     pub async fn query_denied_token(&self) -> Result<String, WyrdTestServerError> {
         let bootstrap = self
             .bootstrap_service(
                 &format!("bifrost-denied-{}", Uuid::now_v7().simple()),
-                &["reader"],
+                &[],
             )
             .await?;
         let api_key = bootstrap.api_key().ok_or_else(|| {

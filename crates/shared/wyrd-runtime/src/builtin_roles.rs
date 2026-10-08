@@ -17,78 +17,100 @@ pub struct BuiltinRole {
     pub permissions: &'static [Permission],
 }
 
+/// Every read a tenant principal can be granted: Cards, artifacts, audit,
+/// Operators, gateway configuration and captured payloads, Bifrost table
+/// definitions, and Bifrost queries.
+const VIEWER: &[Permission] = &[
+    Permission::card_read(),
+    Permission::artifact_read(),
+    Permission::audit_read(),
+    Permission::operators_read(),
+    Permission::gateway_read(),
+    Permission::gateway_payload_read(),
+    Permission::bifrost_table_read(),
+    Permission::bifrost_query_read(),
+];
+
+/// [`VIEWER`] plus every runtime write a running Service or Agent performs:
+/// Bifrost table and record writes, evaluation, Workflow execution, Trigger
+/// writes, Operator invocation, and gateway invocation on every model.
+const WORKLOAD: &[Permission] = &[
+    Permission::card_read(),
+    Permission::artifact_read(),
+    Permission::audit_read(),
+    Permission::operators_read(),
+    Permission::gateway_read(),
+    Permission::gateway_payload_read(),
+    Permission::bifrost_table_read(),
+    Permission::bifrost_query_read(),
+    Permission::bifrost_table_write(),
+    Permission::bifrost_record_write(),
+    Permission::eval_run(),
+    Permission::workflow_run(),
+    Permission::trigger_write(),
+    Permission::operator_invoke(),
+    Permission::gateway_invoke_any(),
+];
+
+/// [`WORKLOAD`] plus authoring: Card and artifact writes, Card deletion, policy
+/// lock, and Service installation. Changing what a workload is verified
+/// against belongs to people, not to the workload itself.
+const EDITOR: &[Permission] = &[
+    Permission::card_read(),
+    Permission::artifact_read(),
+    Permission::audit_read(),
+    Permission::operators_read(),
+    Permission::gateway_read(),
+    Permission::gateway_payload_read(),
+    Permission::bifrost_table_read(),
+    Permission::bifrost_query_read(),
+    Permission::bifrost_table_write(),
+    Permission::bifrost_record_write(),
+    Permission::eval_run(),
+    Permission::workflow_run(),
+    Permission::trigger_write(),
+    Permission::operator_invoke(),
+    Permission::gateway_invoke_any(),
+    Permission::card_write(),
+    Permission::card_delete(),
+    Permission::artifact_write(),
+    Permission::policy_lock(),
+    Permission::service_install(),
+];
+
 /// Source of truth for Wyrd's per-tenant builtin roles.
+///
+/// Exactly four Roles ordered `viewer` ⊂ `workload` ⊂ `editor` ⊂ `admin`.
+/// Only `admin` (through `*`) holds credential, user, identity-connection,
+/// Operator-secret, and gateway-configuration administration. Platform-plane
+/// and engine-peer permissions belong to no tenant Role. Narrower Roles are a
+/// tenant administrator's choice.
 pub const BUILTIN_ROLES: &[BuiltinRole] = &[
     BuiltinRole {
         name: "admin",
         permissions: &[Permission::wildcard()],
     },
     BuiltinRole {
-        name: "writer",
-        permissions: &[
-            Permission::card_read(),
-            Permission::card_write(),
-            Permission::artifact_read(),
-            Permission::artifact_write(),
-            Permission::operator_invoke(),
-            Permission::eval_run(),
-            Permission::trigger_write(),
-            Permission::workflow_run(),
-        ],
-    },
-    BuiltinRole {
-        name: "reader",
-        permissions: &[
-            Permission::card_read(),
-            Permission::artifact_read(),
-            Permission::audit_read(),
-        ],
-    },
-    BuiltinRole {
-        name: "agent",
-        permissions: &[
-            Permission::card_read(),
-            Permission::card_write(),
-            Permission::artifact_read(),
-            Permission::artifact_write(),
-            Permission::operator_invoke(),
-            Permission::eval_run(),
-            Permission::workflow_run(),
-        ],
-    },
-    BuiltinRole {
-        name: "runtime_admin",
-        permissions: &[Permission::service_accounts_write()],
-    },
-    BuiltinRole {
-        name: "workload",
-        permissions: &[
-            Permission::bifrost_table_read(),
-            Permission::bifrost_record_write(),
-            Permission::bifrost_query_read(),
-        ],
+        name: "editor",
+        permissions: EDITOR,
     },
     BuiltinRole {
         name: DEFAULT_CARD_ROLE,
-        permissions: &[
-            Permission::bifrost_table_read(),
-            Permission::bifrost_record_write(),
-            Permission::eval_run(),
-        ],
+        permissions: WORKLOAD,
+    },
+    BuiltinRole {
+        name: "viewer",
+        permissions: VIEWER,
     },
 ];
 
 /// Built-in Role a Card-bound Service or Agent principal receives at its first
 /// projection.
 ///
-/// It lets the workload emit and verify its own evidence: Bifrost table read
-/// (the describe every writer performs before admission), record write, and
-/// Verifier runs, nothing else. Tenant-wide Bifrost query reads are withheld;
-/// they come from an explicit grant of the `workload` Role. The principal's
-/// Card scope still bounds which Cards it may emit for and verify, and an
-/// administrator who revokes the Role is not overridden by a later
-/// re-registration.
-pub const DEFAULT_CARD_ROLE: &str = "wyrd_default";
+/// The grant is a direct assignment made once: an administrator who revokes
+/// it is not overridden by a later re-registration. The principal's Card
+/// scope still bounds which Cards it may attribute evidence to.
+pub const DEFAULT_CARD_ROLE: &str = "workload";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]
@@ -106,6 +128,31 @@ mod tests {
     use super::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
     use crate::Permission;
 
+    /// Returns the named built-in Role's permissions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `name` is not built in.
+    fn permissions(name: &str) -> &'static [Permission] {
+        BUILTIN_ROLES
+            .iter()
+            .find(|role| role.name == name)
+            .expect("role is built in")
+            .permissions
+    }
+
+    /// True when the named Role covers `required`.
+    fn holds(name: &str, required: &Permission) -> bool {
+        permissions(name)
+            .iter()
+            .any(|permission| permission.covers(required))
+    }
+
+    /// Proves every seeded permission survives its JSON round trip.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a permission fails to serialize or decode identically.
     #[test]
     fn all_seeds_are_valid_permissions() {
         for role in BUILTIN_ROLES {
@@ -116,79 +163,123 @@ mod tests {
         }
     }
 
-    /// Human SSO administration is reachable only through the tenant `admin`
-    /// wildcard: `runtime_admin` (credential administration) and every other
-    /// built-in role must not confer `identity_connections:write`.
-    #[test]
-    fn only_admin_grants_identity_connection_administration() {
-        let required = Permission::identity_connections_write();
-        let granting = BUILTIN_ROLES
-            .iter()
-            .filter(|role| role.permissions.iter().any(|held| held.covers(&required)))
-            .map(|role| role.name)
-            .collect::<Vec<_>>();
-        assert_eq!(granting, vec!["admin"]);
-        assert!(!Permission::service_accounts_write().covers(&required));
-    }
-
-    /// Proves Workflow run authority is granted to `writer` and `agent`,
-    /// covered by `admin`'s wildcard, and withheld from `reader` and
-    /// `runtime_admin`.
+    /// Proves Wyrd ships exactly the four persona Roles and no retired name.
     ///
     /// # Panics
     ///
-    /// Panics when a role's Workflow run grant differs from that split.
+    /// Panics when the built-in name set differs.
     #[test]
-    fn workflow_run_is_granted_to_writing_roles_only() {
-        for role in BUILTIN_ROLES {
-            let granted = role
-                .permissions
-                .iter()
-                .any(|permission| permission.covers(&Permission::workflow_run()));
-            let expected = matches!(role.name, "admin" | "writer" | "agent");
-            assert_eq!(granted, expected, "role {}", role.name);
-        }
-    }
-
-    /// Proves the default Card role lets a Service emit and verify its own
-    /// evidence while withholding tenant-wide Bifrost query reads, which stay
-    /// with the explicitly granted `workload` role.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either role is missing or its grants differ from that split.
-    #[test]
-    fn default_card_role_emits_and_verifies_without_tenant_reads() {
-        let held = |name: &str, required: &Permission| {
-            BUILTIN_ROLES
-                .iter()
-                .find(|role| role.name == name)
-                .expect("role is built in")
-                .permissions
-                .iter()
-                .any(|permission| permission.covers(required))
-        };
-        for required in [
-            Permission::bifrost_table_read(),
-            Permission::bifrost_record_write(),
-            Permission::eval_run(),
-        ] {
-            assert!(held(DEFAULT_CARD_ROLE, &required), "{required}");
-        }
-        assert!(!held(DEFAULT_CARD_ROLE, &Permission::bifrost_query_read()));
-        assert!(held("workload", &Permission::bifrost_query_read()));
-    }
-
-    #[test]
-    fn names_are_unique() {
+    fn exactly_four_roles_are_built_in() {
         let names = BUILTIN_ROLES
             .iter()
             .map(|role| role.name)
             .collect::<BTreeSet<_>>();
-
-        assert_eq!(names.len(), BUILTIN_ROLES.len());
+        assert_eq!(
+            names,
+            BTreeSet::from(["admin", "editor", "viewer", "workload"])
+        );
+        assert_eq!(DEFAULT_CARD_ROLE, "workload");
     }
 
+    /// Proves `viewer` ⊂ `workload` ⊂ `editor` ⊂ `admin`, each strictly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a lower Role holds a permission its successor does not, or
+    /// when two adjacent Roles are equal.
+    #[test]
+    fn roles_are_strictly_nested() {
+        for (lower, upper) in [("viewer", "workload"), ("workload", "editor"), ("editor", "admin")] {
+            for permission in permissions(lower) {
+                assert!(holds(upper, permission), "{upper} lacks {permission}");
+            }
+            assert!(
+                permissions(upper)
+                    .iter()
+                    .any(|permission| !holds(lower, permission)),
+                "{upper} adds nothing to {lower}"
+            );
+        }
+    }
+
+    /// Proves each non-admin Role's exact permission set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Role's seeded permissions differ from the specified set.
+    #[test]
+    fn each_role_holds_its_exact_permissions() {
+        let viewer = vec![
+            Permission::card_read(),
+            Permission::artifact_read(),
+            Permission::audit_read(),
+            Permission::operators_read(),
+            Permission::gateway_read(),
+            Permission::gateway_payload_read(),
+            Permission::bifrost_table_read(),
+            Permission::bifrost_query_read(),
+        ];
+        let mut workload = viewer.clone();
+        workload.extend([
+            Permission::bifrost_table_write(),
+            Permission::bifrost_record_write(),
+            Permission::eval_run(),
+            Permission::workflow_run(),
+            Permission::trigger_write(),
+            Permission::operator_invoke(),
+            Permission::gateway_invoke_any(),
+        ]);
+        let mut editor = workload.clone();
+        editor.extend([
+            Permission::card_write(),
+            Permission::card_delete(),
+            Permission::artifact_write(),
+            Permission::policy_lock(),
+            Permission::service_install(),
+        ]);
+        assert_eq!(permissions("viewer"), viewer.as_slice());
+        assert_eq!(permissions("workload"), workload.as_slice());
+        assert_eq!(permissions("editor"), editor.as_slice());
+        assert_eq!(permissions("admin"), [Permission::wildcard()].as_slice());
+    }
+
+    /// Proves tenant administration, platform-plane, and engine-peer
+    /// permissions are reachable only through `admin`'s wildcard, and that
+    /// `workload` cannot author Cards or artifacts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-admin Role covers an administrative permission.
+    #[test]
+    fn only_admin_holds_administration() {
+        for required in [
+            Permission::service_accounts_write(),
+            Permission::identity_connections_write(),
+            Permission::users_manage(),
+            Permission::operators_write(),
+            Permission::gateway_write(),
+            Permission::gateway_delete(),
+            Permission::bifrost_peer_invoke(),
+            Permission::bifrost_table_install(),
+            Permission::tenant_create(),
+        ] {
+            let granting = BUILTIN_ROLES
+                .iter()
+                .filter(|role| holds(role.name, &required))
+                .map(|role| role.name)
+                .collect::<Vec<_>>();
+            assert_eq!(granting, vec!["admin"], "{required}");
+        }
+        assert!(!holds("workload", &Permission::card_write()));
+        assert!(!holds("workload", &Permission::artifact_write()));
+    }
+
+    /// Proves deterministic role ids are stable per tenant and name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the same input yields different ids or different names
+    /// collide.
     #[test]
     fn role_uuid_is_stable_per_tenant_and_name() {
         let tenant = wyrd_spec::DataTenantId::new_v7();
@@ -199,7 +290,7 @@ mod tests {
         );
         assert_ne!(
             builtin_role_uuid(tenant, "admin"),
-            builtin_role_uuid(tenant, "reader")
+            builtin_role_uuid(tenant, "viewer")
         );
     }
 }

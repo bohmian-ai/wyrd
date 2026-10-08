@@ -163,7 +163,7 @@ mod pg_tests {
         } = register_fixture(&cards).await?;
 
         let writer = server
-            .credential_registered_service(&service_ref, &["writer"])
+            .credential_registered_service(&service_ref, &["editor"])
             .await?;
         let writer_client =
             ().serve_with_lifecycle(transport(&server, api_key(&writer)?, None)?, discover())
@@ -236,7 +236,7 @@ mod pg_tests {
 
         // A reader keeps the read tools but is neither offered nor allowed the write tool.
         let reader = server
-            .bootstrap_service("mcp-run-reader", &["reader"])
+            .bootstrap_service("mcp-run-reader", &["viewer"])
             .await?;
         let reader_client =
             ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
@@ -269,7 +269,7 @@ mod pg_tests {
     ///
     /// The Service's graph is hydrated into a temporary bundle with `admin`'s
     /// registry access, observations are written as the Service's own
-    /// `wyrd_default`-role credential, and the lifetime is drained and the server
+    /// `workload`-role credential, and the lifetime is drained and the server
     /// Scribe flushed before returning, so every row is durable and readable.
     ///
     /// # Errors
@@ -425,7 +425,7 @@ mod pg_tests {
         // A direct run reads the tenant's Bifrost observations, which only the
         // explicitly granted `workload` role allows.
         let agent = server
-            .credential_registered_service(&fixture.service_ref, &["writer", "workload"])
+            .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
         let agent_client =
             ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())
@@ -538,7 +538,7 @@ mod pg_tests {
         agent_client.cancel().await?;
 
         let reader = server
-            .bootstrap_service("mcp-direct-reader", &["reader"])
+            .bootstrap_service("mcp-direct-reader", &["viewer"])
             .await?;
         let reader_client =
             ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
@@ -615,7 +615,7 @@ mod pg_tests {
         let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
         let fixture = register_fixture(&cards).await?;
         let agent = server
-            .credential_registered_service(&fixture.service_ref, &["writer"])
+            .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
         let agent_client =
             ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())
@@ -642,7 +642,7 @@ mod pg_tests {
         agent_client.cancel().await?;
 
         let reader = server
-            .bootstrap_service("mcp-execute-reader", &["reader"])
+            .bootstrap_service("mcp-execute-reader", &["viewer"])
             .await?;
         let reader_client =
             ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())

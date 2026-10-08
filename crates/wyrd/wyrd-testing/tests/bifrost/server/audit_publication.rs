@@ -1190,7 +1190,7 @@ async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
         .binding_ids[0];
     let runner = client(&machine_key(
         server
-            .credential_registered_service(&receipt.root, &["writer"])
+            .credential_registered_service(&receipt.root, &["editor"])
             .await?,
     )?)?;
     let dataset = format!("vala.datasets.audit_loss_{}", uuid::Uuid::now_v7().simple());

@@ -61,8 +61,8 @@ async fn mount_trusted_issuer(server: &MockServer) {
             "principal_kind": "Workload",
             "jwks_ttl_secs": 3600,
             "claim_mapping": { "subject": "sub" },
-            "group_role_map": { "dev": ["reader"] },
-            "default_roles": ["reader"]
+            "group_role_map": { "dev": ["viewer"] },
+            "default_roles": ["viewer"]
         })))
         .mount(server)
         .await;
@@ -87,9 +87,9 @@ fn trusted_issuer_add(server: &MockServer, extra: &[&str]) -> Vec<String> {
         "--principal-kind",
         "Workload",
         "--default-role",
-        "reader",
+        "viewer",
         "--group-role",
-        "dev=reader",
+        "dev=viewer",
         "--server",
     ]
     .map(str::to_owned)
@@ -112,8 +112,8 @@ async fn assert_issuer_posted(server: &MockServer) {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("body is JSON");
     assert_eq!(body["client_secret"], CLIENT_SECRET);
     assert_eq!(body["client_auth"], "SecretPost");
-    assert_eq!(body["default_roles"], serde_json::json!(["reader"]));
-    assert_eq!(body["group_role_map"]["dev"], serde_json::json!(["reader"]));
+    assert_eq!(body["default_roles"], serde_json::json!(["viewer"]));
+    assert_eq!(body["group_role_map"]["dev"], serde_json::json!(["viewer"]));
     assert_eq!(
         requests[0]
             .headers

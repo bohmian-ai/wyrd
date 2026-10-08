@@ -831,7 +831,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -985,7 +985,7 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -1224,7 +1224,7 @@ async fn a_credential_cannot_be_revoked_through_another_principal() {
                 tenant_request(
                     Method::POST,
                     "/v1/principals",
-                    Some(json!({ "name": name, "roles": ["reader"] })),
+                    Some(json!({ "name": name, "roles": ["viewer"] })),
                 ),
             )
             .await
@@ -1304,7 +1304,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -2715,7 +2715,7 @@ async fn an_unrecordable_tenant_mutation_still_happens() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "unrecordable-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "unrecordable-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -2958,7 +2958,7 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "leaked-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "leaked-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3250,7 +3250,7 @@ async fn recovery_is_refused_for_every_state_but_active() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "post-recovery", "roles": ["reader"] })),
+                Some(json!({ "name": "post-recovery", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3319,7 +3319,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "beta-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "beta-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3537,7 +3537,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "before-suspension", "roles": ["reader"] })),
+                Some(json!({ "name": "before-suspension", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3575,7 +3575,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "during-suspension", "roles": ["reader"] })),
+                Some(json!({ "name": "during-suspension", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3615,7 +3615,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "after-resume", "roles": ["reader"] })),
+                Some(json!({ "name": "after-resume", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -4358,7 +4358,7 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "unaffected", "roles": ["reader"] })),
+                Some(json!({ "name": "unaffected", "roles": ["viewer"] })),
             ),
         )
         .await

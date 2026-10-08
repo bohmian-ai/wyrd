@@ -581,13 +581,13 @@ mod tests {
             "--claim-groups",
             "groups",
             "--default-role",
-            "reader",
+            "viewer",
             "--default-role",
-            "writer",
+            "editor",
             "--group-role",
-            "dev=reader",
+            "dev=viewer",
             "--group-role",
-            "dev=writer",
+            "dev=editor",
             "--group-role",
             "ops=admin",
             "--principal-kind",
@@ -600,9 +600,9 @@ mod tests {
             TrustedIssuerCommand::Add(args) => {
                 assert_eq!(args.claim_email.as_deref(), Some("email"));
                 assert_eq!(args.claim_groups.as_deref(), Some("groups"));
-                assert_eq!(args.default_roles, vec!["reader", "writer"]);
+                assert_eq!(args.default_roles, vec!["viewer", "editor"]);
                 let map = super::parse_group_roles(&args.group_roles).expect("group roles parse");
-                assert_eq!(map["dev"], vec!["reader", "writer"]);
+                assert_eq!(map["dev"], vec!["viewer", "editor"]);
                 assert_eq!(map["ops"], vec!["admin"]);
             }
             _ => panic!("expected Add"),
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn group_roles_reject_missing_equals() {
         assert!(super::parse_group_roles(&["devreader".to_owned()]).is_err());
-        assert!(super::parse_group_roles(&["=reader".to_owned()]).is_err());
+        assert!(super::parse_group_roles(&["=viewer".to_owned()]).is_err());
         assert!(super::parse_group_roles(&["dev=".to_owned()]).is_err());
     }
 

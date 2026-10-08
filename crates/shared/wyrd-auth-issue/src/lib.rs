@@ -544,7 +544,7 @@ mod tests {
     fn issue_access_token_uses_principal_roles_permissions_audience_and_jti_shape() {
         let token = issuing_key()
             .issue_access_token(
-                grant(user_principal(), vec![role("runtime_admin")]),
+                grant(user_principal(), vec![role("editor")]),
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -556,7 +556,7 @@ mod tests {
         );
         assert_eq!(claims.principal.kind, PrincipalKindTag::User);
         assert_eq!(claims.principal.card_ref, None);
-        assert_eq!(claims.roles, vec![role("runtime_admin")]);
+        assert_eq!(claims.roles, vec![role("editor")]);
         assert_eq!(claims.permissions, permissions());
         assert_eq!(claims.aud, "wyrd");
         assert_eq!(claims.cid, None);
@@ -593,7 +593,7 @@ mod tests {
                 key.issue_access_token(
                     AccessGrant {
                         act,
-                        ..grant(reserved, vec![role("runtime_admin")])
+                        ..grant(reserved, vec![role("editor")])
                     },
                     Duration::minutes(5),
                 ),
@@ -687,7 +687,7 @@ mod tests {
                         PrincipalKindTag::Agent,
                         CardKind::Agent,
                     ),
-                    vec![role("agent")],
+                    vec![role("workload")],
                 ),
                 Duration::minutes(5),
             )
@@ -716,7 +716,7 @@ mod tests {
                     PrincipalKindTag::Agent,
                     CardKind::Service,
                 ),
-                vec![role("agent")],
+                vec![role("workload")],
             ),
             Duration::minutes(5),
         );
@@ -732,7 +732,7 @@ mod tests {
                     card_ref: Some(card_ref(CardKind::Service)),
                     ..user_principal()
                 },
-                vec![role("runtime_admin")],
+                vec![role("editor")],
             ),
             Duration::minutes(5),
         );
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn issue_access_token_rejects_zero_ttl() {
         let result = issuing_key().issue_access_token(
-            grant(user_principal(), vec![role("runtime_admin")]),
+            grant(user_principal(), vec![role("editor")]),
             Duration::zero(),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
@@ -832,7 +832,7 @@ mod tests {
     #[test]
     fn issue_access_token_rejects_negative_ttl() {
         let result = issuing_key().issue_access_token(
-            grant(user_principal(), vec![role("runtime_admin")]),
+            grant(user_principal(), vec![role("editor")]),
             Duration::minutes(-1),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
@@ -858,7 +858,7 @@ mod tests {
                         act: None,
                     })),
                     audience: TokenAudience::Bifrost,
-                    ..grant(user_principal(), vec![role("reader")])
+                    ..grant(user_principal(), vec![role("viewer")])
                 },
                 Duration::minutes(5),
             )
@@ -886,7 +886,7 @@ mod tests {
         let result = issuing_key().issue_access_token(
             AccessGrant {
                 act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH + 1))),
-                ..grant(user_principal(), vec![role("reader")])
+                ..grant(user_principal(), vec![role("viewer")])
             },
             Duration::minutes(5),
         );
@@ -910,7 +910,7 @@ mod tests {
         let result = issuing_key().issue_access_token(
             AccessGrant {
                 act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
-                ..grant(user_principal(), vec![role("reader")])
+                ..grant(user_principal(), vec![role("viewer")])
             },
             Duration::minutes(5),
         );
@@ -950,7 +950,7 @@ mod tests {
                     Vec::new(),
                 ),
             ),
-            ("role", grant(system.clone(), vec![role("runtime_admin")])),
+            ("role", grant(system.clone(), vec![role("editor")])),
             (
                 "credential",
                 AccessGrant {
@@ -1104,7 +1104,7 @@ mod tests {
 
         let token = key
             .issue_access_token(
-                grant(user_principal(), vec![role("runtime_admin")]),
+                grant(user_principal(), vec![role("editor")]),
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -1128,7 +1128,7 @@ mod tests {
 
         let token = key
             .issue_access_token(
-                grant(user_principal(), vec![role("runtime_admin")]),
+                grant(user_principal(), vec![role("editor")]),
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -1232,7 +1232,7 @@ mod tests {
 
     fn issue_user_test_token(ttl: Duration) -> String {
         issuing_key()
-            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), ttl)
+            .issue_access_token(grant(user_principal(), vec![role("editor")]), ttl)
             .expect("token issues")
     }
 

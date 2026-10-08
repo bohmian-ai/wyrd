@@ -145,8 +145,8 @@ def test_gateway_workflow_without_credentials_is_refused_before_any_step() -> No
 
 
 @pytest.mark.usefixtures("team", "no_ambient_credential")
-def test_registry_refs_resolve_through_the_registry(reader_key: str) -> None:
-    reader = WyrdClient(credential=reader_key)
+def test_registry_refs_resolve_through_the_registry(viewer_key: str) -> None:
+    reader = WyrdClient(credential=viewer_key)
 
     run = Workflow.from_path(WORKFLOWS / "mixed/workflow.yaml", client=reader).run(CODE)
 
@@ -187,9 +187,9 @@ def test_deleted_registry_card_is_refused(cards: Cards) -> None:
 
 @pytest.mark.usefixtures("newer_security_reviewer")
 def test_applied_workflow_stays_pinned_to_its_registered_cards(
-    applied: dict[str, CardRef], reader_key: str
+    applied: dict[str, CardRef], viewer_key: str
 ) -> None:
-    reader = Cards(WyrdClient(credential=reader_key))
+    reader = Cards(WyrdClient(credential=viewer_key))
     agents = {name: applied[name].to_dict() for name in PINNED_PROMPTS}
 
     stored = reader.get(applied["code-review"])
@@ -208,9 +208,9 @@ def test_applied_workflow_stays_pinned_to_its_registered_cards(
 @pytest.mark.usefixtures("newer_security_reviewer")
 @pytest.mark.parametrize("selector", ["identity", "uid"])
 def test_loaded_workflow_runs_its_pinned_cards(
-    applied: dict[str, CardRef], reader_key: str, selector: str
+    applied: dict[str, CardRef], viewer_key: str, selector: str
 ) -> None:
-    reader = Cards(WyrdClient(credential=reader_key))
+    reader = Cards(WyrdClient(credential=viewer_key))
     workflow = (
         reader.workflow.load(space="workflow-loading", name="code-review", version="1.0.0")
         if selector == "identity"
@@ -223,9 +223,9 @@ def test_loaded_workflow_runs_its_pinned_cards(
     assert run.steps["final_review"]["text"] == REGISTERED_REVIEW
 
 
-def test_loading_a_bad_selector_is_refused(applied: dict[str, CardRef], reader_key: str) -> None:
+def test_loading_a_bad_selector_is_refused(applied: dict[str, CardRef], viewer_key: str) -> None:
     """An Agent's uid names no Workflow."""
-    reader = Cards(WyrdClient(credential=reader_key))
+    reader = Cards(WyrdClient(credential=viewer_key))
 
     with pytest.raises(WyrdError) as refused:
         reader.workflow.load(uid=str(applied["security-reviewer"].uid))

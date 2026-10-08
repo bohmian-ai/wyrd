@@ -1427,7 +1427,7 @@ async fn no_yaml_projection_is_routed() {
     // probe carries a credential: only a genuinely unrouted path reaches the
     // router's own not-found.
     let reader = server
-        .bootstrap_service("openapi-yaml-probe", &["reader"])
+        .bootstrap_service("openapi-yaml-probe", &["viewer"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1578,7 +1578,7 @@ async fn an_unknown_upload_answers_with_a_code_the_operation_documents() {
         .expect("test server starts");
     let document = served_document(&server).await;
     let writer = server
-        .bootstrap_service("openapi-storage", &["writer"])
+        .bootstrap_service("openapi-storage", &["editor"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1632,7 +1632,7 @@ async fn an_unextractable_local_transfer_locator_answers_with_a_documented_probl
         .expect("test server starts");
     let document = served_document(&server).await;
     let writer = server
-        .bootstrap_service("openapi-local-transfer", &["writer"])
+        .bootstrap_service("openapi-local-transfer", &["editor"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1741,7 +1741,7 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
         .expect("test server starts");
     let document = served_document(&server).await;
     let tenant = server
-        .bootstrap_service("openapi-malformed-id", &["reader"])
+        .bootstrap_service("openapi-malformed-id", &["viewer"])
         .await
         .expect("service bootstraps");
     let tenant_token = server
@@ -1853,7 +1853,7 @@ async fn an_unstageable_exchange_audit_still_grants_a_token() {
         .await
         .expect("test server starts");
     let service = server
-        .bootstrap_service("openapi-token-audit", &["reader"])
+        .bootstrap_service("openapi-token-audit", &["viewer"])
         .await
         .expect("service bootstraps");
     let api_key = service

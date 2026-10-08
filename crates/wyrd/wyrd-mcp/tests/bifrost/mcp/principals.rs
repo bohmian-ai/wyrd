@@ -93,7 +93,7 @@ mod pg_tests {
             .expose_secret()
             .to_owned();
         let reader = server
-            .bootstrap_service("mcp-principal-reader", &["reader"])
+            .bootstrap_service("mcp-principal-reader", &["viewer"])
             .await?;
         let reader_key = reader
             .api_key()

@@ -399,7 +399,7 @@ async fn client_registration_saga_returns_active_receipt() {
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-native-writer", &["writer"])
+        .bootstrap_user("registry-native-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -506,7 +506,7 @@ async fn registration_replays_through_public_authenticated_route() {
         .await
         .expect("test server starts");
     let Bootstrap::User { id, jwt } = server
-        .bootstrap_user("registry-writer", &["writer"])
+        .bootstrap_user("registry-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -564,7 +564,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-child-writer", &["writer"])
+        .bootstrap_user("registry-child-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -647,7 +647,7 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("loader-registry-writer", &["writer"])
+        .bootstrap_user("loader-registry-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -698,7 +698,7 @@ async fn registration_rejects_idempotency_key_reuse_for_different_content() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-conflict-writer", &["writer"])
+        .bootstrap_user("registry-conflict-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -736,7 +736,7 @@ async fn unresolved_dependency_leaves_no_registration_operation() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-unresolved-writer", &["writer"])
+        .bootstrap_user("registry-unresolved-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -779,7 +779,7 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-dependency-state-writer", &["writer"])
+        .bootstrap_user("registry-dependency-state-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -902,7 +902,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-binding-writer", &["writer"])
+        .bootstrap_user("registry-binding-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1275,7 +1275,7 @@ async fn verifier_contract_refusals_leave_no_writes() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("verifier-contract-writer", &["writer"])
+        .bootstrap_user("verifier-contract-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1582,7 +1582,7 @@ async fn composite_with_manifest_rejects_before_writes() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-heavy-writer", &["writer"])
+        .bootstrap_user("registry-heavy-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1627,7 +1627,7 @@ async fn concurrent_same_key_resolves_to_one_registration() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-concurrent-writer", &["writer"])
+        .bootstrap_user("registry-concurrent-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1680,7 +1680,7 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         .await
         .expect("test server starts");
     let Bootstrap::User { id, jwt } = server
-        .bootstrap_user("registry-composite-writer", &["writer"])
+        .bootstrap_user("registry-composite-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1784,7 +1784,7 @@ async fn heavy_registration_initializes_upload_after_commit() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-heavy-only-writer", &["writer"])
+        .bootstrap_user("registry-heavy-only-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -1939,7 +1939,7 @@ async fn card_reconciler_recovers_after_storage_retry() {
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-reconciler-recovery", &["writer"])
+        .bootstrap_user("registry-reconciler-recovery", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2022,7 +2022,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-reconciler-dead-letter", &["writer"])
+        .bootstrap_user("registry-reconciler-dead-letter", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2144,7 +2144,7 @@ async fn completion_succeeds_when_its_decision_audit_fails() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-completion-audit-failure", &["writer"])
+        .bootstrap_user("registry-completion-audit-failure", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2270,7 +2270,7 @@ async fn delete_succeeds_when_its_decision_audit_fails() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-delete-audit-failure", &["writer"])
+        .bootstrap_user("registry-delete-audit-failure", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2378,7 +2378,7 @@ async fn delete_by_ref_not_found_records_one_decision() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-delete-missing", &["writer"])
+        .bootstrap_user("registry-delete-missing", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2434,7 +2434,7 @@ async fn delete_storage_failure_preserves_cleanup_state() {
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-delete-storage-failure", &["writer"])
+        .bootstrap_user("registry-delete-storage-failure", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2516,7 +2516,7 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
     std::fs::write(storage_root.path(), b"not a directory")
         .expect("broken storage root is created");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-blob-storage-failure", &["writer"])
+        .bootstrap_user("registry-blob-storage-failure", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2571,7 +2571,7 @@ async fn registration_succeeds_when_its_decision_audit_fails() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-audit-failure-writer", &["writer"])
+        .bootstrap_user("registry-audit-failure-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2659,7 +2659,7 @@ async fn dependency_cycle_rejects_before_writes() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-cycle-writer", &["writer"])
+        .bootstrap_user("registry-cycle-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2705,7 +2705,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-composition-writer", &["writer"])
+        .bootstrap_user("registry-composition-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2795,7 +2795,7 @@ async fn wire_order_permutation_replays_identical_graph() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-order-writer", &["writer"])
+        .bootstrap_user("registry-order-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -2839,7 +2839,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-reads-writer", &["writer"])
+        .bootstrap_user("registry-reads-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -3245,7 +3245,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("binding-status-writer", &["writer"])
+        .bootstrap_user("binding-status-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -3439,7 +3439,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
     let Bootstrap::Machine {
         api_key: other_key, ..
     } = server
-        .bootstrap_service_in_tenant(other_tenant, "binding-status-foreign", &["writer"])
+        .bootstrap_service_in_tenant(other_tenant, "binding-status-foreign", &["editor"])
         .await
         .expect("foreign reader bootstraps")
     else {
@@ -3776,7 +3776,7 @@ async fn same_card_in_two_spaces_resolves_only_exact_refs() {
         .expect("test server starts");
     seed_binding_dependencies(&server).await;
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("vb-twin-admin", &["writer", "runtime_admin"])
+        .bootstrap_user("vb-twin-admin", &["admin"])
         .await
         .expect("admin bootstraps")
     else {
@@ -4024,7 +4024,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .expect("test server starts");
     seed_binding_dependencies(&server).await;
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("vb-live-admin", &["writer", "runtime_admin"])
+        .bootstrap_user("vb-live-admin", &["admin"])
         .await
         .expect("admin bootstraps")
     else {
@@ -4036,7 +4036,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         let server = &server;
         async move {
             let Bootstrap::Machine { api_key, .. } = server
-                .credential_registered_service(&live_ref(version), &["writer"])
+                .credential_registered_service(&live_ref(version), &["editor"])
                 .await
                 .expect("registered Service is credentialed")
             else {
@@ -4081,7 +4081,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
                 .uri("/v1/principals")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({ "name": "vb-automation", "roles": ["writer"] }).to_string(),
+                    json!({ "name": "vb-automation", "roles": ["editor"] }).to_string(),
                 ))
                 .expect("automation request builds"),
         )

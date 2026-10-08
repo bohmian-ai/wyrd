@@ -110,9 +110,9 @@ def other_tenant(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture(scope="session")
-def reader_key(wyrd_server: WyrdTestServer) -> str:
+def viewer_key(wyrd_server: WyrdTestServer) -> str:
     """An API key whose principal may read but holds no write or ``evals:run`` grant."""
-    return wyrd_server.bootstrap_service(["reader"], name="reader")
+    return wyrd_server.bootstrap_service(["viewer"], name="viewer")
 
 
 @pytest.fixture(scope="session")

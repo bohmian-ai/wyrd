@@ -487,7 +487,7 @@ async fn read_write_separation_and_tenant_isolation() {
         vec![("operators:read".to_owned(), "allowed".to_owned())]
     );
 
-    let (_, writer) = user(&server, "oc-writer", &["writer"]).await;
+    let (_, writer) = user(&server, "oc-writer", &["editor"]).await;
     assert_eq!(
         call(
             &server,

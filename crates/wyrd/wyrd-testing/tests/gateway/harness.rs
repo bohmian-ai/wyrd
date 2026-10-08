@@ -115,7 +115,7 @@ impl Journey {
         let api_keys = [
             api_key(&server, "native_admin", &["admin"]).await,
             api_key(&server, "native_caller", &[INVOKER_ROLE]).await,
-            api_key(&server, "native_reader", &["reader"]).await,
+            api_key(&server, "native_reader", &[]).await,
         ];
         Self::connect(server, upstream, api_keys).await
     }

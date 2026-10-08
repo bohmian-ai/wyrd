@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     fn role() -> RoleRef {
-        RoleRef::new("runtime_admin").expect("static role is valid")
+        RoleRef::new("editor").expect("static role is valid")
     }
 
     fn assert_no_sqlx_in_dir(path: impl AsRef<std::path::Path>) {

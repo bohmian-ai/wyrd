@@ -1075,20 +1075,20 @@ mod pg_tests {
         insert_role(
             &mut conn,
             Uuid::new_v4(),
-            "runtime_admin",
+            "credential_admin",
             &serde_json::json!([]),
             false,
         )
         .await
         .expect("role seeds");
-        replace_user_roles(&mut conn, user_id, &["runtime_admin", "only-at-the-idp"])
+        replace_user_roles(&mut conn, user_id, &["credential_admin", "only-at-the-idp"])
             .await
             .expect("login persists the asserted roles");
         assert_eq!(
             list_user_roles(&mut conn, user_id)
                 .await
                 .expect("roles list"),
-            vec!["runtime_admin".to_owned()],
+            vec!["credential_admin".to_owned()],
             "a name with no local role row is not recorded as authority"
         );
 
@@ -1122,7 +1122,7 @@ mod pg_tests {
                 .iter()
                 .map(|role| role.as_str().to_owned())
                 .collect::<Vec<_>>(),
-            vec!["runtime_admin".to_owned()],
+            vec!["credential_admin".to_owned()],
             "the successor carries the session's authority"
         );
         drain(&audit).await;

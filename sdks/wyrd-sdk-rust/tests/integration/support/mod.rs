@@ -147,7 +147,7 @@ impl Deployment {
     /// `card`, as the administrator through the `wyrd auth issue-key` CLI
     /// function, and return its plaintext.
     ///
-    /// The key holds exactly the default `wyrd_default` Role every Service
+    /// The key holds exactly the default `workload` Role every Service
     /// principal starts with; nothing is granted beyond it.
     ///
     /// # Panics

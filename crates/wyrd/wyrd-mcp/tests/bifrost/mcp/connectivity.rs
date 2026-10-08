@@ -414,7 +414,7 @@ mod pg_tests {
 
         // 2. An authenticated but under-scoped principal is denied by the same
         //    audited RBAC path every Bifrost read uses, and the denial is durable.
-        let denied = server.bootstrap_service("mcp-denied", &["reader"]).await?;
+        let denied = server.bootstrap_service("mcp-denied", &[]).await?;
         let denied_key = denied.api_key().ok_or("service bootstrap carries a key")?;
         let denied_request_id = RequestId::now_v7();
         let denied_client = ()

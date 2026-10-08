@@ -808,7 +808,7 @@ mod pg_tests {
         let path = write_prompt(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-lifecycle-writer", &["writer"])
+            .bootstrap_user("cli-lifecycle-writer", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -1278,7 +1278,7 @@ mod pg_tests {
             .expect("bound server exposes base URL")
             .to_owned();
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("typed-state-journey", &["writer"])
+            .bootstrap_user("typed-state-journey", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {
@@ -1477,7 +1477,7 @@ mod pg_tests {
             .expect("bound server exposes base URL")
             .to_owned();
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("canonical-directory-writer", &["writer"])
+            .bootstrap_user("canonical-directory-writer", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {
@@ -1673,7 +1673,7 @@ mod pg_tests {
         let service_path = write_multi_card_service(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-multi-card-writer", &["writer"])
+            .bootstrap_user("cli-multi-card-writer", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2078,7 +2078,7 @@ mod pg_tests {
         let path = write_prompt(&temp);
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-completion-failure", &["writer"])
+            .bootstrap_user("cli-completion-failure", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2173,7 +2173,7 @@ mod pg_tests {
         let destination = temp.path().join("loaded");
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-load-progress", &["writer"])
+            .bootstrap_user("cli-load-progress", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2248,7 +2248,7 @@ mod pg_tests {
         let metadata_only = temp.path().join("metadata-only");
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-get-progress", &["writer"])
+            .bootstrap_user("cli-get-progress", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2680,7 +2680,7 @@ mod pg_tests {
         assert_eq!(enabled["connection_id"], http.as_str());
 
         let Bootstrap::User { jwt: writer, .. } = server
-            .bootstrap_user("cli-connection-writer", &["writer"])
+            .bootstrap_user("cli-connection-writer", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {

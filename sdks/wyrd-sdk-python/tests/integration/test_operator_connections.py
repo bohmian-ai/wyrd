@@ -53,7 +53,7 @@ def test_admin_manages_redacted_connections(connections: OperatorConnections, sl
 
 def test_writer_is_refused(wyrd_server: WyrdTestServer) -> None:
     writer = OperatorConnections(
-        WyrdClient(credential=wyrd_server.bootstrap_service(["writer"], name="writer"))
+        WyrdClient(credential=wyrd_server.scoped_api_key("card_writer", ["cards:read", "cards:write"]))
     )
     with pytest.raises(WyrdError) as raised:
         writer.list()

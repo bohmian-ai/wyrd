@@ -152,7 +152,7 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: Uuid) -> Option<DateTime<Utc
 ///
 /// # Panics
 /// Panics when any identity, ordering, or persisted-key expectation fails.
-/// A Card's first principal projection grants the built-in `wyrd_default` role
+/// A Card's first principal projection grants the built-in `workload` role
 /// once; re-applying the Card neither duplicates the grant nor restores it
 /// after an administrator revoked it.
 ///

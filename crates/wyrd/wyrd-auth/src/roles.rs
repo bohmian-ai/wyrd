@@ -56,7 +56,7 @@ mod pg_tests {
             .await
             .expect("builtin roles seed");
 
-        for name in ["admin", "runtime_admin"] {
+        for name in ["admin", "viewer"] {
             let error = delete_role(&mut conn, builtin_role_uuid(tenant, name))
                 .await
                 .expect_err("builtin delete should fail");
@@ -113,7 +113,7 @@ mod pg_tests {
         sqlx::query(
             "UPDATE wyrd.auth_roles
                 SET permissions = $1
-              WHERE name = 'writer'",
+              WHERE name = 'editor'",
         )
         .bind(serde_json::json!([{ "resource": "cards", "action": "read", "scope": "all" }]))
         .execute(&mut **conn.transaction())

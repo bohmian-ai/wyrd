@@ -263,14 +263,18 @@ async fn access_token(server: &str, api_key: &str) -> String {
 }
 
 /// The public Keycloak `wyrd-human` connection, granting `admin` to
-/// `wyrd-admins` and `reader` to `wyrd-viewers`.
+/// `wyrd-admins`, `editor` to `wyrd-editors`, and `viewer` to `wyrd-viewers`.
 fn keycloak_connection() -> Value {
     json!({
         "issuer": keycloak_issuer(),
         "client_id": "wyrd-human",
         "client_auth": "Public",
         "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
-        "group_role_map": { "wyrd-admins": ["admin"], "wyrd-viewers": ["reader"] },
+        "group_role_map": {
+            "wyrd-admins": ["admin"],
+            "wyrd-editors": ["editor"],
+            "wyrd-viewers": ["viewer"],
+        },
     })
 }
 
@@ -429,7 +433,7 @@ async fn production_ui_bff_journey() {
         .await
         .expect("oidc-off admin bootstraps");
     let off_reader = srv
-        .bootstrap_service_in_tenant(off, "ui-off-reader", &["reader"])
+        .bootstrap_service_in_tenant(off, "ui-off-reader", &["viewer"])
         .await
         .expect("oidc-off reader bootstraps");
 

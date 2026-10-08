@@ -170,7 +170,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
         "--principal-kind".to_owned(),
         "Workload".to_owned(),
         "--default-role".to_owned(),
-        "reader".to_owned(),
+        "viewer".to_owned(),
     ];
     arguments.extend(endpoint());
     let configured = succeeded(
@@ -204,7 +204,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
         "--name".to_owned(),
         "cli-runner".to_owned(),
         "--role".to_owned(),
-        "reader".to_owned(),
+        "viewer".to_owned(),
     ];
     arguments.extend(endpoint());
     let principal = succeeded(

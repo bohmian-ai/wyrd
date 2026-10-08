@@ -578,8 +578,8 @@ impl WyrdTestServer {
     }
 
     /// Stage, test, and activate the identity lane's Keycloak sign-in for the
-    /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin` and
-    /// `wyrd-viewers` to `reader`.
+    /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin`,
+    /// `wyrd-editors` to `editor`, and `wyrd-viewers` to `viewer`.
     ///
     /// Needs `human_sso=True` and the identity lane's Keycloak.
     ///

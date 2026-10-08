@@ -751,6 +751,7 @@ def create_user(username, email, password, group_path, realm=REALM):
 
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+create_user("carol", "carol@wyrd.test", "carol-password", "wyrd-editors")
 # The second provider's alice shares the first's email: a provider switch must
 # still make her a separate Wyrd user.
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")

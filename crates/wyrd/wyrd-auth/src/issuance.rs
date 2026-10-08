@@ -839,7 +839,7 @@ mod tests {
     fn decodes_and_merges_permissions_from_role_rows() {
         let set = permission_set_from_rows(vec![
             role(
-                "reader",
+                "viewer",
                 json!([
                     { "resource": "cards", "action": "read", "scope": "all" },
                     { "resource": "artifacts", "action": "read", "scope": "all" }

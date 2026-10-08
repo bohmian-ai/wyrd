@@ -422,7 +422,7 @@ def test_card_registry_enforces_cross_tenant_isolation(
     cards_b = Cards(
         WyrdClient(
             credential=wyrd_server.bootstrap_service_in_tenant(
-                tenant_b, ["writer"], name="tenant-b"
+                tenant_b, ["editor"], name="tenant-b"
             )
         )
     )

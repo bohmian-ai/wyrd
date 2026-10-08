@@ -359,7 +359,7 @@ async fn manual_runs_enqueue_replay_and_read_back() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (requester, jwt) = user(&server, "vr-writer", &["writer"]).await;
+    let (requester, jwt) = user(&server, "vr-writer", &["editor"]).await;
 
     let binding_body = run_body(binding_target(fixture.ready_binding));
     let (status, bound) = post_run(&server, &jwt, &binding_body, Some("vr-retry-0001")).await;
@@ -458,7 +458,7 @@ async fn manual_run_refusals_fail_before_enqueue() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (_, jwt) = user(&server, "vr-refused-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vr-refused-writer", &["editor"]).await;
 
     let cases = [
         (
@@ -532,7 +532,7 @@ async fn manual_run_refusals_fail_before_enqueue() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION");
 
-    let (reader, reader_jwt) = user(&server, "vr-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vr-reader", &["viewer"]).await;
     let bound = run_body(binding_target(fixture.ready_binding));
     let (status, problem) = post_run(&server, &reader_jwt, &bound, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -543,7 +543,7 @@ async fn manual_run_refusals_fail_before_enqueue() {
     );
 
     let machine = server
-        .bootstrap_service("vr-foreign-service", &["writer"])
+        .bootstrap_service("vr-foreign-service", &["editor"])
         .await
         .expect("card-bound service bootstraps");
     let machine_token = machine_jwt(&server, &machine).await;
@@ -583,7 +583,7 @@ async fn status_reads_audit_cards_read_decisions() {
         .await
         .expect("test server starts");
     let fixture = Fixture::seed(&server, server.data_tenant_id()).await;
-    let (_, writer) = user(&server, "vr-status-writer", &["writer"]).await;
+    let (_, writer) = user(&server, "vr-status-writer", &["editor"]).await;
     let (status, run) = post_run(
         &server,
         &writer,
@@ -598,7 +598,7 @@ async fn status_reads_audit_cards_read_decisions() {
         run["run_id"].as_str().expect("run_id is a string")
     );
 
-    let (reader, reader_jwt) = user(&server, "vr-status-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vr-status-reader", &["viewer"]).await;
     for uri in [&binding_uri, &run_uri] {
         let (status, body) = get(&server, &reader_jwt, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
@@ -613,7 +613,7 @@ async fn status_reads_audit_cards_read_decisions() {
         allowed
     );
 
-    let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &["runtime_admin"]).await;
+    let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
     for uri in [&binding_uri, &run_uri] {
         let (status, problem) = get(&server, &outsider_jwt, uri).await;
         assert_eq!(
@@ -650,7 +650,7 @@ async fn verification_state_is_tenant_isolated() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (_, jwt) = user(&server, "vr-home-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vr-home-writer", &["editor"]).await;
     let (status, run) = post_run(
         &server,
         &jwt,
@@ -993,7 +993,7 @@ async fn direct_execution_judges_inline_without_runs() {
         .await
         .expect("test server starts");
     let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-writer", &["writer"]).await;
+    let (caller, jwt) = user(&server, "vx-writer", &["editor"]).await;
 
     let spread: Vec<f64> = (0..1000).map(f64::from).collect();
     let skewed = vec![990.0; 500];
@@ -1081,7 +1081,7 @@ async fn direct_execution_refusals_are_stable() {
         .await
         .expect("test server starts");
     let direct = Direct::seed(&server).await;
-    let (_, jwt) = user(&server, "vx-refused-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vx-refused-writer", &["editor"]).await;
     let service = &direct.service;
     let record = json!({ "kind": "eval_record", "context": { "x": 1 } });
     let wide: serde_json::Map<String, Value> =
@@ -1198,7 +1198,7 @@ async fn direct_execution_refusals_are_stable() {
     }
 
     let allowed = execute_body(&direct.eval, service, record).to_string();
-    let (reader, reader_jwt) = user(&server, "vx-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vx-reader", &["viewer"]).await;
     let (status, problem) = post_execute(&server, &reader_jwt, allowed.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
@@ -1207,7 +1207,7 @@ async fn direct_execution_refusals_are_stable() {
         vec![("evals:run".to_owned(), "denied".to_owned())]
     );
     let machine = server
-        .bootstrap_service("vx-foreign-service", &["writer"])
+        .bootstrap_service("vx-foreign-service", &["editor"])
         .await
         .expect("card-bound service bootstraps");
     let machine_token = machine_jwt(&server, &machine).await;
@@ -1239,9 +1239,9 @@ async fn direct_execution_does_not_wait_on_audit() {
         .await
         .expect("test server starts");
     let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-audit-writer", &["writer"]).await;
+    let (caller, jwt) = user(&server, "vx-audit-writer", &["editor"]).await;
     let machine = server
-        .bootstrap_service("vx-audit-foreign-service", &["writer"])
+        .bootstrap_service("vx-audit-foreign-service", &["editor"])
         .await
         .expect("card-bound service bootstraps");
     let machine_token = machine_jwt(&server, &machine).await;
@@ -1385,7 +1385,7 @@ async fn direct_execution_calls_the_judge_provider() {
         .verifier("vx-judge", &judge_spec())
         .await
         .expect("judge Verifier registers");
-    let (_, jwt) = user(&server, "vx-judge-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vx-judge-writer", &["editor"]).await;
     let body = execute_body(
         &judge,
         &service,

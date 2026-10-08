@@ -198,7 +198,7 @@ async fn start_server(storage_root: &Path) -> (WyrdTestServer, String) {
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("workflow-registry-writer", &["writer"])
+        .bootstrap_user("workflow-registry-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {

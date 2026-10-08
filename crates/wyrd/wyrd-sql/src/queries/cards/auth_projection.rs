@@ -104,7 +104,7 @@ pub async fn upsert_service_account_from_card(
 /// Grants the tenant's built-in [`DEFAULT_CARD_ROLE`] to a newly projected principal.
 ///
 /// Every provisioned tenant carries the built-in roles (seeded at
-/// provisioning, backfilled by migration); a bare tenant without them, such as
+/// provisioning); a bare tenant without them, such as
 /// a persistence-level fixture, projects the principal with no Role.
 ///
 /// # Errors

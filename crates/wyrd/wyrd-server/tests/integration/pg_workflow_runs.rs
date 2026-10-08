@@ -1199,15 +1199,16 @@ fn chain(name: &str, depth: usize) -> TempDir {
 #[tokio::test(flavor = "multi_thread")]
 /// Every refusal of a create happens before any run exists or any provider
 /// or tool is called. Unauthenticated callers are refused first; principals
-/// without `workflows:run` (reader, runtime_admin) are refused and audited
+/// without `workflows:run` (viewer, and a principal holding no Role) are refused and audited
 /// before any run lookup; request-shape, route-override, and timeout errors
 /// are refused before authorization; an unknown version, a native route,
 /// undeclarable tools, an unbound external route, an oversized input, a
 /// deleted root, and a full tenant are refused after an audited allow; an
 /// unrecordable decision never refuses the create and commits once staging
 /// recovers; and another tenant's
-/// administrator cannot name this tenant's Workflow at all. Writer, agent, and admin principals are
-/// accepted, with live gateway grants still applying to the run.
+/// administrator cannot name this tenant's Workflow at all. A principal holding
+/// `workflows:run` without gateway invocation, and an admin, are accepted, with
+/// live gateway grants still applying to the run.
 ///
 /// # Panics
 /// Panics when any status, code, upstream call, or retained decision differs.
@@ -1229,10 +1230,8 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
         fixture.register(&bundle.path().join("workflow.yaml")).await;
     }
     fixture.delete_card("Workflow", "retired-review").await;
-    let reader = fixture.principal("workflow-reader", &["reader"]).await;
-    let runtime_admin = fixture
-        .principal("workflow-runtime-admin", &["runtime_admin"])
-        .await;
+    let viewer = fixture.principal("workflow-viewer", &["viewer"]).await;
+    let roleless = fixture.principal("workflow-roleless", &[]).await;
     let runner = &fixture.runner.token;
     let request = run_request("code-review", "fn secret_marker() {}");
     let unknown = uuid::Uuid::now_v7().to_string();
@@ -1246,7 +1245,7 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    for denied in [&reader, &runtime_admin] {
+    for denied in [&viewer, &roleless] {
         let denial = "WYRD_PERMISSION_403_DENIED_RBAC";
         problem(
             fixture.create(&denied.token, &new_key(), &request).await,
@@ -1390,17 +1389,24 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     assert_eq!(finished.outputs["review"], json!("DONE"));
     assert_eq!(fixture.upstream.arrivals(), 3);
 
-    let writer = fixture.principal("workflow-writer", &["writer"]).await;
-    let agent = fixture.principal("workflow-agent", &["agent"]).await;
-    for ungoverned in [&writer, &agent] {
-        let run = fixture.accept(&ungoverned.token, &request).await;
-        let run = fixture.terminal(&ungoverned.token, &run).await;
-        assert_eq!(
-            run.status,
-            WorkflowRunStatus::Failed,
-            "the gateway still refuses a caller without invoke permission"
-        );
-    }
+    fixture
+        .server
+        .seed_role(
+            "workflow_only",
+            &[Permission::workflow_run(), Permission::card_read()],
+        )
+        .await
+        .expect("workflow-only role seeds");
+    let ungoverned = fixture
+        .principal("workflow-ungoverned", &["workflow_only"])
+        .await;
+    let run = fixture.accept(&ungoverned.token, &request).await;
+    let run = fixture.terminal(&ungoverned.token, &run).await;
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Failed,
+        "the gateway still refuses a caller without invoke permission"
+    );
     assert_eq!(fixture.upstream.arrivals(), 3);
     let run = fixture.accept(&fixture.admin.token, &request).await;
     let run = fixture.terminal(&fixture.admin.token, &run).await;
@@ -1430,7 +1436,7 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     let resource = "workflow:engineering/code-review@1.0.0";
     let creates = fixture.decisions("workflow.run.create").await;
     let reads = fixture.decisions("workflow.run.read").await;
-    for denied in [&reader, &runtime_admin] {
+    for denied in [&viewer, &roleless] {
         let create = made_for(&creates, denied, "denied");
         assert_eq!(create.len(), 1, "{create:?}");
         assert_eq!(create[0].permission, "workflows:run");
@@ -1441,7 +1447,7 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     }
     let allowed = made_for(&creates, &fixture.runner, "allowed");
     assert_eq!(allowed.len(), runner_allowed, "{allowed:?}");
-    for accepted in [&writer, &agent, &fixture.admin] {
+    for accepted in [&ungoverned, &fixture.admin] {
         let allowed = made_for(&creates, accepted, "allowed");
         assert_eq!(allowed.len(), 1, "{allowed:?}");
     }

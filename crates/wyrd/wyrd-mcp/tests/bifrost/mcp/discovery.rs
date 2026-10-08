@@ -251,7 +251,7 @@ mod pg_tests {
         client.cancel().await?;
 
         let denied = server
-            .bootstrap_service("mcp-discovery-denied", &["reader"])
+            .bootstrap_service("mcp-discovery-denied", &[])
             .await?;
         let denied_client = ()
             .serve_with_lifecycle(

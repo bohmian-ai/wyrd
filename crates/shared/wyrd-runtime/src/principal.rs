@@ -288,9 +288,9 @@ mod tests {
 
     #[test]
     fn role_ref_accepts_locked_name_shape() {
-        let role = RoleRef::new("runtime_admin").expect("role name is valid");
+        let role = RoleRef::new("credential_admin").expect("role name is valid");
 
-        assert_eq!(role.as_str(), "runtime_admin");
+        assert_eq!(role.as_str(), "credential_admin");
     }
 
     #[test]

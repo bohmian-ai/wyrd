@@ -574,7 +574,7 @@ mod pg_tests {
                 "https://legacy-idp.example.com/roles",
                 "SecretBasic",
                 Some(secret),
-                serde_json::json!(["writer"]),
+                serde_json::json!(["editor"]),
             )
             .await;
             assert_preflight_refuses(pool, tenant, secret, "default roles").await;

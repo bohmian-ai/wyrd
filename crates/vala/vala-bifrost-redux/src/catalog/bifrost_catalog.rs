@@ -1783,12 +1783,12 @@ mod schema_shape_tests {
     #[test]
     fn schema_shape_rejects_reordered_columns() {
         let declared = Schema::new(vec![
-            Field::new("seq", DataType::Int64, false),
-            Field::new("entry_hash", DataType::Utf8, false),
+            Field::new("attempt", DataType::Int64, false),
+            Field::new("operation", DataType::Utf8, false),
         ]);
         let reordered = Schema::new(vec![
-            Field::new("entry_hash", DataType::Utf8, false),
-            Field::new("seq", DataType::Int64, false),
+            Field::new("operation", DataType::Utf8, false),
+            Field::new("attempt", DataType::Int64, false),
         ]);
 
         assert!(!schema_shape_matches(&declared, &reordered));

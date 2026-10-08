@@ -97,6 +97,8 @@ const rootAllowed = new Set([
   "dist/error-codes.js",
   "dist/index.d.ts",
   "dist/index.js",
+  "dist/otel.d.ts",
+  "dist/otel.js",
   "index.cjs",
   "index.d.cts",
   "index.d.ts",

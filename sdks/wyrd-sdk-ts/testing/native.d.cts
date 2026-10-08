@@ -144,6 +144,15 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapServiceInTenant(tenantId: string, roles: Array<string>, name: string): string
   /**
+   * Issue a key for the fixture tenant's unbound administrator: the key
+   * `wyrd setup` prints, bound to no Card.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or issuing fails.
+   */
+  tenantAdminKey(): string
+  /**
    * Activate the identity lane's Keycloak sign-in for one tenant and
    * return its id: the fixture tenant when `tenantSlug` is absent, else a
    * newly seeded tenant of that slug with its own administrator.
@@ -374,6 +383,12 @@ export interface NativeTestServerOptions {
    * register, for saved user login journeys.
    */
   humanSso?: boolean
+  /**
+   * Access-token lifetime in seconds, verified with no clock-skew
+   * allowance, so a journey can outlive one token; omitted keeps the
+   * production lifetime.
+   */
+  accessTtlSeconds?: number
 }
 
 /**

@@ -357,6 +357,22 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Issue a key for the fixture tenant's unbound administrator: the key
+    /// `wyrd setup` prints, bound to no Card.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or issuing fails.
+    #[napi]
+    pub fn tenant_admin_key(&self) -> Result<String> {
+        self.with_server(|server| {
+            let key = wyrd_runtime::runtime()
+                .block_on(server.tenant_admin_key())
+                .map_err(reason)?;
+            Ok(secrecy::ExposeSecret::expose_secret(&key).to_owned())
+        })
+    }
+
     /// Run `call` against the open harness while holding its lock.
     ///
     /// # Errors
@@ -517,6 +533,10 @@ pub struct NativeTestServerOptions {
     /// `true` serves the public origin the identity lane's Keycloak clients
     /// register, for saved user login journeys.
     pub human_sso: Option<bool>,
+    /// Access-token lifetime in seconds, verified with no clock-skew
+    /// allowance, so a journey can outlive one token; omitted keeps the
+    /// production lifetime.
+    pub access_ttl_seconds: Option<u32>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -536,6 +556,7 @@ pub fn start_test_server(
         audit_publication: None,
         verification_runtime: None,
         human_sso: None,
+        access_ttl_seconds: None,
     });
     let provider_root = options
         .provider_base_url
@@ -551,6 +572,7 @@ pub fn start_test_server(
         options.audit_publication.unwrap_or(true),
         options.verification_runtime.unwrap_or(false),
         options.human_sso.unwrap_or(false),
+        options.access_ttl_seconds,
     )))
 }
 
@@ -564,8 +586,16 @@ async fn start_test_server_async(
     audit_publication: bool,
     verification_runtime: bool,
     human_sso: bool,
+    access_ttl_seconds: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    if let Some(seconds) = access_ttl_seconds {
+        builder = builder
+            .with_access_ttl(chrono::Duration::seconds(i64::from(seconds)))
+            .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                allowed_clock_skew: Duration::ZERO,
+            });
+    }
     if human_sso {
         builder = builder.with_public_origin(url::Url::parse(HUMAN_PUBLIC_ORIGIN).map_err(reason)?);
     }

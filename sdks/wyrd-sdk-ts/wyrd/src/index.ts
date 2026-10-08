@@ -2814,6 +2814,26 @@ export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
 }
 
 /**
+ * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
+ *
+ * Hand it to a stock client, such as
+ * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
+ * Each request asks `client` for its current access token and sends it as
+ * `Authorization: Bearer <token>`, so a long-lived client keeps working after
+ * any one access token expires.
+ *
+ * @param client - The client whose access token every request carries.
+ * @returns The authenticating `fetch`.
+ */
+export function gatewayFetch(client: WyrdClient): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.set("authorization", `Bearer ${await client.accessToken()}`);
+    return fetch(input, { ...init, headers });
+  };
+}
+
+/**
  * Tenant gateway administration over the shared Rust `Gateway` handle.
  *
  * Bodies are validated in Rust and by the server; credential reads are always

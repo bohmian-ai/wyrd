@@ -597,7 +597,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -608,7 +608,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -817,14 +817,15 @@ saved_login_journey() {
     typescript)
       mise run ts:build
       mise run ts:build:testing
-      # The story file is the journey: its six tests, one per saved-login outcome.
-      journey=tests/integration/saved-user-auth.test.ts
-      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list "$journey" | grep -c . || true)"
-      if [ "$count" != 6 ]; then
-        echo "TypeScript journey $journey selects $count tests; expected exactly 6" >&2
+      # The story files are the journey: six saved-login outcomes plus the
+      # signed-in development workflow.
+      journey="tests/integration/saved-user-auth.test.ts tests/integration/signed-in-development.test.ts"
+      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list $journey | grep -c . || true)"
+      if [ "$count" != 7 ]; then
+        echo "TypeScript journey $journey selects $count tests; expected exactly 7" >&2
         exit 1
       fi
-      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run "$journey")
+      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run $journey)
       ;;
   esac
 }
@@ -1587,9 +1588,9 @@ seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via s
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"
-# The saved user login journey needs the identity lane's Keycloak; only
-# test:identity:journey runs it.
-run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts"
+# The saved user login journeys need the identity lane's Keycloak; only
+# test:identity:journey runs them.
+run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts --exclude tests/integration/signed-in-development.test.ts"
 
 [tasks."gate"]
 description = "Full repository aggregate for nightly, release, mixed, global, and unclassified changes. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at the first failed lane."

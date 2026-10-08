@@ -20,6 +20,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./otel": {
+      "types": "./dist/otel.d.ts",
+      "import": "./dist/otel.js"
     }
   },
   "napi": {
@@ -41,5 +45,21 @@
   },
   "dependencies": {
     "apache-arrow": "21.1.0"
+  },
+  "peerDependencies": {
+    "@opentelemetry/exporter-logs-otlp-proto": "^0.222.0",
+    "@opentelemetry/exporter-metrics-otlp-proto": "^0.222.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/exporter-logs-otlp-proto": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-metrics-otlp-proto": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-proto": {
+      "optional": true
+    }
   }
 }

@@ -56,7 +56,7 @@ use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, VerifierResultAttribution};
 
-use crate::components::gateway::CallCapture;
+use crate::components::gateway::{CallCapture, CaptureDrop};
 use crate::verification::results::ResultPayload;
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
@@ -81,8 +81,9 @@ const FRAME_BUDGET_BYTES: usize = BIFROST_INGEST_REQUEST_LIMIT_BYTES / 4;
 pub enum ScribeWrite {
     /// One authorization decision bound for retained audit history.
     Audit {
-        /// The decision.
-        event: AuditEvent,
+        /// The decision, boxed so the enum stays as small as its pointer
+        /// variants.
+        event: Box<AuditEvent>,
         /// When the boundary decided, captured as the decision is staged.
         decided_at: DateTime<Utc>,
     },
@@ -103,7 +104,7 @@ impl From<AuditEvent> for ScribeWrite {
     /// the instant the boundary decided.
     fn from(event: AuditEvent) -> Self {
         Self::Audit {
-            event,
+            event: Box::new(event),
             decided_at: Utc::now(),
         }
     }
@@ -144,7 +145,7 @@ impl ScribeWrite {
             }]),
             Self::Capture(capture) => Ok(capture
                 .batches()
-                .map_err(|drop| drop.reason())?
+                .map_err(CaptureDrop::reason)?
                 .into_iter()
                 .map(|(table, batch)| Rows {
                     table,

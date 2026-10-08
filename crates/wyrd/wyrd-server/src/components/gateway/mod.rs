@@ -23,6 +23,7 @@ mod workflow;
 
 pub use batches::{BatchAnswer, GatewayBatches};
 pub use capture::CallCapture;
+pub(crate) use capture::CaptureDrop;
 #[cfg(test)]
 pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;

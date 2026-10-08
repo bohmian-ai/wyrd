@@ -32,6 +32,7 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, RelyingPartyError, ScreenError, TrustedIssuer,
     WorkloadBinding,
 };
+use wyrd_runtime::builtin_roles::DEFAULT_ISSUER_ROLE;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
@@ -325,7 +326,10 @@ async fn create_trusted_issuer(
         client_auth,
         claim_mapping: claim_mapping_into_domain(request.claim_mapping.clone()),
         group_role_map: request.group_role_map.clone(),
-        default_roles: request.default_roles.clone(),
+        default_roles: request
+            .default_roles
+            .clone()
+            .unwrap_or_else(|| vec![DEFAULT_ISSUER_ROLE.to_owned()]),
         principal_kind: principal_kind_policy(request.principal_kind),
         jwks_ttl: request
             .jwks_ttl_secs
@@ -1092,7 +1096,7 @@ mod pg_tests {
                 groups: Some("realm_access.roles".to_owned()),
             },
             group_role_map: HashMap::new(),
-            default_roles: vec!["viewer".to_owned()],
+            default_roles: Some(vec!["viewer".to_owned()]),
             principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl_secs: None,
         }
@@ -1716,6 +1720,48 @@ mod pg_tests {
             .await
             .expect("audit staging restores");
         decision_rows(fixture, state, operation).await
+    }
+
+    /// An issuer created without `default_roles` grants `viewer`, while an
+    /// explicit empty list stays empty.
+    ///
+    /// The request is decoded from JSON so the omission is the wire's, not a
+    /// Rust default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn omitted_default_roles_grant_viewer_and_explicit_empty_stays_empty() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        let mut created = Vec::new();
+        // Each IdP outlives the loop so the second never reuses the first's
+        // port, and with it the first issuer's URL.
+        let mut idps = Vec::new();
+        for roles in [None, Some(serde_json::json!([]))] {
+            let (idp, issuer) = discovery_server().await;
+            idps.push(idp);
+            let mut body =
+                serde_json::to_value(create_issuer_request(issuer, Some(SECRET))).expect("encodes");
+            match roles {
+                Some(roles) => body["default_roles"] = roles,
+                None => {
+                    body.as_object_mut()
+                        .expect("request is an object")
+                        .remove("default_roles");
+                }
+            }
+            let request = serde_json::from_value(body).expect("decodes");
+            let Json(view) =
+                create_trusted_issuer(State(state.clone()), writer(tenant), Json(request))
+                    .await
+                    .expect("issuer creates");
+            created.push(view.default_roles);
+        }
+
+        assert_eq!(created, [vec!["viewer".to_owned()], Vec::new()]);
     }
 
     /// An issuer create whose audit cannot be written still registers its

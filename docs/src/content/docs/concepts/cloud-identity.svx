@@ -88,7 +88,7 @@ Issuer fields:
     ['claim_mapping.email', 'No', 'Not used by workload federation.'],
     ['claim_mapping.groups', 'No', 'Not used by workload federation.'],
     ['group_role_map', 'No', 'Not used by workload federation: a workload acts with the authority of the principal its workload binding names.'],
-    ['default_roles', 'No', 'Not used by workload federation.'],
+    ['default_roles', 'No', 'Omitted, the server stores ["viewer"]; an explicit [] stays empty. Not used by workload federation.'],
     ['jwks_ttl_secs', 'No', 'JWKS cache TTL in seconds. Omit to use the boot default.']
   ]}
 />

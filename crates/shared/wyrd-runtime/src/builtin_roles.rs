@@ -99,7 +99,7 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         permissions: WORKLOAD,
     },
     BuiltinRole {
-        name: "viewer",
+        name: DEFAULT_ISSUER_ROLE,
         permissions: VIEWER,
     },
 ];
@@ -111,6 +111,13 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
 /// it is not overridden by a later re-registration. The principal's Card
 /// scope still bounds which Cards it may attribute evidence to.
 pub const DEFAULT_CARD_ROLE: &str = "workload";
+
+/// Built-in Role a trusted issuer grants every principal it authenticates
+/// when its create request omits `default_roles`.
+///
+/// Read-only by design: an explicit empty list still grants nothing, and
+/// issuers already stored keep the Roles they were created with.
+pub const DEFAULT_ISSUER_ROLE: &str = "viewer";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]

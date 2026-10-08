@@ -60,7 +60,8 @@ pub struct AddArgs {
     /// Optional claim path that yields the principal groups.
     #[arg(long, value_name = "CLAIM")]
     pub claim_groups: Option<String>,
-    /// Role granted to every principal from this issuer. Repeatable.
+    /// Role granted to every principal from this issuer. Repeatable; omitted,
+    /// the server grants `viewer`.
     #[arg(long = "default-role", value_name = "ROLE")]
     pub default_roles: Vec<String>,
     /// Map an issuer group to a Wyrd role, as `group=role`. Repeatable; the same
@@ -157,7 +158,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
                     groups: args.claim_groups,
                 },
                 group_role_map,
-                default_roles: args.default_roles,
+                default_roles: (!args.default_roles.is_empty()).then_some(args.default_roles),
                 principal_kind,
                 jwks_ttl_secs: args.jwks_ttl_secs,
             }),

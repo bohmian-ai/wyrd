@@ -87,9 +87,11 @@ pub struct CreateTrustedIssuerRequest {
     /// Mapping from issuer group to Wyrd roles.
     #[serde(default)]
     pub group_role_map: HashMap<String, Vec<String>>,
-    /// Roles granted to every principal from this issuer.
-    #[serde(default)]
-    pub default_roles: Vec<String>,
+    /// Roles granted to every principal from this issuer. Omitted, the
+    /// server grants the built-in `viewer`; an explicit empty list grants
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_roles: Option<Vec<String>>,
     /// Whether tokens represent humans or workloads.
     pub principal_kind: IssuerTokenPolicy,
     /// Optional JWKS key-cache TTL override in seconds.

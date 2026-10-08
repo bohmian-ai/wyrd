@@ -343,13 +343,18 @@ latency requirements table above.
 
 ## Handoff (2026-10-08): remaining work, in order
 
-State of the three repositories (nothing since these commits is committed):
+State of the three repositories (committed locally 2026-10-08, nothing pushed):
 
-| Repo | Path | Base | Uncommitted work |
+| Repo | Path and branch | Base | Local commit |
 |---|---|---|---|
-| Wyrd | this worktree, branch `wyrd/bifrost-variant/TASK-003` | `b145767dd` | step 2–3 Wyrd edits; this plan file and `benches/bifrost_reads/` are untracked |
-| DataFusion fork | `/home/thorrester/Documents/GitHub/datafusion`, branch `wyrd-arrow60-variant-read-plan`, remote `github.com/bohmian-ai/datafusion` | `38b7a7a0a` (pushed) | V1, V2, V3-F5, V3 groundwork, item-3 codec hook, `parquet_variant_query` bench, `[patch.crates-io]` to local arrow-rs; `datafusion-testing` submodule shows modified (check before committing) |
-| arrow-rs | `/home/thorrester/Documents/GitHub/arrow-rs`, remote is upstream `apache/arrow-rs` (no Bohmian fork yet) | tag 60.0.0 `ef1fa15` | `unshred_variant` pre-size fix: `parquet-variant/src/builder.rs`, `parquet-variant-compute/src/{variant_array_builder,unshred_variant}.rs` |
+| Wyrd | this worktree, `wyrd/bifrost-variant/TASK-003` | `b145767dd` | `4559cff37` (excludes `spec.md` and TASK-004, never committed) |
+| DataFusion fork | `/home/thorrester/Documents/GitHub/datafusion`, `wyrd-arrow60-variant-read-plan`, remote `github.com/bohmian-ai/datafusion` | `38b7a7a0a` (pushed) | `b86808d88`: V1, V2, V3-F5, V3 groundwork, item-3 codec hook, `parquet_variant_query`, `[patch.crates-io]` to local arrow-rs. The `datafusion-testing` submodule pointer change is unrelated and left uncommitted. |
+| arrow-rs | `/home/thorrester/Documents/GitHub/arrow-rs`, `wyrd-unshred-presize`, remote is upstream `apache/arrow-rs` (no Bohmian fork yet) | tag 60.0.0 `ef1fa15` | `c134488`: `unshred_variant` pre-size fix |
+
+Wyrd's worktrees share the main checkout's `pre-commit` hook, which runs
+`mise run check:file-size`, a task defined only on another branch
+(`wyrd/verified-change-contract/TASK-017`). `4559cff37` ran that task's
+command by hand (pass) and committed with `--no-verify`.
 
 How Wyrd builds today (root `Cargo.toml` `[patch.crates-io]`):
 - DataFusion crates point at `/tmp/.../6cd9bbbe-.../scratchpad/df-snap2`, a

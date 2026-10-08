@@ -9,8 +9,8 @@ CREDENTIAL_VARIABLES = ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT
 
 @pytest.fixture
 def fixtures_dir() -> Path:
-    """The repository-root ``fixtures/`` directory the three SDKs share."""
-    return Path(__file__).resolve().parents[4] / "fixtures"
+    """The Python SDK's offline ``tests/fixtures/``: bundles, authoring Cards, and invalid inputs."""
+    return Path(__file__).resolve().parents[1] / "fixtures"
 
 
 @pytest.fixture

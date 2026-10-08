@@ -61,7 +61,8 @@ Refusals load one deliberately broken Card from `invalid/`:
 Names are fixed, so registering a fixture again is idempotent. Add a story
 only when a journey needs Cards none of these provide.
 
-Python unit tests also load offline inputs: `bundles/` holds downloaded
-Service bundles that `WyrdState` hydrates without a server, `authoring/`
-holds Cards loaded through `from_path`, and `invalid/{data,model,prompt,bundles}/`
-holds one broken input per local refusal.
+Offline inputs that only Python unit tests load live with them in
+`sdks/wyrd-sdk-python/tests/fixtures/`: `bundles/` holds downloaded Service
+bundles that `WyrdState` hydrates without a server (`builtin-model/` holds only
+the files that differ from `complete/`), `authoring/` holds Cards loaded
+through `from_path`, and `invalid/` holds one broken input per local refusal.

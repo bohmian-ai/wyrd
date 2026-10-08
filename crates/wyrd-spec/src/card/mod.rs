@@ -1372,7 +1372,7 @@ mod model_schema_drift_tests {
     use schemars::schema_for;
 
     fn snapshot_path(file_name: &str) -> String {
-        format!("{}/tests/schemas/{file_name}", env!("CARGO_MANIFEST_DIR"))
+        format!("{}/schemas/{file_name}", env!("CARGO_MANIFEST_DIR"))
     }
 
     fn assert_schema_matches_snapshot<T: schemars::JsonSchema>(file_name: &str) {

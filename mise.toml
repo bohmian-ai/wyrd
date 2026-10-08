@@ -1421,13 +1421,23 @@ wait $SERVER_PID $UI_PID
 """
 
 [tasks.check]
-description = "Whole-plan closeout gate: fmt check + all-feature Clippy"
+description = "Whole-plan closeout gate: tracked file size + fmt check + all-feature Clippy"
 run = """
 set -eu
+mise run check:file-size
 mise run fmt:check
 mise run check:workspace-hack
 mise run lints
 """
+
+[tasks."check:file-size"]
+hide = true
+description = "Fail when a tracked file exceeds 1 MiB. Git history keeps every committed blob forever, so a model, dataset, or archive committed once makes every clone heavier. Lockfiles are exempt."
+run = '''
+git ls-files -z | xargs -0 wc -c 2>/dev/null \
+  | awk '$2 != "total" && $1 > 1048576 && $2 !~ /(^|\/)(uv\.lock|Cargo\.lock|pnpm-lock\.yaml|package-lock\.json)$/ { print; bad = 1 } END { exit bad }' \
+  || { echo 'tracked files over 1 MiB: keep large data out of git (generate it, download it in the test, or shrink the fixture)'; exit 1; }
+'''
 
 [tasks."check:workspace-hack"]
 hide = true
@@ -1443,7 +1453,6 @@ cargo hakari verify
 description = "Regenerate JSON schemas / MCP tool list / pyi stubs / typed Card envelopes from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
-cargo run --locked -p wyrd-client --example gen_schemas
 python3 scripts/gen_card_types.py
 (cd sdks/wyrd-sdk-python && uv run ruff format python/wyrd/_card_types.py)
 mise run codegen:stubs
@@ -1463,8 +1472,7 @@ description = "Fail if generated schemas, pyi stubs, TypeScript error codes, typ
 run = """
 snapshot_codegen() {
   {
-    find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
-    find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
+    find crates/wyrd-spec/schemas -type f -name '*.json'
     printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts \
       sdks/wyrd-sdk-python/python/wyrd/_card_types.py
     find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \

@@ -101,10 +101,22 @@ def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer, service: Card
     assert revoked.value.code == DENIED
 
 
-def test_discovery_finds_the_service_by_name(server: WyrdTestServer, service: CardRef) -> None:
-    principal, _ = issue(server, service)
+def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None:
+    user = server.bootstrap_user(["viewer"], "pr-person")
+    principals = Principals(client_of(server))
 
-    page = Principals(client_of(server)).list(kind="service", name=service.name)
-
-    assert [found["principal_id"] for found in page["principals"]] == [principal]
+    page = principals.list(email="pr-person@test.wyrd")
+    assert [(found["principal_id"], found["kind"]) for found in page["principals"]] == [
+        (user, "user")
+    ]
     assert page["next"] is None
+
+    granted = principals.grant_role(user, "viewer")
+    assert granted["changed"]
+    assert granted["roles"] == [
+        {"role": "viewer", "source": "direct"},
+        {"role": "viewer", "source": "idp"},
+    ]
+    revoked = principals.revoke_role(user, "viewer")
+    assert revoked["changed"]
+    assert revoked["roles"] == [{"role": "viewer", "source": "idp"}]

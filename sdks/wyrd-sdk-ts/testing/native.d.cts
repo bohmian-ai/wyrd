@@ -114,6 +114,23 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapService(roles: Array<string>, name: string): string
   /**
+   * Sign in a fixture-tenant user holding identity-provider `roles` and
+   * return the user's principal id.
+   *
+   * The roles are recorded as a login would record them, so a journey can
+   * prove a direct grant coexists with them.
+   *
+   * # Arguments
+   *
+   * * `roles` - The role names the identity provider grants.
+   * * `name` - The user's name; the email is `<name>@test.wyrd`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or bootstrapping fails.
+   */
+  bootstrapUser(roles: Array<string>, name: string): string
+  /**
    * Bootstrap a service principal holding `roles` in tenant `tenant_id` and
    * return its API key.
    *

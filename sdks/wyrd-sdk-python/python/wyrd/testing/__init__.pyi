@@ -142,6 +142,23 @@ class WyrdTestServer:
         """Fixture tenant UUID string."""
         ...
 
+    def bootstrap_user(self, roles: list[str], name: str) -> str:
+        """Sign in a fixture-tenant user holding identity-provider ``roles``.
+
+        Args:
+            roles: Role names recorded as the identity provider's, as a login
+                records them.
+            name: the user's name; the email is ``<name>@test.wyrd``.
+
+        Returns:
+            The user's principal id.
+
+        Raises:
+            WyrdError: Outside the context manager, or when bootstrap fails.
+
+        """
+        ...
+
     def bootstrap_service(self, roles: list[str], name: str = "svc") -> str:
         """Mint a fixture-tenant service principal and return its API key.
 

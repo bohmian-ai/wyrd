@@ -374,6 +374,26 @@ impl WyrdTestServer {
         )
     }
 
+    /// Bootstrap a signed-in user holding identity-provider `roles`,
+    /// returning the user's principal id.
+    ///
+    /// The roles are recorded as a login would record them, so a journey can
+    /// prove a direct grant coexists with them. Must be called inside the
+    /// context manager.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or
+    /// bootstrap fails.
+    #[pyo3(signature = (roles, name))]
+    fn bootstrap_user(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+        let server = self.started()?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(server.bootstrap_user(name, &roles))
+            .map_err(py_error)?;
+        Ok(bootstrap.id().to_string())
+    }
+
     /// Issue an API key for the principal projected by a registered Service Card.
     ///
     /// A credential fixture: `roles` are granted to the Service's existing

@@ -61,11 +61,21 @@ test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
   await expect(own.revokeRole(principal, "workload")).rejects.toMatchObject(DENIED);
 });
 
-test("discovery finds the service by name", async ({ bundle: _ }) => {
-  const { principal } = await issue();
+test("direct and idp user assignments coexist", async ({ server }) => {
+  const user = server.bootstrapUser(["viewer"], "pr-person");
+  const principals = Principals.connect();
 
-  const page = await Principals.connect().list({ kind: "service", name: "observed-service" });
-
-  expect(page.principals.map((found) => found.principal_id)).toEqual([principal]);
+  const page = await principals.list({ email: "pr-person@test.wyrd" });
+  expect(page.principals.map((found) => [found.principal_id, found.kind])).toEqual([[user, "user"]]);
   expect(page.next).toBeNull();
+
+  const granted = await principals.grantRole(user, "viewer");
+  expect(granted.changed).toBe(true);
+  expect(granted.roles).toEqual([
+    { role: "viewer", source: "direct" },
+    { role: "viewer", source: "idp" },
+  ]);
+  const revoked = await principals.revokeRole(user, "viewer");
+  expect(revoked.changed).toBe(true);
+  expect(revoked.roles).toEqual([{ role: "viewer", source: "idp" }]);
 });
